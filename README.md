@@ -1,0 +1,118 @@
+# LIENS — Latent Interface Evolution Neural Surrogate
+## A latent-space neural surrogate for phase-field microstructure evolution
+
+
+This project uses neural network (NN) models in materials science and engineering (MSE). It investigates whether neural nets can learn a latent-space surrogate model for phase-field microstructure evolution. Instead of repeatedly solving the governing partial differential equations (PDE), a neural network learns the mapping between successive microstructures directly from simulation data. The objective is to accelerate phase-field simulations while preserving the underlying physics and microstructural evolution.
+
+
+
+## A quick introduction to phase field
+Phase-field modeling is a computational framework used to simulate the evolution of microstructures without explicitly tracking sharp interfaces. Instead of representing boundaries (such as grain boundaries or phase interfaces) as discrete surfaces, the method introduces one or more continuous order parameters (OP) that vary smoothly across space. These fields take distinct values in different phases and vary smoothly across interfaces over a finite width. The evolution of the system is typically governed by PDEs describing gradient flow of a free-energy functional: the Cahn-Hilliard equation is used for conserved OP (e.g. composition) and Allen-Cahn if not conserved (phases).
+
+For details (equations, implementation), see `./docs/phase_field.md`.
+
+
+
+## Neural surrogate
+The NN model will be trained on phase-field simulation results to predict the microstructure at $t + \Delta t$ based on the microstructure at $t$, i.e. it will learn a surrogate that approximates phase-field time evolution operators, without explicitly solving discretized PDEs.
+
+The model will use an autoencoder (AE) based on convolutional neural networks (CNN). The encoder will compress the image of the microstructure, $x(t)$, as a latent representation, $z(t)$. From this the decoder will recover (approximately) the microstructure:
+- encode: $z = E(x)$,
+- decode: $x'= D(z)$, i.e. $D(E(x))$.
+
+The convolutional autoencoder has a symmetric encoder–decoder architecture. The latent representation retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. For details on the architecture of the autoencoder, see `./docs/neural_nets.md`.
+
+
+
+## Latent representation 
+The latent representation will also be used by a Latent Dynamics Surrogate (LDS) model to predict the microstructure at $t + \Delta t$: $z(t + \Delta t) = z(t) + f_\theta(z(t), \Delta t)$, with $\theta$ physical parameters (e.g. temperature). As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\Delta t$ a multiple of the phase-field time step).
+
+Representing the microstructure in latent space rather than real space has two advantages:
+- it can be much smaller (even a smallish 256×256 image has 65'000 degrees of freedom),
+- it is customized to our purpose (a bit like using a vectorized image instead of a bitmap).
+This is essentially a learned reduced-order model of a PDE flow map.
+
+The underlying hypothesis is two-fold. Phase-field evolution occurs on a smooth low-dimensional manifold that can be learnt by a convolutional autoencoder. And the corresponding latent dynamics can be approximated by a neural surrogate operating entirely in latent space.
+
+For phase-field systems, the latent variables are expected to behave similarly to coordinates on a reduced thermodynamic manifold, dynamics should approximate gradient flow.
+
+
+
+## Process
+The process is:
+$$x(t) \xrightarrow{E} z(t) \xrightarrow{f_\theta} z(t+\Delta t) \xrightarrow{D} x(t+\Delta t).$$
+In fact, the encoding occurs only once at the beginning and the decoding once at the end (plus when plots are needed):
+$$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\theta} z(2 \Delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(T).$$
+
+
+```text
+        x(t)
+          │
+          ▼
+    ┌───────────┐
+    │ encoder E │
+    └─────┬─────┘
+          │
+        z(t)
+          │
+          ├───────────────────┐
+          │                   │
+          │                   ▼
+          │             ┌───────────┐
+          │             │    fθ     │
+          │             └─────┬─────┘
+          │                   │
+          │                   ▼
+          │                z(t+Δt)
+          │                   │
+          ▼                   ▼
+    ┌───────────┐       ┌───────────┐
+    │ decoder D │       │ decoder D │
+    └─────┬─────┘       └─────┬─────┘
+          │                   │
+          ▼                   ▼
+       x'(t)              x'(t+Δt)
+```
+
+
+
+## Workflow
+1.	Generate tens or hundreds of phase-field simulations. 
+2.	Train a CNN autoencoder on individual microstructures (no time evolution yet).
+3.  Latent-space validation: latent space behaves like a smooth, structured coordinate system (see `./docs/neural_nets.md` for more details).
+4.	Freeze encoder and train latent dynamics to predict future microstructures in latent space.
+5.	Regularized encoder fine-tuning with small learning rate and latent consistency loss.
+6.	Fine-tune end-to-end 
+7.	Add a simple inverse-design demo?
+  - find process parameters from desired domain size, 
+
+
+
+
+## Repository structure
+
+```text
+.
+├── cpp/               # phase-field solver
+│   └── utils/
+├── python/
+│   ├── models/
+│   ├── training/
+│   ├── evaluation/
+│   └── utils/
+├── data/
+├── docs/
+│   ├── phase_field.md
+│   ├── neural_nets.md
+└── README.md
+```
+
+## Current status
+
+- [ ] C++ phase-field solver
+- [ ] Dataset generation
+- [ ] CNN autoencoder
+- [ ] Latent-space validation
+- [ ] Latent dynamics surrogate
+- [ ] End-to-end training
+- [ ] Inverse design
