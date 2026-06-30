@@ -23,11 +23,12 @@ struct Config
 
     // Parameter sweeps
     std::vector<double> temperatures;
-    std::vector<double> noise;
-    std::vector<double> seeds;
+    std::vector<double> noises;
+    std::vector<int>    seeds;
 
     // Snapshot schedule
     std::vector<int> save;
 
     void load(const std::string& filename);
+    void validate() const;
 };

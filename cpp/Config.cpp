@@ -1,10 +1,15 @@
-#include "Config.hpp"
+#include "config.hpp"
 
 #include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <iostream>
+
+using std::runtime_error;
+using std::to_string;
+using std::stod;   using std::stoi;
 
 namespace
 {
@@ -41,7 +46,7 @@ void Config::load(const std::string& filename)
     std::ifstream file(filename);
 
     if (!file)
-        throw std::runtime_error("Cannot open configuration file.");
+        throw runtime_error("Cannot open configuration file.");
 
     std::unordered_map<std::string, bool> seen;
 
@@ -60,57 +65,57 @@ void Config::load(const std::string& filename)
         auto pos = line.find('=');
 
         if (pos == std::string::npos)
-            throw std::runtime_error("Invalid line: " + line);
+            throw runtime_error("Invalid line: " + line);
 
-        std::string key = trim(line.substr(0, pos));
+        std::string key   = trim(line.substr(0, pos));
         std::string value = trim(line.substr(pos + 1));
 
         seen[key] = true;
 
         if (key == "Nx")
-            Nx = std::stoi(value);
+            Nx = stoi(value);
 
         else if (key == "Ny")
-            Ny = std::stoi(value);
+            Ny = stoi(value);
 
         else if (key == "dt")
-            dt = std::stod(value);
+            dt = stod(value);
 
         else if (key == "steps")
-            steps = std::stoi(value);
+            steps = stoi(value);
 
         else if (key == "kappa")
-            kappa = std::stod(value);
+            kappa = stod(value);
 
         else if (key == "a0")
-            a0 = std::stod(value);
+            a0 = stod(value);
 
         else if (key == "b")
-            b = std::stod(value);
+            b = stod(value);
 
         else if (key == "M")
-            M = std::stod(value);
+            M = stod(value);
 
         else if (key == "T0")
-            T0 = std::stod(value);
+            T0 = stod(value);
 
         else if (key == "phi0")
-            phi0 = std::stod(value);
+            phi0 = stod(value);
 
         else if (key == "temperatures")
         {
             temperatures.clear();
 
             for (const auto& s : split(value))
-                temperatures.push_back(std::stod(s));
+                temperatures.push_back(stod(s));
         }
 
-        else if (key == "noise")
+        else if (key == "noises")
         {
-            noise.clear();
+            noises.clear();
 
             for (const auto& s : split(value))
-                noise.push_back(std::stod(s));
+                noises.push_back(stod(s));
         }
 
         else if (key == "seeds")
@@ -118,7 +123,7 @@ void Config::load(const std::string& filename)
             seeds.clear();
 
             for (const auto& s : split(value))
-                seeds.push_back(std::stod(s));
+                seeds.push_back(stoi(s));
         }
 
         else if (key == "save")
@@ -126,12 +131,12 @@ void Config::load(const std::string& filename)
             save.clear();
 
             for (const auto& s : split(value))
-                save.push_back(std::stoi(s));
+                save.push_back(stoi(s));
         }
 
         else
         {
-            throw std::runtime_error("Unknown key: " + key);
+            throw runtime_error("Unknown key: " + key);
         }
     }
 
@@ -139,16 +144,54 @@ void Config::load(const std::string& filename)
     {
         "Nx","Ny",
         "dt","steps",
-        "kappa","a0","b","M", "T0",
+        "kappa", "a0", "b", "M", "T0",
         "phi0",
-        "temperatures", "noise", "seeds",
+        "temperatures", "noises", "seeds",
         "save"
     };
 
     for (auto key : required)
     {
         if (!seen[key])
-            throw std::runtime_error(
+            throw runtime_error(
                 std::string("Missing parameter: ") + key);
     }
+}
+
+bool is_power_of_two(unsigned int n)
+{
+    return n != 0 && (n & (n - 1)) == 0;
+}
+
+void Config::validate() const
+{
+    // Grid dimensions
+    if (Nx <= 0)
+        throw runtime_error("Nx must be positive, not " + to_string(Nx));
+    if (Ny <= 0)
+        throw runtime_error("Ny must be positive, not " + to_string(Ny));
+    if (Nx != Ny)
+        std::cerr << "Nx and Ny should be equal.\n";
+    if (!is_power_of_two(Nx))
+        std::cerr << "Nx should be a power of 2.\n";
+    if (!is_power_of_two(Ny))
+        std::cerr << "Ny should be a power of 2.\n";
+
+    // Time integration
+    if (dt <= 0)
+        throw runtime_error("dt must be positive, not " + to_string(dt));
+    if (steps <= 0)
+        throw runtime_error("steps must be positive, not " + steps);
+    
+    // Physics
+    if (kappa <= 0)
+        throw runtime_error("kappa must be positive, not " + to_string(kappa));
+    if (a0 <= 0)
+        throw runtime_error("a0 must be positive, not " + to_string(a0));
+    if (b <= 0)
+        throw runtime_error("b must be positive, not " + to_string(b));
+    if (M <= 0)
+        throw runtime_error("M must be positive, not " + to_string(M));
+    if (T0 <= 0)
+        throw runtime_error("T0 must be positive, not " + to_string(T0));
 }
