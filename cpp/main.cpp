@@ -1,10 +1,7 @@
 #include <iostream>
 
 #include "config.hpp"
-#include "state.hpp"
-// #include "allen_cahn.hpp"
-// #include "free_energy.hpp"
-// #include "simulation.hpp"
+#include "simulation.hpp"
 
 
 
@@ -20,37 +17,8 @@ int main(int argc, char* argv[])
     std::cout << "nb temperatures: "<< cfg.temperatures.size() << '\n';
 
 
+    // run several simulations
+    Simulation sim(cfg);
+    sim.run();
     
-    for (double temperature : cfg.temperatures)
-        for (double noise : cfg.noises)
-            for (int seed : cfg.seeds)
-            {
-                std::cout << "T: " << temperature << ", noise: " << noise << ", seed: " << seed << '\n';
-                // creating one non-conserved order parameter
-                
-                OrderParameter phi{
-                    Field(cfg.Nx, cfg.Ny, cfg.phi0, noise, seed),
-                    false,  // is_conserved
-                    cfg.M
-                };
-                // std::cout << phi.size() << '\n';
-
-
-                struct RunParameters
-                {
-                    double temperature;
-                    double noise;
-                    int seed;
-                };
-
-                RunParameters run{temperature, noise, seed};
-
-
-                // Simulation sim(cfg, run);
-                // sim.run();
-            }
 }
-
-// double df(double phi, double T) {
-//     return a(T)*phi + b*phi*phi*phi;
-// }
