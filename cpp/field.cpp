@@ -25,13 +25,36 @@ void Field::initialize(double phi0,
 
 
 // statistics
-double Field::average()
+double Field::average() const
 {
     double total = 0.;
 
-    for (double& v : __values)
+    for (double v : __values)
         total += v;
     return total / size();
+}
+
+std::map<std::string, double> Field::statistics() const
+{
+    if (__values.empty())
+        throw std::runtime_error("Field is empty");
+
+    double min = __values[0];
+    double max = __values[0];
+    double total = 0.0;
+
+    for (double v : __values)
+    {
+        if (v < min) min = v;
+        if (v > max) max = v;
+        total += v;
+    }
+
+    return {
+        {"min", min},
+        {"avg", total / __values.size()},
+        {"max", max}
+    };
 }
 
 

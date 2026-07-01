@@ -45,7 +45,8 @@ void writer::save_phi_half(const std::vector<double>& phi,
 }
 
 
-std::string writer::make_dir_name(double T, double noise, int seed)
+std::string writer::make_dir_name(int nx, int ny,
+                                  double T, double noise, int seed)
 {
     auto fmt = [](double x, int scale)
     {
@@ -58,6 +59,7 @@ std::string writer::make_dir_name(double T, double noise, int seed)
 
     std::ostringstream oss;
     oss << "../datasets/"
+        << nx << "x"  << ny << "/"
         << "T" << Ti
         << "_n" << std::setw(3) << std::setfill('0') << ni
         << "_s" << seed;

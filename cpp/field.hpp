@@ -1,6 +1,8 @@
 #pragma once
 
 #include <vector>
+#include <map>
+#include <string>
 #include <cassert>
 #include <stdexcept>
 #include <filesystem>
@@ -62,7 +64,8 @@ public:
     { return __values[index(i, j)]; }
 
     // statistics
-    double average();
+    double average() const;
+    std::map<std::string, double> statistics() const;
 
     // save as image
     void save_as_png(const std::filesystem::path& file);
@@ -125,7 +128,8 @@ public:
     double& operator()(int i, int j) { return __phi(i, j);}
     
     // statistics
-    double average() {return __phi.average(); }
+    double average   () {return __phi.average   (); }
+    auto   statistics() {return __phi.statistics(); }
     
     // save as image
     void save_as_png(const std::filesystem::path& file)

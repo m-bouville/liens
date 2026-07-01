@@ -11,6 +11,7 @@ namespace writer
     void save_phi_half(const std::vector<double>& phi,
                        const std::filesystem::path& file);
 
-    std::string make_dir_name(double T, double noise, int seed);
+    std::string make_dir_name(int nx, int ny,
+                              double T, double noise, int seed);
 
 }

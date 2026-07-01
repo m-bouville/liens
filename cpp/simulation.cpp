@@ -38,7 +38,8 @@ void Simulation::__runOneSimulation(double T,
                                     int seed)
 {
     
-    std::filesystem::path outdir = writer::make_dir_name(T, noise, seed);
+    std::filesystem::path outdir = 
+            writer::make_dir_name(__config.Nx, __config.Ny, T, noise, seed);
 
     if (std::filesystem::exists(outdir / "COMPLETE"))
     {
@@ -74,11 +75,13 @@ std::filesystem::create_directories(outdir);
     std::unordered_set<int> save_steps(__config.save.begin(),
                                        __config.save.end  ());
     std::cout << std::left
-            << std::setw(10) << "step"
-            << std::setw(15) << "avg (%)"
-            << std::setw(15) << "energy"
+            << std::setw(8) << "step"
+            << std::setw(7) << "min (%)"
+            << std::setw(7) << "avg (%)"
+            << std::setw(7) << "max (%)"
+            << std::setw(8) << "energy"
             << '\n';          
-    std::cout << std::string(40, '-') << '\n';
+    std::cout << std::string(35, '-') << '\n';
 
     std::filesystem::path file;
 
@@ -90,12 +93,14 @@ std::filesystem::create_directories(outdir);
         if (save_steps.contains(step))
         {
             // display
+            auto stats = op.statistics();
             std::cout << std::left
-                    << std::setw(10) << step
-                    << std::setw(15) << std::fixed << std::setprecision(6)
-                    << op.average() * 100
-                    << std::setw(15)
-                    << solver.energy(op, potential, T)
+                    << std::setw(8) << step
+                    << std::setw(7) << std::fixed << std::setprecision(2)
+                    << stats["min"]* 100 
+                    << std::setw(7) << stats["avg"]* 100 
+                    << std::setw(7) << stats["max"]* 100 
+                    << std::setw(8) << std::setprecision(3) << solver.energy(op, potential, T)
                     << '\n';
 
             // reset (important if more printing follows)
@@ -121,4 +126,5 @@ std::filesystem::create_directories(outdir);
             << " max = " << *maxIt << "\n";
 
     op.save_as_png(file.replace_extension(".png"));
+    std::cout << '\n';  
 }
