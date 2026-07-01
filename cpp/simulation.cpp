@@ -23,7 +23,7 @@
 
 void Simulation::run()
 {
-    constexpr std::size_t max_threads = 10;
+    const std::size_t max_threads = __config.max_threads;
     
     std::vector<std::future<void>> futures;
 
@@ -74,7 +74,6 @@ void Simulation::__runOneSimulation(double T,
                 ", seed: " << seed << '\n';
     }
         
-    std::mutex cout_mutex;
     {
         std::lock_guard<std::mutex> lock(cout_mutex);
         std::cout << os_start.str();

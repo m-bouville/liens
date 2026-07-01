@@ -2,6 +2,8 @@
 
 #include "config.hpp"
 
+#include <mutex>
+
 
 class Simulation
 {
@@ -16,6 +18,8 @@ public:
 private:
 
     Config __config;
+
+    std::mutex cout_mutex;
 
     void __runOneSimulation(double T,
                             double noise,

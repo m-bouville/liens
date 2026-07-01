@@ -1,14 +1,17 @@
 # Grid
-Nx      = 128
-Ny      = 128
+Nx      = 512
+Ny      = 512
 
 # Time integration
 dt      = 0.05
-steps   = 60001
+steps   = 100001
+
+# threads
+max_threads = 12
 
 # Physical parameters
 kappa   = 0.2
-M       = 0.02
+M       = 0.05
 
 a0      = 1.0
 b       = 1.0

@@ -88,6 +88,9 @@ void Config::load(const std::string& filename)
         else if (key == "steps")
             steps = stoi(value);
 
+        else if (key == "max_threads")
+            max_threads = stoi(value);            
+
         else if (key == "kappa")
             kappa = stod(value);
 
@@ -147,7 +150,7 @@ void Config::load(const std::string& filename)
     const char* required[] =
     {
         "Nx","Ny",
-        "dt","steps",
+        "dt","steps", "max_threads",
         "kappa", "a0", "b", "M", "T0",
         "phi0",
         "temperatures", "noises", "seeds",
@@ -186,16 +189,21 @@ void Config::validate() const
         throw runtime_error("dt must be positive, not " + to_string(dt));
     if (steps <= 0)
         throw runtime_error("steps must be positive, not " + to_string(steps));
-    
+
+    // threads
+    if (max_threads < 1)
+        throw runtime_error("max_threads must at least 1, not " + to_string(max_threads));
+
     // Physics
     if (kappa <= 0)
         throw runtime_error("kappa must be positive, not " + to_string(kappa));
+    if (M <= 0)
+        throw runtime_error("M must be positive, not " + to_string(M));
+        
     if (a0 <= 0)
         throw runtime_error("a0 must be positive, not " + to_string(a0));
     if (b <= 0)
         throw runtime_error("b must be positive, not " + to_string(b));
-    if (M <= 0)
-        throw runtime_error("M must be positive, not " + to_string(M));
     if (T0 <= 0)
         throw runtime_error("T0 must be positive, not " + to_string(T0));
 }

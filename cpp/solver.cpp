@@ -43,5 +43,6 @@ double FDSolver::energy(   OrderParameter& op,
                    const Potential&      potential,
                          double          T)
     {
-        return (potential.energy(op, T) + op.kappa() * FD::gradient_sqr(op.field()));
+        return (potential.bulk_energy(op, T) + 
+                0.5 * op.kappa() * FD::gradient_sqr(op.field()));
     }

@@ -6,42 +6,12 @@
 
 
 
-// class FreeEnergy
-// {
-// public:
-
-//     virtual void derivative(
-//         const OrderParameter& order_para,
-//         std::vector<Field>& dF) const = 0;
-// };
-
-
-// class LandauGinzburg : public FreeEnergy
-// {
-// public:
-
-
-
-//     //-----------------------------
-//     // Physical parameters
-//     //-----------------------------
-    
-//     double M;
-//     double kappa;
-// };
-
-
-
-
-
-
-
 
 class Potential
 {
 public:
-    virtual double energy    (const OrderParameter& phi,
-                                    double          T)      const = 0;
+    virtual double bulk_energy(const OrderParameter& phi,
+                                     double          T)      const = 0;
     
     virtual void   derivative(const OrderParameter& phi,
                                     double          T,
@@ -61,8 +31,8 @@ public:
           __T0(T0)
     {}
     
-    double energy(const OrderParameter& order_para,
-                  double T) const override;
+    double bulk_energy(const OrderParameter& order_para,
+                             double          T) const override;
 
     // derivative w.r.t. order parameter phi
     void derivative(const OrderParameter& order_para,

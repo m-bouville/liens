@@ -19,8 +19,8 @@ double LandauPotential::__energy_one_pixel(double phi,
     return __a(T)/2. * phi2 + __b/4. * phi2*phi2;
 }
 
-double LandauPotential::energy(const OrderParameter& order_para,
-                                        double T) const
+double LandauPotential::bulk_energy(const OrderParameter& order_para,
+                                         double T) const
 {
     const std::vector<double>& values = order_para.values();
 
@@ -44,7 +44,7 @@ void LandauPotential::derivative(const OrderParameter& order_para,
 {
     const std::vector<double>& values = order_para.values();
 
-    result.values().resize(values.size());
+    // result.values().resize(values.size());
 
     for (size_t i = 0; i < values.size(); ++i)
         result.values()[i] = __derivative_one_pixel(values[i], T);
