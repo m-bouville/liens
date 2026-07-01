@@ -4,7 +4,7 @@ Ny      =  64
 
 # Time integration
 dt      = 0.05
-steps   = 50'000
+steps   = 40001
 
 # Physical parameters
 kappa   = 2.0

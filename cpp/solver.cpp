@@ -37,3 +37,11 @@ void FDSolver::step(     OrderParameter& op,
                 op[i] += dt * op.mobility() * __ws.laplacian_mu[i];
         }
     }
+
+
+double FDSolver::energy(   OrderParameter& op,
+                   const Potential&      potential,
+                         double          T)
+    {
+        return (potential.energy(op, T) + op.kappa() * FD::gradient_sqr(op.field()));
+    }

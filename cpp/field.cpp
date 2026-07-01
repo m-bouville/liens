@@ -1,8 +1,9 @@
+#include "field.hpp"
+
 #include <vector>
 #include <cmath>
 #include <random>
-
-#include "field.hpp"
+#include <opencv2/opencv.hpp>
 
 using std::vector;
 
@@ -23,5 +24,27 @@ void Field::initialize(double phi0,
 }
 
 
+// statistics
+double Field::average()
+{
+    double total = 0.;
 
+    for (double& v : __values)
+        total += v;
+    return total / size();
+}
+
+
+// save as image
+void Field::save_as_png(const std::filesystem::path& file)
+{
+    cv::Mat img(__nx, __ny, CV_64F, __values.data());  // TODO __ny, __nx?
+
+    cv::Mat norm;
+    cv::normalize(img, norm, -127.5, 127.5, cv::NORM_MINMAX);
+
+    norm.convertTo(norm, CV_8U);
+
+    cv::imwrite(file.string(), norm);
+}
 

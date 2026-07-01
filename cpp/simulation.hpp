@@ -1,5 +1,6 @@
-#include "config.hpp"
+#pragma once
 
+#include "config.hpp"
 
 
 class Simulation
@@ -19,6 +20,7 @@ private:
     void __runOneSimulation(double T,
                             double noise,
                             int seed);
+
 
     // SnapshotWriter writer;
 };

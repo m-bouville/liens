@@ -46,7 +46,11 @@ void Config::load(const std::string& filename)
     std::ifstream file(filename);
 
     if (!file)
+    {
+        std::cerr << "Open failed\n";
         throw runtime_error("Cannot open configuration file.");
+    }
+    std::cout << "Opened successfully\n";
 
     std::unordered_map<std::string, bool> seen;
 
@@ -181,7 +185,7 @@ void Config::validate() const
     if (dt <= 0)
         throw runtime_error("dt must be positive, not " + to_string(dt));
     if (steps <= 0)
-        throw runtime_error("steps must be positive, not " + steps);
+        throw runtime_error("steps must be positive, not " + to_string(steps));
     
     // Physics
     if (kappa <= 0)

@@ -45,10 +45,9 @@
 //     }
 // }
 
-void FD::gradient_sqr(const Field& in, Field& out)
+double FD::gradient_sqr(const Field& in)
 {
-    assert(in.nx() == out.nx());
-    assert(in.ny() == out.ny());
+    double out = 0;
 
     for (int j = 0; j < in.ny(); ++j)
         {
@@ -63,10 +62,34 @@ void FD::gradient_sqr(const Field& in, Field& out)
                 double gx = 0.5 * (in(ip, j) - in(im, j));
                 double gy = 0.5 * (in(i, jp) - in(i, jm));
 
-                out(i, j) = gx * gx + gy * gy;
+                out += gx * gx + gy * gy;
             }
         }
+    return out;
 }
+
+// void FD::gradient_sqr(const Field& in, Field& out)
+// {
+//     assert(in.nx() == out.nx());
+//     assert(in.ny() == out.ny());
+
+//     for (int j = 0; j < in.ny(); ++j)
+//         {
+//             int jp = (j + 1) % in.ny();
+//             int jm = (j - 1 + in.ny()) % in.ny();
+
+//             for (int i = 0; i < in.nx(); ++i)
+//             {
+//                 int ip = (i + 1) % in.nx();
+//                 int im = (i - 1 + in.nx()) % in.nx();
+
+//                 double gx = 0.5 * (in(ip, j) - in(im, j));
+//                 double gy = 0.5 * (in(i, jp) - in(i, jm));
+
+//                 out(i, j) = gx * gx + gy * gy;
+//             }
+//         }
+// }
 
 void FD::laplacian(const Field& in, Field& out)
 {   

@@ -3,6 +3,7 @@
 #include <vector>
 #include <cassert>
 #include <stdexcept>
+#include <filesystem>
 
 
 
@@ -59,6 +60,12 @@ public:
     { return __values[index(i, j)]; }
     const double operator()(int i, int j) const
     { return __values[index(i, j)]; }
+
+    // statistics
+    double average();
+
+    // save as image
+    void save_as_png(const std::filesystem::path& file);
     
 
 private:
@@ -117,7 +124,13 @@ public:
     double& operator[](int idx)      { return __phi[idx]; }
     double& operator()(int i, int j) { return __phi(i, j);}
     
-    void step(double dt);
+    // statistics
+    double average() {return __phi.average(); }
+    
+    // save as image
+    void save_as_png(const std::filesystem::path& file)
+    {return __phi.save_as_png(file); }
+
 
 private:
     Field  __phi;

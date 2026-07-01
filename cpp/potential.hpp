@@ -68,6 +68,8 @@ public:
     void derivative(const OrderParameter& order_para,
                           double          T,
                           Field&          result) const override;
+    
+    double minimum(double T) const;
 
 private:
     double __a0;

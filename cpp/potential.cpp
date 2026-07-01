@@ -1,6 +1,8 @@
-#include <vector>
 
 #include "potential.hpp"
+
+#include <vector>
+#include <cmath>
 
 #include "field.hpp"
 
@@ -46,4 +48,12 @@ void LandauPotential::derivative(const OrderParameter& order_para,
 
     for (size_t i = 0; i < values.size(); ++i)
         result.values()[i] = __derivative_one_pixel(values[i], T);
+}
+
+
+double LandauPotential::minimum(double T) const
+{
+    if (T >= __T0)
+        return 0.;
+    return std::sqrt(-__a(T) / __b);
 }

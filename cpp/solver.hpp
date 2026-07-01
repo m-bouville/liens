@@ -13,6 +13,10 @@ public:
                       const Potential&      potential,
                             double          T,
                             double          dt) = 0;
+
+    virtual double energy(      OrderParameter& op,
+                          const Potential&      potential,
+                                double          T) = 0;
 };
 
 
@@ -28,6 +32,11 @@ public:
               const Potential&      potential,
                     double          T,
                     double          dt) override;
+
+
+    double energy(      OrderParameter& op,
+                  const Potential&      potential,
+                        double          T) override;
 
 
 private:

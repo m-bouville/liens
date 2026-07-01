@@ -12,7 +12,8 @@ namespace FD
 {
     // void gradient_x  (const Field& in, Field& out);
     // void gradient_y  (const Field& in, Field& out);
-    void gradient_sqr(const Field& in, Field& out);
+    double gradient_sqr(const Field& in);
+    // void gradient_sqr(const Field& in, Field& out);
     void laplacian   (const Field& in, Field& out);
 
 
@@ -36,13 +37,15 @@ namespace FD
             : df_dphi    (nx, ny),
             laplacian_phi(nx, ny),
             mu           (nx, ny),
-            laplacian_mu (nx, ny)
+            laplacian_mu (nx, ny),
+            gradient_sqr (nx, ny)
         {}
 
         Field df_dphi;      // d f  / d phi
         Field laplacian_phi;// laplacian of phi
         Field mu;           // chemical potential = derivative (potential + gradient)
         Field laplacian_mu; // laplacian of chemical potential
+        Field gradient_sqr; // for energy
     };
 
 
