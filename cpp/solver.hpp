@@ -10,12 +10,14 @@ class Solver
 {
 public:
     virtual void step(      OrderParameter& op,
-                      const Potential&      potential,
+                      const Potential&      potential, 
+                      const FD::Neighbors&  neighbors,
                             double          T,
                             double          dt) = 0;
 
     virtual double energy(const OrderParameter& op,
-                          const Potential&      potential,
+                          const Potential&      potential, 
+                          const FD::Neighbors&  neighbors,
                                 double          T) const = 0;
 };
 
@@ -29,13 +31,15 @@ public:
     {}
 
     void step(      OrderParameter& op,
-              const Potential&      potential,
+              const Potential&      potential, 
+              const FD::Neighbors&  neighbors,
                     double          T,
                     double          dt) override;
 
 
     double energy(const OrderParameter& op,
-                  const Potential&      potential,
+                  const Potential&      potential, 
+                  const FD::Neighbors&  neighbors,
                         double          T) const override;
 
 private:

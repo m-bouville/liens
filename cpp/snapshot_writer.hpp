@@ -11,13 +11,23 @@
 struct Statistics
 {
     int    time_step;
+
     double avg_phi;
     double stdev_phi;
+
     double phi_below_neg10;
     double phi_below_0;
     double phi_above_10;
+
     double avg_gradient;
     double gradient_sqr;
+
+    double autocorr_correl;
+    int    autocorr_length;
+
+    double anisotropy;
+    double angle;           // in radians
+
     double energy;
 };
 
@@ -35,7 +45,8 @@ namespace writer
                               
     Statistics statistics(const OrderParameter& op, std::ostringstream& log,
                           int step, double T, 
-                          const Potential& potential, const Solver& solver);
+                          const Potential& potential, const Solver& solver, 
+                          const FD::Neighbors& neighbors);
 
     void     write_csv(const std::filesystem::path&   filename,
                        const std::vector<Statistics>& stats);

@@ -86,6 +86,8 @@ void Simulation::__runOneSimulation(double T,
               __config.phi0,
               noise,
               seed);
+    
+    const FD::Neighbors neighbors(__config.Nx, __config.Ny);
 
     OrderParameter op(std::move(phi),
                       false,    // is_conserved
@@ -113,18 +115,22 @@ void Simulation::__runOneSimulation(double T,
     log << "minimum at " << potential.minimum(T) << '\n';
     log << std::left
             << std::setw( 8) << "step"
-            << std::setw(28) << "order para (%)"
+            << std::setw(28) << "     order parameter (%)"
+            << std::setw(14) << "gradient"
+            << std::setw(11) << "autocorrel"
+            << std::setw(11) << "anisotropy"
             << std::setw( 8) << "total"
             << '\n';  
     log << std::left
             << std::setw( 8) << " "
-            << std::setw( 7) << "min"
-            << std::setw( 7) << "avg"
-            << std::setw( 7) << "max"
+            << std::setw( 7) << "min" << std::setw( 7) << "avg" << std::setw( 7) << "max"
             << std::setw( 7) << "stdev"
+            << std::setw( 7) << "avg"   << std::setw( 7) << "sqr"
+            << std::setw( 7) << "value" << std::setw( 4) << "at"
+            << std::setw( 7) << "stren" << std::setw( 4) << "ang"
             << std::setw( 8) << "energy"
             << '\n';          
-    log << std::string(40, '-') << '\n';
+    log << std::string(90, '-') << '\n';
 
 
     std::filesystem::path file;
@@ -132,14 +138,14 @@ void Simulation::__runOneSimulation(double T,
 
     for (int step = 0; step < __config.steps; ++step)
     {
-        solver.step(op, potential,
+        solver.step(op, potential, neighbors,
                     T, __config.dt);
 
         if (save_steps.contains(step))
         {
             // display
             all_stats.push_back(
-                writer::statistics(op, log, step, T, potential, solver)
+                writer::statistics(op, log, step, T, potential, solver, neighbors)
             );
 
 
@@ -155,10 +161,6 @@ void Simulation::__runOneSimulation(double T,
         }
     }
     std::ofstream(outdir / "COMPLETE").close();
-
-
-    // auto [minIt, maxIt] = std::minmax_element(op.phi().begin(), op.phi().end());
-    // log << "min = " << *minIt << " max = " << *maxIt << "\n";
 
     op.save_as_png(file.replace_extension(".png"));
     writer::write_csv(outdir / "statistics.csv", all_stats);

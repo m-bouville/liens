@@ -6,6 +6,8 @@
 
 #include <cmath>
 
+#include "finite_differences.hpp"
+
 
 
 namespace fs = std::filesystem;
@@ -77,7 +79,8 @@ Statistics writer::statistics(const OrderParameter& op,
                                     int             step,
                                     double          T, 
                               const Potential&      potential, 
-                              const Solver&         solver)
+                              const Solver&         solver, 
+                              const FD::Neighbors&  neighbors)
 {
     Statistics out;
 
@@ -94,17 +97,24 @@ Statistics writer::statistics(const OrderParameter& op,
     out.phi_below_0    = stats_frac.below[1];
     out.phi_above_10   = stats_frac.above[0];
 
-    // energy
-    out.energy = solver.energy(op, potential, T);
-
     // gradient
-    out.avg_gradient = FD::avg_gradient(op.field());
-    out.gradient_sqr = FD::gradient_sqr(op.field());
+    out.avg_gradient = FD::avg_gradient(op.field(), neighbors);
+    out.gradient_sqr = FD::gradient_sqr(op.field(), neighbors);
 
-    // TODO characteristic length
+    // characteristic length
+    int max_dist = std::min(std::min(op.nx()*2/3, op.ny()*2/3), 64);
+    std::vector<double> autocorr = FD::autocorrelation(op.field(), max_dist);
+    out.autocorr_length = autocorr[0];
+    out.autocorr_correl = autocorr[1];
 
-    // TODO anisotropy
+    // anisotropy
+    auto aniso = FD::structure_tensor(op.field(), neighbors);
+    out.anisotropy = aniso.anisotropy;   // (λ1-λ2)/(λ1+λ2)
+    out.angle      = aniso.angle;        // radians in [-π/2, π/2]
 
+    
+    // energy
+    out.energy = solver.energy(op, potential, neighbors, T);
 
     // display statistics to console
     log << std::left
@@ -114,6 +124,11 @@ Statistics writer::statistics(const OrderParameter& op,
         << std::setw(7) << stats["avg"]* 100 
         << std::setw(7) << stats["max"]* 100 
         << std::setw(7) << stats["std"]* 100 
+        << std::setw(7) << out.avg_gradient*100 << std::setw(7) << out.gradient_sqr
+        << std::setw(7) << std::setprecision(2) << out.autocorr_correl*100
+        << std::setw(4) << out.autocorr_length
+        << std::setw(7) << out.anisotropy*100   
+        << std::setw(7) << std::setprecision(0) << out.angle*180/3.1415
         << std::setw(8) << std::setprecision(1) << out.energy << '\n';
 
     // reset (important if more printing follows)
@@ -131,16 +146,16 @@ void writer::write_csv(const std::filesystem::path&   filename,
     out << "step,avg_phi,stdev_phi,"
            "phi_below_-10,phi_below_0,phi_above_10,"
            "avg_gradient,gradient_sqr,"
+           "autocorr_correl,autocorr_length,"
+           "anisotropy, angles",
            "energy\n";
 
     for (const auto& s : stats)
-        out << s.time_step    << ','
-            << s.avg_phi      << ','
-            << s.stdev_phi    << ','
-            << s.phi_below_neg10<< ','
-            << s.phi_below_0  << ','
-            << s.phi_above_10 << ','
-            << s.avg_gradient << ','
-            << s.gradient_sqr << ','
-            << s.energy << '\n';
+        out << s.time_step      << ','
+            << s.avg_phi        << ',' << s.stdev_phi      << ','
+            << s.phi_below_neg10<< ',' << s.phi_below_0    << ','<< s.phi_above_10<< ','
+            << s.avg_gradient   << ',' << s.gradient_sqr   << ','
+            << s.autocorr_correl<< ',' << s.autocorr_length<< ','
+            << s.anisotropy     << ',' << s.angle          << ','
+            << s.energy         << '\n';
 }
