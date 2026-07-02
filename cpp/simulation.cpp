@@ -116,18 +116,18 @@ void Simulation::__runOneSimulation(double T,
     log << std::left
             << std::setw( 8) << "step"
             << std::setw(28) << "     order parameter (%)"
-            << std::setw(14) << "gradient"
+            << std::setw(14) << "  gradient"
             << std::setw(11) << "autocorrel"
-            << std::setw(11) << "anisotropy"
+            << std::setw(17) << "   anisotropy"
             << std::setw( 8) << "total"
             << '\n';  
     log << std::left
             << std::setw( 8) << " "
             << std::setw( 7) << "min" << std::setw( 7) << "avg" << std::setw( 7) << "max"
             << std::setw( 7) << "stdev"
-            << std::setw( 7) << "avg"   << std::setw( 7) << "sqr"
+            << std::setw( 7) << "<|g|>"   << std::setw( 7) << "<g^2>"
             << std::setw( 7) << "value" << std::setw( 4) << "at"
-            << std::setw( 7) << "stren" << std::setw( 4) << "ang"
+            << std::setw( 7) << "trace" << std::setw( 7) << "diff" << std::setw( 4) << "ang"
             << std::setw( 8) << "energy"
             << '\n';          
     log << std::string(90, '-') << '\n';

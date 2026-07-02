@@ -64,37 +64,26 @@ where $\hat{z}(t_{k+i+1}) = \hat{z}(t_{k+i}) + f_\theta(\hat{z}(t_{k+i}), \Delta
 
 
 ## Physics-informed statistics
+
+###Motivation
 The latent representation serves two purposes:
 - recover the microstructure in real space (decoder),
 - predict the microstructure at $t + \Delta t$.
 
 The reconstruction loss alone does not constrain the latent representation to preserve physically meaningful features. Auxiliary losses based on microstructural statistics nudge the encoder toward latent variables that capture characteristics such as phase fraction, interface density, anisotropy and characteristic length scales. This is expected to improve latent-space organization and, consequently, the accuracy and stability of the learned surrogate dynamics.
 
-Simple microstructures will be produced by hand to check that statistics work properly:
-- vertical and horizontal stripes of two or three different widths,
-- stripes with sinusoidal interfaces (grains are still elongated but interfaces are not purely anisotropic),
-- checkerboard.
 
-
-### Possible statistics
-Written for stable states at order parameter OP = 0 and 1. 
+### Statistics
 - Overall metrics:
-  - average(OP) [hard mass-conservation constraint if conserved OP]
-  - sum(OP < 0) and sum(OP > 1) [unphysical -> turn into penalty?]
-  - stdev(OP) [proxy for evolution of phases]
-  - fraction(OP < 0.1) and fraction(OP > 0.9) [volume of each phase]
+  - average(OP)
+  - stdev(OP)
+  - fraction(OP < 0.1) and fraction(OP > 0.9) [in the case of an order parameter between 0 and 1]
   - energy
 - fraction in grain boundary (GB):
-  - number of (OP ∉ [0.1, 0.9])
-  - number of OP gradients with norm > 0
-- Anisotropy (of boundaries or grains):
-  - OP gradient orientation along [01], [10], [11], [−11] (exclude those with norm ≈ 0)
-  - stdev(SMA of OP along x), idem y and ±45 °
+  - average norm of OP gradients
+- Anisotropy (see below)
 - Length scale:
-  - first peak in Fourier and/or autocorrelation
-    - along [01], [10], [11], [−11]
-
-Note: gradients with norm $\approx 0$ are excluded because the orientation of a (quasi) null vector is meaningless.
+  - first peak in autocorrelation: length and strength.
 
 
 ### No live calculations
@@ -109,32 +98,17 @@ Linear(128 → Ns)
 ```
 
 
-### Variant
+### Anisotropy
 Compute, pixel by pixel, 
 $$J_\sigma = G_\sigma \ast \left(\!\nabla z\ \nabla z^{\!\top}\right),$$
 with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ and eigenvectors $v_1$ and $v_2$. Derive:
 - Anisotropy measure: $A = (\lambda_1 - \lambda_2) / (\lambda_1 + \lambda_2 + \varepsilon)$, with $\varepsilon > 0$ a small constant for numerical stability.
   - $A \approx 0$: isotropic,
   - $A \approx 1$: strong directional structure.
-- Interface density: $\lambda_1 + \lambda_2$
+- Interface density: $\lambda_1 + \lambda_2$ (trace)
   - high: many interfaces, 
   - low: bulk phases.
 - Local orientation (normal direction): $\arctan(v_{1y} / v_{1x})$.	
-
-Store:
-- mean($\lambda_1$)
-- mean($\lambda_2$)
-- mean anisotropy $A$
-- stdev($A$)
-- interface density
-- orientation entropy
-- 10-bin orientation histogram (or PCA-reduced)
-- spatial histogram pooling [what exactly?]
-
-Total: 15–20 scalars per image. This is enough to:
-- constrain latent space,
-- detect collapse,
-- guide physics consistency.
 
 
 

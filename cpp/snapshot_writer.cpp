@@ -5,6 +5,7 @@
 #include <iomanip>   // setw, fixed, setprecision
 
 #include <cmath>
+#include <numbers>   // for pi
 
 #include "finite_differences.hpp"
 
@@ -88,8 +89,8 @@ Statistics writer::statistics(const OrderParameter& op,
 
     // average and std deviation for phi
     auto stats = op.statistics();
-    out.avg_phi   = stats["avg"];
-    out.stdev_phi = stats["std"];
+    out.avg_phi   = stats.average;
+    out.stdev_phi = stats.stdev;
     
     // fraction for phi below or above some threshold
     auto stats_frac = op.phase_fractions({-0.1, 0.}, {0.1});
@@ -99,16 +100,20 @@ Statistics writer::statistics(const OrderParameter& op,
 
     // gradient
     out.avg_gradient = FD::avg_gradient(op.field(), neighbors);
-    out.gradient_sqr = FD::gradient_sqr(op.field(), neighbors);
+    out.gradient_sqr = FD::gradient_sqr(op.field(), neighbors) / op.size();
 
     // characteristic length
-    int max_dist = std::min(std::min(op.nx()*2/3, op.ny()*2/3), 64);
-    std::vector<double> autocorr = FD::autocorrelation(op.field(), max_dist);
-    out.autocorr_length = autocorr[0];
-    out.autocorr_correl = autocorr[1];
+    int max_dist = std::min(op.nx()*2/3, op.ny()*2/3);
+            // to cut computation time
+    // std::cout << "max_dist for autocorrelation: " << max_dist << '\n';
+
+    auto autocorr = FD::autocorrelation(op.field(), max_dist);
+    out.autocorr_length = autocorr.peak_distance;
+    out.autocorr_correl = autocorr.peak_value;
 
     // anisotropy
     auto aniso = FD::structure_tensor(op.field(), neighbors);
+    out.trace      = aniso.trace;        // λ1+λ2
     out.anisotropy = aniso.anisotropy;   // (λ1-λ2)/(λ1+λ2)
     out.angle      = aniso.angle;        // radians in [-π/2, π/2]
 
@@ -120,15 +125,15 @@ Statistics writer::statistics(const OrderParameter& op,
     log << std::left
         << std::setw(8) << step
         << std::setw(7) << std::fixed << std::setprecision(1)
-        << stats["min"]* 100 
-        << std::setw(7) << stats["avg"]* 100 
-        << std::setw(7) << stats["max"]* 100 
-        << std::setw(7) << stats["std"]* 100 
-        << std::setw(7) << out.avg_gradient*100 << std::setw(7) << out.gradient_sqr
+        << stats.min * 100 
+        << std::setw(7) << stats.average * 100 
+        << std::setw(7) << stats.max * 100 
+        << std::setw(7) << stats.stdev * 100 
+        << std::setw(7) << out.avg_gradient*100 << std::setw(7) << out.gradient_sqr*100
         << std::setw(7) << std::setprecision(2) << out.autocorr_correl*100
         << std::setw(4) << out.autocorr_length
-        << std::setw(7) << out.anisotropy*100   
-        << std::setw(7) << std::setprecision(0) << out.angle*180/3.1415
+        << std::setw(7) << out.trace*100   << std::setw(7) << out.anisotropy*100   
+        << std::setw(7) << std::setprecision(0) << out.angle*180/std::numbers::pi
         << std::setw(8) << std::setprecision(1) << out.energy << '\n';
 
     // reset (important if more printing follows)
@@ -147,7 +152,7 @@ void writer::write_csv(const std::filesystem::path&   filename,
            "phi_below_-10,phi_below_0,phi_above_10,"
            "avg_gradient,gradient_sqr,"
            "autocorr_correl,autocorr_length,"
-           "anisotropy, angles",
+           "trace,anisotropy,angle,"
            "energy\n";
 
     for (const auto& s : stats)
@@ -156,6 +161,6 @@ void writer::write_csv(const std::filesystem::path&   filename,
             << s.phi_below_neg10<< ',' << s.phi_below_0    << ','<< s.phi_above_10<< ','
             << s.avg_gradient   << ',' << s.gradient_sqr   << ','
             << s.autocorr_correl<< ',' << s.autocorr_length<< ','
-            << s.anisotropy     << ',' << s.angle          << ','
+            << s.trace          << ',' << s.anisotropy     << ',' << s.angle      << ','
             << s.energy         << '\n';
 }

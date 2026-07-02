@@ -7,7 +7,7 @@ This project uses neural network (NN) models in materials science and engineerin
 
 
 ## A quick introduction to phase field
-Phase-field modeling is a computational framework used to simulate the evolution of microstructures without explicitly tracking sharp interfaces. Instead of representing boundaries (such as grain boundaries or phase interfaces) as discrete surfaces, the method introduces one or more continuous order parameters (OP) that vary smoothly across space. These fields take distinct values in different phases and vary smoothly across interfaces over a finite width. The evolution of the system is typically governed by PDEs describing gradient flow of a free-energy functional: the Cahn-Hilliard equation is used for conserved OP (e.g. composition) and Allen-Cahn if not conserved (phases).
+Phase-field simulates the evolution of microstructures without explicitly tracking sharp interfaces (e.g. grain boundaries). Instead the method introduces one or more continuous order parameters (OP) that vary smoothly across space, so that interfaces have a finite width. These fields take distinct values in different phases. The evolution of the system is typically governed by PDEs describing gradient flow of a free-energy functional: the Cahn-Hilliard equation is used for conserved OP (e.g. composition) and Allen-Cahn if not conserved (phases).
 
 For details (equations, implementation), see `./docs/phase_field.md`.
 
@@ -94,22 +94,23 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 ```text
 .
 ├── cpp/               # phase-field solver
-│   └── utils/
 ├── python/
 │   ├── models/
 │   ├── training/
 │   ├── evaluation/
 │   └── utils/
-├── data/
+├── datasets/
+│   ├── 128x128/
+│   └── 256x256/
 ├── docs/
 │   ├── phase_field.md
-│   ├── neural_nets.md
+│   └── neural_nets.md
 └── README.md
 ```
 
 ## Current status
 
-- [ ] C++ phase-field solver
+- [X] C++ phase-field solver
 - [ ] Dataset generation
 - [ ] CNN autoencoder
 - [ ] Latent-space validation

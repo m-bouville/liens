@@ -34,8 +34,10 @@ double Field::average() const
     return total / size();
 }
 
-std::map<std::string, double> Field::statistics() const
+FieldStatistics Field::statistics() const
 {
+    FieldStatistics out;
+
     double min = __values[0];
     double max = __values[0];
     double total     = 0.0;
@@ -49,15 +51,13 @@ std::map<std::string, double> Field::statistics() const
         total_sqr += v*v;
     }
 
-    double avg     = total    / __values.size();
+    out.average    = total    / __values.size();
     double avg_sqr = total_sqr/ __values.size();
+    out.stdev = std::sqrt(avg_sqr - out.average*out.average);  // std deviation
+    out.min = min;
+    out.max = max;
 
-    return {
-        {"min", min},
-        {"avg", avg},
-        {"max", max},
-        {"std", std::sqrt(avg_sqr - avg*avg)}  // std deviation
-    };
+    return out;
 }
 
 
@@ -106,7 +106,7 @@ ThresholdFractions Field::phase_fractions(
 // save as image
 void Field::save_as_png(const std::filesystem::path& file)
 {
-    cv::Mat img(__nx, __ny, CV_64F, __values.data());  // TODO __ny, __nx?
+    cv::Mat img(__ny, __nx, CV_64F, __values.data());  // TODO __ny, __nx?
 
     cv::Mat norm;
     cv::normalize(img, norm, -127.5, 127.5, cv::NORM_MINMAX);

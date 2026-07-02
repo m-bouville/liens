@@ -16,6 +16,14 @@ struct ThresholdFractions
     std::vector<double> above;
 };
 
+struct FieldStatistics
+{
+    double min;
+    double max;
+    double average;
+    double stdev;
+};
+
 class Field
 {
 public:
@@ -72,7 +80,7 @@ public:
 
     // statistics
     double average() const;
-    std::map<std::string, double> statistics() const;
+    FieldStatistics statistics() const;
 
     ThresholdFractions phase_fractions(
         std::initializer_list<double> below,

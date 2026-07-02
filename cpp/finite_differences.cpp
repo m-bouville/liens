@@ -1,5 +1,3 @@
-// #include <vector>
-
 #include "finite_differences.hpp"
 
 #include <vector>
@@ -8,43 +6,23 @@
 
 #include "field.hpp"
 
-// using std::vector;
 
 
+FD::Neighbors::Neighbors(int nx, int ny)
+            : ip(nx), im(nx), jp(ny), jm(ny)
+{
+    for (int i = 0; i < nx; ++i)
+    {
+        ip[i] = (i + 1) % nx;
+        im[i] = (i - 1 + nx) % nx;
+    }
 
-// derivatives (gradient, Laplacian)   
-// void FD::gradient_x(const Field& in, Field& out)
-// {
-//     assert(in.nx() == out.nx());
-//     assert(in.ny() == out.ny());
-
-//     const int nx = phi.nx();
-
-//     for (int i = 0; i < nx; ++i)
-//     {
-//         int ip = (i + 1) % nx;
-//         int im = (i - 1 + nx) % nx;
-
-//         for (int j = 0; j < in.ny(); ++j)
-//             out[in.index(i, j)] = 0.5 * (in(ip, j) - in(im, j));
-//     }
-// }
-// void FD::gradient_y(const Field& in, Field& out)
-// {
-//     assert(in.nx() == out.nx());
-//     assert(in.ny() == out.ny());
-    
-//     const int ny = in.ny();
-
-//     for (int j = 0; j < ny; ++j)
-//     {     
-//         int jp = (j + 1) % ny;
-//         int jm = (j - 1 + ny) % ny;
-
-//         for (int i = 0; i < in.nx(); ++i)
-//             out[in.index(i, j)] = 0.5 * (in(i, jp) - in(i, jm));
-//     }
-// }
+    for (int j = 0; j < ny; ++j)
+    {
+        jp[j] = (j + 1) % ny;
+        jm[j] = (j - 1 + ny) % ny;
+    }
+}
 
 double FD::gradient_sqr(const Field& phi, const Neighbors& nb)
 {
@@ -53,7 +31,7 @@ double FD::gradient_sqr(const Field& phi, const Neighbors& nb)
     const int nx = phi.nx();
     const int ny = phi.ny();
 
-    for (int j = 0; j < phi.ny(); ++j)
+    for (int j = 0; j < ny; ++j)
     {
         const int jp = nb.jp[j];
         const int jm = nb.jm[j];
@@ -72,31 +50,6 @@ double FD::gradient_sqr(const Field& phi, const Neighbors& nb)
     return out;
 }
 
-// void FD::gradient_sqr(const Field& in, Field& out)
-// {
-//     assert(in.nx() == out.nx());
-//     assert(in.ny() == out.ny());
-
-//     const int nx = in.nx();
-//     const int ny = in.ny();
-
-//     for (int j = 0; j < ny; ++j)
-//     {
-//         int jp = (j + 1) % ny;
-//         int jm = (j - 1 + ny) % ny;
-
-//         for (int i = 0; i < nx; ++i)
-//         {
-//             int ip = (i + 1) % nx;
-//             int im = (i - 1 + nx) % nx;
-
-//             double gx = 0.5 * (in(ip, j) - in(im, j));
-//             double gy = 0.5 * (in(i, jp) - in(i, jm));
-
-//             out(i, j) = gx * gx + gy * gy;
-//         }
-//     }
-// }
 
 void FD::laplacian(const Field& in, Field& out, const Neighbors& nb)
 {   
@@ -155,63 +108,6 @@ double FD::avg_gradient(const Field& phi, const Neighbors& nb)
 }
 
 
-
-// void FD::all_gradients(const Field& phi, 
-//                              Field& grad_x,
-//                              Field& grad_y,                            
-//                              Field& grad_sqr,
-//                              Field& laplacian)
-// {   
-//     assert(phi.nx() == grad_x.nx() == grad_y.nx() == grad_sqr.nx() == laplacian.nx());
-//     assert(phi.ny() == grad_x.ny() == grad_y.ny() == grad_sqr.ny() == laplacian.ny());
-
-//     const int nx = phi.nx();
-//     const int ny = phi.ny();
-
-//     for (int j = 0; j < ny; ++j)
-//     {
-//         int jp = (j + 1) % ny;
-//         int jm = (j - 1 + ny) % ny;
-
-//         for (int i = 0; i < nx; ++i)
-//         {
-//             int ip = (i + 1) % nx;
-//             int im = (i - 1 + nx) % nx;
-
-            
-//             grad_x (i, j) = 0.5 * (phi(ip, j) - phi(im, j));
-//             grad_y (i, j) = 0.5 * (phi(i, jp) - phi(i, jm));
-
-//             grad_sqr (i, j) = grad_x(i, j) * grad_x(i, j) + 
-//                               grad_y(i, j) * grad_y(i, j);
-
-//             laplacian(i, j) =
-//                 phi(ip, j) +
-//                 phi(im, j) +
-//                 phi(i, jp) +
-//                 phi(i, jm) -
-//                 4.0 * phi(i, j);
-//         }
-//     }
-// }
-
-
-
-// double FD::gradient_x(const Field& phi, int i, int j)
-// {
-//     int ip = (i + 1) % phi.nx();
-//     int im = (i - 1 + phi.nx()) % phi.nx();
-
-//     return 0.5 * (phi(ip, j) - phi(im, j));
-// }
-// double FD::gradient_y(const Field& phi, int i, int j)
-// {
-//     int jp = (j + 1) % phi.ny();
-//     int jm = (j - 1 + phi.ny()) % phi.ny();
-
-//     return 0.5 * (phi(i, jp) - phi(i, jm));
-// }
-
 // for statistics (anisotropy)
 FD::StructureTensor FD::structure_tensor(const Field& phi, const Neighbors& nb)
 {
@@ -245,16 +141,16 @@ FD::StructureTensor FD::structure_tensor(const Field& phi, const Neighbors& nb)
     out.Jxy_avg *= invN;
     out.Jyy_avg *= invN;
 
-    const double tr  = out.Jxx_avg + out.Jyy_avg;
+    out.trace = out.Jxx_avg + out.Jyy_avg;
     const double det = out.Jxx_avg * out.Jyy_avg - out.Jxy_avg * out.Jxy_avg;
 
-    const double disc = std::sqrt(std::max(0.0, tr * tr - 4.0 * det));
+    const double disc = std::sqrt(std::max(0.0, out.trace * out.trace - 4.0 * det));
 
-    out.lambda1 = 0.5 * (tr + disc);
-    out.lambda2 = 0.5 * (tr - disc);
+    out.lambda1 = 0.5 * (out.trace + disc);
+    out.lambda2 = 0.5 * (out.trace - disc);
 
-    if (tr > 1e-12)
-        out.anisotropy = (out.lambda1 - out.lambda2) / tr;
+    if (out.trace > 1e-12)
+        out.anisotropy = (out.lambda1 - out.lambda2) / out.trace;
     else
         out.anisotropy = 0.0;
 
@@ -266,12 +162,14 @@ FD::StructureTensor FD::structure_tensor(const Field& phi, const Neighbors& nb)
 
 
 // characteristic length
-std::vector<double> FD::autocorrelation(const Field& phi, int max_dist)
+FD::AutoCorrelMetrics FD::autocorrelation(const Field& phi, int max_dist)
 {
     const auto& f  = phi.values();   // assume flattened 2D
     const int   Nx = phi.nx();
     const int   Ny = phi.ny();
     const int   N  = Nx * Ny;
+
+    max_dist = std::min(max_dist, std::max(Nx, Ny));
     const int   max_dist2 = max_dist*max_dist;
 
     auto idx = [&](int x, int y)
@@ -328,8 +226,8 @@ std::vector<double> FD::autocorrelation(const Field& phi, int max_dist)
     }
 
     // find first non-trivial peak (skip r=0)
-    int    peak_r   = 1;
-    double peak_val = C[1];
+    int    peak_r  =   1;
+    double peak_val= C[1];
 
     bool   seen_negative  = false;
 
@@ -348,50 +246,17 @@ std::vector<double> FD::autocorrelation(const Field& phi, int max_dist)
 
         if (center > left && center > right)
         {
-            peak_r = r;
+            peak_r   = r;
             peak_val = C[r];
             break;
         }
     }
 
-    // append peak info
-    C.insert(C.begin(), (double)peak_val);
-    C.insert(C.begin(), (double)peak_r);
+    // constructing output
+    AutoCorrelMetrics out;
+    out.values        = C;
+    out.peak_distance = peak_r > 1 ? peak_r   :   max_dist;
+    out.peak_value    = peak_r > 1 ? peak_val : C[max_dist];
 
-    return C;
+    return out;
 }
-
-
-
-
-
-
-// template<class LocalDerivative>
-// void FD::chemical_potential(const Field& phi,
-//                         Field& mu,
-//                         double kappa,
-//                         LocalDerivative dfdphi)
-// {
-//     FD::laplacian(phi, lap);
-
-//     for (int j = 0; j < phi.ny(); ++j)
-//     {
-//         int jp = (j + 1) % phi.ny();
-//         int jm = (j - 1 + phi.ny()) % phi.ny();
-
-//         for (int i = 0; i < phi.nx(); ++i)
-//         {
-//             int ip = (i + 1) % phi.nx();
-//             int im = (i - 1 + phi.nx()) % phi.nx();
-
-//             double lap =
-//                 phi(ip,j) + phi(im,j) +
-//                 phi(i,jp) + phi(i,jm)
-//                 - 4.0 * phi(i,j);
-
-//             mu(i,j) =
-//                 dfdphi(phi(i,j))
-//                 - kappa * lap;
-//         }
-//     }
-// }

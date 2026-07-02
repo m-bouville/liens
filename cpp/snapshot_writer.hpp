@@ -25,6 +25,7 @@ struct Statistics
     double autocorr_correl;
     int    autocorr_length;
 
+    double trace;
     double anisotropy;
     double angle;           // in radians
 

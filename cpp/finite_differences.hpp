@@ -17,21 +17,7 @@ namespace FD
         std::vector<int> ip, im;
         std::vector<int> jp, jm;
 
-        Neighbors(int nx, int ny)
-            : ip(nx), im(nx), jp(ny), jm(ny)
-        {
-            for (int i = 0; i < nx; ++i)
-            {
-                ip[i] = (i + 1) % nx;
-                im[i] = (i - 1 + nx) % nx;
-            }
-
-            for (int j = 0; j < ny; ++j)
-            {
-                jp[j] = (j + 1) % ny;
-                jm[j] = (j - 1 + ny) % ny;
-            }
-        }
+        Neighbors(int nx, int ny);
     };
 
 
@@ -43,6 +29,14 @@ namespace FD
 
 
     // for statistics
+    struct AutoCorrelMetrics
+    {
+        std::vector<double> values;
+
+        int peak_distance;
+        double peak_value;
+    };
+
     struct StructureTensor
     {
         double Jxx_avg;
@@ -52,7 +46,8 @@ namespace FD
         double lambda1;      // largest eigenvalue
         double lambda2;      // smallest eigenvalue
 
-        double anisotropy;   // (λ1-λ2)/(λ1+λ2)
+        double trace;        //  λ1 + λ2
+        double anisotropy;   // (λ1-λ2) / (λ1+λ2)
         double angle;        // radians in [-π/2, π/2]
     };
 
@@ -63,13 +58,7 @@ namespace FD
     double avg_gradient(const Field& phi, const Neighbors& nb);
 
     // characteristic length
-    std::vector<double> autocorrelation(const Field& phi, int max_dist);
-
-    // void chemical_potential(const Field& phi,
-    //                         Field&       mu,
-    //                         double       kappa,
-    //                         LocalDerivative dfdphi);
-
+    AutoCorrelMetrics autocorrelation(const Field& phi, int max_dist);
     
     // Memory management: avoid repeated reallocations
     struct Workspace
