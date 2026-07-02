@@ -50,7 +50,9 @@ Simulation parameters are stored in a plain text file at `./config.txt`. Its for
 ## Storing simulation results
 Simulation results are stored in binary format (no need for human access) readable in Python. Half precision (`float16`) values are used to reduce storage requirements while preserving sufficient numerical accuracy for neural-network training. 
 
-There is one subdirectory for each simulation run, containing one binary file per stored snapshot (named by time index). Subdirectories are named by system size, then by parameters (temperature, initial conditions): `./datasets/256x256/T980_n050_s97/t0001100`for $T=0.980$, noise amplitude of 0.050 and 97 for seed. Unlike a single file for the whole trajectory, this allows random access to individual snapshots during autoencoder training while preserving temporal ordering for training the latent surrogate model.
+There is one subdirectory for each simulation run, containing one binary file per stored snapshot (named by time index). Subdirectories are named by system size, then by parameters (temperature, initial conditions): `/datasets/256x256/T980_n050_s97/t0001100`for $T=0.980$, noise amplitude of 0.050 and 97 for seed. Unlike a single file for the whole trajectory, this allows random access to individual snapshots during autoencoder training while preserving temporal ordering for training the latent surrogate model.
+
+Physics-based statistics are also computed (see `/docs/neural_nets.md` for more details).
 
 
 ### On snapshot schedule

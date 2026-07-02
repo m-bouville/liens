@@ -23,6 +23,10 @@ namespace FD
                         Field& Jxy,
                         Field& Jyy);
 
+    
+    // for statistics
+    double avg_gradient(const Field& in);
+
 
     // void chemical_potential(const Field& phi,
     //                         Field&       mu,
@@ -43,8 +47,10 @@ namespace FD
 
         Field df_dphi;      // d f  / d phi
         Field laplacian_phi;// laplacian of phi
+
         Field mu;           // chemical potential = derivative (potential + gradient)
         Field laplacian_mu; // laplacian of chemical potential
+        
         Field gradient_sqr; // for energy
     };
 

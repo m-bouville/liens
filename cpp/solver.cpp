@@ -1,6 +1,5 @@
-
-
 #include "solver.hpp"
+
 
 // #include "field.hpp"
 // #include "potential.hpp"
@@ -39,9 +38,9 @@ void FDSolver::step(     OrderParameter& op,
     }
 
 
-double FDSolver::energy(   OrderParameter& op,
-                   const Potential&      potential,
-                         double          T)
+double FDSolver::energy(const OrderParameter& op,
+                        const Potential&      potential,
+                              double          T) const
     {
         return (potential.bulk_energy(op, T) + 
                 0.5 * op.kappa() * FD::gradient_sqr(op.field()));

@@ -9,6 +9,13 @@
 
 
 
+
+struct ThresholdFractions
+{
+    std::vector<double> below;
+    std::vector<double> above;
+};
+
 class Field
 {
 public:
@@ -67,6 +74,10 @@ public:
     double average() const;
     std::map<std::string, double> statistics() const;
 
+    ThresholdFractions phase_fractions(
+        std::initializer_list<double> below,
+        std::initializer_list<double> above) const;
+
     // save as image
     void save_as_png(const std::filesystem::path& file);
     
@@ -81,7 +92,6 @@ private:
                     double noiseAmplitude,
                     int    seed);
 };
-
 
 
 
@@ -128,8 +138,13 @@ public:
     double& operator()(int i, int j) { return __phi(i, j);}
     
     // statistics
-    double average   () {return __phi.average   (); }
-    auto   statistics() {return __phi.statistics(); }
+    double average   () const {return __phi.average   (); }
+    auto   statistics() const {return __phi.statistics(); }
+
+    auto   phase_fractions(
+        std::initializer_list<double> below,
+        std::initializer_list<double> above) const 
+    {return __phi.phase_fractions(below, above); }
     
     // save as image
     void save_as_png(const std::filesystem::path& file)

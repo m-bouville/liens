@@ -2,6 +2,8 @@
 
 #include "finite_differences.hpp"
 
+#include <cmath>
+
 #include "field.hpp"
 
 // using std::vector;
@@ -114,6 +116,31 @@ void FD::laplacian(const Field& in, Field& out)
                 4.0 * in(i, j);
         }
     }
+}
+
+
+
+double FD::avg_gradient(const Field& in)
+{
+    double sum_grad = 0;
+
+    for (int j = 0; j < in.ny(); ++j)
+        {
+            int jp = (j + 1) % in.ny();
+            int jm = (j - 1 + in.ny()) % in.ny();
+
+            for (int i = 0; i < in.nx(); ++i)
+            {
+                int ip = (i + 1) % in.nx();
+                int im = (i - 1 + in.nx()) % in.nx();
+
+                double gx = 0.5 * (in(ip, j) - in(im, j));
+                double gy = 0.5 * (in(i, jp) - in(i, jm));
+
+                sum_grad += std::sqrt(gx * gx + gy * gy);
+            }
+        }
+    return (sum_grad / in.size());
 }
 
 

@@ -1,13 +1,13 @@
 # Grid
-Nx      = 512
-Ny      = 512
+Nx      = 128
+Ny      = 128
 
 # Time integration
 dt      = 0.05
 steps   = 100001
 
 # threads
-max_threads = 12
+max_threads = 8
 
 # Landau potential 
 a0      = 1.0			# quadratic term in Landau potential

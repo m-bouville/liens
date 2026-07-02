@@ -14,9 +14,9 @@ public:
                             double          T,
                             double          dt) = 0;
 
-    virtual double energy(      OrderParameter& op,
+    virtual double energy(const OrderParameter& op,
                           const Potential&      potential,
-                                double          T) = 0;
+                                double          T) const = 0;
 };
 
 
@@ -34,10 +34,9 @@ public:
                     double          dt) override;
 
 
-    double energy(      OrderParameter& op,
+    double energy(const OrderParameter& op,
                   const Potential&      potential,
-                        double          T) override;
-
+                        double          T) const override;
 
 private:
     FD::Workspace __ws;  // storing derivatives

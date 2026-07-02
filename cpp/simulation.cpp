@@ -113,7 +113,7 @@ void Simulation::__runOneSimulation(double T,
     log << "minimum at " << potential.minimum(T) << '\n';
     log << std::left
             << std::setw( 8) << "step"
-            << std::setw(21) << "order para (%)"
+            << std::setw(28) << "order para (%)"
             << std::setw( 8) << "total"
             << '\n';  
     log << std::left
@@ -121,12 +121,14 @@ void Simulation::__runOneSimulation(double T,
             << std::setw( 7) << "min"
             << std::setw( 7) << "avg"
             << std::setw( 7) << "max"
+            << std::setw( 7) << "stdev"
             << std::setw( 8) << "energy"
             << '\n';          
-    log << std::string(35, '-') << '\n';
+    log << std::string(40, '-') << '\n';
 
 
     std::filesystem::path file;
+    std::vector<Statistics> all_stats;
 
     for (int step = 0; step < __config.steps; ++step)
     {
@@ -136,19 +138,10 @@ void Simulation::__runOneSimulation(double T,
         if (save_steps.contains(step))
         {
             // display
-            auto stats = op.statistics();
-            log << std::left
-                    << std::setw(8) << step
-                    << std::setw(7) << std::fixed << std::setprecision(1)
-                    << stats["min"]* 100 
-                    << std::setw(7) << stats["avg"]* 100 
-                    << std::setw(7) << stats["max"]* 100 
-                    << std::setw(8) << std::setprecision(1) << solver.energy(op, potential, T)
-                    << '\n';
+            all_stats.push_back(
+                writer::statistics(op, log, step, T, potential, solver)
+            );
 
-            // reset (important if more printing follows)
-            log.unsetf(std::ios::fixed);
-            log << std::setprecision(6);
 
             // save
             std::ostringstream name;
@@ -168,6 +161,7 @@ void Simulation::__runOneSimulation(double T,
     // log << "min = " << *minIt << " max = " << *maxIt << "\n";
 
     op.save_as_png(file.replace_extension(".png"));
+    writer::write_csv(outdir / "statistics.csv", all_stats);
 
     {
         std::lock_guard<std::mutex> lock(cout_mutex);
