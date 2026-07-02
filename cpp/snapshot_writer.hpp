@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <sstream>   // std::ostringstream
 
+#include "config.hpp"
 #include "field.hpp"
 #include "potential.hpp"
 #include "solver.hpp"
@@ -51,4 +52,12 @@ namespace writer
 
     void     write_csv(const std::filesystem::path&   filename,
                        const std::vector<Statistics>& stats);
+
+    void write_metadata(const std::filesystem::path& filename,
+                        const Config& config,
+                        double      T,
+                        double      noise,
+                        int         seed,
+                        std::string code_version,
+                        bool        completed = false);
 }

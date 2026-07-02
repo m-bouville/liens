@@ -164,3 +164,61 @@ void writer::write_csv(const std::filesystem::path&   filename,
             << s.trace          << ',' << s.anisotropy     << ',' << s.angle      << ','
             << s.energy         << '\n';
 }
+
+void writer::write_metadata(const std::filesystem::path& file,
+                            const Config& config,
+                            double      T,
+                            double      noise,
+                            int         seed,
+                            std::string code_version,
+                            bool        completed)
+{
+    std::ofstream out(file);
+    if (!out)
+        throw std::runtime_error("Failed to open " + file.string());
+
+    out << "# Phase-field simulation metadata\n\n";
+
+    out << "directory    = " << file.parent_path().generic_string() << '\n';
+    out << "code version = " << code_version << '\n';
+    out << "status       = " << (completed ? "complete" : "incomplete") << '\n';
+    out << '\n';
+
+    out << "# Grid\n";
+    out << "Nx           = " << config.Nx << '\n';
+    out << "Ny           = " << config.Ny << '\n';
+    out << '\n';
+
+    out << "# Time integration\n";
+    out << "dt           = " << config.dt << '\n';
+    out << "steps        = " << config.steps << '\n';
+    out << "save_steps   =";
+    for (int s : config.save)
+        if (s <= config.steps)
+            out << ' ' << s;
+    out << '\n';
+    out << '\n';
+
+    out << "# Landau potential \n";
+    out << "a0           = " << config.a0 << "   # quadratic term in Landau potential\n";
+    out << "b            = " << config.b  << "   # fourth-degree term in Landau potential\n";
+    out << "T0           = " << config.T0 << "   # threshold temperature in Landau potential\n";
+    out << '\n';
+
+    out << "# Physical parameters \n";
+    out << "temperature  = " << T << '\n';
+    out << "kappa        = " << config.kappa << "   # coefficient of gradient in free energy\n";
+    out << "mobility     = " << config.M << '\n';
+    out << '\n';
+    
+    out << "# Initialization \n";
+    out << "phi0         = " << config.phi0  << "   # initial average value of the order parameter\n";
+    out << "noise        = " << noise << '\n';
+    out << "seed         = " << seed << '\n';
+    out << '\n';
+
+    out << "# Equations \n";
+    out << "equation     = Allen-Cahn\n";       // TODO hardcoded for now
+    out << "solver       = finite difference\n";// TODO hardcoded for now
+    out << '\n';
+}

@@ -56,7 +56,7 @@ void Simulation::run()
 
 void Simulation::__runOneSimulation(double T, 
                                     double noise,
-                                    int seed)
+                                    int    seed)
 {
     std::filesystem::path outdir = 
             writer::make_dir_name(__config.Nx, __config.Ny, T, noise, seed);
@@ -80,6 +80,11 @@ void Simulation::__runOneSimulation(double T,
     }
   
     std::filesystem::create_directories(outdir);
+    
+    writer::write_metadata(outdir / "metadata.txt", __config,
+                            T, noise, seed,
+                            "2026-07-02",
+                            false);
 
     Field phi(__config.Nx,
               __config.Ny,
@@ -161,6 +166,10 @@ void Simulation::__runOneSimulation(double T,
         }
     }
     std::ofstream(outdir / "COMPLETE").close();
+    writer::write_metadata(outdir / "metadata.txt", __config,
+                            T, noise, seed,
+                            "2026-07-02",
+                            true);
 
     op.save_as_png(file.replace_extension(".png"));
     writer::write_csv(outdir / "statistics.csv", all_stats);
