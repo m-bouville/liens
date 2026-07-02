@@ -7,6 +7,8 @@
 #include <cmath>
 #include <numbers>   // for pi
 
+#include <mutex>
+
 #include "finite_differences.hpp"
 
 
@@ -107,9 +109,15 @@ Statistics writer::statistics(const OrderParameter& op,
             // to cut computation time
     // std::cout << "max_dist for autocorrelation: " << max_dist << '\n';
 
-    auto autocorr = FD::autocorrelation(op.field(), max_dist);
-    out.autocorr_length = autocorr.peak_distance;
-    out.autocorr_correl = autocorr.peak_value;
+    
+    static std::mutex fftw_mutex;
+    {
+        std::lock_guard<std::mutex> lock(fftw_mutex);
+        
+        auto autocorr = FD::autocorrelation(op.field());  // , max_dist);
+        out.autocorr_length = autocorr.peak_distance;
+        out.autocorr_correl = autocorr.peak_value;
+    }
 
     // anisotropy
     auto aniso = FD::structure_tensor(op.field(), neighbors);

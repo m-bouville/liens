@@ -58,7 +58,7 @@ namespace FD
     double avg_gradient(const Field& phi, const Neighbors& nb);
 
     // characteristic length
-    AutoCorrelMetrics autocorrelation(const Field& phi, int max_dist);
+    AutoCorrelMetrics autocorrelation(const Field& phi);  // , int max_dist);
     
     // Memory management: avoid repeated reallocations
     struct Workspace

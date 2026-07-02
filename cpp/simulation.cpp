@@ -123,7 +123,7 @@ void Simulation::__runOneSimulation(double T,
             << std::setw(28) << "     order parameter (%)"
             << std::setw(14) << "  gradient"
             << std::setw(11) << "autocorrel"
-            << std::setw(17) << "   anisotropy"
+            << std::setw(18) << "   anisotropy"
             << std::setw( 8) << "total"
             << '\n';  
     log << std::left
