@@ -1,5 +1,7 @@
 #include "statistics.hpp"
 
+#include <iostream>
+
 #include <vector>
 #include <cmath>
 
@@ -137,12 +139,22 @@ statistics::AutoCorrelMetrics statistics::autocorrelation(const Field& phi)
 
     fftw_execute(backward);
 
-    //------------------------------------------
-    // normalize
-    //------------------------------------------
+    // std::cout << corr[0] << " (before normalizing)\n";
 
+    // normalize
+    const double invN2 = 1.0 / (double(N) * double(N));
     for (int i = 0; i < N; ++i)
-        corr[i] /= N;
+        corr[i] *= invN2;
+
+    
+    double var = 0.0;
+    for (double v : phi.values())
+    {
+        double d = v - mean;
+        var += d*d;
+    }
+    var /= N;
+
 
     //------------------------------------------
     // radial average
@@ -183,10 +195,10 @@ statistics::AutoCorrelMetrics statistics::autocorrelation(const Field& phi)
         if (counts[r] > 0)
             radial[r] /= counts[r];
 
-    //------------------------------------------
-    // normalize by C(0)
-    //------------------------------------------
 
+    // normalize by C(0)
+    // std::cout <<  "variance = " << var << ", corr[0]: " << corr[0] 
+    //           << ", radial[0]: " << radial[0] << '\n';
     if (std::abs(radial[0]) > 1e-15)
     {
         for (double& v : radial)
@@ -218,19 +230,25 @@ statistics::AutoCorrelMetrics statistics::autocorrelation(const Field& phi)
         double center= (radial[r-1] + radial[r  ] + radial[r+1]) / 3.0;
         double right = (radial[r+1] + radial[r+2] + radial[r+3]) / 3.0;
 
+        if (center > 1.1)  // should be <= 1
+        {
+            std::cout << "Warning: r:" << r << ", left:" << left
+                      << ", center:" << center << ", right:" << right << '\n';
+        }
+
         if (center > left &&
             center > right)
         {
             out.peak_distance = r;
-            out.peak_value    = radial[r];
+            out.peak_value    = center;   // smoother than radial[r];
             break;
         }
     }
     
     if (out.peak_distance == -1)  // nothing found
     {
-        out.peak_value   = 0.;  // /!\ arbitrary
         out.peak_distance= max_dist;
+        out.peak_value   = 0.;  // /!\ arbitrary
     }
 
     fftw_destroy_plan(forward);

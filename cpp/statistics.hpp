@@ -3,15 +3,6 @@
 #include "field.hpp"
 #include "finite_differences.hpp"
 
-// struct Statistics
-// {
-//     double avg_phi;
-//     double stdev_phi;
-//     double phi_below_10;
-//     double phi_below_50;
-//     double phi_above_90;
-//     double avg_gradient;
-// };
 
 namespace statistics
 {

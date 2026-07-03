@@ -50,7 +50,7 @@ void Config::load(const std::string& filename)
         std::cerr << "Open failed\n";
         throw runtime_error("Cannot open configuration file.");
     }
-    std::cout << "Opened successfully\n";
+    // std::cout << "Opened successfully\n";
 
     std::unordered_map<std::string, bool> seen;
 
