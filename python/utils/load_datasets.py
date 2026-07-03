@@ -4,11 +4,11 @@ sweep config, and per-run metadata/directory naming.
 """
 
 import math
-# import re
+import re
 from   dataclasses import dataclass
 from   pathlib     import Path
 
-# import numpy  as np
+import numpy  as np
 import pandas as pd
 
 
@@ -245,42 +245,42 @@ def read_statistics_csv(path: str | Path) -> pd.DataFrame:
 
 
 
-# # ---------------------------------------------------------------------------
-# # Snapshot files (one binary file per saved timestep, e.g. "t0100000")
-# # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Snapshot files (one binary file per saved timestep, e.g. "t0100000")
+# ---------------------------------------------------------------------------
 
-# _STEP_RE = re.compile(r"^t(\d+)$")
-
-
-# def read_phi_half(path: str | Path, nx: int, ny: int) -> np.ndarray:
-#     """
-#     Read a phase-field snapshot saved by cpp/writer::save_phi_half.
-
-#     Format: raw IEEE 754 binary16, no header, little-endian, nx*ny values,
-#     row-major with __ny rows / __nx columns (confirmed via Field::save_as_png's
-#     cv::Mat(__ny, __nx, ...) construction -- x is the fastest-varying index).
-
-#     Returns
-#     -------
-#     np.ndarray, shape (ny, nx), dtype float32
-#     """
-#     path = Path(path)
-#     data = np.fromfile(path, dtype="<f2")
-
-#     expected = nx * ny
-#     if data.size != expected:
-#         raise ValueError(
-#             f"{path}: expected {expected} values ({nx}x{ny}), got {data.size}"
-#         )
-
-#     return data.reshape(ny, nx).astype(np.float32)
+_STEP_RE = re.compile(r"^t(\d+)$")
 
 
-# def parse_step(filename: str | Path) -> int:
-#     """Extract the integer step number from a snapshot filename like 't0100000'."""
-#     name = Path(filename).name
-#     m = _STEP_RE.match(name)
-#     if not m:
-#         raise ValueError(f"Filename '{name}' does not match expected pattern 't<digits>'")
-#     return int(m.group(1))
+def read_phi_half(path: str | Path, nx: int, ny: int) -> np.ndarray:
+    """
+    Read a phase-field snapshot saved by cpp/writer::save_phi_half.
+
+    Format: raw IEEE 754 binary16, no header, little-endian, nx*ny values,
+    row-major with __ny rows / __nx columns (confirmed via Field::save_as_png's
+    cv::Mat(__ny, __nx, ...) construction -- x is the fastest-varying index).
+
+    Returns
+    -------
+    np.ndarray, shape (ny, nx), dtype float32
+    """
+    path = Path(path)
+    data = np.fromfile(path, dtype="<f2")
+
+    expected = nx * ny
+    if data.size != expected:
+        raise ValueError(
+            f"{path}: expected {expected} values ({nx}x{ny}), got {data.size}"
+        )
+
+    return data.reshape(ny, nx).astype(np.float32)
+
+
+def parse_step(filename: str | Path) -> int:
+    """Extract the integer step number from a snapshot filename like 't0100000'."""
+    name = Path(filename).name
+    m = _STEP_RE.match(name)
+    if not m:
+        raise ValueError(f"Filename '{name}' does not match expected pattern 't<digits>'")
+    return int(m.group(1))
 

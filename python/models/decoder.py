@@ -11,6 +11,7 @@ import torch.nn as nn
 from   models.blocks import UpBlock
 
 
+
 class Decoder(nn.Module):
     """
     A 1x1 conv expands latent_channels back to the encoder's final
@@ -60,14 +61,27 @@ class Decoder(nn.Module):
         # at full resolution, i.e. out_channels here vs in_channels there).
         channels = [out_channels] + [base_channels * 2**i for i in range(n_stages)]
         self.channels = channels
-        reverse_channels = list(reversed(channels))  # coarse -> fine
+        hidden_channels = channels[1:]  # [c_1, ..., c_n], excludes out_channels
 
-        self.unbottleneck = nn.Conv2d(latent_channels, reverse_channels[0], kernel_size=1)
+        self.unbottleneck = nn.Conv2d(latent_channels, hidden_channels[-1], kernel_size=1)
 
+        # n_stages UpBlocks give n_stages spatial doublings (8 -> output_size),
+        # same as before. But the LAST one now stays at hidden_channels[0]
+        # (channel-preserving upsample) instead of dropping straight to
+        # out_channels -- because UpBlock's internal ConvBlock always ends
+        # in ReLU, and ending the whole decoder on a ReLU would clamp every
+        # negative pixel value to exactly 0. Order parameters here are
+        # signed (~-a to +a), so the true output layer needs to be linear.
+        up_channels = list(reversed(hidden_channels)) + [hidden_channels[0]]
         self.up_blocks = nn.ModuleList([
-            UpBlock(reverse_channels[i], reverse_channels[i + 1], norm=norm)
+            UpBlock(up_channels[i], up_channels[i + 1], norm=norm)
             for i in range(n_stages)
         ])
+
+        # Final output layer: plain linear conv, no norm, no activation.
+        # This is the only thing standing between the network and the
+        # pixel values it returns, so it must be able to output negatives.
+        self.output_conv = nn.Conv2d(hidden_channels[0], out_channels, kernel_size=3, padding=1)
 
     def forward(self, z: torch.Tensor, skips: list[torch.Tensor] | None = None) -> torch.Tensor:
         if z.shape[-2:] != (8, 8):
@@ -79,4 +93,4 @@ class Decoder(nn.Module):
         for up in self.up_blocks:
             x = up(x, skip=None)
 
-        return x
+        return self.output_conv(x)

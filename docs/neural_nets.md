@@ -25,7 +25,7 @@ From each snapshot, more can be created throuh
 - mirror (horizontal and vertical);
 - rotation by $\pm$90 °, 180°;
 - transposing;
-- translation by (Nx/2, 0), (0, Ny/2), (Nx/2, Ny/2).
+- translation by (Nx/2, 0), (0, Ny/2), (Nx/2, Ny/2) thanks to periodic boundaries.
 
 
 ### Training Stages

@@ -1,10 +1,10 @@
 import matplotlib.pyplot    as plt
 import matplotlib.animation as animation
 
-from   pathlib     import Path
+from   pathlib  import Path
 
 
-from utils import io
+from   utils    import load_datasets as load
 
 
 def show_snapshot(path: str | Path, nx: int, ny: int,
@@ -14,7 +14,7 @@ def show_snapshot(path: str | Path, nx: int, ny: int,
     Display a single raw binary snapshot (as written by save_phi_half),
     without going through the solver's PNG export.
     """
-    phi = io.read_phi_half(path, nx, ny)
+    phi = load.read_phi_half(path, nx, ny)
 
     if ax is None:
         _, ax = plt.subplots(figsize=(5, 5))
@@ -27,7 +27,7 @@ def show_snapshot(path: str | Path, nx: int, ny: int,
     return ax
 
 
-def make_video(run_dir: str | Path, metadata: "io.RunMetadata",
+def make_video(run_dir: str | Path, metadata: "load.RunMetadata",
                output_path: str | Path, fps: int = 10,
                cmap: str = "RdBu", vmin: float = -1.0, vmax: float = 1.0):
     """
@@ -52,9 +52,9 @@ def make_video(run_dir: str | Path, metadata: "io.RunMetadata",
     count  = 0
     print(f"Making a video from the time steps: {metadata.save_steps}")
     for step in metadata.save_steps:
-        f = run_dir / io.snapshot_filename(step)
+        f = run_dir / load.snapshot_filename(step)
         if f.exists():
-            frames.append((step, io.read_phi_half(f, metadata.nx, metadata.ny)))
+            frames.append((step, load.read_phi_half(f, metadata.nx, metadata.ny)))
             count += 1
 
     if not frames:
