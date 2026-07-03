@@ -20,6 +20,14 @@ To avoid this, skip connections will be added and trained only after freezing th
 
 ## Training Stages and loss functions
 
+### Dataset expansion
+From each snapshot, more can be created throuh
+- mirror (horizontal and vertical);
+- rotation by $\pm$90 °, 180°;
+- transposing;
+- translation by (Nx/2, 0), (0, Ny/2), (Nx/2, Ny/2).
+
+
 ### Training Stages
 
 There are four losses, which can be mixed and matched at different steps:
