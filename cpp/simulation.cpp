@@ -83,7 +83,7 @@ void Simulation::__runOneSimulation(double T,
     
     writer::write_metadata(outdir / "metadata.txt", __config,
                             T, noise, seed,
-                            "2026-07-02",
+                            "2026-07-03",
                             false);
 
     Field phi(__config.Nx,
@@ -139,7 +139,7 @@ void Simulation::__runOneSimulation(double T,
 
 
     std::filesystem::path file;
-    std::vector<Statistics> all_stats;
+    std::vector<writer::WriterStatistics> all_stats;
 
     for (int step = 0; step < __config.steps; ++step)
     {
@@ -168,7 +168,7 @@ void Simulation::__runOneSimulation(double T,
     std::ofstream(outdir / "COMPLETE").close();
     writer::write_metadata(outdir / "metadata.txt", __config,
                             T, noise, seed,
-                            "2026-07-02",
+                            "2026-07-03",
                             true);
 
     op.save_as_png(file.replace_extension(".png"));

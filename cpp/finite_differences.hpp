@@ -27,39 +27,8 @@ namespace FD
     // void gradient_sqr(const Field& in, Field& out);
     void laplacian   (const Field& in, Field& out, const Neighbors& nb);
 
+    double avg_gradient(const Field& phi, const FD::Neighbors& nb);
 
-    // for statistics
-    struct AutoCorrelMetrics
-    {
-        std::vector<double> values;
-
-        int peak_distance;
-        double peak_value;
-    };
-
-    struct StructureTensor
-    {
-        double Jxx_avg;
-        double Jxy_avg;
-        double Jyy_avg;
-
-        double lambda1;      // largest eigenvalue
-        double lambda2;      // smallest eigenvalue
-
-        double trace;        //  λ1 + λ2
-        double anisotropy;   // (λ1-λ2) / (λ1+λ2)
-        double angle;        // radians in [-π/2, π/2]
-    };
-
-    StructureTensor structure_tensor(const Field& phi, const Neighbors& nb);
-
-    
-    // for statistics
-    double avg_gradient(const Field& phi, const Neighbors& nb);
-
-    // characteristic length
-    AutoCorrelMetrics autocorrelation(const Field& phi);  // , int max_dist);
-    
     // Memory management: avoid repeated reallocations
     struct Workspace
     {

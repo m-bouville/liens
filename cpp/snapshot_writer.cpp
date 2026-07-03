@@ -10,6 +10,7 @@
 #include <mutex>
 
 #include "finite_differences.hpp"
+#include "statistics.hpp"
 
 
 
@@ -77,15 +78,15 @@ std::string writer::make_dir_name(int nx, int ny,
 
 
 // Calculating and displaying statistics
-Statistics writer::statistics(const OrderParameter& op, 
-                                    std::ostringstream& log, 
-                                    int             step,
-                                    double          T, 
-                              const Potential&      potential, 
-                              const Solver&         solver, 
-                              const FD::Neighbors&  neighbors)
+writer::WriterStatistics writer::statistics(const OrderParameter& op, 
+                                                  std::ostringstream& log, 
+                                                  int             step,
+                                                  double          T, 
+                                            const Potential&      potential, 
+                                            const Solver&         solver, 
+                                            const FD::Neighbors&  neighbors)
 {
-    Statistics out;
+    WriterStatistics out;
 
     out.time_step = step;
 
@@ -114,13 +115,13 @@ Statistics writer::statistics(const OrderParameter& op,
     {
         std::lock_guard<std::mutex> lock(fftw_mutex);
         
-        auto autocorr = FD::autocorrelation(op.field());  // , max_dist);
+        auto autocorr = statistics::autocorrelation(op.field());  // , max_dist);
         out.autocorr_length = autocorr.peak_distance;
         out.autocorr_correl = autocorr.peak_value;
     }
 
     // anisotropy
-    auto aniso = FD::structure_tensor(op.field(), neighbors);
+    auto aniso = statistics::structure_tensor(op.field(), neighbors);
     out.trace      = aniso.trace;        // λ1+λ2
     out.anisotropy = aniso.anisotropy;   // (λ1-λ2)/(λ1+λ2)
     out.angle      = aniso.angle;        // radians in [-π/2, π/2]
@@ -151,8 +152,8 @@ Statistics writer::statistics(const OrderParameter& op,
     return out;
 }
 
-void writer::write_csv(const std::filesystem::path&   filename,
-                       const std::vector<Statistics>& stats)
+void writer::write_csv(const std::filesystem::path&         filename,
+                       const std::vector<WriterStatistics>& stats)
 {
     std::ofstream out(filename);
 
