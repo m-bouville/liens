@@ -8,8 +8,7 @@ import math
 import torch
 import torch.nn as nn
 
-from   models.blocks import DownBlock
-
+from .blocks import DownBlock
 
 
 class Encoder(nn.Module):
@@ -28,12 +27,12 @@ class Encoder(nn.Module):
 
     def __init__(
         self,
-        input_size:     int,
-        in_channels:    int =  1,
-        base_channels:  int = 32,
-        latent_channels:int = 16,
-        norm:           str = "batch",
-        use_skips:      bool= False,
+        input_size: int,
+        in_channels: int = 1,
+        base_channels: int = 32,
+        latent_channels: int = 16,
+        norm: str = "batch",
+        use_skips: bool = False,
     ):
         super().__init__()
 
@@ -45,8 +44,8 @@ class Encoder(nn.Module):
         n_stages = int(n_stages)
 
         self.input_size = input_size
-        self.n_stages   = n_stages
-        self.use_skips  = use_skips
+        self.n_stages = n_stages
+        self.use_skips = use_skips
 
         # channels[0] = input channels, channels[i] = output channels of stage i.
         # Doubling per stage is a starting choice, not dictated by the docs --

@@ -8,8 +8,7 @@ import math
 import torch
 import torch.nn as nn
 
-from   models.blocks import UpBlock
-
+from .blocks import UpBlock
 
 
 class Decoder(nn.Module):

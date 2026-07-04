@@ -1,4 +1,3 @@
-# python/models/autoencoder.py
 """
 Wraps a matched Encoder/Decoder pair built from one shared config, so
 their shapes are guaranteed to line up.
@@ -7,8 +6,8 @@ their shapes are guaranteed to line up.
 import torch
 import torch.nn as nn
 
-from   models.decoder import Decoder
-from   models.encoder import Encoder
+from .decoder import Decoder
+from .encoder import Encoder
 
 
 class Autoencoder(nn.Module):

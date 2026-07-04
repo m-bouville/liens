@@ -38,22 +38,30 @@ FieldStatistics Field::statistics() const
 {
     FieldStatistics out;
 
-    double min = __values[0];
-    double max = __values[0];
-    double total     = 0.0;
-    double total_sqr = 0.0;  // std deviation
+    double min  = __values[0];
+    double max  = __values[0];
+    double mean = 0.0;
+    double M2   = 0.0;
+
+    std::size_t n = 0;
+    double delta;
 
     for (double v : __values)
     {
+        ++n;
         if (v < min) min = v;
         if (v > max) max = v;
-        total     += v;
-        total_sqr += v*v;
+        
+    // Welford's algorithm
+        delta = v - mean;
+        mean += delta / n;
+        M2 += delta * (v - mean);
     }
 
-    out.average    = total    / __values.size();
-    double avg_sqr = total_sqr/ __values.size();
-    out.stdev = std::sqrt(avg_sqr - out.average*out.average);  // std deviation
+    out.average    = mean;
+    double variance= std::max(0.0, M2 / n);
+    out.stdev      = std::sqrt(variance);  // std deviation
+
     out.min = min;
     out.max = max;
 
@@ -109,7 +117,7 @@ void Field::save_as_png(const std::filesystem::path& file)
     cv::Mat img(__ny, __nx, CV_64F, __values.data());  // TODO __ny, __nx?
 
     cv::Mat norm;
-    cv::normalize(img, norm, -127.5, 127.5, cv::NORM_MINMAX);
+    cv::normalize(img, norm, 0.0, 255.0, cv::NORM_MINMAX);
 
     norm.convertTo(norm, CV_8U);
 

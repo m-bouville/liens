@@ -5,12 +5,51 @@ sweep config, and per-run metadata/directory naming.
 
 import math
 import re
-from   dataclasses import dataclass
-from   pathlib     import Path
+from dataclasses import dataclass
+from pathlib import Path
 
-import numpy  as np
+import numpy as np
 import pandas as pd
 
+
+# ---------------------------------------------------------------------------
+# Snapshot files (one binary file per saved timestep, e.g. "t0100000")
+# ---------------------------------------------------------------------------
+
+_STEP_RE = re.compile(r"^t(\d+)$")
+
+
+def read_phi_half(path: str | Path, nx: int, ny: int) -> np.ndarray:
+    """
+    Read a phase-field snapshot saved by writer::save_phi_half.
+
+    Format: raw IEEE 754 binary16, no header, little-endian, nx*ny values,
+    row-major with __ny rows / __nx columns (confirmed via Field::save_as_png's
+    cv::Mat(__ny, __nx, ...) construction -- x is the fastest-varying index).
+
+    Returns
+    -------
+    np.ndarray, shape (ny, nx), dtype float32
+    """
+    path = Path(path)
+    data = np.fromfile(path, dtype="<f2")
+
+    expected = nx * ny
+    if data.size != expected:
+        raise ValueError(
+            f"{path}: expected {expected} values ({nx}x{ny}), got {data.size}"
+        )
+
+    return data.reshape(ny, nx).astype(np.float32)
+
+
+def parse_step(filename: str | Path) -> int:
+    """Extract the integer step number from a snapshot filename like 't0100000'."""
+    name = Path(filename).name
+    m = _STEP_RE.match(name)
+    if not m:
+        raise ValueError(f"Filename '{name}' does not match expected pattern 't<digits>'")
+    return int(m.group(1))
 
 
 # ---------------------------------------------------------------------------
@@ -39,20 +78,20 @@ def _parse_list(raw: str, cast=float) -> list:
 
 @dataclass
 class SweepConfig:
-    nx:         int
-    ny:         int
-    dt:         float
-    steps:      int
-    max_threads:int
-    a0:         float
-    b:          float
-    T0:         float
-    kappa:      float
-    M:          float
-    temperatures:list[float]
-    noises:     list[float]
-    seeds:      list[int]
-    phi0:       float
+    nx: int
+    ny: int
+    dt: float
+    steps: int
+    max_threads: int
+    a0: float
+    b: float
+    T0: float
+    kappa: float
+    mobility: float
+    temperatures: list[float]
+    noises: list[float]
+    seeds: list[int]
+    phi0: float
     save_steps: list[int]
 
 
@@ -60,85 +99,23 @@ def read_config(path: str | Path) -> SweepConfig:
     """Parse the sweep config.txt written before a batch of simulations."""
     kv = _parse_kv_file(path)
     return SweepConfig(
-        nx      = int  (kv["Nx"]),
-        ny      = int  (kv["Ny"]),
-        dt      = float(kv["dt"]),
-        steps   = int  (kv["steps"]),
+        nx=int(kv["Nx"]),
+        ny=int(kv["Ny"]),
+        dt=float(kv["dt"]),
+        steps=int(kv["steps"]),
         max_threads=int(kv["max_threads"]),
-        a0      = float(kv["a0"]),
-        b       = float(kv["b"]),
-        T0      = float(kv["T0"]),
-        kappa   = float(kv["kappa"]),
-        M       = float(kv["M"]),
+        a0=float(kv["a0"]),
+        b=float(kv["b"]),
+        T0=float(kv["T0"]),
+        kappa=float(kv["kappa"]),
+        mobility=float(kv["M"]),
         temperatures=_parse_list(kv["temperatures"], float),
-        noises  = _parse_list(kv["noises"], float),
-        seeds   = _parse_list(kv["seeds"], int),
-        phi0    = float(kv["phi0"]),
+        noises=_parse_list(kv["noises"], float),
+        seeds=_parse_list(kv["seeds"], int),
+        phi0=float(kv["phi0"]),
         save_steps=_parse_list(kv["save"], int),
     )
 
-
-
-# ---------------------------------------------------------------------------
-# Per-run metadata (metadata.txt)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class RunMetadata:
-    directory:    str
-    code_version: str
-    status:       str
-    nx:           int
-    ny:           int
-    dt:           float
-    steps:        int
-    save_steps:   list[int]
-    a0:           float
-    b:            float
-    T0:           float
-    temperature:  float
-    kappa:        float
-    mobility:     float
-    phi0:         float
-    noise:        float
-    seed:         int
-    equation:     str
-    solver:       str
-
-    @property
-    def is_complete(self) -> bool:
-        return self.status.strip().lower() == "complete"
-
-
-def read_metadata(path: str | Path) -> RunMetadata:
-    """
-    Parse a per-run metadata.txt. Unlike config.txt's comma-separated
-    `save`, metadata.txt's `save_steps` is whitespace-separated -- the
-    C++ side writes actual save times for this specific run, which can
-    be shorter than the config.txt sweep list (e.g. if a run stopped early).
-    """
-    kv = _parse_kv_file(path)
-    return RunMetadata(
-        directory    = kv["directory"],
-        code_version = kv["code version"],
-        status       = kv["status"],
-        nx           = int(kv["Nx"]),
-        ny           = int(kv["Ny"]),
-        dt           = float(kv["dt"]),
-        steps        = int(kv["steps"]),
-        save_steps   = [int(x) for x in kv["save_steps"].split()],
-        a0           = float(kv["a0"]),
-        b            = float(kv["b"]),
-        T0           = float(kv["T0"]),
-        temperature  = float(kv["temperature"]),
-        kappa        = float(kv["kappa"]),
-        mobility     = float(kv["mobility"]),
-        phi0         = float(kv["phi0"]),
-        noise        = float(kv["noise"]),
-        seed         = int(kv["seed"]),
-        equation     = kv["equation"],
-        solver       = kv["solver"],
-    )
 
 # ---------------------------------------------------------------------------
 # Run directory naming (mirrors writer::make_dir_name)
@@ -184,10 +161,36 @@ def is_complete(run_dir: str | Path) -> bool:
     return (Path(run_dir) / "COMPLETE").exists()
 
 
+# ---------------------------------------------------------------------------
+# Per-run metadata (metadata.txt)
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# check that all timesteps saved do have a file
-# ---------------------------------------------------------------------------
+@dataclass
+class RunMetadata:
+    directory:    str
+    code_version: str
+    status:       str
+    nx:           int
+    ny:           int
+    dt:           float
+    steps:        int
+    save_steps:   list[int]
+    a0:           float
+    b:            float
+    T0:           float
+    temperature:  float
+    kappa:        float
+    mobility:     float
+    phi0:         float
+    noise:        float
+    seed:         int
+    equation:     str
+    solver:       str
+
+    @property
+    def is_complete(self) -> bool:
+        return self.status.strip().lower() == "complete"
+
 
 def snapshot_filename(step: int, width: int = 7) -> str:
     """Filename for a saved snapshot at a given step, e.g. step=100000 -> 't0100000'."""
@@ -209,7 +212,7 @@ def check_snapshots_saved(run_dir: str | Path, metadata: RunMetadata) -> dict[st
     run_dir = Path(run_dir)
     expected_bytes = metadata.nx * metadata.ny * 2  # float16 = 2 bytes
 
-    missing  = []
+    missing = []
     bad_size = []
 
     for step in metadata.save_steps:
@@ -223,64 +226,57 @@ def check_snapshots_saved(run_dir: str | Path, metadata: RunMetadata) -> dict[st
     return {"missing": missing, "bad_size": bad_size}
 
 
+def read_metadata(path: str | Path) -> RunMetadata:
+    """
+    Parse a per-run metadata.txt. Unlike config.txt's comma-separated
+    `save`, metadata.txt's `save_steps` is whitespace-separated -- the
+    C++ side writes actual save times for this specific run, which can
+    be shorter than the config.txt sweep list (e.g. if a run stopped early).
+    """
+    kv = _parse_kv_file(path)
+    return RunMetadata(
+        directory    = kv["directory"],
+        code_version = kv["code version"],
+        status       = kv["status"],
+        nx           = int(kv["Nx"]),
+        ny           = int(kv["Ny"]),
+        dt           = float(kv["dt"]),
+        steps        = int(kv["steps"]),
+        save_steps   = [int(x) for x in kv["save_steps"].split()],
+        a0           = float(kv["a0"]),
+        b            = float(kv["b"]),
+        T0           = float(kv["T0"]),
+        temperature  = float(kv["temperature"]),
+        kappa        = float(kv["kappa"]),
+        mobility     = float(kv["mobility"]),
+        phi0         = float(kv["phi0"]),
+        noise        = float(kv["noise"]),
+        seed         = int(kv["seed"]),
+        equation     = kv["equation"],
+        solver       = kv["solver"],
+    )
+
 
 # ---------------------------------------------------------------------------
-# read statistics csv
+# Per-run statistics (statistics.csv)
 # ---------------------------------------------------------------------------
 
 def read_statistics_csv(path: str | Path) -> pd.DataFrame:
     """
     Read a per-run statistics.csv into a DataFrame, indexed by step
     (for joining against snapshot filenames via snapshot_filename(step)).
+
+    NOTE: different batches of runs can have different columns (e.g. a
+    'trace' column dropped later because it was found to duplicate
+    'gradient_sqr') -- this function doesn't enforce a fixed schema;
+    callers pooling statistics across multiple runs need to check
+    column consistency themselves (see training/datasets.py).
     """
     path = Path(path)
-    df   = pd.read_csv(path)
+    df = pd.read_csv(path)
 
     if "step" not in df.columns:
         raise ValueError(f"{path}: missing 'step' column")
 
     df["step"] = df["step"].astype(int)
-
     return df.set_index("step")
-
-
-
-# ---------------------------------------------------------------------------
-# Snapshot files (one binary file per saved timestep, e.g. "t0100000")
-# ---------------------------------------------------------------------------
-
-_STEP_RE = re.compile(r"^t(\d+)$")
-
-
-def read_phi_half(path: str | Path, nx: int, ny: int) -> np.ndarray:
-    """
-    Read a phase-field snapshot saved by cpp/writer::save_phi_half.
-
-    Format: raw IEEE 754 binary16, no header, little-endian, nx*ny values,
-    row-major with __ny rows / __nx columns (confirmed via Field::save_as_png's
-    cv::Mat(__ny, __nx, ...) construction -- x is the fastest-varying index).
-
-    Returns
-    -------
-    np.ndarray, shape (ny, nx), dtype float32
-    """
-    path = Path(path)
-    data = np.fromfile(path, dtype="<f2")
-
-    expected = nx * ny
-    if data.size != expected:
-        raise ValueError(
-            f"{path}: expected {expected} values ({nx}x{ny}), got {data.size}"
-        )
-
-    return data.reshape(ny, nx).astype(np.float32)
-
-
-def parse_step(filename: str | Path) -> int:
-    """Extract the integer step number from a snapshot filename like 't0100000'."""
-    name = Path(filename).name
-    m = _STEP_RE.match(name)
-    if not m:
-        raise ValueError(f"Filename '{name}' does not match expected pattern 't<digits>'")
-    return int(m.group(1))
-

@@ -9,6 +9,7 @@ Usage:
 import argparse
 from   pathlib import Path
 import sys
+import gc
 
 import torch
 
@@ -19,9 +20,9 @@ from   utils  import plots
 
 from   models import encoder, decoder, autoencoder
 
-from   training.datasets import MicrostructureSnapshotDataset
-from   training.losses import ReconLoss
-
+from   training.datasets import MicrostructureSnapshotDataset, \
+                                complete_run_dirs, split_run_dirs
+from   training.losses   import ReconLoss
 
 
 
@@ -43,6 +44,18 @@ def main():
     n_complete   = 0
     n_incomplete = 0
     n_missing    = 0
+
+
+
+
+    config = load.read_config("../config.txt")  # your 64x64 config
+    run_dirs = complete_run_dirs(config, "../datasets")
+    train_dirs, _, _ = split_run_dirs(run_dirs, 0.2, 0.1, seed=0)
+
+    ds = MicrostructureSnapshotDataset(train_dirs, min_step=4000, include_stats=True)
+    mean, std = ds.stats_normalization()
+    for name, m, s in zip(ds.stat_names, mean, std):
+        print(f"{name:16s} mean={m.item(): .6g}  std={s.item(): .6g}")
 
 
 
@@ -79,8 +92,6 @@ def main():
 
 
     sys.exit()
-
-
 
 
     for d in dirs:
@@ -126,3 +137,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    if torch.cuda.is_available():
+        # clear VRAM
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
