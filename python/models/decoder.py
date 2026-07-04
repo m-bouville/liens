@@ -80,7 +80,8 @@ class Decoder(nn.Module):
         # Final output layer: plain linear conv, no norm, no activation.
         # This is the only thing standing between the network and the
         # pixel values it returns, so it must be able to output negatives.
-        self.output_conv = nn.Conv2d(hidden_channels[0], out_channels, kernel_size=3, padding=1)
+        self.output_conv = nn.Conv2d(hidden_channels[0], out_channels, kernel_size=3, padding=1,
+                                      padding_mode="circular")
 
     def forward(self, z: torch.Tensor, skips: list[torch.Tensor] | None = None) -> torch.Tensor:
         if z.shape[-2:] != (8, 8):

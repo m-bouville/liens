@@ -26,12 +26,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config",       type=Path, default=Path("../config.txt"))
     parser.add_argument("--base",         type=Path, default=Path("../datasets"))
-    parser.add_argument("--epochs",       type=int,  default=20)
+    parser.add_argument("--epochs",       type=int,  default=40)
     parser.add_argument("--batch-size",   type=int,  default=64)
                 # 64 for 64x64, 32 for 128x128
     parser.add_argument("--lr",           type=float,default=1e-3)
     parser.add_argument("--base-channels",type=int,  default=32)
-    parser.add_argument("--latent-channels",type=int,default=8)
+    parser.add_argument("--latent-channels",type=int,default=4)
                 # 4 for 64x64, 6? for 128x128
     parser.add_argument("--val-fraction", type=float,default=0.2)
     parser.add_argument("--test-fraction",type=float,default=0.1,
@@ -42,10 +42,13 @@ def main():
     # parser.add_argument("--augment", action="store_true",
     #         help="expand training data 32x via D4 symmetry + periodic translation")
     # parser.add_argument("--cache-in-memory", action="store_true")
-    parser.add_argument("--min-step", type=int, default=1_000,
+    parser.add_argument("--min-step", type=int, default=4_000,
             help="skip snapshots earlier than this step (early steps are "
                  "near-pure noise, before microstructure develops)")
-    parser.add_argument("--min-stdev-phi", type=float, default=0.01)
+    parser.add_argument("--min-stdev-phi", type=float, default=0.01,
+            help="skip snapshots whose statistics.csv stdev_phi is below this "
+                 "or NaN -- catches both pre-growth noise AND post-coarsening "
+                 "single-grain states")
     parser.add_argument("--stat-names", type=str, nargs="+", default=None,
             help="which statistics.csv columns to predict; default auto-detects "
                  "from the first train run (risky if runs have mixed schemas -- "
@@ -53,9 +56,16 @@ def main():
                  "'angle' is transformed to match D4 augmentation (see "
                  "training/datasets.py's _transform_angle) -- the 90-degree "
                  "rotation sign is a documented, unconfirmed assumption there.")
-    parser.add_argument("--stats-weight", type=float, default=0.1,
+    parser.add_argument("--stats-weight", type=float, default=0.01,
             help="lambda_1: weight of L_stats relative to L_recon."
                 "0.: statistics not used, only L_recon")
+    parser.add_argument("--val-ema-decay", type=float, default=0.7,
+            help="EMA decay for the val loss used in checkpoint selection "
+                 "(effective window ~= 1/(1-decay) epochs, so 0.7 ~ 3 epochs). "
+                 "Smooths single-epoch val spikes/dips -- e.g. from a small val "
+                 "set where a few hard/borderline samples can swing the whole "
+                 "epoch average -- so checkpointing isn't driven by which epoch "
+                 "got lucky on those samples.")
     parser.add_argument("--seed",       type=int, default=0,
             help="fixed for reproducibility across runs (data split + model init "
                  "+ shuffling); no expectation this needs changing between runs")
@@ -123,7 +133,8 @@ def main():
 
     train_set = MicrostructureSnapshotDataset(
         train_dirs, cache_in_memory=args.cache_in_memory, augment=args.augment,
-        min_step=args.min_step, include_stats=args.include_stats, stat_names=args.stat_names,
+        min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
+        include_stats=args.include_stats, stat_names=args.stat_names,
     )
     # Lock val's stat_names to whatever train resolved (auto-detection is
     # order-dependent; without this, val could silently end up checked
@@ -131,7 +142,8 @@ def main():
     val_stat_names = train_set.stat_names if args.include_stats else None
     val_set = MicrostructureSnapshotDataset(
         val_dirs, cache_in_memory=args.cache_in_memory, augment=False,
-        min_step=args.min_step, include_stats=args.include_stats, stat_names=val_stat_names,
+        min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
+        include_stats=args.include_stats, stat_names=val_stat_names,
     )
 
     print(f"{train_set.n_base_samples} base snapshots (train)"
@@ -203,16 +215,20 @@ def main():
         return total.item(), recon.item(), stats.item()
 
     best_val_loss = float("inf")
+    val_ema = None  # EMA of val_total, used for checkpoint selection instead of
+                    # the raw per-epoch value -- see --val-ema-decay help text
 
 
     print(f"Starting {args.epochs} epochs (batches of {args.batch_size})...")
 
     # heading for tabulated output
-    heading = (f"/{args.epochs:3d} ")
+    heading = (f"/{args.epochs:3d} |")
     if args.include_stats:
-        heading += (" train (e-3) = recon + stat | valid (e-3) = recon + stat")
+        heading +=      "        training       |          validation            | (all e-3)\n"
+        heading +=  "     |  total  recon  stats  |  total  recon  stats  |  ema |\n"
+        heading += f"     [[  total = recon + {args.stats_weight} * stats  ]]"
     else:
-        heading += ("recon: train valid")
+        heading += ("train | valid   | ema   (all e-3)")
     print(heading)
 
 
@@ -248,22 +264,34 @@ def main():
         val_recon /= n_val
         val_stats /= n_val
 
-        msg = (f"{epoch:4d}")
-        if args.include_stats:
-            msg+=(f"{train_total*1_000:8.2f} ={train_recon*1_000:8.2f} +{train_stats*1_000:8.2f} |"
-                 +f"{val_total  *1_000:8.2f} ={val_recon  *1_000:8.2f} +{val_stats  *1_000:8.2f}")
+        # EMA update: first epoch has no history, so start from the raw value
+        # rather than e.g. 0 (which would bias the whole EMA trajectory low).
+        if val_ema is None:
+            val_ema = val_total
         else:
-           msg += f"{train_total*1_000:8.2f} |{val_total*1_000:8.2f}"
-        print(msg)
+            val_ema = args.val_ema_decay * val_ema + (1 - args.val_ema_decay) * val_total
 
-        if val_total < best_val_loss:
-            best_val_loss = val_total
+        msg = (f"{epoch:4d} |")
+        if args.include_stats:
+            msg+=(f"{train_total*1_000:6.3f} ={train_recon*1_000:6.3f} +{train_stats*1_000:6.1f} |"
+                 +f"{val_total  *1_000:6.3f} ={val_recon  *1_000:6.3f} +{val_stats  *1_000:6.1f}"
+                 +f" |{val_ema*1_000:6.3f} |")
+        else:
+           msg += f"{train_total*1_000:6.3f} |{val_total*1_000:6.3f} |{val_ema*1_000:6.3f} |"
+
+        # Checkpoint on the EMA, not the raw per-epoch val_total: with a small
+        # val set, a few hard/borderline samples can swing the whole-epoch
+        # average enough that "best epoch" ends up picked by which epoch got
+        # lucky on those samples rather than genuine improvement.
+        if val_ema < best_val_loss:
+            best_val_loss = val_ema
             checkpoint = {
                 "model_state": ae.state_dict(),
                 "stats_head_state": stats_head.state_dict()
                                 if stats_head is not None else None,
                 "epoch": epoch,
-                "val_loss": val_total,
+                "val_loss": val_total,      # raw value, for reference
+                "val_loss_ema": val_ema,    # smoothed value that actually triggered this save
                 "normalized": False,  # not yet implemented -- always False for now
                 "test_dirs": [str(d) for d in test_dirs],
                 "config": {
@@ -280,8 +308,9 @@ def main():
                 } if args.include_stats else None,
             }
             torch.save(checkpoint, args.checkpoint)
-            print(f"  -> saved checkpoint to {args.checkpoint}")
+            msg += "  -> saved"
 
+        print(msg)
 
 if __name__ == "__main__":
     main()

@@ -24,15 +24,30 @@ class ConvBlock(nn.Module):
     The basic building block at every resolution level: used inside
     DownBlock/UpBlock, and standalone for the decoder's optional
     post-skip refinement once skip connections are added.
+
+    padding_mode='circular': the phase-field solver uses periodic
+    boundary conditions (confirmed -- see the translation-augmentation
+    discussion in training/datasets.py), so the true continuation past
+    an edge is the opposite edge of the same image, not zero. Default
+    zero-padding tells every conv layer "there's nothing beyond this
+    border", which is architecturally wrong for this data: it gives
+    edge pixels a permanently different receptive field than interior
+    pixels (visible as boundary artifacts that persist regardless of
+    training), and makes it structurally impossible to correctly
+    reconstruct a grain that wraps across the domain edge, since the
+    correct information (the other side of the domain) is unavailable
+    to a zero-padded kernel no matter how much training happens.
     """
 
     def __init__(self, in_channels: int, out_channels: int, norm: str = "batch"):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1,
+                      padding_mode="circular"),
             _make_norm(norm, out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1,
+                      padding_mode="circular"),
             _make_norm(norm, out_channels),
             nn.ReLU(inplace=True),
         )
@@ -56,7 +71,11 @@ class DownBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, norm: str = "batch"):
         super().__init__()
         self.conv = ConvBlock(in_channels, out_channels, norm=norm)
-        self.down = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
+        # Same circular-padding rationale as ConvBlock -- this is also a
+        # padded (padding=1) conv, so it has the same boundary mismatch
+        # if left at the zero-padding default.
+        self.down = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1,
+                               padding_mode="circular")
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.conv(x)
@@ -73,6 +92,12 @@ class UpBlock(nn.Module):
     features before the ConvBlock. The merge is additive for now (simplest
     option that doesn't change channel counts); revisit once
     skip_connections.py defines how skip features are adapted to match.
+
+    NOTE: self.up (ConvTranspose2d) is NOT switched to circular padding --
+    it uses padding=0 already (a clean, non-overlapping 2x expansion with
+    no boundary ambiguity to begin with), and PyTorch's ConvTranspose2d
+    doesn't support padding_mode='circular' regardless. The boundary
+    fix only applies to the padded 3x3 convs in ConvBlock/DownBlock.
     """
 
     def __init__(self, in_channels: int, out_channels: int, norm: str = "batch"):

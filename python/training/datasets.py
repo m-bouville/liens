@@ -2,6 +2,7 @@
 PyTorch Dataset classes for loading phase-field runs off disk.
 """
 
+import math
 from pathlib import Path
 
 import torch
@@ -155,12 +156,28 @@ class MicrostructureSnapshotDataset(Dataset):
                  min_stdev_phi: float | None = None,
                  include_stats: bool = False, stat_names: list[str] | None = None):
         """
-        min_step: skip snapshots earlier than this step. Early steps
-        (near t=0) are dominated by the initial noise (phi0 + noise in
-        metadata.txt) rather than developed microstructure -- at low
-        noise amplitude they're visually near-flat and arguably not
-        useful/desirable training targets either. Default 0 keeps
-        everything; pass e.g. 10000 to exclude the noise-dominated regime.
+        min_step: skip snapshots earlier than this step. Kept as a cheap,
+        always-available filter that needs no statistics.csv, but a fixed
+        step count doesn't generalize across a sweep -- different (T,
+        noise) combinations develop at very different rates, so one
+        threshold that's safe for a fast-developing combo can still land
+        inside the noise regime for a slow one. Default 0 keeps everything.
+
+        min_stdev_phi: skip snapshots whose statistics.csv stdev_phi is
+        below this value OR is NaN. This is a better criterion than
+        min_step for excluding "uninteresting" smooth fields, since it
+        catches BOTH ends of the evolution with one physically-meaningful
+        check: near-t=0 noise (before microstructure develops) AND late,
+        fully-coarsened single-grain states -- both have near-zero
+        variance. The NaN case isn't incidental: stdev_phi is NaN
+        specifically at very low true variance, consistent with
+        floating-point cancellation in a one-pass variance computation
+        (E[X^2] - E[X]^2 going slightly negative before the sqrt) --
+        confirmed empirically to occur at both very early and very late
+        (post-coarsening) steps, i.e. exactly the smooth-field regime
+        this filter is meant to exclude. Reads statistics.csv even if
+        include_stats=False, since this filter is about data relevance,
+        not the stats-prediction feature. Default None disables it.
 
         include_stats: if True, __getitem__ returns (x, stats) instead
         of just x, where stats is a fixed-order vector of the columns in
@@ -212,7 +229,6 @@ class MicrostructureSnapshotDataset(Dataset):
                 stats_df = load.read_statistics_csv(run_dir / "statistics.csv")
 
             if include_stats:
-                stats_df = load.read_statistics_csv(run_dir / "statistics.csv")
                 if stat_names is None:
                     stat_names = sorted(stats_df.columns)
                 missing = set(stat_names) - set(stats_df.columns)
@@ -230,6 +246,15 @@ class MicrostructureSnapshotDataset(Dataset):
                         continue  # can't verify the criterion -- exclude rather than assume
                     stdev = stats_df.loc[step, "stdev_phi"]
                     if math.isnan(stdev) or stdev < min_stdev_phi:
+                        continue
+                if include_stats:
+                    # ANY NaN in ANY requested column poisons stats_normalization()
+                    # for the WHOLE dataset (mean()/std() over an array containing
+                    # a single NaN returns NaN, not just for that one row) -- this
+                    # must check every stat_names column, not just stdev_phi.
+                    if step not in stats_df.index:
+                        continue
+                    if stats_df.loc[step, stat_names].isna().any():
                         continue
                 self._index.append((run_dir, step, metadata.nx, metadata.ny))
 
@@ -345,4 +370,26 @@ class MicrostructureSnapshotDataset(Dataset):
         if not self.include_stats:
             raise ValueError("include_stats=False -- no statistics loaded")
         values = torch.stack([self._load_stats(i) for i in range(len(self._index))])
-        return values.mean(dim=0), values.std(dim=0).clamp_min(1e-8)
+        mean = values.mean(dim=0)
+        std = values.std(dim=0).clamp_min(1e-8)
+
+        # Defense in depth: __init__ already excludes any row with a NaN
+        # in a requested column, so this should never fire. But a single
+        # NaN slipping through (e.g. a future filtering gap) would
+        # silently make mean/std NaN for that column, which then makes
+        # StatsLoss NaN for EVERY sample, not just the bad one -- and
+        # from there, a shared-encoder gradient update corrupts the
+        # model permanently on the very first backward pass. Catching it
+        # here, with the specific column named, beats debugging an
+        # unexplained epoch-1 NaN in the training loop.
+        bad = torch.isnan(mean) | torch.isnan(std)
+        if bad.any():
+            bad_cols = [name for name, is_bad in zip(self.stat_names, bad.tolist()) if is_bad]
+            raise ValueError(
+                f"stats_normalization() produced NaN for columns {bad_cols} -- at least "
+                f"one pooled sample has NaN in that column despite row-level filtering. "
+                f"This should not happen; check for a gap in the NaN-exclusion logic "
+                f"in __init__, or that statistics.csv itself isn't corrupted."
+            )
+
+        return mean, std

@@ -92,7 +92,8 @@ def main():
             # THIS sample -- a fixed global scale makes low-amplitude
             # fields (like early, still noise-dominated steps) look
             # flat/blank even though real structure is there.
-            scale = max(abs(x_np.min()), abs(x_np.max()), 1e-6)
+            scale      = max(abs(x_np   .min()), abs(x_np   .max()), 0.1)
+                # if the scale drops below +/-0.1, we plot noise as signal.
             diff_scale = max(abs(diff_np.min()), abs(diff_np.max()), 1e-6)
 
             axes[row, 0].imshow(x_np, cmap="RdBu", vmin=-scale, vmax=scale)
