@@ -24,9 +24,9 @@ from   utils               import load_datasets   as load
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config",       type=Path, default=Path("../config.txt"))
-    parser.add_argument("--base",         type=Path, default=Path("../datasets"))
-    parser.add_argument("--epochs",       type=int,  default=40)
+    parser.add_argument("--config",       type=Path, default=Path("../../config.txt"))
+    parser.add_argument("--base",         type=Path, default=Path("../../datasets"))
+    parser.add_argument("--epochs",       type=int,  default=20)
     parser.add_argument("--batch-size",   type=int,  default=64)
                 # 64 for 64x64, 32 for 128x128
     parser.add_argument("--lr",           type=float,default=1e-3)
@@ -70,7 +70,7 @@ def main():
             help="fixed for reproducibility across runs (data split + model init "
                  "+ shuffling); no expectation this needs changing between runs")
     parser.add_argument("--checkpoint", type=Path,
-                        default=Path("../output/ae_checkpoint.pt"))
+                        default=Path("../../output/ae_checkpoint.pt"))
     parser.add_argument("--device",     type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -226,7 +226,7 @@ def main():
     if args.include_stats:
         heading +=      "        training       |          validation            | (all e-3)\n"
         heading +=  "     |  total  recon  stats  |  total  recon  stats  |  ema |\n"
-        heading += f"     [[  total = recon + {args.stats_weight} * stats  ]]"
+        heading += f"         [[  total = recon + {args.stats_weight} * stats  ]]"
     else:
         heading += ("train | valid   | ema   (all e-3)")
     print(heading)
@@ -308,7 +308,7 @@ def main():
                 } if args.include_stats else None,
             }
             torch.save(checkpoint, args.checkpoint)
-            msg += "  -> saved"
+            msg += " -> saved"
 
         print(msg)
 

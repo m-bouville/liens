@@ -123,6 +123,72 @@ def split_run_dirs(run_dirs: list[Path], val_fraction: float, test_fraction: flo
     )
 
 
+def _filtered_steps(metadata: "load.RunMetadata", bad_steps: set[int],
+                     min_step: int, min_stdev_phi: float | None, stats_df) -> list[int]:
+    """
+    Steps from metadata.save_steps passing the filters shared by every
+    dataset in this module: not missing/corrupt (bad_steps), not earlier
+    than min_step, and (if min_stdev_phi is set) not NaN/below threshold
+    in statistics.csv's stdev_phi column. Factored out so
+    MicrostructureSnapshotDataset and MicrostructureEvolutionDataset
+    can't silently diverge in what counts as an excluded step.
+    """
+    kept = []
+    for step in metadata.save_steps:
+        if step in bad_steps or step < min_step:
+            continue
+        if min_stdev_phi is not None:
+            if stats_df is None or step not in stats_df.index:
+                continue  # can't verify the criterion -- exclude rather than assume
+            stdev = stats_df.loc[step, "stdev_phi"]
+            if math.isnan(stdev) or stdev < min_stdev_phi:
+                continue
+        kept.append(step)
+    return kept
+
+
+def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
+                      min_step: int = 0, min_stdev_phi: float | None = None,
+                      ) -> dict[Path, list[int]]:
+    """
+    Scan run_dirs ONCE and return a stable {run_dir: [kept_step, ...]}
+    mapping -- the single source of truth for "which snapshots count as
+    usable" under a given filter configuration.
+
+    Both MicrostructureSnapshotDataset and MicrostructureEvolutionDataset
+    call this exact function rather than each re-deriving their own
+    filtered step list. That's a stronger guarantee than just sharing
+    _filtered_steps's logic: two separate call sites invoking the same
+    function can still drift in the bookkeeping around it (e.g. a future
+    edit to one call site's loop), whereas both classes consuming the
+    same precomputed dict cannot silently disagree.
+
+    Pass the result of one call here into BOTH a Snapshot and an
+    Evolution dataset built from the same run_dirs/filter settings (via
+    their optional good_steps= argument) to skip the scan entirely on
+    the second construction, rather than paying for it twice.
+    """
+    good_steps: dict[Path, list[int]] = {}
+    for run_dir in run_dirs:
+        run_dir = Path(run_dir)
+        metadata = load.read_metadata(run_dir / "metadata.txt")
+
+        check = load.check_snapshots_saved(run_dir, metadata)
+        bad_steps = set(check["missing"]) | set(check["bad_size"])
+        if bad_steps and not skip_bad:
+            raise ValueError(
+                f"{run_dir}: {len(bad_steps)} bad/missing snapshot(s) "
+                f"({sorted(bad_steps)[:5]}...), and skip_bad=False"
+            )
+
+        stats_df = load.read_statistics_csv(run_dir / "statistics.csv") \
+            if min_stdev_phi is not None else None
+        good_steps[run_dir] = _filtered_steps(metadata, bad_steps, min_step, min_stdev_phi,
+                                               stats_df)
+
+    return good_steps
+
+
 class MicrostructureSnapshotDataset(Dataset):
     """
     Flat collection of individual microstructure snapshots x(t), pooled
@@ -154,8 +220,15 @@ class MicrostructureSnapshotDataset(Dataset):
     def __init__(self, run_dirs: list[str | Path], skip_bad: bool = True,
                  cache_in_memory: bool = False, augment: bool = False, min_step: int = 0,
                  min_stdev_phi: float | None = None,
-                 include_stats: bool = False, stat_names: list[str] | None = None):
+                 include_stats: bool = False, stat_names: list[str] | None = None,
+                 good_steps: dict[Path, list[int]] | None = None):
         """
+        good_steps: a precomputed {run_dir: [kept_step, ...]} mapping
+        from build_good_steps(), to skip re-scanning run_dirs when
+        another dataset (e.g. a paired MicrostructureEvolutionDataset
+        over the same run_dirs) already computed it with the same
+        skip_bad/min_step/min_stdev_phi. Default None computes it here.
+
         min_step: skip snapshots earlier than this step. Kept as a cheap,
         always-available filter that needs no statistics.csv, but a fixed
         step count doesn't generalize across a sweep -- different (T,
@@ -208,27 +281,21 @@ class MicrostructureSnapshotDataset(Dataset):
         self._index: list[tuple[Path, int, int, int]] = []  # (run_dir, step, nx, ny)
         self._stats_by_run = {}  # dict[Path, pd.DataFrame], populated below if include_stats
 
+        run_dirs = [Path(d) for d in run_dirs]
+        if good_steps is None:
+            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi)
+
         for run_dir in run_dirs:
-            run_dir = Path(run_dir)
             metadata = load.read_metadata(run_dir / "metadata.txt")
+            kept_steps = good_steps[run_dir]
 
-            check = load.check_snapshots_saved(run_dir, metadata)
-            bad_steps = set(check["missing"]) | set(check["bad_size"])
-
-            if bad_steps and not skip_bad:
-                raise ValueError(
-                    f"{run_dir}: {len(bad_steps)} bad/missing snapshot(s) "
-                    f"({sorted(bad_steps)[:5]}...), and skip_bad=False"
-                )
-
-            # Read statistics.csv if EITHER include_stats needs the full
-            # columns, OR min_stdev_phi needs just stdev_phi -- share one
-            # read either way rather than reading the file twice.
+            # Still needed here (independent of build_good_steps) when
+            # include_stats wants the full DataFrame, not just the
+            # stdev_phi column build_good_steps may have already used
+            # internally for min_stdev_phi filtering.
             stats_df = None
-            if include_stats or min_stdev_phi is not None:
-                stats_df = load.read_statistics_csv(run_dir / "statistics.csv")
-
             if include_stats:
+                stats_df = load.read_statistics_csv(run_dir / "statistics.csv")
                 if stat_names is None:
                     stat_names = sorted(stats_df.columns)
                 missing = set(stat_names) - set(stats_df.columns)
@@ -238,15 +305,7 @@ class MicrostructureSnapshotDataset(Dataset):
                     )
                 self._stats_by_run[run_dir] = stats_df
 
-            for step in metadata.save_steps:
-                if step in bad_steps or step < min_step:
-                    continue
-                if min_stdev_phi is not None:
-                    if step not in stats_df.index:
-                        continue  # can't verify the criterion -- exclude rather than assume
-                    stdev = stats_df.loc[step, "stdev_phi"]
-                    if math.isnan(stdev) or stdev < min_stdev_phi:
-                        continue
+            for step in kept_steps:
                 if include_stats:
                     # ANY NaN in ANY requested column poisons stats_normalization()
                     # for the WHOLE dataset (mean()/std() over an array containing
@@ -393,3 +452,180 @@ class MicrostructureSnapshotDataset(Dataset):
             )
 
         return mean, std
+
+
+class MicrostructureEvolutionDataset(Dataset):
+    """
+    Sequences of consecutive latent codes z(t), for LDS training (stage
+    4+): z(t_k), z(t_k+dt_0), ..., z(t_k+dt_0+...+dt_{n-1}), each a
+    window of n_r+1 consecutive KEPT steps from a single run (never
+    crossing run boundaries -- a "sequence" spanning two different runs
+    isn't a real trajectory).
+
+    The encoder is frozen during this stage (per docs/neural_nets.md),
+    so z(t) is computed ONCE for every kept step, upfront, and cached --
+    not re-encoded from raw snapshots every batch. Latents are tiny
+    compared to raw images (e.g. a 4x8x8 latent is ~200x smaller than a
+    64x64 snapshot), so caching every one is cheap even for a large sweep.
+
+    __getitem__ returns (z_window, dt_window, theta):
+      z_window:  (n_r+1, latent_channels, 8, 8)
+      dt_window: (n_r,) float32, physical time between consecutive steps
+                 in the window, i.e. (step_b - step_a) * metadata.dt.
+      theta:     (1,) float32, currently [temperature - T0]. Per
+                 docs/neural_nets.md, f_theta's theta subscript denotes
+                 PHYSICAL parameters (e.g. temperature), not the neural
+                 net's own learnable weights -- conditioning on theta is
+                 what lets one LDS model generalize across a whole sweep
+                 of different runs, rather than needing a separate model
+                 per temperature. Centered on T0 (the Landau potential's
+                 threshold temperature, metadata.T0) rather than raw
+                 temperature: the whole sweep is subcritical (T < T0),
+                 and distance from T0 is the physically meaningful
+                 quantity governing dynamics, not distance from 0 --
+                 centering puts that boundary at theta=0 for free rather
+                 than requiring the network to discover T0's significance
+                 from data. Only temperature (via this centering) is
+                 included: noise only sets the INITIAL condition phi(0)
+                 and never appears in the governing Allen-Cahn equation
+                 itself (a0, b, T0, kappa, mobility are fixed constants
+                 across the current sweep), so two runs at the same
+                 temperature with different noise follow IDENTICAL
+                 dynamics from different starting points -- noise is not
+                 a dynamics-relevant conditioning variable. seed is pure
+                 RNG choice, not physical, and is also excluded.
+                 Constant across a window (one run), unlike dt_window.
+
+    dt is always computed from the ACTUAL kept step numbers, never
+    assumed uniform: your save_steps are already irregularly spaced, and
+    min_step/min_stdev_phi filtering can additionally skip an
+    intermediate step, widening the gap between the two steps that end
+    up adjacent in the kept sequence. Both cases are handled identically
+    here -- this matches the docs' explicit design intent that the LDS
+    can operate at a coarser, non-uniform effective time resolution than
+    the raw solver, rather than assuming one fixed dt throughout.
+
+    Filtering (skip_bad/min_step/min_stdev_phi) is delegated to
+    build_good_steps(), the same function MicrostructureSnapshotDataset
+    uses, so the two classes are guaranteed to agree on which steps are
+    usable for the same run_dirs/filter settings -- pass a precomputed
+    good_steps= dict to skip re-scanning if you're building both from
+    the same run_dirs.
+    """
+
+    def __init__(self, run_dirs: list[str | Path], encoder: torch.nn.Module,
+                 device: str | torch.device = "cpu", window_length: int = 5,
+                 skip_bad: bool = True, min_step: int = 0,
+                 min_stdev_phi: float | None = None, encode_batch_size: int = 256,
+                 good_steps: dict[Path, list[int]] | None = None):
+        """
+        window_length: n_r + 1 (e.g. window_length=5 -> n_r=4 predicted steps).
+        encode_batch_size: batch size used only for the upfront encoding
+        pass, unrelated to LDS training batch size.
+        good_steps: a precomputed {run_dir: [kept_step, ...]} mapping
+        from build_good_steps(), to skip re-scanning run_dirs when a
+        paired MicrostructureSnapshotDataset over the same run_dirs
+        already computed it with the same skip_bad/min_step/min_stdev_phi.
+        Default None computes it here.
+        """
+        if window_length < 2:
+            raise ValueError(f"window_length must be >= 2 (got {window_length}), "
+                              f"since a window needs at least one transition to predict")
+
+        self.window_length = window_length
+        self._run_dirs: list[Path] = []         # run_dir per run_idx, for tracing samples back
+        self._run_steps: list[list[int]] = []   # kept step numbers per run, in order
+        self._run_latents: list[torch.Tensor] = []  # (n_kept, latent_channels, 8, 8) per run, on CPU
+        self._run_dt_scale: list[float] = []    # metadata.dt per run
+        self._run_theta: list[torch.Tensor] = []  # (n_theta,) physical params per run -- see class docstring
+        self._index: list[tuple[int, int]] = []  # (run_idx, window_start_position)
+
+        run_dirs = [Path(d) for d in run_dirs]
+        if good_steps is None:
+            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi)
+
+        encoder = encoder.to(device).eval()
+        n_windowless_runs = 0
+
+        for run_dir in run_dirs:
+            metadata = load.read_metadata(run_dir / "metadata.txt")
+            kept_steps = good_steps[run_dir]
+
+            if len(kept_steps) < window_length:
+                n_windowless_runs += 1
+                continue  # not enough consecutive kept steps for even one window
+
+            # Encode every kept step once, in batches (this is the only
+            # place raw snapshots are touched -- everything after this is
+            # pure latent-space bookkeeping).
+            frames = torch.stack([
+                torch.from_numpy(load.read_phi_half(
+                    run_dir / load.snapshot_filename(step), metadata.nx, metadata.ny
+                )).unsqueeze(0)
+                for step in kept_steps
+            ])  # (n_kept, 1, ny, nx)
+
+            latents = []
+            with torch.no_grad():
+                for i in range(0, len(frames), encode_batch_size):
+                    batch = frames[i:i + encode_batch_size].to(device)
+                    latents.append(encoder(batch).cpu())
+            latents = torch.cat(latents, dim=0)  # (n_kept, latent_channels, 8, 8)
+
+            run_idx = len(self._run_steps)
+            self._run_dirs.append(run_dir)
+            self._run_steps.append(kept_steps)
+            self._run_latents.append(latents)
+            self._run_dt_scale.append(metadata.dt)
+            # T0 (metadata: "threshold temperature in Landau potential") is
+            # the physically meaningful reference point, not 0 -- the whole
+            # sweep is subcritical (T < T0), and how close a run sits to
+            # T0 is what actually governs the dynamics' character, not the
+            # raw temperature value. Centering here puts that boundary at
+            # theta=0 instead of asking the network to discover T0's
+            # significance implicitly from data.
+            self._run_theta.append(
+                torch.tensor([metadata.temperature - metadata.T0], dtype=torch.float32)
+            )
+
+            for start in range(len(kept_steps) - window_length + 1):
+                self._index.append((run_idx, start))
+
+        if n_windowless_runs:
+            print(f"MicrostructureEvolutionDataset: {n_windowless_runs}/{len(run_dirs)} runs "
+                  f"had fewer than window_length={window_length} kept steps and were skipped "
+                  f"entirely (consider a shorter window_length or looser filtering if this "
+                  f"is a large fraction)")
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        run_idx, start = self._index[idx]
+        end = start + self.window_length
+
+        z_window = self._run_latents[run_idx][start:end]  # (window_length, C, 8, 8)
+
+        steps = self._run_steps[run_idx][start:end]
+        dt_scale = self._run_dt_scale[run_idx]
+        dt_window = torch.tensor(
+            [(steps[i + 1] - steps[i]) * dt_scale for i in range(len(steps) - 1)],
+            dtype=torch.float32,
+        )  # (window_length - 1,)
+
+        theta = self._run_theta[run_idx]  # (n_theta,) -- constant across the window (same run)
+
+        return z_window, dt_window, theta
+
+    def window_info(self, idx: int) -> tuple[Path, list[int]]:
+        """
+        (run_dir, [step, ...]) for a given __getitem__ index -- the
+        dataset itself only caches latents (not raw pixels) to keep
+        memory small, so anything needing the actual snapshot files for
+        a sample (e.g. check_rollout.py decoding a prediction and
+        comparing against the real x(t+dt)) uses this to know which
+        files to re-read.
+        """
+        run_idx, start = self._index[idx]
+        end = start + self.window_length
+        return self._run_dirs[run_idx], self._run_steps[run_idx][start:end]

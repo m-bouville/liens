@@ -21,8 +21,11 @@ from   utils  import plots
 from   models import encoder, decoder, autoencoder
 
 from   training.datasets import MicrostructureSnapshotDataset, \
+                                MicrostructureEvolutionDataset, \
                                 complete_run_dirs, split_run_dirs
-from   training.losses   import ReconLoss
+from   training.losses   import ReconLoss, OneStepLoss
+
+from   models.latent_dynamics import LatentDynamics
 
 
 
@@ -52,43 +55,74 @@ def main():
     run_dirs = complete_run_dirs(config, "../datasets")
     train_dirs, _, _ = split_run_dirs(run_dirs, 0.2, 0.1, seed=0)
 
-    ds = MicrostructureSnapshotDataset(train_dirs, min_step=4000, include_stats=True)
-    mean, std = ds.stats_normalization()
-    for name, m, s in zip(ds.stat_names, mean, std):
-        print(f"{name:16s} mean={m.item(): .6g}  std={s.item(): .6g}")
+    # ds = MicrostructureSnapshotDataset(train_dirs, min_step=4000, include_stats=True)
+    # mean, std = ds.stats_normalization()
+    # for name, m, s in zip(ds.stat_names, mean, std):
+    #     print(f"{name:16s} mean={m.item(): .6g}  std={s.item(): .6g}")
 
 
 
-    # testing models/{encoder, decoder, autoencoder}.py
-    x = torch.randn(2, 1, 64, 64)
-    z = encoder.Encoder(64)(x)
+    # # testing models/{encoder, decoder, autoencoder}.py
+    # x = torch.randn(2, 1, 64, 64)
+    # z = encoder.Encoder(64)(x)
 
-    x_recon = decoder.Decoder(64)(z)
-    print(z.shape, x_recon.shape)
+    # x_recon = decoder.Decoder(64)(z)
+    # print(z.shape, x_recon.shape)
 
-    ae = autoencoder.Autoencoder(64)
-    x_recon, z = ae(x)
-    print(x_recon.shape, z.shape)  # expect [2, 1, 64, 64], [2, 16, 8, 8]
-    assert x_recon.shape == torch.Size([2,  1, 64, 64])
-    assert z      .shape == torch.Size([2, 16,  8,  8])
-    # [2, 16, 8, 8]: (batch, latent_channels, 8, 8),
-
-
-    # Testing /training/datasets.py
-    config = load.read_config("../config.txt")
-    ds = MicrostructureSnapshotDataset.from_sweep(config, base="../datasets")
-    print(len(ds), ds[0].shape)
-    assert ds[0].shape == torch.Size([1, config.nx, config.ny])
+    # ae = autoencoder.Autoencoder(64)
+    # x_recon, z = ae(x)
+    # print(x_recon.shape, z.shape)  # expect [2, 1, 64, 64], [2, 16, 8, 8]
+    # assert x_recon.shape == torch.Size([2,  1, 64, 64])
+    # assert z      .shape == torch.Size([2, 16,  8,  8])
+    # # [2, 16, 8, 8]: (batch, latent_channels, 8, 8),
 
 
-    # Testing losses
-    ae = autoencoder.Autoencoder(512)
-    recon_loss = ReconLoss()
+    # # Testing /training/datasets.py
+    # config = load.read_config("../config.txt")
+    # ds = MicrostructureSnapshotDataset.from_sweep(config, base="../datasets")
+    # print(len(ds), ds[0].shape)
+    # assert ds[0].shape == torch.Size([1, config.nx, config.ny])
 
-    x = torch.randn(2, 1, 512, 512)
-    x_recon, z = ae(x)
-    loss = recon_loss(x_recon, x)
+
+    # # Testing losses
+    # ae = autoencoder.Autoencoder(512)
+    # recon_loss = ReconLoss()
+
+    # x = torch.randn(2, 1, 512, 512)
+    # x_recon, z = ae(x)
+    # loss = recon_loss(x_recon, x)
+    # print(loss.item())
+
+
+    # Testing LatentDynamics
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ae = autoencoder.Autoencoder(64, base_channels=32, latent_channels=4)
+    checkpoint = torch.load("../output/ae_checkpoint-64x64_4latent-stats_weight001.pt",
+                            map_location=device, weights_only=True)
+    ae = autoencoder.Autoencoder(
+        size=checkpoint["config"]["size"],
+        channels=1,
+        base_channels=checkpoint["config"]["base_channels"],
+        latent_channels=checkpoint["config"]["latent_channels"],
+    ).to(device)
+    ae.load_state_dict(checkpoint["model_state"])
+    ae.encoder.eval()
+
+    ds = MicrostructureEvolutionDataset(
+        train_dirs, encoder=ae.encoder, device="cuda",
+        window_length=2, min_step=4000, min_stdev_phi=0.01,
+    )
+
+    f_theta = LatentDynamics(latent_channels=4, n_theta=1)
+    one_step_loss = OneStepLoss()
+
+    z_window, dt_window, theta = ds[0]
+    z_t, z_next_true = z_window[0:1], z_window[1:2]
+    z_next_pred = z_t + f_theta(z_t, dt_window[0:1], theta.unsqueeze(0))
+    loss = one_step_loss(z_next_pred, z_next_true)
     print(loss.item())
+
 
 
     sys.exit()

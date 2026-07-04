@@ -2,7 +2,6 @@
 
 
 
-
 ## Autoencoder
 
 ### Architecture
@@ -21,7 +20,7 @@ To avoid this, skip connections will be added and trained only after freezing th
 ## Training Stages and loss functions
 
 ### Dataset expansion
-From each snapshot, more can be created throuh
+From each snapshot, more are created through
 - mirror (horizontal and vertical);
 - rotation by $\pm$90 °, 180°;
 - transposing;
@@ -113,9 +112,6 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 - Anisotropy measure: $A = (\lambda_1 - \lambda_2) / (\lambda_1 + \lambda_2 + \varepsilon)$, with $\varepsilon > 0$ a small constant for numerical stability.
   - $A \approx 0$: isotropic,
   - $A \approx 1$: strong directional structure.
-- Interface density: $\lambda_1 + \lambda_2$ (trace)
-  - high: many interfaces, 
-  - low: bulk phases.
 - Local orientation (normal direction): $\arctan(v_{1y} / v_{1x})$.	
 
 

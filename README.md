@@ -27,6 +27,10 @@ The convolutional autoencoder has a symmetric encoder–decoder architecture. Th
 ## Latent representation 
 The latent representation will also be used by a Latent Dynamics Surrogate (LDS) model to predict the microstructure at $t + \Delta t$: $z(t + \Delta t) = z(t) + f_\theta(z(t), \Delta t)$, with $\theta$ physical parameters (e.g. temperature). As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\Delta t$ a multiple of the phase-field time step).
 
+$f$ is largely linear: $f_\theta(z(t), \Delta t) \propto \Delta t$, so what we need to learn is the slope,
+$$g_\theta(z(t)) = \dfrac{z(t + \Delta t) - z(t)}{\Delta t}.$$ 
+Then, $z(t + \Delta t) = z(t) + g_\theta(z(t))\,\Delta t$.
+
 Representing the microstructure in latent space rather than real space has two advantages:
 - it can be much smaller (even a smallish 256×256 image has 65'000 degrees of freedom),
 - it is customized to our purpose (a bit like using a vectorized image instead of a bitmap).
@@ -111,9 +115,9 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 ## Current status
 
 - [X] C++ phase-field solver
-- [ ] Dataset generation
-- [ ] CNN autoencoder
-- [ ] Latent-space validation
+- [x] Dataset generation
+- [X] CNN autoencoder
+- [X] Latent-space validation
 - [ ] Latent dynamics surrogate
 - [ ] End-to-end training
 - [ ] Inverse design
