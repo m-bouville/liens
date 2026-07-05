@@ -120,10 +120,10 @@ void Simulation::__runOneSimulation(double T,
     log << "minimum at " << potential.minimum(T) << '\n';
     log << std::left
             << std::setw( 8) << "step"
-            << std::setw(28) << "     order parameter (%)"
+            << std::setw(28) << "   order parameter (%)"
             << std::setw(14) << "  gradient"
             << std::setw(11) << "autocorrel"
-            << std::setw(18) << "   anisotropy"
+            << std::setw(11) << "   anisotropy"
             << std::setw( 8) << "total"
             << '\n';  
     log << std::left
@@ -132,7 +132,8 @@ void Simulation::__runOneSimulation(double T,
             << std::setw( 7) << "stdev"
             << std::setw( 7) << "<|g|>"   << std::setw( 7) << "<g^2>"
             << std::setw( 7) << "value" << std::setw( 4) << "at"
-            << std::setw( 7) << "trace" << std::setw( 7) << "diff" << std::setw( 4) << "ang"
+            // << std::setw( 7) << "trace" << std::setw( 7)  // identical to <g^2>
+            << "diff" << std::setw( 4) << "ang"
             << std::setw( 8) << "energy"
             << '\n';          
     log << std::string(90, '-') << '\n';

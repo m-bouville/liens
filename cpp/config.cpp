@@ -141,6 +141,14 @@ void Config::load(const std::string& filename)
                 save.push_back(stoi(s));
         }
 
+        else if (key == "min_step"      ||
+                 key == "min_stdev_phi" ||
+                 key == "stats_weight")
+        {
+            continue;
+            // not relevant to phase field
+        }
+
         else
         {
             throw runtime_error("Unknown key: " + key);

@@ -122,7 +122,7 @@ writer::WriterStatistics writer::statistics(const OrderParameter& op,
 
     // anisotropy
     auto aniso = statistics::structure_tensor(op.field(), neighbors);
-    out.trace      = aniso.trace;        // λ1+λ2
+    // out.trace      = aniso.trace;        // λ1+λ2
     out.anisotropy = aniso.anisotropy;   // (λ1-λ2)/(λ1+λ2)
     out.angle      = aniso.angle;        // radians in [-π/2, π/2]
 
@@ -141,7 +141,8 @@ writer::WriterStatistics writer::statistics(const OrderParameter& op,
         << std::setw(7) << out.avg_gradient*100 << std::setw(7) << out.gradient_sqr*100
         << std::setw(7) << std::setprecision(2) << out.autocorr_correl*100
         << std::setw(4) << out.autocorr_length
-        << std::setw(7) << out.trace*100   << std::setw(7) << out.anisotropy*100   
+        // << std::setw(7) << out.trace*100   
+        << std::setw(7) << out.anisotropy*100   
         << std::setw(7) << std::setprecision(0) << out.angle*180/std::numbers::pi
         << std::setw(8) << std::setprecision(1) << out.energy << '\n';
 
@@ -161,7 +162,7 @@ void writer::write_csv(const std::filesystem::path&         filename,
            "phi_below_-10,phi_below_0,phi_above_10,"
            "avg_gradient,gradient_sqr,"
            "autocorr_correl,autocorr_length,"
-           "trace,anisotropy,angle,"
+           "anisotropy,angle,"
            "energy\n";
 
     for (const auto& s : stats)
@@ -170,7 +171,7 @@ void writer::write_csv(const std::filesystem::path&         filename,
             << s.phi_below_neg10<< ',' << s.phi_below_0    << ','<< s.phi_above_10<< ','
             << s.avg_gradient   << ',' << s.gradient_sqr   << ','
             << s.autocorr_correl<< ',' << s.autocorr_length<< ','
-            << s.trace          << ',' << s.anisotropy     << ',' << s.angle      << ','
+            << s.anisotropy     << ',' << s.angle      << ','
             << s.energy         << '\n';
 }
 
