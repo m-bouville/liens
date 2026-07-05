@@ -629,3 +629,79 @@ class MicrostructureEvolutionDataset(Dataset):
         run_idx, start = self._index[idx]
         end = start + self.window_length
         return self._run_dirs[run_idx], self._run_steps[run_idx][start:end]
+
+
+class MicrostructureTripletDataset(Dataset):
+    """
+    Real-pixel (t1, t2, t3) triplets for stage 3 (interpolation-consistency
+    fine-tuning). UNLIKE MicrostructureEvolutionDataset, this does NOT
+    precompute/cache latents under a frozen encoder: stage 3 continues
+    training the encoder (and stats_head), so gradients must flow through
+    z1/z2/z3 every forward pass. Returns raw pixels; encoding happens
+    fresh in the training loop.
+
+    __getitem__ returns (x1, x2, x3, alpha, true_stats_t2):
+      x1, x2, x3: (1, H, W) raw snapshots at t1 < t2 < t3
+      alpha: scalar, (t2-t1)/(t3-t1) -- dt-weighted, not the midpoint,
+             since save_steps are irregular
+      true_stats_t2: (n_stats,) RAW (not normalized) statistics.csv row
+             at t2 -- StatsLoss handles normalization, matching how
+             stage 2 already uses it
+    """
+
+    def __init__(self, run_dirs: list[str | Path], stat_names: list[str],
+                 skip_bad: bool = True, min_step: int = 0,
+                 min_stdev_phi: float | None = None,
+                 good_steps: dict[Path, list[int]] | None = None):
+        """
+        stat_names: REQUIRED and must match the stage-2 checkpoint's
+        stats_config exactly -- unlike MicrostructureSnapshotDataset,
+        auto-detection isn't offered here, since silently resolving a
+        different schema than the already-trained stats_head expects
+        would be a much worse failure mode (wrong-shape predictions or
+        silently-misaligned columns) than requiring it explicitly.
+        """
+        run_dirs = [Path(d) for d in run_dirs]
+        if good_steps is None:
+            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi)
+
+        self.stat_names = stat_names
+        self._index: list[tuple[Path, int, int, int]] = []  # (run_dir, t1, t2, t3)
+        self._nx_ny: dict[Path, tuple[int, int]] = {}
+        self._stats_by_run = {}
+
+        for run_dir in run_dirs:
+            metadata = load.read_metadata(run_dir / "metadata.txt")
+            kept = good_steps[run_dir]
+            if len(kept) < 3:
+                continue
+            stats_df = load.read_statistics_csv(run_dir / "statistics.csv")
+            missing = set(stat_names) - set(stats_df.columns)
+            if missing:
+                raise ValueError(f"{run_dir}/statistics.csv is missing columns {missing}")
+            self._stats_by_run[run_dir] = stats_df
+            self._nx_ny[run_dir] = (metadata.nx, metadata.ny)
+
+            for i in range(len(kept) - 2):
+                t1, t2, t3 = kept[i], kept[i + 1], kept[i + 2]
+                if t2 not in stats_df.index or stats_df.loc[t2, stat_names].isna().any():
+                    continue  # same NaN-guard rationale as MicrostructureSnapshotDataset
+                self._index.append((run_dir, t1, t2, t3))
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int):
+        run_dir, t1, t2, t3 = self._index[idx]
+        nx, ny = self._nx_ny[run_dir]
+
+        x1 = torch.from_numpy(load.read_phi_half(run_dir / load.snapshot_filename(t1), nx, ny)).unsqueeze(0)
+        x2 = torch.from_numpy(load.read_phi_half(run_dir / load.snapshot_filename(t2), nx, ny)).unsqueeze(0)
+        x3 = torch.from_numpy(load.read_phi_half(run_dir / load.snapshot_filename(t3), nx, ny)).unsqueeze(0)
+
+        alpha = torch.tensor((t2 - t1) / (t3 - t1), dtype=torch.float32)
+        true_stats = torch.tensor(
+            self._stats_by_run[run_dir].loc[t2, self.stat_names].to_numpy(dtype=float),
+            dtype=torch.float32,
+        )
+        return x1, x2, x3, alpha, true_stats

@@ -30,7 +30,7 @@ namespace writer
         double autocorr_correl;
         int    autocorr_length;
 
-        double trace;
+        // double trace;          // identical to gradient_sqr
         double anisotropy;
         double angle;           // in radians
 

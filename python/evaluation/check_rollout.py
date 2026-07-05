@@ -100,7 +100,7 @@ def main():
                  "convention) rather than you needing to type out a filename. Required "
                  "unless --lds-checkpoint is given directly (no --config is read here, "
                  "so size can't be inferred).")
-    parser.add_argument("--latent-channels", type=int, default=None, help="see --size")
+    parser.add_argument("--latent-channels", type=int, default=8, help="see --size")
     parser.add_argument("--stats-weight", type=float, default=None, help="see --size")
     parser.add_argument("--n-rollout-steps", type=int, default=None, help="see --size")
     parser.add_argument("--lds-checkpoint", type=Path, default=None,

@@ -19,17 +19,20 @@ from models.autoencoder import Autoencoder
 from training.datasets import MicrostructureSnapshotDataset
 from training.losses import ReconLoss
 from utils.naming import ae_checkpoint_name
+from utils import load_datasets as load
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=Path("../../config.txt"),
+            help="source for --size/--stats-weight/--min-step defaults")
     parser.add_argument("--size", type=int, default=None,
             help="which AE to check, by the parameters you actually know -- e.g. "
                  "--size 64 --latent-channels 4 --stats-weight 0.01. Reconstructs the "
                  "expected checkpoint path (train_ae.py's naming convention) rather than "
                  "you needing to type out a filename. Required unless --checkpoint is "
                  "given directly (no --config is read here, so size can't be inferred).")
-    parser.add_argument("--latent-channels", type=int, default=None, help="see --size")
+    parser.add_argument("--latent-channels", type=int, default=8, help="see --size")
     parser.add_argument("--stats-weight", type=float, default=None, help="see --size")
     parser.add_argument("--checkpoint", type=Path, default=None,
             help="direct path override, if you'd rather specify the checkpoint this way "
@@ -47,6 +50,15 @@ def main():
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    if args.size is None or args.stats_weight is None or args.min_step is None:
+        config = load.read_config(args.config)
+        if args.size is None:
+            args.size = config.nx
+        if args.stats_weight is None:
+            args.stats_weight = config.stats_weight
+        if args.min_step is None:
+            args.min_step = config.min_step
 
     if args.checkpoint is None:
         if args.size is None or args.latent_channels is None or args.stats_weight is None:

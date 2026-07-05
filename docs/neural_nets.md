@@ -117,21 +117,32 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 
 
 ## Latent-space validation (step 3)
-Verify that latent space behaves like a smooth, structured coordinate system rather than a brittle compression code.
+We want to verify that latent space behaves like a smooth, structured coordinate system rather than a brittle compression code. Put simply: latent representation must make sense.
+
+Inasmuch as possible, we work directly in latent space (to avoid having to rely on the decoder), where we cannot measure a direct distance between microstructures pixel by pixel: the calculation $z_2 - z_1$ has no meaning. Instead we use the statistics described above, a vector of norm $\|\mathrm{stats}(z)\|$.
+
+Note: $\mathrm{stats}(z)$ means statistics of $x$ in the real world, with $z=E(x)$: statistics cannot be calculated directly in the latent space.
+
 
 ### Interpolation
-Take two real states $x_1$ and $x_2$, and their latent representations $z_1 = E(x_1)$ and $z_2 = E(x_2)$. Interpolate $x_\alpha = (1-\alpha) x_1 + \alpha x_2$ and $z_\alpha = (1-\alpha) z_1 + \alpha z_2$, with $\alpha \in [0, 1]$. Compare $x_\alpha$ to $D(z_\alpha)$,
-- in particular, one can take $t_1$, $t_2$ and $t_3$ three successive time steps, and recreate the $t_2$ state by interpolation: $\alpha = (t_2−t_1) / (t_3−t_1)$;
-- interpolation should preserve physical plausibility, not just visual smoothness;
-- compare $z_\alpha$ to $E(x_\alpha)$ instead?
-  - does not involve the decoder,
-  - but the comparison must be in latent space (one must use statistics as the metric).
- 
- 
-### Perturbing the latent representation
-Let $z_{\varepsilon_i} = z + \varepsilon_i \times \eta$, where $\eta \sim \mathcal{N}(0, 1)$. Decoding again, $x_{\varepsilon_i} = D(z_{\varepsilon_i})$ should be close to $x$, with a distance proportional to ${\varepsilon_i}$. We calculate $\dfrac{\|x_{\varepsilon_2} - x\|}{\|x_{\varepsilon_1} - x\|}$, which should scale as $\varepsilon_2 / \varepsilon_1$.
+One takes $t_1 < t_2 < t_3$ three successive time steps, with real states $x_i$ and latent representations $z_i = E(x_i)$. We compare $z_2$ to the interpolated $\tilde{z} = (1-\alpha) z_1 + \alpha z_3$, with $\alpha = (t_2−t_1) / (t_3−t_1)$. Interpolation should preserve physical plausibility, not just visual smoothness. More precisely, we measure 
+$$\frac{\|[(1-\alpha) \, \mathrm{stats}(z_1) + \alpha \, \mathrm{stats}(z_3)] - \mathrm{stats}(z_2)\|} {\|\mathrm{stats}(z_2)\|},$$
+which should be small.
 
-This can instead be a perturbation of the real state: $x_{\varepsilon_i} = x + \varepsilon_i \times \eta$.
+
+### Perturbation in latent space
+Let $z_{\varepsilon} = z + \varepsilon \times \eta$, with $\eta \sim \mathcal{N}(0, 1)$. Decoding, $x_{\varepsilon} = D(z_{\varepsilon})$ should be close to $x = D(z)$, with a distance proportional to $\varepsilon$. 
+
+Analogy to principal components analysis (PCA): if I perturb $X = \alpha_1 P_1 + \alpha_2 P_2$ to $\alpha_1(1 + \varepsilon_1) P_1 + \alpha_2(1 + \varepsilon_2) P_2$ I should retain a state which is (i) sensible and (ii) close to the $X$.
+
+A linear regression of $x_{\varepsilon}$ can verify if:
+- intercept $\approx 0$ (no discontinuity),
+- $R^2 \approx 1$ (e.g. not curvature). 
+
+Three issues:
+- we have to rely on the decoder,
+- $\mathrm{stats}(x_{\varepsilon})$ needs to be calculated afresh (it is a brand new state),
+- statistics are calculated is C++ and have not been ported to Python.
 
 Variants:
 - isotropic noise,
@@ -147,8 +158,3 @@ Variants:
 ### Reconstruction under partial corruption
 Mask random patches in input image, encode + decode, check if latent representation still reconstructs global structure (as opposed to local pixel memorization).
 
-
-### Consistency over a cycle (encode → decode → re-encode)
-On top of the obvious $D(E(x)) \approx x$, check that $E(D(z)) \approx z$, to detect:
-- decoder hallucination,
-- encoder/decoder mismatch.

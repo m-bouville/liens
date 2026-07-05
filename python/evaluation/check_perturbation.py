@@ -1,39 +1,39 @@
 """
-Stage 3 latent validation: perturbation robustness, quantified via an
-explicit power-law fit rather than a visual "looks proportional" check.
+Stage 3 latent validation: perturbation in LATENT space.
 
-Two perturbation directions (per docs):
-  - LATENT perturbation: z_eps = z + eps*eta, decode, measure real-space
-    ||D(z_eps) - x|| as a function of eps -- tests the DECODER's local
-    sensitivity/linearity around real data.
-  - REAL-space perturbation: x_eps = x + eps*eta, re-encode, measure
-    latent-space ||E(x_eps) - z|| as a function of eps -- tests the
-    ENCODER's local sensitivity/linearity instead.
+Real-space perturbation (x_eps = x + eps*eta, checking stats(z_eps)) was
+tried first and abandoned: stats_head predicts statistics for latents of
+REAL simulation snapshots, but x_eps is synthetic, off-manifold noise --
+stats_head(E(x_eps)) reflects whatever the LEARNED MODEL outputs for an
+input it was never trained on, not the TRUE physical statistics of that
+synthetic state (which would require running the actual C++ statistics
+computation, unavailable in Python). That conflates "is stats_head smooth"
+with "is the representation smooth", and there's no ground truth available
+to settle it either way.
 
-For a well-behaved (locally linear) map, error should scale as eps^1 for
-small eps -- fit log(error) = a*log(eps) + b via least squares and report
-the fitted slope `a` (expect ~1.0) and R^2 (how well it follows ANY power
-law over the tested range -- deviation at large eps is EXPECTED, since
-eventually a large enough perturbation must leave the locally-linear
-regime; the diagnostic value is seeing where that happens, not assuming
-it shouldn't).
+Perturbation in LATENT space avoids this entirely: z_eps = z + eps*eta
+stays close to the real data manifold for small eps (unlike a noisy
+pixel blend), and decoding gives x_eps = D(z_eps), a real image directly
+comparable in PIXEL SPACE -- no model standing in for missing ground
+truth, and no stats_head needed at all (this works even for an AE
+trained without a stats loss).
 
-The fitted slope from the LATENT-perturbation direction also serves as
-an empirical calibration between latent-space and real-space distance
-(see module docstring discussion) -- printed explicitly so other
-latent-distance metrics elsewhere can be interpreted through it, rather
-than left as raw, unitless numbers.
+For each real test frame x, z = E(x), baseline = D(z) (NOT the raw x --
+comparing against D(z) isolates decoder SMOOTHNESS specifically, without
+conflating it with the AE's own reconstruction error at eps=0, which
+would confound the intercept check below):
+    delta(eps) = || D(z + eps*eta) - D(z) ||   (real-space RMSE, averaged
+                                                  over several eta draws)
 
-Isotropic (eta ~ N(0,1)) and directional (eta = a fixed real trajectory
-direction, via --direction-window) variants are both supported.
+A linear regression of delta against eps, PER SAMPLE, gives both
+diagnostics from one fit:
+  intercept ~ 0   -> no discontinuity right at eps=0
+  R^2 ~ 1         -> response is genuinely linear (proportional to eps),
+                     not curved/saturating
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
-    python -m evaluation.check_perturbation \
-        --checkpoint ../../output/ae_checkpoint_pt/64x64-4latent-stats_weight_0p01.pt
-    python -m evaluation.check_perturbation \
-        --checkpoint ../../output/ae_checkpoint_pt/64x64-4latent-stats_weight_0p01.pt \
-        --direction-window "../../datasets/64x64/T800_n050_s79:100000:120000"
+    python -m evaluation.check_perturbation --latent-channels 8
 """
 
 import argparse
@@ -44,57 +44,67 @@ import numpy as np
 import torch
 
 from models.autoencoder import Autoencoder
-from training.datasets import MicrostructureEvolutionDataset
 from utils import load_datasets as load
+from utils.naming import ae_checkpoint_name
 
 
-def power_law_fit(eps_values: np.ndarray, errors: np.ndarray) -> tuple[float, float, float]:
-    """
-    Least-squares fit of log(error) = a*log(eps) + b. Returns (a, b, r_squared).
-    r_squared measures how well the data follows ANY power law over the
-    tested range -- not whether a=1 specifically.
-    """
-    log_eps = np.log(eps_values)
-    log_err = np.log(np.clip(errors, 1e-12, None))
-    a, b = np.polyfit(log_eps, log_err, 1)
-    pred = a * log_eps + b
-    ss_res = np.sum((log_err - pred) ** 2)
-    ss_tot = np.sum((log_err - log_err.mean()) ** 2)
+def linear_fit(eps_values: np.ndarray, delta: np.ndarray) -> tuple[float, float, float]:
+    """delta = dz*eps + c via least squares. Returns (dz, c, r_squared)."""
+    dz, c = np.polyfit(eps_values, delta, 1)
+    pred = dz * eps_values + c
+    ss_res = np.sum((delta - pred) ** 2)
+    ss_tot = np.sum((delta - delta.mean()) ** 2)
     r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-    return a, b, r_squared
-
-
-def parse_fixed_window(s: str) -> tuple[Path, int, int]:
-    parts = s.split(":")
-    if len(parts) != 3:
-        raise ValueError(f"expected 'run_dir:step_t:step_next', got '{s}'")
-    return Path(parts[0]), int(parts[1]), int(parts[2])
+    return dz, c, r_squared
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--n-samples", type=int, default=8,
-                         help="number of real test-set frames to perturb and average over")
+    parser.add_argument("--config", type=Path, default=Path("../../config.txt"))
+    parser.add_argument("--size", type=int, default=None)
+    parser.add_argument("--latent-channels", type=int, default=8)
+    parser.add_argument("--stats-weight", type=float, default=None)
+    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--n-samples", type=int, default=16,
+                         help="real test-set frames to perturb and average over")
     parser.add_argument("--n-repeats", type=int, default=16,
                          help="random eta draws per (sample, eps) -- averaged, to separate "
                               "genuine eps-scaling from single-draw direction noise")
     parser.add_argument("--eps-values", type=float, nargs="+",
-                         default=[0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0],
-                         help="sweep of perturbation magnitudes, log-spaced by default")
-    parser.add_argument("--direction-window", type=str, default=None,
-                         help="'run_dir:step_t:step_next' -- if given, perturb along this "
-                              "real trajectory's normalized (z(t+dt)-z(t)) direction instead "
-                              "of isotropic random noise, for each sample independently "
-                              "reusing the SAME direction (tests sensitivity along a "
-                              "physically meaningful axis vs generic isotropic robustness)")
-    parser.add_argument("--min-step", type=int, default=0)
+                         default=[0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4],
+                         help="sweep of LATENT perturbation magnitudes")
+    parser.add_argument("--pairwise-eps", type=float, nargs=2, default=[0.1, 0.3],
+                         metavar=("EPS1", "EPS2"),
+                         help="direct illustrative check: (delta(eps2))/(delta(eps1)) "
+                              "=? eps2/eps1, on the pooled mean -- the regression's R^2 "
+                              "already tests this more generally, this is just a concrete "
+                              "sanity-check number")
+    parser.add_argument("--min-step", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, default=None,
             help="default: ../../output/perturbation_check_png/<checkpoint name>.png")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    if args.size is None or args.stats_weight is None or args.min_step is None:
+        config = load.read_config(args.config)
+        if args.size is None:
+            args.size = config.nx
+        if args.stats_weight is None:
+            args.stats_weight = config.stats_weight
+        if args.min_step is None:
+            args.min_step = config.min_step
+
+    if args.checkpoint is None:
+        if args.latent_channels is None:
+            raise ValueError(
+                "Provide either --checkpoint directly, or --latent-channels (--size and "
+                "--stats-weight now default to config.txt's values if not given)."
+            )
+        name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
+        args.checkpoint = Path(f"../../output/ae_checkpoint_pt/{name}.pt")
+        print(f"Reconstructed checkpoint path: {args.checkpoint}")
 
     if args.output is None:
         args.output = Path(f"../../output/perturbation_check_png/{args.checkpoint.stem}.png")
@@ -117,108 +127,99 @@ def main():
         raise ValueError(f"{args.checkpoint} has no saved test_dirs")
     test_dirs = [Path(d) for d in test_dirs]
 
-    # Sample real frames from the held-out test set, at the AE's own size.
     nx = ny = model_cfg["size"]
     frames = []
-    generator = torch.Generator().manual_seed(args.seed)
     for run_dir in test_dirs:
         metadata = load.read_metadata(run_dir / "metadata.txt")
         check = load.check_snapshots_saved(run_dir, metadata)
         bad_steps = set(check["missing"]) | set(check["bad_size"])
         for step in metadata.save_steps:
-            if step in bad_steps or step < args.min_step:
-                continue
-            frames.append((run_dir, step))
-    if len(frames) == 0:
+            if step not in bad_steps and step >= args.min_step:
+                frames.append((run_dir, step))
+    if not frames:
         raise ValueError("No usable test frames found")
+
+    generator = torch.Generator().manual_seed(args.seed)
     idx = torch.randperm(len(frames), generator=generator)[:args.n_samples].tolist()
     chosen = [frames[i] for i in idx]
-    print(f"Perturbing {len(chosen)} real test-set frames")
-
-    # Optional fixed direction, computed once, reused for every sample
-    # (same direction vector applied everywhere -- tests sensitivity
-    # along ONE physically meaningful axis consistently, not a
-    # per-sample-local one, which would conflate "is this direction
-    # special" with "is this a different direction each time").
-    fixed_direction = None
-    if args.direction_window:
-        run_dir, step_t, step_next = parse_fixed_window(args.direction_window)
-        metadata = load.read_metadata(run_dir / "metadata.txt")
-        x_t = load.read_phi_half(run_dir / load.snapshot_filename(step_t), nx, ny)
-        x_next = load.read_phi_half(run_dir / load.snapshot_filename(step_next), nx, ny)
-        with torch.no_grad():
-            z_t = ae.encoder(torch.from_numpy(x_t).unsqueeze(0).unsqueeze(0).to(device))
-            z_next = ae.encoder(torch.from_numpy(x_next).unsqueeze(0).unsqueeze(0).to(device))
-        direction = (z_next - z_t)
-        direction = direction / direction.norm()
-        fixed_direction = direction
-        print(f"Using fixed direction from {args.direction_window} "
-              f"(directional/structured perturbation mode)")
+    print(f"Perturbing {len(chosen)} real test-set frames in LATENT space, "
+          f"{args.n_repeats} eta draws each")
 
     eps_values = np.array(args.eps_values)
-    decoder_errors = np.zeros(len(eps_values))  # ||D(z+eps*eta) - x||, real space
-    encoder_errors = np.zeros(len(eps_values))  # ||E(x+eps*eta) - z||, latent space
+    all_deltas = []  # (n_samples, n_eps), real-space RMSE
 
     with torch.no_grad():
         for run_dir, step in chosen:
-            nx_i, ny_i = nx, ny
-            x_np = load.read_phi_half(run_dir / load.snapshot_filename(step), nx_i, ny_i)
+            x_np = load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny)
             x = torch.from_numpy(x_np).unsqueeze(0).unsqueeze(0).to(device)
             z = ae.encoder(x)
+            baseline = ae.decoder(z)  # D(z), NOT raw x -- isolates decoder smoothness
+                                       # specifically, without AE reconstruction error
+                                       # at eps=0 confounding the intercept check
 
-            for i, eps in enumerate(eps_values):
-                d_err_sum, e_err_sum = 0.0, 0.0
+            deltas = []
+            for eps in eps_values:
+                delta_sum = 0.0
                 for _ in range(args.n_repeats):
-                    if fixed_direction is not None:
-                        eta_latent = fixed_direction
-                    else:
-                        eta_latent = torch.randn_like(z)
-                    z_eps = z + eps * eta_latent
-                    x_from_z_eps = ae.decoder(z_eps)
-                    d_err_sum += (x_from_z_eps - x).pow(2).mean().sqrt().item()
+                    eta = torch.randn_like(z)
+                    z_eps = z + eps * eta
+                    x_eps = ae.decoder(z_eps)
+                    delta_sum += (x_eps - baseline).pow(2).mean().sqrt().item()
+                deltas.append(delta_sum / args.n_repeats)
+            all_deltas.append(deltas)
 
-                    eta_real = torch.randn_like(x)  # directional real-space perturbation
-                                                     # not defined without a decode step,
-                                                     # so real-space variant stays isotropic
-                    x_eps = x + eps * eta_real
-                    z_from_x_eps = ae.encoder(x_eps)
-                    e_err_sum += (z_from_x_eps - z).pow(2).mean().sqrt().item()
+    all_deltas = np.array(all_deltas)  # (n_samples, n_eps)
+    mean_delta = all_deltas.mean(axis=0)
 
-                decoder_errors[i] += d_err_sum / args.n_repeats
-                encoder_errors[i] += e_err_sum / args.n_repeats
+    # Pooled (aggregate) fit -- one headline number.
+    dz, c, r_squared = linear_fit(eps_values, mean_delta)
+    print(f"\nPooled fit, delta = dz*eps + c, across {len(chosen)} samples:")
+    print(f"  dz = {dz:.5f}   intercept c = {c:.5f}   R^2 = {r_squared:.4f}")
+    print(f"  (c far from 0 -> discontinuity; R^2 far from 1 -> curvature/saturation)")
 
-    decoder_errors /= len(chosen)
-    encoder_errors /= len(chosen)
+    # Per-sample fits -- catches individual discontinuous/nonlinear samples
+    # even when the pooled average looks clean.
+    per_sample_c = np.zeros(len(chosen))
+    per_sample_r2 = np.zeros(len(chosen))
+    for i in range(len(chosen)):
+        _, c_i, r2_i = linear_fit(eps_values, all_deltas[i])
+        per_sample_c[i] = c_i
+        per_sample_r2[i] = r2_i
+    print(f"\nPer-sample fits ({len(chosen)} samples):")
+    print(f"  intercept: mean={per_sample_c.mean():.5f}  std={per_sample_c.std():.5f}  "
+          f"max|c|={np.abs(per_sample_c).max():.5f}")
+    print(f"  R^2:       mean={per_sample_r2.mean():.4f}  min={per_sample_r2.min():.4f}")
 
-    a_dec, b_dec, r2_dec = power_law_fit(eps_values, decoder_errors)
-    a_enc, b_enc, r2_enc = power_law_fit(eps_values, encoder_errors)
+    # Concrete illustrative pairwise check on the pooled mean, at specific
+    # requested eps values (not sweep endpoints).
+    eps1_target, eps2_target = args.pairwise_eps
+    idx1 = np.argmin(np.abs(eps_values - eps1_target))
+    idx2 = np.argmin(np.abs(eps_values - eps2_target))
+    eps1, eps2 = eps_values[idx1], eps_values[idx2]
+    d1, d2 = mean_delta[idx1], mean_delta[idx2]
+    if d1 > 1e-8:
+        print(f"\nPairwise check: delta({eps2})/delta({eps1}) = {d2/d1:.3f} "
+              f"vs expected eps2/eps1 = {eps2/eps1:.3f}")
 
-    print(f"\nDecoder response (latent perturbation -> real-space error):")
-    print(f"  fitted slope a = {a_dec:.3f} (expect ~1.0 for locally linear), R^2 = {r2_dec:.4f}")
-    print(f"  CALIBRATION: exp(b) = {np.exp(b_dec):.4f} real-space units per 1 unit of "
-          f"latent eps -- use this to convert other raw latent distances into an "
-          f"interpretable real-space scale")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    print(f"\nEncoder response (real-space perturbation -> latent-space error):")
-    print(f"  fitted slope a = {a_enc:.3f} (expect ~1.0 for locally linear), R^2 = {r2_enc:.4f}")
+    ax = axes[0]
+    for row in all_deltas:
+        ax.plot(eps_values, row, color="tab:blue", alpha=0.15)
+    ax.plot(eps_values, mean_delta, color="tab:blue", linewidth=2, marker="o", label="mean")
+    ax.plot(eps_values, dz * eps_values + c, "--", color="gray",
+            label=f"pooled fit (c={c:.4f}, R2={r_squared:.3f})")
+    ax.set_xlabel("eps (latent space)")
+    ax.set_ylabel("||D(z+eps*eta) - D(z)|| (real space)")
+    ax.set_title(f"Perturbation response across {len(chosen)} real frames")
+    ax.legend()
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    for ax, errors, a, b, r2, title, ylabel in [
-        (axes[0], decoder_errors, a_dec, b_dec, r2_dec,
-         "Decoder: latent eps -> real-space error", "||D(z+eps*eta) - x|| (real space)"),
-        (axes[1], encoder_errors, a_enc, b_enc, r2_enc,
-         "Encoder: real-space eps -> latent error", "||E(x+eps*eta) - z|| (latent space)"),
-    ]:
-        ax.scatter(eps_values, errors, s=40, label="measured")
-        fit_line = np.exp(b) * eps_values ** a
-        ax.plot(eps_values, fit_line, "--", color="gray",
-                label=f"fit: slope={a:.2f}, R2={r2:.3f}")
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("eps")
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.legend()
+    axes[1].hist(per_sample_c, bins=min(20, max(6, len(per_sample_c) // 3)))
+    axes[1].axvline(0.0, color="red", linestyle="--", label="0 = no discontinuity")
+    axes[1].set_xlabel("per-sample fitted intercept c")
+    axes[1].set_ylabel("count")
+    axes[1].set_title("Distribution of per-sample discontinuities")
+    axes[1].legend(fontsize=8)
 
     fig.tight_layout()
     fig.savefig(args.output, dpi=120)

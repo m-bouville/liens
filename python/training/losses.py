@@ -55,14 +55,35 @@ class StatsLoss(nn.Module):
     training.
     """
 
-    def __init__(self, mean: torch.Tensor, std: torch.Tensor):
+    def __init__(self, mean: torch.Tensor, std: torch.Tensor, stat_names: list[str] | None = None):
         super().__init__()
         self.register_buffer("mean", mean)
         self.register_buffer("std", std)
+        # angle (docs: local orientation, arctan(v1y/v1x)) is defined mod
+        # pi -- an interface has no distinguishable "front" direction, so
+        # e.g. 1.55 and -1.55 rad are nearly the SAME physical orientation
+        # (both near the +-pi/2 wrap boundary), not ~pi apart. A naive
+        # difference in the MSE would report a large, spurious error (and
+        # gradient) for two predictions that are actually almost correct --
+        # this directly corrupts encoder training via L_stats, not just a
+        # diagnostic-script cosmetic issue. Wrapping the difference into
+        # the equivalent normalized half-period fixes this; every other
+        # stat is untouched.
+        self.angle_idx = stat_names.index("angle") if stat_names and "angle" in stat_names else None
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target_norm = (target - self.mean) / self.std
-        return nn.functional.mse_loss(pred, target_norm)
+        diff = pred - target_norm
+        if self.angle_idx is not None:
+            # Period in NORMALIZED units is pi/std (normalization is a
+            # linear rescale, which rescales the period too) -- wrap the
+            # angle column's difference into (-period/2, period/2].
+            period = torch.pi / self.std[self.angle_idx]
+            angle_diff = diff[..., self.angle_idx]
+            wrapped = ((angle_diff + period / 2) % period) - period / 2
+            diff = diff.clone()
+            diff[..., self.angle_idx] = wrapped
+        return (diff ** 2).mean()
 
 
 class OneStepLoss(nn.Module):
