@@ -102,8 +102,10 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 │   ├── models/
 │   ├── training/
 │   ├── evaluation/
-│   └── utils/
+│   ├── utils/
+│   └── output/
 ├── datasets/
+│   ├── 64x64/
 │   ├── 128x128/
 │   └── 256x256/
 ├── docs/
@@ -117,7 +119,7 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 - [X] C++ phase-field solver
 - [x] Dataset generation
 - [X] CNN autoencoder
-- [X] Latent-space validation
+- [ ] Latent-space validation
 - [ ] Latent dynamics surrogate
 - [ ] End-to-end training
 - [ ] Inverse design

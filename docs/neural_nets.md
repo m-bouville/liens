@@ -5,13 +5,13 @@
 ## Autoencoder
 
 ### Architecture
-The convolutional autoencoder has a symmetric encoder–decoder architecture. The encoder depth scales with the (square) system size so that the spatial bottleneck remains 8×8: three downsampling stages for 64×64 inputs (64→32→16→8), five for 256×256, and so on. Each resolution level consists of two padded 3×3 convolutions with ReLU activations, followed by a stride-2 convolution for downsampling (mirrored by learned upsampling in the decoder), with BatchNorm/LayerNorm.
+The convolutional autoencoder has a symmetric encoder–decoder architecture. The encoder depth scales with the (square) system size so that the spatial bottleneck remains 8×8: three downsampling stages for 64×64 inputs (64→32→16→8), five for 256×256, and so on. Each resolution level consists of two 3×3 convolutions (circular padding to match periodic boundaries) with ReLU activations, followed by a stride-2 convolution for downsampling (mirrored by learned upsampling in the decoder), with BatchNorm/LayerNorm.
 
 The encoder terminates with a 1×1 convolution reducing the feature dimension to 16 channels, yielding an 8×8×16 latent representation. This bottleneck retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. Initial runs will use a larger latent space, to ensure that sufficient information is available for reconstruction, before shrinking it to find the lower bound for accuracy.
 
 
 ### Using a U-Net?
-Using a U-Net instead of a pure AE would improve the decoding. But skip connections may interfere with the LDS. Since the decoder will have more information (latent representation + skips) than the LDS (only latent), the encoder-decoder pair may work even if the latent representation has little information (which would break the LDS). 
+Using a U-Net instead of a pure AE would improve the decoding. But skip connections may interfere with the Latent Dynamics Surrogate (LDS). Since the decoder will have more information (latent representation + skips) than the LDS (only latent), the encoder-decoder pair may work even if the latent representation has little information (which would break the LDS). 
 
 To avoid this, skip connections will be added and trained only after freezing the encoder. Step 4 (or separate step just before or after) now includes: train skip connections and retrain decoder (encoder still frozen). Possible to alternate in step 4: train encoder + decoder (+ skips) and train encoder + LDS?
 
@@ -72,7 +72,7 @@ where $\hat{z}(t_{k+i+1}) = \hat{z}(t_{k+i}) + f_\theta(\hat{z}(t_{k+i}), \Delta
 
 ## Physics-informed statistics
 
-###Motivation
+### Motivation
 The latent representation serves two purposes:
 - recover the microstructure in real space (decoder),
 - predict the microstructure at $t + \Delta t$.
@@ -117,17 +117,38 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 
 
 ## Latent-space validation (step 3)
-Verify that latent space behaves like a smooth, structured coordinate system rather than a brittle compression code:
-- Interpolation: compare $D(z_\alpha)$ to $x_\alpha = (1-\alpha) x_1 + \alpha x_2$, with $z_\alpha = (1-\alpha) z_1 + \alpha z_2$ and $\alpha \in [0, 1]$.
-  - interpolation should preserve physical plausibility, not just visual smoothness.
-- Perturbing the latent representation ($z_\varepsilon = z + \varepsilon \times \eta$, where $\eta \sim \mathcal{N}(0, 1)$) and decode again: $x_\varepsilon = D(z_\varepsilon)$
-  - isotropic noise,
-  - structured perturbations (directional latent shifts).
-- Temporal consistency check:
-  - Take real simulation sequences, $x(t)$ and $x(t+\Delta t)$, and encode both: $z(t) = E(x(t))$ and $z(t+\Delta t) = E(x(t+\Delta t))$. 
-  - Compute latent displacement statistics, $\Delta z = z(t+\Delta t) - z(t)$, and check that the distribution of $\Delta z(t)$ is smooth, bounded and not heavy-tailed and that $\Delta z$ is correlated over time (deterministic evolution rather than stochastic latent collapse).
-  - check direction consistency: Are transitions consistent? For similar states: $\Delta z$ should be similar in direction/magnitude.
-- Reconstruction under partial corruption: mask random patches in input image, encode + decode, check if latent representation still reconstructs global structure (as opposed to local pixel memorization).
-- Consistency over a cycle (encode → decode → re-encode): on top of the obvious $D(E(x)) \approx x$, check that $E(D(z)) \approx z$, to detect:
-  - decoder hallucination,
-  - encoder/decoder mismatch.
+Verify that latent space behaves like a smooth, structured coordinate system rather than a brittle compression code.
+
+### Interpolation
+Take two real states $x_1$ and $x_2$, and their latent representations $z_1 = E(x_1)$ and $z_2 = E(x_2)$. Interpolate $x_\alpha = (1-\alpha) x_1 + \alpha x_2$ and $z_\alpha = (1-\alpha) z_1 + \alpha z_2$, with $\alpha \in [0, 1]$. Compare $x_\alpha$ to $D(z_\alpha)$,
+- in particular, one can take $t_1$, $t_2$ and $t_3$ three successive time steps, and recreate the $t_2$ state by interpolation: $\alpha = (t_2−t_1) / (t_3−t_1)$;
+- interpolation should preserve physical plausibility, not just visual smoothness;
+- compare $z_\alpha$ to $E(x_\alpha)$ instead?
+  - does not involve the decoder,
+  - but the comparison must be in latent space (one must use statistics as the metric).
+ 
+ 
+### Perturbing the latent representation
+Let $z_{\varepsilon_i} = z + \varepsilon_i \times \eta$, where $\eta \sim \mathcal{N}(0, 1)$. Decoding again, $x_{\varepsilon_i} = D(z_{\varepsilon_i})$ should be close to $x$, with a distance proportional to ${\varepsilon_i}$. We calculate $\dfrac{\|x_{\varepsilon_2} - x\|}{\|x_{\varepsilon_1} - x\|}$, which should scale as $\varepsilon_2 / \varepsilon_1$.
+
+This can instead be a perturbation of the real state: $x_{\varepsilon_i} = x + \varepsilon_i \times \eta$.
+
+Variants:
+- isotropic noise,
+- structured perturbations (directional latent shifts).
+
+
+### Temporal consistency check:
+- Take real simulation sequences, $x(t)$ and $x(t+\Delta t)$, and encode both: $z(t) = E(x(t))$ and $z(t+\Delta t) = E(x(t+\Delta t))$. 
+- Compute latent displacement statistics, $\Delta z(t) = z(t+\Delta t) - z(t)$, and check that the distribution of $\Delta z(t)$ is smooth, bounded and not heavy-tailed and that $\Delta z$ is correlated over time (deterministic evolution rather than stochastic latent collapse).
+- check direction consistency: Are transitions consistent? For similar states: $\Delta z$ should be similar in direction/magnitude.
+
+
+### Reconstruction under partial corruption
+Mask random patches in input image, encode + decode, check if latent representation still reconstructs global structure (as opposed to local pixel memorization).
+
+
+### Consistency over a cycle (encode → decode → re-encode)
+On top of the obvious $D(E(x)) \approx x$, check that $E(D(z)) \approx z$, to detect:
+- decoder hallucination,
+- encoder/decoder mismatch.

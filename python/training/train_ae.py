@@ -20,18 +20,19 @@ from   training.datasets   import MicrostructureSnapshotDataset, \
 from   training.losses     import ReconLoss, StatsLoss
 from   training.stats_head import StatsHead
 from   utils               import load_datasets   as load
+from   utils.naming        import ae_checkpoint_name
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config",       type=Path, default=Path("../../config.txt"))
-    parser.add_argument("--base",         type=Path, default=Path("../../datasets"))
+    parser.add_argument("--config",       type=Path, default=Path("../config.txt"))
+    parser.add_argument("--base",         type=Path, default=Path("../datasets"))
     parser.add_argument("--epochs",       type=int,  default=20)
     parser.add_argument("--batch-size",   type=int,  default=64)
                 # 64 for 64x64, 32 for 128x128
     parser.add_argument("--lr",           type=float,default=1e-3)
     parser.add_argument("--base-channels",type=int,  default=32)
-    parser.add_argument("--latent-channels",type=int,default=4)
+    parser.add_argument("--latent-channels",type=int,default=8)
                 # 4 for 64x64, 6? for 128x128
     parser.add_argument("--val-fraction", type=float,default=0.2)
     parser.add_argument("--test-fraction",type=float,default=0.1,
@@ -42,13 +43,15 @@ def main():
     # parser.add_argument("--augment", action="store_true",
     #         help="expand training data 32x via D4 symmetry + periodic translation")
     # parser.add_argument("--cache-in-memory", action="store_true")
-    parser.add_argument("--min-step", type=int, default=4_000,
+    parser.add_argument("--min-step", type=int, default=None,
             help="skip snapshots earlier than this step (early steps are "
-                 "near-pure noise, before microstructure develops)")
-    parser.add_argument("--min-stdev-phi", type=float, default=0.01,
+                 "near-pure noise, before microstructure develops). Default: read "
+                 "from config.txt's min_step.")
+    parser.add_argument("--min-stdev-phi", type=float, default=None,
             help="skip snapshots whose statistics.csv stdev_phi is below this "
                  "or NaN -- catches both pre-growth noise AND post-coarsening "
-                 "single-grain states")
+                 "single-grain states. Default: read from config.txt's "
+                 "min_stdev_phi.")
     parser.add_argument("--stat-names", type=str, nargs="+", default=None,
             help="which statistics.csv columns to predict; default auto-detects "
                  "from the first train run (risky if runs have mixed schemas -- "
@@ -56,9 +59,10 @@ def main():
                  "'angle' is transformed to match D4 augmentation (see "
                  "training/datasets.py's _transform_angle) -- the 90-degree "
                  "rotation sign is a documented, unconfirmed assumption there.")
-    parser.add_argument("--stats-weight", type=float, default=0.01,
-            help="lambda_1: weight of L_stats relative to L_recon."
-                "0.: statistics not used, only L_recon")
+    parser.add_argument("--stats-weight", type=float, default=None,
+            help="lambda_1: weight of L_stats relative to L_recon. 0.: statistics "
+                 "not used, only L_recon. Default: read from config.txt's "
+                 "stats_weight.")
     parser.add_argument("--val-ema-decay", type=float, default=0.7,
             help="EMA decay for the val loss used in checkpoint selection "
                  "(effective window ~= 1/(1-decay) epochs, so 0.7 ~ 3 epochs). "
@@ -69,18 +73,16 @@ def main():
     parser.add_argument("--seed",       type=int, default=0,
             help="fixed for reproducibility across runs (data split + model init "
                  "+ shuffling); no expectation this needs changing between runs")
-    parser.add_argument("--checkpoint", type=Path,
-                        default=Path("../../output/ae_checkpoint.pt"))
+    parser.add_argument("--checkpoint", type=Path, default=None,
+            help="default: auto-generated from size/latent-channels/stats-weight, e.g. "
+                 "../output/ae_checkpoint_pt/64x64-4latent-stats_weight_0p01.pt -- "
+                 "override to name it yourself")
     parser.add_argument("--device",     type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    args.include_stats = (args.stats_weight > 1e-6)
-
     args.augment = True
     args.cache_in_memory = True
-
-    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
 
 
 
@@ -114,6 +116,26 @@ def main():
     config = load.read_config(args.config)
     if config.nx != config.ny:
         raise ValueError(f"Autoencoder assumes a square grid, got {config.nx}x{config.ny}")
+
+    # CLI flag wins if explicitly given; otherwise use config.txt's
+    # centralized value (single canonical config.txt, no backward-compat
+    # fallback needed).
+    if args.min_step is None:
+        args.min_step = config.min_step
+    if args.min_stdev_phi is None:
+        args.min_stdev_phi = config.min_stdev_phi
+    if args.stats_weight is None:
+        args.stats_weight = config.stats_weight
+    print(f"min_step={args.min_step}  min_stdev_phi={args.min_stdev_phi}  "
+          f"stats_weight={args.stats_weight}")
+
+    args.include_stats = (args.stats_weight > 1e-6)
+
+    if args.checkpoint is None:
+        name = ae_checkpoint_name(config.nx, args.latent_channels, args.stats_weight)
+        args.checkpoint = Path(f"../output/ae_checkpoint_pt/{name}.pt")
+    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    print(f"checkpoint: {args.checkpoint}")
 
     run_dirs = complete_run_dirs(config, args.base)
     if not run_dirs:
@@ -222,13 +244,12 @@ def main():
     print(f"Starting {args.epochs} epochs (batches of {args.batch_size})...")
 
     # heading for tabulated output
-    heading = (f"/{args.epochs:3d} |")
+    heading = (f"/{args.epochs:3d} ")
     if args.include_stats:
-        heading +=      "        training       |          validation            | (all e-3)\n"
-        heading +=  "     |  total  recon  stats  |  total  recon  stats  |  ema |\n"
-        heading += f"         [[  total = recon + {args.stats_weight} * stats  ]]"
+        heading += (f"train = recon +{args.stats_weight:6.3f} stats | "
+                    f"valid = recon +{args.stats_weight:6.3f} stats  (e-3)  ema")
     else:
-        heading += ("train | valid   | ema   (all e-3)")
+        heading += ("train | valid  (e-3)  ema")
     print(heading)
 
 
@@ -271,13 +292,13 @@ def main():
         else:
             val_ema = args.val_ema_decay * val_ema + (1 - args.val_ema_decay) * val_total
 
-        msg = (f"{epoch:4d} |")
+        msg = (f"{epoch:4d}")
         if args.include_stats:
-            msg+=(f"{train_total*1_000:6.3f} ={train_recon*1_000:6.3f} +{train_stats*1_000:6.1f} |"
-                 +f"{val_total  *1_000:6.3f} ={val_recon  *1_000:6.3f} +{val_stats  *1_000:6.1f}"
-                 +f" |{val_ema*1_000:6.3f} |")
+            msg+=(f"{train_total*1_000:7.2f} ={train_recon*1_000:7.2f} +{train_stats*1_000:7.1f} |"
+                 +f"{val_total  *1_000:7.2f} ={val_recon  *1_000:7.2f} +{val_stats  *1_000:7.1f}"
+                 +f"  {val_ema*1_000:7.2f}")
         else:
-           msg += f"{train_total*1_000:6.3f} |{val_total*1_000:6.3f} |{val_ema*1_000:6.3f} |"
+           msg += f"{train_total*1_000:7.2f} |{val_total*1_000:7.2f}  {val_ema*1_000:7.2f}"
 
         # Checkpoint on the EMA, not the raw per-epoch val_total: with a small
         # val set, a few hard/borderline samples can swing the whole-epoch
@@ -298,6 +319,7 @@ def main():
                     "size": config.nx,
                     "base_channels": args.base_channels,
                     "latent_channels": args.latent_channels,
+                    "stats_weight": args.stats_weight,
                 },
                 "stats_config": {
                     "stat_names": train_set.stat_names,
@@ -308,7 +330,7 @@ def main():
                 } if args.include_stats else None,
             }
             torch.save(checkpoint, args.checkpoint)
-            msg += " -> saved"
+            msg += "  -> saved"
 
         print(msg)
 

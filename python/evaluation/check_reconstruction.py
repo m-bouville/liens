@@ -5,23 +5,35 @@ training or checkpoint selection) against their reconstructions.
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
-    python -m evaluation.check_reconstruction --checkpoint ae_checkpoint.pt
+    python -m evaluation.check_reconstruction \
+        --size 64 --latent-channels 4 --stats-weight 0.01
 """
 
 import argparse
-from   pathlib import Path
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
 
-from   models.autoencoder import Autoencoder
-from   training.datasets  import MicrostructureSnapshotDataset
-from   training.losses    import ReconLoss
+from models.autoencoder import Autoencoder
+from training.datasets import MicrostructureSnapshotDataset
+from training.losses import ReconLoss
+from utils.naming import ae_checkpoint_name
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, default=Path("../../output/ae_checkpoint.pt"))
+    parser.add_argument("--size", type=int, default=None,
+            help="which AE to check, by the parameters you actually know -- e.g. "
+                 "--size 64 --latent-channels 4 --stats-weight 0.01. Reconstructs the "
+                 "expected checkpoint path (train_ae.py's naming convention) rather than "
+                 "you needing to type out a filename. Required unless --checkpoint is "
+                 "given directly (no --config is read here, so size can't be inferred).")
+    parser.add_argument("--latent-channels", type=int, default=None, help="see --size")
+    parser.add_argument("--stats-weight", type=float, default=None, help="see --size")
+    parser.add_argument("--checkpoint", type=Path, default=None,
+            help="direct path override, if you'd rather specify the checkpoint this way "
+                 "instead of by --size/--latent-channels/--stats-weight")
     parser.add_argument("--n-samples", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0,
                          help="which test-set frames to display (not the train/val/test "
@@ -29,10 +41,27 @@ def main():
     parser.add_argument("--min-step", type=int, default=0,
                          help="skip snapshots earlier than this step (early steps are "
                               "near-pure noise and look flat under any fixed color scale)")
-    parser.add_argument("--output", type=Path, default=Path("../../output/reconstruction_check.png"))
+    parser.add_argument("--output", type=Path, default=None,
+            help="default: ../../output/reconstruction_check_png/<checkpoint name>.png -- "
+                 "named after the checkpoint so checks of different variants don't collide")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    if args.checkpoint is None:
+        if args.size is None or args.latent_channels is None or args.stats_weight is None:
+            raise ValueError(
+                "Provide either --checkpoint directly, or all of --size, "
+                "--latent-channels, and --stats-weight so the expected path can be "
+                "reconstructed."
+            )
+        name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
+        args.checkpoint = Path(f"../../output/ae_checkpoint_pt/{name}.pt")
+        print(f"Reconstructed checkpoint path: {args.checkpoint}")
+
+    if args.output is None:
+        args.output = Path(f"../../output/reconstruction_check_png/{args.checkpoint.stem}.png")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
@@ -92,9 +121,14 @@ def main():
             # THIS sample -- a fixed global scale makes low-amplitude
             # fields (like early, still noise-dominated steps) look
             # flat/blank even though real structure is there.
-            scale      = max(abs(x_np   .min()), abs(x_np   .max()), 0.1)
-                # if the scale drops below +/-0.1, we plot noise as signal.
-            diff_scale = max(abs(diff_np.min()), abs(diff_np.max()), scale/5)
+            # Floor at 0.1: auto-scaling a near-pure-noise sample to its own
+            # tiny range (e.g. +-0.003) stretches that noise to fill the full
+            # colormap, making it visually indistinguishable from real signal
+            # and easy to misread as structure. The diff panel keeps a tight
+            # auto-scale on purpose -- it should show small errors precisely,
+            # not get washed out by the same floor.
+            scale = max(abs(x_np.min()), abs(x_np.max()), 0.1)
+            diff_scale = max(abs(diff_np.min()), abs(diff_np.max()), 1e-6)
 
             axes[row, 0].imshow(x_np, cmap="RdBu", vmin=-scale, vmax=scale)
             axes[row, 0].set_title(f"original (idx={idx}, scale=+-{scale:.3f})" if row == 0

@@ -93,6 +93,12 @@ class SweepConfig:
     seeds: list[int]
     phi0: float
     save_steps: list[int]
+    # ML training defaults, centralized here so train_ae.py/train_lds.py/
+    # evaluation scripts read ONE shared source instead of each hardcoding
+    # its own default and silently drifting out of sync.
+    min_step: int
+    min_stdev_phi: float
+    stats_weight: float
 
 
 def read_config(path: str | Path) -> SweepConfig:
@@ -114,6 +120,9 @@ def read_config(path: str | Path) -> SweepConfig:
         seeds=_parse_list(kv["seeds"], int),
         phi0=float(kv["phi0"]),
         save_steps=_parse_list(kv["save"], int),
+        min_step=int(kv["min_step"]),
+        min_stdev_phi=float(kv["min_stdev_phi"]),
+        stats_weight=float(kv["stats_weight"]),
     )
 
 

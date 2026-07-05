@@ -8,7 +8,7 @@ visual checks).
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
-    python -m training.train_lds --ae-checkpoint ../../output/ae_checkpoint.pt \
+    python -m training.train_lds --ae-latent-channels 8 --ae-stats-weight 0.01 \
         --config ../../config.txt --base ../../datasets --n-rollout-steps 6
 """
 
@@ -23,11 +23,26 @@ from models.latent_dynamics import LatentDynamics
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss
 from utils import load_datasets as load
+from utils.naming import ae_checkpoint_name, lds_checkpoint_name
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ae-checkpoint", type=Path, default=Path("../../output/ae_checkpoint.pt"))
+    parser.add_argument("--ae-latent-channels", type=int, default=8,
+            help="which AE to use, by the parameters you actually know -- e.g. "
+                 "--ae-latent-channels 8 --ae-stats-weight 0.01. Reconstructs the "
+                 "expected checkpoint path (using this script's own --config grid size "
+                 "and train_ae.py's naming convention) rather than you needing to type "
+                 "out a filename. Required unless --ae-checkpoint is given directly.")
+    parser.add_argument("--ae-stats-weight", type=float, default=None,
+            help="see --ae-latent-channels. Also used directly as this LDS checkpoint's "
+                 "own auto-generated name component (below), since it's already known "
+                 "from what you typed -- no need to read it back out of the AE checkpoint. "
+                 "Default: read from config.txt's stats_weight.")
+    parser.add_argument("--ae-checkpoint", type=Path, default=None,
+            help="direct path override, if you'd rather specify the AE checkpoint this "
+                 "way instead of by --ae-latent-channels/--ae-stats-weight (e.g. for a "
+                 "checkpoint that doesn't follow the standard naming convention)")
     parser.add_argument("--config", type=Path, default=Path("../../config.txt"))
     parser.add_argument("--base", type=Path, default=Path("../../datasets"))
     parser.add_argument("--epochs", type=int, default=100)
@@ -52,14 +67,15 @@ def main():
                  "verified). >1 trains against real compounding drift: each step's "
                  "prediction feeds into the next, rather than always resetting to the "
                  "true z(t) before predicting. window_length is n_rollout_steps+1.")
-    parser.add_argument("--min-step", type=int, default=4_000,
-            help="should match (or be a superset of) what the AE was trained/filtered with -- "
-                 "see --min-stdev-phi")
-    parser.add_argument("--min-stdev-phi", type=float, default=0.01,
+    parser.add_argument("--min-step", type=int, default=None,
+            help="should match (or be a superset of) what the AE was trained/filtered "
+                 "with -- see --min-stdev-phi. Default: read from config.txt's min_step.")
+    parser.add_argument("--min-stdev-phi", type=float, default=None,
             help="skip snapshots whose statistics.csv stdev_phi is below this or NaN -- "
                  "same rationale as train_ae.py's filter, applied here too since a "
                  "transition into/out of the noise-dominated regime isn't a meaningful "
-                 "dynamics example either")
+                 "dynamics example either. Default: read from config.txt's "
+                 "min_stdev_phi.")
     parser.add_argument("--encode-batch-size", type=int, default=256,
             help="batch size for the upfront, one-time encoding pass -- unrelated to "
                  "--batch-size, which is for LDS training itself")
@@ -89,7 +105,10 @@ def main():
                  "largest dt values can still produce a large first gradient. Set to 0 "
                  "to disable.")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--checkpoint", type=Path, default=Path("../../output/lds_checkpoint.pt"))
+    parser.add_argument("--checkpoint", type=Path, default=None,
+            help="default: auto-generated from the AE's size/latent-channels/"
+                 "stats-weight plus --n-rollout-steps, e.g. "
+                 "../../output/lds_checkpoint_pt/64x64-4latent-weight_0p01-rollout_3.pt")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -98,11 +117,41 @@ def main():
         raise ValueError(f"--n-rollout-steps must be >= 1 (got {args.n_rollout_steps})")
     window_length = args.n_rollout_steps + 1
 
-    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     print(f"device: {device}\n")
+
+    # Read config FIRST: needed to resolve --ae-checkpoint from parameters
+    # (its grid size must match this script's own --config), before we can
+    # even locate the AE checkpoint file to load.
+    config = load.read_config(args.config)
+    if config.nx != config.ny:
+        raise ValueError(f"Autoencoder assumes a square grid, got {config.nx}x{config.ny}")
+
+    # CLI flag wins if explicitly given; otherwise use config.txt's
+    # centralized value (single canonical config.txt, no backward-compat
+    # fallback needed). Same pattern as train_ae.py.
+    if args.ae_stats_weight is None:
+        args.ae_stats_weight = config.stats_weight
+    if args.min_step is None:
+        args.min_step = config.min_step
+    if args.min_stdev_phi is None:
+        args.min_stdev_phi = config.min_stdev_phi
+    print(f"min_step={args.min_step}  min_stdev_phi={args.min_stdev_phi}  "
+          f"ae_stats_weight={args.ae_stats_weight}")
+
+    if args.ae_checkpoint is None:
+        if args.ae_latent_channels is None:
+            raise ValueError(
+                "Provide either --ae-checkpoint directly, or --ae-latent-channels "
+                "(--ae-stats-weight is no longer required to be explicit -- it now "
+                "falls back to config.txt's stats_weight) so the expected path can "
+                f"be reconstructed (using this script's own --config grid size, "
+                f"{config.nx}x{config.nx})."
+            )
+        ae_name = ae_checkpoint_name(config.nx, args.ae_latent_channels, args.ae_stats_weight)
+        args.ae_checkpoint = Path(f"../../output/ae_checkpoint_pt/{ae_name}.pt")
+        print(f"Reconstructed AE checkpoint path: {args.ae_checkpoint}")
 
     # Load the frozen autoencoder. Only .encoder is ever used below --
     # the decoder is irrelevant to stage 4 training (see docs/README.md's
@@ -122,10 +171,20 @@ def main():
           f"(epoch {ae_checkpoint['epoch']}, val_loss={ae_checkpoint['val_loss']:.6f}, "
           f"latent_channels={ae_config['latent_channels']})\n")
 
-    config = load.read_config(args.config)
     if config.nx != ae_config["size"]:
         raise ValueError(f"config.txt grid size ({config.nx}) doesn't match the "
                           f"autoencoder checkpoint's size ({ae_config['size']})")
+
+    if args.checkpoint is None:
+        # args.ae_stats_weight is always resolved to a real value by this
+        # point (CLI, config.txt, or the hardcoded fallback above) --
+        # regardless of whether --ae-checkpoint was given directly or
+        # reconstructed, so no "unknown" fallback is needed here anymore.
+        name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
+                                    args.ae_stats_weight, args.n_rollout_steps)
+        args.checkpoint = Path(f"../../output/lds_checkpoint_pt/{name}.pt")
+    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    print(f"checkpoint: {args.checkpoint}\n")
 
     run_dirs = complete_run_dirs(config, args.base)
     if not run_dirs:
