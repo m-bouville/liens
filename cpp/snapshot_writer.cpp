@@ -1,11 +1,16 @@
 #include "snapshot_writer.hpp"
 
+#include <filesystem>
 #include <iostream>
 #include <fstream>
 #include <iomanip>   // setw, fixed, setprecision
 
+#include <vector>
+#include <set>
+#include <algorithm>
 #include <cmath>
 #include <numbers>   // for pi
+#include <regex>
 
 #include <mutex>
 
@@ -231,4 +236,182 @@ void writer::write_metadata(const std::filesystem::path& file,
     out << "equation     = Allen-Cahn\n";       // TODO hardcoded for now
     out << "solver       = finite difference\n";// TODO hardcoded for now
     out << '\n';
+}
+
+
+namespace
+{
+    std::mutex dataset_metadata_mutex;
+}
+
+void writer::create_dataset_metadata(
+    const std::filesystem::path& dataset_dir,
+    int nx,
+    int ny,
+    const std::vector<double>& temperatures,
+    const std::vector<double>& noises,
+    const std::vector<int>& seeds)
+{
+    namespace fs = std::filesystem;
+
+    fs::path file = dataset_dir / "metadata.txt";
+
+    if (fs::exists(file))
+        return;
+
+    std::ofstream out(file);
+
+    if (!out)
+        throw std::runtime_error("Failed to create " + file.string());
+
+    out << "Nx = " << nx << '\n';
+    out << "Ny = " << ny << "\n\n";
+
+    out << "temperatures = ";
+    for (std::size_t i = 0; i < temperatures.size(); ++i)
+    {
+        if (i) out << ", ";
+        out << temperatures[i];
+    }
+
+    out << "\n";
+
+    out << "noises = ";
+    for (std::size_t i = 0; i < noises.size(); ++i)
+    {
+        if (i) out << ", ";
+        out << noises[i];
+    }
+
+    out << "\n";
+
+    out << "seeds = ";
+    for (std::size_t i = 0; i < seeds.size(); ++i)
+    {
+        if (i) out << ", ";
+        out << seeds[i];
+    }
+
+    out << "\n\n";
+    out << "subdirs =\n";
+}
+
+
+void writer::register_completed_run(const std::filesystem::path& run_dir)
+{
+    namespace fs = std::filesystem;
+
+    fs::path dataset_dir = run_dir.parent_path();
+    fs::path metadata = dataset_dir / "metadata.txt";
+
+    std::lock_guard lock(dataset_metadata_mutex);
+
+    std::ofstream out(metadata, std::ios::app);
+
+    if (!out)
+        throw std::runtime_error("Failed to open " + metadata.string());
+
+    out << run_dir.filename().string() << '\n';
+}
+
+
+void writer::rebuild_dataset_metadata(
+    const std::filesystem::path& datasets_root)
+{
+    namespace fs = std::filesystem;
+
+    for (const auto& dataset : fs::directory_iterator(datasets_root))
+    {
+        if (!dataset.is_directory())
+            continue;
+
+        // std::cout << "Working on " << dataset << "/metadata.txt\n";
+
+        const fs::path dataset_dir = dataset.path();
+
+        int nx = 0;
+        int ny = 0;
+
+        if (std::sscanf(dataset_dir.filename().string().c_str(),
+                        "%dx%d", &nx, &ny) != 2)
+            continue;
+
+        std::set<int> temperatures;
+        std::set<int> noises;
+        std::set<int> seeds;
+
+        std::vector<std::string> subdirs;
+
+        std::regex pattern(R"(T(\d+)_n(\d+)_s(\d+))");
+
+        for (const auto& run : fs::directory_iterator(dataset_dir))
+        {
+            if (!run.is_directory())
+                continue;
+
+            if (!fs::exists(run.path() / "COMPLETE"))
+                continue;
+
+            std::smatch m;
+
+            std::string name = run.path().filename().string();
+
+            if (!std::regex_match(name, m, pattern))
+                continue;
+
+            temperatures.insert(std::stoi(m[1]));
+            noises.insert(std::stoi(m[2]));
+            seeds.insert(std::stoi(m[3]));
+
+            subdirs.push_back(name);
+        }
+
+        std::sort(subdirs.begin(), subdirs.end());
+
+        std::ofstream out(dataset_dir / "metadata.txt");
+
+        if (!out)
+            throw std::runtime_error(
+                "Failed to write " +
+                (dataset_dir / "metadata.txt").string());
+
+        out << "Nx = " << nx << '\n';
+        out << "Ny = " << ny << "\n\n";
+
+        out << "temperatures = ";
+        bool first = true;
+        for (int T : temperatures)
+        {
+            if (!first) out << ", ";
+            out << T / 1000.0;
+            first = false;
+        }
+
+        out << "\n";
+
+        out << "noises = ";
+        first = true;
+        for (int n : noises)
+        {
+            if (!first) out << ", ";
+            out << n / 1000.0;
+            first = false;
+        }
+
+        out << "\n";
+
+        out << "seeds = ";
+        first = true;
+        for (int s : seeds)
+        {
+            if (!first) out << ", ";
+            out << s;
+            first = false;
+        }
+
+        out << "\n\nsubdirs =\n";
+
+        for (const auto& s : subdirs)
+            out << s << '\n';
+    }
 }

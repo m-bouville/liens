@@ -29,18 +29,21 @@ From each snapshot, more are created through
 
 ### Training Stages
 
-There are four losses, which can be mixed and matched at different steps:
+There are five losses, which can be mixed and matched at different steps:
 - reconstruction loss: $L_\mathrm{recon}$,
 - statistics loss: $L_\mathrm{stats}$,
+- interpolation loss: $L_\mathrm{interp}$,
 - one-step latent prediction loss: $L_\mathrm{1step}$,
 - multi-step rollout loss: $L_\mathrm{rollout}$.
 
 | Stage                | Train    | Space | Loss                   |
 |----------------------|----------|-------|------------------------|
-| 2. AE                | (E, D)   | real  | `L_recon + λ₁ L_stats`  |
-| 4. LDS               | (f)      | latent| `L_rollout` (or `L_1step` initially) |
-| 5. Encoder refinement| (E, f)   | latent| `L_rollout + ε L_recon + λ₁ L_stats` |
-| 6. End-to-end        | (E, f, D)| real  | `L_recon + λ₁ L_stats + λ₂ L_rollout` |
+| 1. autoencoder       | (E, D)   | real  | `L_recon + λ₁ L_stats`  |
+| 2. latent validation | (E, D)   | latent| `L_recon + λ₁ L_interp` |
+| 3. Latent Dynamics   | (f)      | latent| `L_1step` 				|
+| 3'. &nbsp; &nbsp; Surrogate (LDS)| (f)      | latent| `L_rollout`    |
+| 4. encoder refinement| (E, f)   | latent| `L_rollout + ε L_recon + λ₁ L_stats` |
+| 5. end-to-end        | (E, f, D)| real  | `L_recon + λ₁ L_stats + λ₂ L_rollout` |
 
 
 ### Reconstruction loss
@@ -53,6 +56,10 @@ This is done in real space. $L_1$ may be used if sharper interfaces are desired.
 Letting $s_i(x)$ denote the _i_-th (out of $N_s$) microstructural statistic and $w_i$ its weight,
 $$L_\mathrm{stats} = \sum_{i=1}^{N_s} w_i \left[g_i(x') - s_i(x)\right]^2$$
 in real space, or $g_i(\hat{z})$ instead of $g_i(x')$ in latent space. (See below for more details.)
+
+
+### Interpolation loss
+See latent-space validation (step 2) below.
 
 
 ### One-step latent prediction loss
@@ -116,7 +123,7 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 
 
 
-## Latent-space validation (step 3)
+## Latent-space validation (stage 2)
 We want to verify that latent space behaves like a smooth, structured coordinate system rather than a brittle compression code. Put simply: latent representation must make sense.
 
 Inasmuch as possible, we work directly in latent space (to avoid having to rely on the decoder), where we cannot measure a direct distance between microstructures pixel by pixel: the calculation $z_2 - z_1$ has no meaning. Instead we use the statistics described above, a vector of norm $\|\mathrm{stats}(z)\|$.

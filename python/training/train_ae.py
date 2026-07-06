@@ -1,16 +1,17 @@
 """
-Stage 2 (train_autoencoder) and stage 3 (train_stage3) of the LIENS
+Stage 1 (train_autoencoder) and stage 2 (train_stage2) of the LIENS
 pipeline. Both are importable functions, not just CLI scripts -- see
-main.py for the orchestrated 2 -> 3 -> 4 pipeline. train_ae.py's CLI
-below covers stage 2 only; stage 3 is driven by main.py, since it always
-resumes from a stage-2 checkpoint (there's no "stage 3 from scratch").
+main.py for the orchestrated 1 -> 2 -> 3 pipeline. train_ae.py's CLI
+below covers stage 1 only; stage 2 is driven by main.py, since it always
+resumes from a stage-1 checkpoint (there's no "stage 2 from scratch").
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
-    python -m training.train_ae --config ../config.txt --base ../datasets
+    python -m training.train_ae --size 64 --base ../datasets
 """
 
 import argparse
+from collections.abc import Callable
 from pathlib import Path
 import gc
 
@@ -22,12 +23,11 @@ from training.datasets import MicrostructureSnapshotDataset, MicrostructureTripl
                                complete_run_dirs, split_run_dirs
 from training.losses import ReconLoss, StatsLoss
 from training.stats_head import StatsHead
-from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
 
 
 def train_autoencoder(
-    config_path: Path, base_path: Path,
+    size: int, base_path: Path,
     epochs: int = 100, batch_size: int = 64, lr: float = 1e-3,
     base_channels: int = 32, latent_channels: int = 8,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
@@ -36,12 +36,25 @@ def train_autoencoder(
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
     seed: int = 0, checkpoint_path: Path | None = None,
     resume_from: Path | None = None, device: str | None = None,
+    on_checkpoint_saved: Callable[[Path, int], None] | None = None,
 ) -> Path:
     """
-    Stage 2: train the AE on individual snapshots with L_recon, and (if
+    Stage 1: train the AE on individual snapshots with L_recon, and (if
     stats_weight > 0) L_stats via stats_head.py. Returns the path of the
     best checkpoint saved (selected on an EMA of val_total, see
     val_ema_decay).
+
+    on_checkpoint_saved: optional callback(checkpoint_path, epoch),
+    called immediately after EVERY checkpoint save (not just the final
+    one) -- e.g. so a caller can update a parameter registry as
+    training progresses, rather than only after this function returns,
+    which would otherwise mean a crashed/interrupted run leaves a valid
+    checkpoint+log on disk with no registry entry at all.
+
+    size: grid size (square only) -- this is what locates the dataset
+    (base_path/<size>x<size>/), read from ITS OWN metadata.txt (not
+    config.txt, which may describe an unrelated sweep -- see
+    complete_run_dirs).
 
     resume_from: optional checkpoint to initialize model_state/
     stats_head_state from before training starts (e.g. to continue stage
@@ -56,36 +69,36 @@ def train_autoencoder(
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(seed)
 
-    config = load.read_config(config_path)
-    if config.nx != config.ny:
-        raise ValueError(f"Autoencoder assumes a square grid, got {config.nx}x{config.ny}")
-
-    if min_step is None:
-        min_step = config.min_step
-    if min_stdev_phi is None:
-        min_stdev_phi = config.min_stdev_phi
-    if stats_weight is None:
-        stats_weight = config.stats_weight
+    # config.txt is simulation-sweep-only now (Nx/Ny/dt/temperatures/...) --
+    # min_step/min_stdev_phi/stats_weight are ML training parameters and
+    # must be passed explicitly by the caller (e.g. from a stage-parameters
+    # file via main.py), not silently inferred from config.txt.
+    missing = [name for name, v in [("min_step", min_step), ("min_stdev_phi", min_stdev_phi),
+                                     ("stats_weight", stats_weight)] if v is None]
+    if missing:
+        raise ValueError(f"train_autoencoder() requires {', '.join(missing)} to be given "
+                          f"explicitly -- config.txt no longer provides ML training defaults.")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  stats_weight={stats_weight}")
 
     include_stats = stats_weight > 1e-6
 
     if checkpoint_path is None:
-        name = ae_checkpoint_name(config.nx, latent_channels, stats_weight)
+        name = ae_checkpoint_name(size, latent_channels, stats_weight)
         checkpoint_path = Path(f"../output/ae_checkpoint_pt/{name}.pt")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
 
-    run_dirs = complete_run_dirs(config, base_path)
+    run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
-        raise ValueError("No complete runs found -- check config_path/base_path")
+        raise ValueError(f"No complete runs found under {base_path}/{size}x{size} -- "
+                          f"check base_path/size, or that metadata.txt exists there")
 
     # Split at the DIRECTORY level, not by frame: two frames from the same
     # run, even at unrelated timesteps, are snapshots of one continuous
     # evolution and can look very similar, so splitting below the
     # directory level risks leaking correlated frames across train/val/test.
     train_dirs, val_dirs, test_dirs = split_run_dirs(run_dirs, val_fraction, test_fraction, seed=seed)
-    print(f"{len(run_dirs)} complete runs ({config.nx} x {config.ny}) -> "
+    print(f"{len(run_dirs)} complete runs ({size} x {size}) -> "
           f"{len(train_dirs)} train / {len(val_dirs)} val / {len(test_dirs)} test dirs")
 
     train_set = MicrostructureSnapshotDataset(
@@ -114,7 +127,7 @@ def train_autoencoder(
         persistent_workers=num_workers > 0, pin_memory=device.type == "cuda",
     )
 
-    ae = Autoencoder(size=config.nx, channels=1, base_channels=base_channels,
+    ae = Autoencoder(size=size, channels=1, base_channels=base_channels,
                       latent_channels=latent_channels).to(device)
 
     recon_loss = ReconLoss()
@@ -228,7 +241,7 @@ def train_autoencoder(
                 "normalized": False,
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
-                    "size": config.nx, "base_channels": base_channels,
+                    "size": size, "base_channels": base_channels,
                     "latent_channels": latent_channels, "stats_weight": stats_weight,
                 },
                 "stats_config": {
@@ -239,6 +252,8 @@ def train_autoencoder(
             }
             torch.save(checkpoint, checkpoint_path)
             msg += "  -> saved"
+            if on_checkpoint_saved is not None:
+                on_checkpoint_saved(checkpoint_path, epoch)
         else:
             epochs_since_improvement += 1
 
@@ -252,37 +267,42 @@ def train_autoencoder(
     return checkpoint_path
 
 
-def train_stage3(
-    config_path: Path, base_path: Path, resume_from: Path,
+def train_stage2(
+    base_path: Path, resume_from: Path,
     interp_weight: float = 1.0,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     min_step: int | None = None, min_stdev_phi: float | None = None,
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
+    on_checkpoint_saved: Callable[[Path, int], None] | None = None,
 ) -> Path:
     """
-    Stage 3: continue training the AE (encoder, decoder, AND stats_head --
+    Stage 2: continue training the AE (encoder, decoder, AND stats_head --
     none of them frozen here) on real (t1,t2,t3) triplets, adding
     L_interp (interpolation-consistency, compared against TRUE t2
     statistics from statistics.csv, not stats_head(z2) -- grounds the
     target in real data rather than another model's prediction) to
     L_recon and L_stats, BOTH of which are computed on x2/z2 specifically
     (the real middle frame of each triplet), continuing exactly the same
-    objective stage 2 used, just now alongside L_interp.
+    objective stage 1 used, just now alongside L_interp.
 
-    Always resumes from a stage-2 (or another stage-3) checkpoint --
-    there's no "stage 3 from scratch". stats_weight is read from that
-    checkpoint's own config, not re-specified here.
+    on_checkpoint_saved: see train_autoencoder().
+
+    Always resumes from a stage-1 (or another stage-2) checkpoint --
+    there's no "stage 2 from scratch". stats_weight AND grid size are
+    both read from that checkpoint's own config, not re-specified here.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(seed)
 
-    config = load.read_config(config_path)
-    if min_step is None:
-        min_step = config.min_step
-    if min_stdev_phi is None:
-        min_stdev_phi = config.min_stdev_phi
+    # Same rationale as train_autoencoder(): config.txt is simulation-only
+    # now, these must be passed explicitly.
+    missing = [name for name, v in [("min_step", min_step), ("min_stdev_phi", min_stdev_phi)]
+               if v is None]
+    if missing:
+        raise ValueError(f"train_stage2() requires {', '.join(missing)} to be given "
+                          f"explicitly -- config.txt no longer provides ML training defaults.")
 
     prev = torch.load(resume_from, map_location=device, weights_only=True)
     model_cfg = prev["config"]
@@ -292,9 +312,10 @@ def train_stage3(
                           f"both L_stats and L_interp require it)")
     stat_names = stats_config["stat_names"]
     stats_weight = model_cfg["stats_weight"]
+    size = model_cfg["size"]
     print(f"Resuming from {resume_from} (stat_names={stat_names}, stats_weight={stats_weight})")
 
-    ae = Autoencoder(size=model_cfg["size"], channels=1, base_channels=model_cfg["base_channels"],
+    ae = Autoencoder(size=size, channels=1, base_channels=model_cfg["base_channels"],
                       latent_channels=model_cfg["latent_channels"]).to(device)
     ae.load_state_dict(prev["model_state"])
 
@@ -307,14 +328,15 @@ def train_stage3(
     recon_loss = ReconLoss()
 
     if checkpoint_path is None:
-        name = ae_checkpoint_name(model_cfg["size"], model_cfg["latent_channels"], stats_weight)
-        checkpoint_path = Path(f"../output/ae_checkpoint_pt/{name}-stage3.pt")
+        name = ae_checkpoint_name(size, model_cfg["latent_channels"], stats_weight)
+        checkpoint_path = Path(f"../output/ae_checkpoint_pt/{name}-stage2.pt")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
 
-    run_dirs = complete_run_dirs(config, base_path)
+    run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
-        raise ValueError("No complete runs found -- check config_path/base_path")
+        raise ValueError(f"No complete runs found under {base_path}/{size}x{size} -- "
+                          f"check base_path, or that metadata.txt exists there")
     train_dirs, val_dirs, test_dirs = split_run_dirs(run_dirs, val_fraction, test_fraction, seed=seed)
     print(f"{len(run_dirs)} complete runs -> "
           f"{len(train_dirs)} train / {len(val_dirs)} val / {len(test_dirs)} test dirs")
@@ -368,7 +390,7 @@ def train_stage3(
     val_ema = None
     epochs_since_improvement = 0
 
-    print(f"Stage 3: starting {epochs} epochs (batches of {batch_size}), interp_weight={interp_weight}")
+    print(f"Stage 2: starting {epochs} epochs (batches of {batch_size}), interp_weight={interp_weight}")
     print(f"/{epochs:3d} train=recon+stats+interp | valid=... (e-3) ema")
 
     for epoch in range(1, epochs + 1):
@@ -427,9 +449,11 @@ def train_stage3(
                     "latent_channels": model_cfg["latent_channels"], "stats_weight": stats_weight,
                 },
                 "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
-                "stage3_config": {"interp_weight": interp_weight, "resumed_from": str(resume_from)},
+                "stage2_config": {"interp_weight": interp_weight, "resumed_from": str(resume_from)},
             }, checkpoint_path)
             msg += "  -> saved"
+            if on_checkpoint_saved is not None:
+                on_checkpoint_saved(checkpoint_path, epoch)
         else:
             epochs_since_improvement += 1
 
@@ -445,7 +469,9 @@ def train_stage3(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("../config.txt"))
+    parser.add_argument("--size", type=int, required=True,
+                         help="grid size (square only) -- locates base/<size>x<size>/, "
+                              "reading ITS OWN metadata.txt (not config.txt)")
     parser.add_argument("--base", type=Path, default=Path("../datasets"))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -480,7 +506,7 @@ def main():
         print("CUDA not available")
 
     train_autoencoder(
-        config_path=args.config, base_path=args.base,
+        size=args.size, base_path=args.base,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         base_channels=args.base_channels, latent_channels=args.latent_channels,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,

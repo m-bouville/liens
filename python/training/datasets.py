@@ -75,9 +75,16 @@ def _transform_angle(angle: torch.Tensor, k: int, flip: bool) -> torch.Tensor:
     return angle
 
 
-def complete_run_dirs(config: "load.SweepConfig", base: str | Path = "../datasets") -> list[Path]:
-    """All directories implied by a sweep that exist on disk and are marked complete."""
-    return [d for d in load.enumerate_run_dirs(config, base) if load.is_complete(d)]
+def complete_run_dirs(base: str | Path, nx: int, ny: int) -> list[Path]:
+    """
+    All directories for one grid size that exist on disk and are marked
+    complete -- reads base/<nx>x<ny>/metadata.txt directly (see
+    load.enumerate_run_dirs_from_metadata), NOT config.txt: metadata.txt
+    is co-located with the actual dataset, so it's always correct for
+    THIS directory, with no risk of describing an unrelated sweep (which
+    a shared, possibly-currently-mutated config.txt could).
+    """
+    return [d for d in load.enumerate_run_dirs_from_metadata(base, nx, ny) if load.is_complete(d)]
 
 
 def split_run_dirs(run_dirs: list[Path], val_fraction: float, test_fraction: float = 0.0,
@@ -340,18 +347,18 @@ class MicrostructureSnapshotDataset(Dataset):
             self._cache = [self._load(i) for i in range(len(self._index))]
 
     @classmethod
-    def from_sweep(cls, config: "load.SweepConfig", base: str | Path = "../datasets",
+    def from_sweep(cls, base: str | Path, size: int,
                     skip_bad: bool = True, cache_in_memory: bool = False,
                     augment: bool = False, min_step: int = 0, min_stdev_phi: float | None = None,
                     include_stats: bool = False, stat_names: list[str] | None = None,
                     ) -> "MicrostructureSnapshotDataset":
         """
-        Convenience: pool every complete run in a sweep, skipping
+        Convenience: pool every complete run for one grid size, skipping
         incomplete ones. NOTE: this does not split into train/val/test --
         for that, get the dir list via complete_run_dirs(), split it with
         split_run_dirs(), and construct one instance per split instead.
         """
-        run_dirs = complete_run_dirs(config, base)
+        run_dirs = complete_run_dirs(base, size, size)
         return cls(run_dirs, skip_bad=skip_bad, cache_in_memory=cache_in_memory,
                    augment=augment, min_step=min_step, min_stdev_phi=min_stdev_phi,
                    include_stats=include_stats, stat_names=stat_names)

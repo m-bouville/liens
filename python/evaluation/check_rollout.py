@@ -91,69 +91,21 @@ def compute_sample(run_dir: Path, step_t: int, step_next: int, ae, f_theta,
     return x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_val
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--size", type=int, default=None,
-            help="which LDS to check, by the parameters you actually know -- e.g. "
-                 "--size 64 --latent-channels 8 --stats-weight 0.01 --n-rollout-steps 3. "
-                 "Reconstructs the expected checkpoint path (train_lds.py's naming "
-                 "convention) rather than you needing to type out a filename. Required "
-                 "unless --lds-checkpoint is given directly (no --config is read here, "
-                 "so size can't be inferred).")
-    parser.add_argument("--latent-channels", type=int, default=8, help="see --size")
-    parser.add_argument("--stats-weight", type=float, default=None, help="see --size")
-    parser.add_argument("--n-rollout-steps", type=int, default=None, help="see --size")
-    parser.add_argument("--lds-checkpoint", type=Path, default=None,
-            help="direct path override, if you'd rather specify the checkpoint this way "
-                 "instead of by --size/--latent-channels/--stats-weight/--n-rollout-steps")
-    parser.add_argument("--n-samples", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=0,
-                         help="which test-set windows to display (ignored if --fixed-windows "
-                              "is given), not the train/val/test split itself, which is "
-                              "fixed and loaded from the checkpoint")
-    parser.add_argument("--fixed-windows", type=str, nargs="+", default=None,
-                         help="exact 'run_dir:step_t:step_next' triples to display "
-                              "(repeatable), bypassing random dataset-based selection "
-                              "entirely -- for reproducible before/after comparisons across "
-                              "different --min-step/--min-stdev-phi training runs. Every "
-                              "random run prints its picks in this exact format.")
-    parser.add_argument("--min-step", type=int, default=None,
-                         help="override the checkpoint's recorded min_step, if given "
-                              "(ignored if --fixed-windows is given)")
-    parser.add_argument("--min-stdev-phi", type=float, default=None,
-                         help="override the checkpoint's recorded min_stdev_phi, if given "
-                              "(ignored if --fixed-windows is given)")
-    parser.add_argument("--output", type=Path, default=None,
-            help="default: ../../output/rollout_check_png/<lds checkpoint name>"
-                 "[-seed<N> if random-sampling].png -- named after the checkpoint "
-                 "(and seed) so different checks don't collide")
-    parser.add_argument("--device", type=str,
-                         default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+def check_rollout(
+    lds_checkpoint_path: Path, n_samples: int = 6, seed: int = 0,
+    fixed_windows: list[str] | None = None,
+    min_step: int | None = None, min_stdev_phi: float | None = None,
+    output_path: Path | None = None, device: str | None = None,
+) -> Path:
+    """Saves a visual rollout-comparison figure and returns its path."""
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    if args.lds_checkpoint is None:
-        missing = [n for n, v in [("--size", args.size), ("--latent-channels", args.latent_channels),
-                                   ("--stats-weight", args.stats_weight),
-                                   ("--n-rollout-steps", args.n_rollout_steps)] if v is None]
-        if missing:
-            raise ValueError(
-                f"Provide either --lds-checkpoint directly, or all of --size, "
-                f"--latent-channels, --stats-weight, --n-rollout-steps so the expected "
-                f"path can be reconstructed (missing: {', '.join(missing)})."
-            )
-        name = lds_checkpoint_name(args.size, args.latent_channels, args.stats_weight,
-                                    args.n_rollout_steps)
-        args.lds_checkpoint = Path(f"../../output/lds_checkpoint_pt/{name}.pt")
-        print(f"Reconstructed checkpoint path: {args.lds_checkpoint}")
+    if output_path is None:
+        suffix = "" if fixed_windows else f"-seed{seed}"
+        output_path = Path(f"../../output/rollout_check_png/{lds_checkpoint_path.stem}{suffix}.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.output is None:
-        suffix = "" if args.fixed_windows else f"-seed{args.seed}"
-        args.output = Path(f"../../output/rollout_check_png/{args.lds_checkpoint.stem}{suffix}.png")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    device = torch.device(args.device)
-
-    lds_checkpoint = torch.load(args.lds_checkpoint, map_location=device, weights_only=True)
+    lds_checkpoint = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
     lds_config = lds_checkpoint["config"]
     print(f"Loaded LDS checkpoint from epoch {lds_checkpoint['epoch']}, "
           f"val_loss={lds_checkpoint['val_loss']:.6f}, config={lds_config}")
@@ -175,8 +127,8 @@ def main():
     f_theta.load_state_dict(lds_checkpoint["model_state"])
     f_theta.eval()
 
-    if args.fixed_windows:
-        windows = [parse_fixed_window(s) for s in args.fixed_windows]
+    if fixed_windows:
+        windows = [parse_fixed_window(s) for s in fixed_windows]
         print(f"Using {len(windows)} fixed windows (dataset filtering bypassed entirely)")
     else:
         data_config = lds_checkpoint.get("data_config")
@@ -185,14 +137,14 @@ def main():
                   "min_step=0, min_stdev_phi=None, window_length=2, which may NOT match "
                   "what training actually used.")
             data_config = {"min_step": 0, "min_stdev_phi": None, "window_length": 2}
-        min_step = args.min_step if args.min_step is not None else data_config["min_step"]
-        min_stdev_phi = args.min_stdev_phi if args.min_stdev_phi is not None else data_config["min_stdev_phi"]
+        min_step = min_step if min_step is not None else data_config["min_step"]
+        min_stdev_phi = min_stdev_phi if min_stdev_phi is not None else data_config["min_stdev_phi"]
         window_length = data_config["window_length"]
 
         test_dirs = lds_checkpoint.get("test_dirs") or []
         if not test_dirs:
             raise ValueError(
-                f"{args.lds_checkpoint} has no saved test_dirs -- it was likely trained "
+                f"{lds_checkpoint_path} has no saved test_dirs -- it was likely trained "
                 f"with --test-fraction 0."
             )
         test_dirs = [Path(d) for d in test_dirs]
@@ -209,8 +161,8 @@ def main():
                               f"test_dirs (after min_step={min_step}/"
                               f"min_stdev_phi={min_stdev_phi} filtering)")
 
-        generator = torch.Generator().manual_seed(args.seed)
-        n_samples = min(args.n_samples, len(dataset))
+        generator = torch.Generator().manual_seed(seed)
+        n_samples = min(n_samples, len(dataset))
         indices = torch.randperm(len(dataset), generator=generator)[:n_samples].tolist()
 
         windows = []
@@ -280,8 +232,72 @@ def main():
 
     fig.tight_layout()
     fig.subplots_adjust(wspace=0.3, hspace=0.4)
-    fig.savefig(args.output, dpi=120)
-    print(f"Saved rollout comparison to {args.output} ({n_samples} samples)")
+    fig.savefig(output_path, dpi=120)
+    print(f"Saved rollout comparison to {output_path} ({n_samples} samples)")
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=Path("../../config.txt"),
+            help="source for --size/--stats-weight defaults")
+    parser.add_argument("--size", type=int, default=None, help="default: read from --config")
+    parser.add_argument("--latent-channels", type=int, default=None, help="see --size")
+    parser.add_argument("--stats-weight", type=float, default=None,
+            help="default: read from --config")
+    parser.add_argument("--n-rollout-steps", type=int, default=None, help="see --size")
+    parser.add_argument("--lds-checkpoint", type=Path, default=None,
+            help="direct path override, if you'd rather specify the checkpoint this way "
+                 "instead of by --size/--latent-channels/--stats-weight/--n-rollout-steps")
+    parser.add_argument("--n-samples", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=0,
+                         help="which test-set windows to display (ignored if --fixed-windows "
+                              "is given), not the train/val/test split itself, which is "
+                              "fixed and loaded from the checkpoint")
+    parser.add_argument("--fixed-windows", type=str, nargs="+", default=None,
+                         help="exact 'run_dir:step_t:step_next' triples to display "
+                              "(repeatable), bypassing random dataset-based selection "
+                              "entirely -- for reproducible before/after comparisons across "
+                              "different --min-step/--min-stdev-phi training runs. Every "
+                              "random run prints its picks in this exact format.")
+    parser.add_argument("--min-step", type=int, default=None,
+                         help="override the checkpoint's recorded min_step, if given "
+                              "(ignored if --fixed-windows is given)")
+    parser.add_argument("--min-stdev-phi", type=float, default=None,
+                         help="override the checkpoint's recorded min_stdev_phi, if given "
+                              "(ignored if --fixed-windows is given)")
+    parser.add_argument("--output", type=Path, default=None,
+            help="default: ../../output/rollout_check_png/<lds checkpoint name>"
+                 "[-seed<N> if random-sampling].png -- named after the checkpoint "
+                 "(and seed) so different checks don't collide")
+    parser.add_argument("--device", type=str,
+                         default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    if args.lds_checkpoint is None:
+        if args.size is None or args.stats_weight is None:
+            config = load.read_config(args.config)
+            if args.size is None:
+                args.size = config.nx
+            if args.stats_weight is None:
+                args.stats_weight = config.stats_weight
+        missing = [n for n, v in [("--latent-channels", args.latent_channels),
+                                   ("--n-rollout-steps", args.n_rollout_steps)] if v is None]
+        if missing:
+            raise ValueError(
+                f"Provide either --lds-checkpoint directly, or --latent-channels and "
+                f"--n-rollout-steps (missing: {', '.join(missing)})."
+            )
+        name = lds_checkpoint_name(args.size, args.latent_channels, args.stats_weight,
+                                    args.n_rollout_steps)
+        args.lds_checkpoint = Path(f"../../output/lds_checkpoint_pt/{name}.pt")
+        print(f"Reconstructed checkpoint path: {args.lds_checkpoint}")
+
+    check_rollout(
+        lds_checkpoint_path=args.lds_checkpoint, n_samples=args.n_samples, seed=args.seed,
+        fixed_windows=args.fixed_windows, min_step=args.min_step,
+        min_stdev_phi=args.min_stdev_phi, output_path=args.output, device=args.device,
+    )
 
 
 if __name__ == "__main__":

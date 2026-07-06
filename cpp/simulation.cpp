@@ -175,6 +175,8 @@ void Simulation::__runOneSimulation(double T,
     op.save_as_png(file.replace_extension(".png"));
     writer::write_csv(outdir / "statistics.csv", all_stats);
 
+    writer::register_completed_run(outdir);
+
     {
         std::lock_guard<std::mutex> lock(cout_mutex);
         std::cout << log.str() << '\n';  

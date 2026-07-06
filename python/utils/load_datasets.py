@@ -93,16 +93,13 @@ class SweepConfig:
     seeds: list[int]
     phi0: float
     save_steps: list[int]
-    # ML training defaults, centralized here so train_ae.py/train_lds.py/
-    # evaluation scripts read ONE shared source instead of each hardcoding
-    # its own default and silently drifting out of sync.
-    min_step: int
-    min_stdev_phi: float
-    stats_weight: float
 
 
 def read_config(path: str | Path) -> SweepConfig:
-    """Parse the sweep config.txt written before a batch of simulations."""
+    """Parse the sweep config.txt written before a batch of simulations.
+    Simulation-sweep parameters ONLY -- min_step/min_stdev_phi/
+    stats_weight (ML training parameters) are no longer read from here;
+    they belong in a stage-parameters file instead (see main.py)."""
     kv = _parse_kv_file(path)
     return SweepConfig(
         nx=int(kv["Nx"]),
@@ -120,9 +117,6 @@ def read_config(path: str | Path) -> SweepConfig:
         seeds=_parse_list(kv["seeds"], int),
         phi0=float(kv["phi0"]),
         save_steps=_parse_list(kv["save"], int),
-        min_step=int(kv["min_step"]),
-        min_stdev_phi=float(kv["min_stdev_phi"]),
-        stats_weight=float(kv["stats_weight"]),
     )
 
 
@@ -168,6 +162,72 @@ def enumerate_run_dirs(config: SweepConfig, base: str | Path = "../datasets") ->
 def is_complete(run_dir: str | Path) -> bool:
     """A run is complete iff a COMPLETE marker file exists in its directory."""
     return (Path(run_dir) / "COMPLETE").exists()
+
+
+@dataclass
+class SweepMetadata:
+    """
+    Parsed from datasets/<nx>x<ny>/metadata.txt -- NOT the same as
+    RunMetadata below, which is per-INDIVIDUAL-run. This describes the
+    whole sweep for one grid size, co-located with the actual dataset
+    directory rather than a separate, potentially-stale or
+    describing-a-different-sweep config.txt. subdirs lists the actual
+    run directory names directly -- no need to recompute the
+    temperature x noise x seed cross-product or know the naming
+    convention at all.
+    """
+    nx: int
+    ny: int
+    temperatures: list[float]
+    noises: list[float]
+    seeds: list[int]
+    subdirs: list[str]
+
+
+def read_sweep_metadata(path: str | Path) -> SweepMetadata:
+    """
+    Parses datasets/<nx>x<ny>/metadata.txt. Format: ordinary key=value
+    lines for Nx/Ny/temperatures/noises/seeds, then a 'subdirs =' line
+    (with nothing after the '=') followed by one subdirectory name per
+    line for the rest of the file -- a different shape from the plain
+    key=value files _parse_kv_file handles, so this needs its own parser.
+    """
+    kv: dict[str, str] = {}
+    subdirs: list[str] = []
+    in_subdirs = False
+    for raw_line in Path(path).read_text().splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if in_subdirs:
+            subdirs.append(line)
+            continue
+        if "=" in line:
+            key, value = (part.strip() for part in line.split("=", 1))
+            if key == "subdirs" and value == "":
+                in_subdirs = True
+                continue
+            kv[key] = value
+    return SweepMetadata(
+        nx=int(kv["Nx"]), ny=int(kv["Ny"]),
+        temperatures=_parse_list(kv["temperatures"], float),
+        noises=_parse_list(kv["noises"], float),
+        seeds=_parse_list(kv["seeds"], int),
+        subdirs=subdirs,
+    )
+
+
+def enumerate_run_dirs_from_metadata(base: str | Path, nx: int, ny: int) -> list[Path]:
+    """
+    All directory names for one grid size, read directly from that
+    size's own datasets/<nx>x<ny>/metadata.txt -- replaces
+    enumerate_run_dirs()'s config.txt-based cross-product entirely.
+    Pure string construction from the metadata's subdirs list -- does
+    not touch individual run directories, so it works even before any
+    run in the list actually exists.
+    """
+    metadata = read_sweep_metadata(Path(base) / f"{nx}x{ny}" / "metadata.txt")
+    return [Path(base) / f"{nx}x{ny}" / subdir for subdir in metadata.subdirs]
 
 
 # ---------------------------------------------------------------------------

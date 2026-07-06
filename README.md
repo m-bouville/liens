@@ -81,13 +81,13 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 
 
 ## Workflow
-1.	Generate tens or hundreds of phase-field simulations. 
-2.	Train a CNN autoencoder on individual microstructures (no time evolution yet).
-3.  Latent-space validation: latent space behaves like a smooth, structured coordinate system (see `./docs/neural_nets.md` for more details).
-4.	Freeze encoder and train latent dynamics to predict future microstructures in latent space.
-5.	Regularized encoder fine-tuning with small learning rate and latent consistency loss.
-6.	Fine-tune end-to-end 
-7.	Add a simple inverse-design demo?
+0.	Generate tens or hundreds of phase-field simulations. 
+1.	Train a CNN autoencoder on individual microstructures (no time evolution yet).
+2.  Latent-space validation: latent space behaves like a smooth, structured coordinate system (see `./docs/neural_nets.md` for more details).
+3.	Freeze encoder and train latent dynamics to predict future microstructures in latent space.
+4.	Regularized encoder fine-tuning with small learning rate and latent consistency loss.
+5.	Fine-tune end-to-end 
+6.	Add a simple inverse-design demo?
   - find process parameters from desired domain size, 
 
 
@@ -99,15 +99,18 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 .
 ├── cpp/               # phase-field solver
 ├── python/
+│   ├── main.py
+│   ├── params/
 │   ├── models/
 │   ├── training/
 │   ├── evaluation/
 │   ├── utils/
-│   └── output/
+│   └── checkpoints/
 ├── datasets/
 │   ├── 64x64/
 │   ├── 128x128/
 │   └── 256x256/
+├── output/
 ├── docs/
 │   ├── phase_field.md
 │   └── neural_nets.md

@@ -3,10 +3,13 @@ Load a trained autoencoder checkpoint and visually compare its held-out
 TEST set (saved in the checkpoint by train_ae.py, never touched during
 training or checkpoint selection) against their reconstructions.
 
+check_reconstruction() is importable -- see main.py, which calls it
+automatically after stages 2/3 with the checkpoint path it already has
+in hand. The CLI below is for standalone use.
+
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
-    python -m evaluation.check_reconstruction \
-        --size 64 --latent-channels 4 --stats-weight 0.01
+    python -m evaluation.check_reconstruction --latent-channels 4
 """
 
 import argparse
@@ -18,65 +21,22 @@ import torch
 from models.autoencoder import Autoencoder
 from training.datasets import MicrostructureSnapshotDataset
 from training.losses import ReconLoss
-from utils.naming import ae_checkpoint_name
 from utils import load_datasets as load
+from utils.naming import ae_checkpoint_name
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("../../config.txt"),
-            help="source for --size/--stats-weight/--min-step defaults")
-    parser.add_argument("--size", type=int, default=None,
-            help="which AE to check, by the parameters you actually know -- e.g. "
-                 "--size 64 --latent-channels 4 --stats-weight 0.01. Reconstructs the "
-                 "expected checkpoint path (train_ae.py's naming convention) rather than "
-                 "you needing to type out a filename. Required unless --checkpoint is "
-                 "given directly (no --config is read here, so size can't be inferred).")
-    parser.add_argument("--latent-channels", type=int, default=8, help="see --size")
-    parser.add_argument("--stats-weight", type=float, default=None, help="see --size")
-    parser.add_argument("--checkpoint", type=Path, default=None,
-            help="direct path override, if you'd rather specify the checkpoint this way "
-                 "instead of by --size/--latent-channels/--stats-weight")
-    parser.add_argument("--n-samples", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=0,
-                         help="which test-set frames to display (not the train/val/test "
-                              "split itself, which is fixed and loaded from the checkpoint)")
-    parser.add_argument("--min-step", type=int, default=0,
-                         help="skip snapshots earlier than this step (early steps are "
-                              "near-pure noise and look flat under any fixed color scale)")
-    parser.add_argument("--output", type=Path, default=None,
-            help="default: ../../output/reconstruction_check_png/<checkpoint name>.png -- "
-                 "named after the checkpoint so checks of different variants don't collide")
-    parser.add_argument("--device", type=str,
-                         default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+def check_reconstruction(
+    checkpoint_path: Path, n_samples: int = 6, seed: int = 0, min_step: int = 0,
+    output_path: Path | None = None, device: str | None = None,
+) -> Path:
+    """Saves a visual comparison figure and returns its path."""
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    if args.size is None or args.stats_weight is None or args.min_step is None:
-        config = load.read_config(args.config)
-        if args.size is None:
-            args.size = config.nx
-        if args.stats_weight is None:
-            args.stats_weight = config.stats_weight
-        if args.min_step is None:
-            args.min_step = config.min_step
+    if output_path is None:
+        output_path = Path(f"../../output/reconstruction_check_png/{checkpoint_path.stem}.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.checkpoint is None:
-        if args.size is None or args.latent_channels is None or args.stats_weight is None:
-            raise ValueError(
-                "Provide either --checkpoint directly, or all of --size, "
-                "--latent-channels, and --stats-weight so the expected path can be "
-                "reconstructed."
-            )
-        name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
-        args.checkpoint = Path(f"../../output/ae_checkpoint_pt/{name}.pt")
-        print(f"Reconstructed checkpoint path: {args.checkpoint}")
-
-    if args.output is None:
-        args.output = Path(f"../../output/reconstruction_check_png/{args.checkpoint.stem}.png")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    device = torch.device(args.device)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model_cfg = checkpoint["config"]
     print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, "
           f"val_loss={checkpoint['val_loss']:.6f}, config={model_cfg}")
@@ -84,17 +44,14 @@ def main():
     test_dirs = checkpoint.get("test_dirs") or []
     if not test_dirs:
         raise ValueError(
-            f"{args.checkpoint} has no saved test_dirs -- it was likely trained with "
-            f"--test-fraction 0, or with an older version of train_ae.py. Re-train with "
-            f"--test-fraction > 0 to get a held-out test set for this script."
+            f"{checkpoint_path} has no saved test_dirs -- it was likely trained with "
+            f"--test-fraction 0, or with an older version of train_ae.py."
         )
     test_dirs = [Path(d) for d in test_dirs]
 
     ae = Autoencoder(
-        size=model_cfg["size"],
-        channels=1,
-        base_channels=model_cfg["base_channels"],
-        latent_channels=model_cfg["latent_channels"],
+        size=model_cfg["size"], channels=1,
+        base_channels=model_cfg["base_channels"], latent_channels=model_cfg["latent_channels"],
     ).to(device)
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
@@ -102,15 +59,14 @@ def main():
     # Deliberately unaugmented: we want to look at real frames, not
     # rotated/translated synthetic views. Uses the checkpoint's own
     # saved test_dirs, so this is guaranteed to be the exact same held-out
-    # set that training never touched -- not re-derived from config/seed,
-    # which could silently drift if the dataset on disk changes later.
-    dataset = MicrostructureSnapshotDataset(test_dirs, augment=False, min_step=args.min_step)
+    # set that training never touched.
+    dataset = MicrostructureSnapshotDataset(test_dirs, augment=False, min_step=min_step)
     if len(dataset) == 0:
         raise ValueError(f"No snapshots found in the checkpoint's {len(test_dirs)} test_dirs "
-                          f"(after min_step={args.min_step} filtering)")
+                          f"(after min_step={min_step} filtering)")
 
-    generator = torch.Generator().manual_seed(args.seed)
-    n_samples = min(args.n_samples, len(dataset))
+    generator = torch.Generator().manual_seed(seed)
+    n_samples = min(n_samples, len(dataset))
     indices = torch.randperm(len(dataset), generator=generator)[:n_samples].tolist()
 
     recon_loss = ReconLoss()
@@ -130,15 +86,8 @@ def main():
             diff_np = x_recon_np - x_np
 
             # Auto-scale symmetric around 0, from the actual data range of
-            # THIS sample -- a fixed global scale makes low-amplitude
-            # fields (like early, still noise-dominated steps) look
-            # flat/blank even though real structure is there.
-            # Floor at 0.1: auto-scaling a near-pure-noise sample to its own
-            # tiny range (e.g. +-0.003) stretches that noise to fill the full
-            # colormap, making it visually indistinguishable from real signal
-            # and easy to misread as structure. The diff panel keeps a tight
-            # auto-scale on purpose -- it should show small errors precisely,
-            # not get washed out by the same floor.
+            # THIS sample, floored at 0.1 (see docstring history: avoids
+            # amplifying near-noise samples into looking like real signal).
             scale = max(abs(x_np.min()), abs(x_np.max()), 0.1)
             diff_scale = max(abs(diff_np.min()), abs(diff_np.max()), 1e-6)
 
@@ -158,9 +107,48 @@ def main():
                 ax.set_yticks([])
 
     fig.tight_layout()
-    fig.savefig(args.output, dpi=120)
-    print(f"Saved comparison figure to {args.output} ({n_samples} samples from "
+    fig.savefig(output_path, dpi=120)
+    print(f"Saved comparison figure to {output_path} ({n_samples} samples from "
           f"{len(test_dirs)} held-out test dirs)")
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=Path("../../config.txt"),
+            help="source for --size/--stats-weight defaults")
+    parser.add_argument("--size", type=int, default=None, help="default: read from --config")
+    parser.add_argument("--latent-channels", type=int, default=None,
+            help="required -- not a sweep parameter, so config.txt has no value for this")
+    parser.add_argument("--stats-weight", type=float, default=None,
+            help="default: read from --config")
+    parser.add_argument("--checkpoint", type=Path, default=None,
+            help="direct path override, instead of --size/--latent-channels/--stats-weight")
+    parser.add_argument("--n-samples", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--min-step", type=int, default=0)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--device", type=str,
+                         default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    if args.checkpoint is None:
+        if args.size is None or args.stats_weight is None:
+            config = load.read_config(args.config)
+            if args.size is None:
+                args.size = config.nx
+            if args.stats_weight is None:
+                args.stats_weight = config.stats_weight
+        if args.latent_channels is None:
+            raise ValueError("Provide either --checkpoint directly, or --latent-channels")
+        name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
+        args.checkpoint = Path(f"../../output/ae_checkpoint_pt/{name}.pt")
+        print(f"Reconstructed checkpoint path: {args.checkpoint}")
+
+    check_reconstruction(
+        checkpoint_path=args.checkpoint, n_samples=args.n_samples, seed=args.seed,
+        min_step=args.min_step, output_path=args.output, device=args.device,
+    )
 
 
 if __name__ == "__main__":

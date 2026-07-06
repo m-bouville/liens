@@ -75,7 +75,7 @@ def main():
             help="source for --size/--stats-weight/--min-step defaults")
     parser.add_argument("--size", type=int, default=None,
             help="default: read from --config's Nx/Ny")
-    parser.add_argument("--latent-channels", type=int, default=8,
+    parser.add_argument("--latent-channels", type=int, default=4,
             help="required -- not a sweep parameter, so config.txt has no value for this")
     parser.add_argument("--stats-weight", type=float, default=None,
             help="default: read from --config's stats_weight")

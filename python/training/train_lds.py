@@ -1,5 +1,5 @@
 """
-Stage 4: train the Latent Dynamics Surrogate (f_theta) with L_rollout
+Stage 3: train the Latent Dynamics Surrogate (f_theta) with L_rollout
 (chained multi-step prediction, errors accumulating as they would at
 real inference time -- not L_1step's ground-truth-conditioned single
 transitions), on top of a FROZEN, already-trained autoencoder (its
@@ -7,15 +7,16 @@ encoder only -- the decoder is not used here at all, only for later
 visual checks).
 
 train_lds() is importable -- see main.py for the orchestrated
-2 -> 3 -> 4 pipeline. The CLI below is for standalone stage-4 runs.
+1 -> 2 -> 3 pipeline. The CLI below is for standalone stage-3 runs.
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
     python -m training.train_lds --ae-latent-channels 8 --ae-stats-weight 0.01 \
-        --config ../../config.txt --base ../../datasets --n-rollout-steps 6
+        --size 64 --base ../../datasets --n-rollout-steps 6
 """
 
 import argparse
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -25,14 +26,13 @@ from models.autoencoder import Autoencoder
 from models.latent_dynamics import LatentDynamics
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss
-from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
 
 
 def train_lds(
-    config_path: Path, base_path: Path,
+    size: int, base_path: Path,
     ae_checkpoint_path: Path | None = None,
-    ae_latent_channels: int | None = None, ae_stats_weight: float | None = None,
+    ae_latent_channels: int | None = None, stats_weight: float | None = None,
     epochs: int = 100, batch_size: int = 512, lr: float = 1e-3,
     hidden_dim: int = 256, n_hidden_layers: int = 2,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
@@ -41,12 +41,18 @@ def train_lds(
     early_stopping_patience: int | None = None,
     lr_warmup_steps: int = 20, grad_clip: float = 1.0,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
+    on_checkpoint_saved: Callable[[Path, int], None] | None = None,
 ) -> Path:
     """
-    Stage 4. Returns the path of the best checkpoint saved. Either give
+    Stage 3. Returns the path of the best checkpoint saved. Either give
     ae_checkpoint_path directly, or both ae_latent_channels and
-    ae_stats_weight (ae_stats_weight defaults to config.txt's value if
-    not given) to reconstruct the expected path.
+    stats_weight (the AE checkpoint's own stats_weight, used only to
+    reconstruct its expected filename -- must be given explicitly,
+    config.txt no longer provides ML training defaults).
+
+    on_checkpoint_saved: optional callback(checkpoint_path, epoch),
+    called immediately after EVERY checkpoint save, not just the final
+    one -- see train_autoencoder()'s docstring for the rationale.
     """
     if n_rollout_steps < 1:
         raise ValueError(f"n_rollout_steps must be >= 1 (got {n_rollout_steps})")
@@ -56,17 +62,15 @@ def train_lds(
     torch.manual_seed(seed)
     print(f"device: {device}\n")
 
-    config = load.read_config(config_path)
-    if config.nx != config.ny:
-        raise ValueError(f"Autoencoder assumes a square grid, got {config.nx}x{config.ny}")
-
-    if ae_stats_weight is None:
-        ae_stats_weight = config.stats_weight
-    if min_step is None:
-        min_step = config.min_step
-    if min_stdev_phi is None:
-        min_stdev_phi = config.min_stdev_phi
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  ae_stats_weight={ae_stats_weight}")
+    # Same rationale as train_ae.py: config.txt is simulation-only now,
+    # these must be passed explicitly by the caller.
+    missing = [name for name, v in [("size", size), ("stats_weight", stats_weight),
+                                     ("min_step", min_step), ("min_stdev_phi", min_stdev_phi)]
+               if v is None]
+    if missing:
+        raise ValueError(f"train_lds() requires {', '.join(missing)} to be given explicitly "
+                          f"-- config.txt no longer provides ML training defaults.")
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  stats_weight={stats_weight}")
 
     if ae_checkpoint_path is None:
         if ae_latent_channels is None:
@@ -74,12 +78,12 @@ def train_lds(
                 "Provide either ae_checkpoint_path directly, or ae_latent_channels "
                 "so the expected path can be reconstructed."
             )
-        ae_name = ae_checkpoint_name(config.nx, ae_latent_channels, ae_stats_weight)
+        ae_name = ae_checkpoint_name(size, ae_latent_channels, stats_weight)
         ae_checkpoint_path = Path(f"../output/ae_checkpoint_pt/{ae_name}.pt")
         print(f"Reconstructed AE checkpoint path: {ae_checkpoint_path}")
 
     # Load the frozen autoencoder. Only .encoder is ever used below --
-    # the decoder is irrelevant to stage 4 training.
+    # the decoder is irrelevant to stage 3 training.
     ae_checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
     ae_config = ae_checkpoint["config"]
     ae = Autoencoder(size=ae_config["size"], channels=1, base_channels=ae_config["base_channels"],
@@ -93,20 +97,25 @@ def train_lds(
           f"(epoch {ae_checkpoint['epoch']}, val_loss={ae_checkpoint['val_loss']:.6f}, "
           f"latent_channels={ae_config['latent_channels']})\n")
 
-    if config.nx != ae_config["size"]:
-        raise ValueError(f"config.txt grid size ({config.nx}) doesn't match the "
-                          f"autoencoder checkpoint's size ({ae_config['size']})")
+    # Still a valuable sanity check -- just against the size YOU gave,
+    # not config.txt (which may describe an unrelated sweep entirely).
+    if size != ae_config["size"]:
+        raise ValueError(
+            f"size given ({size}) doesn't match the autoencoder checkpoint's own "
+            f"size ({ae_config['size']}) -- double check which checkpoint/size you meant."
+        )
 
     if checkpoint_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
-                                    ae_stats_weight, n_rollout_steps)
+                                    stats_weight, n_rollout_steps)
         checkpoint_path = Path(f"../output/lds_checkpoint_pt/{name}.pt")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}\n")
 
-    run_dirs = complete_run_dirs(config, base_path)
+    run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
-        raise ValueError("No complete runs found -- check config_path/base_path")
+        raise ValueError(f"No complete runs found under {base_path}/{size}x{size} -- "
+                          f"check base_path/size, or that metadata.txt exists there")
 
     train_dirs, val_dirs, test_dirs = split_run_dirs(run_dirs, val_fraction, test_fraction, seed=seed)
     print(f"{len(run_dirs)} complete runs -> "
@@ -208,7 +217,7 @@ def train_lds(
                 "epoch": epoch,
                 "val_loss": val_loss,
                 "val_loss_ema": val_ema,
-                "ae_checkpoint": str(ae_checkpoint_path),
+                "ae_checkpoint": str(Path(ae_checkpoint_path).resolve()),
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
                     "latent_channels": ae_config["latent_channels"], "n_theta": 1,
@@ -220,6 +229,8 @@ def train_lds(
                 },
             }, checkpoint_path)
             msg += "  -> saved"
+            if on_checkpoint_saved is not None:
+                on_checkpoint_saved(checkpoint_path, epoch)
         else:
             epochs_since_improvement += 1
 
@@ -241,9 +252,15 @@ def train_lds(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ae-latent-channels", type=int, default=None)
-    parser.add_argument("--ae-stats-weight", type=float, default=None)
+    parser.add_argument("--ae-stats-weight", type=float, default=None, dest="stats_weight",
+                         help="the AE checkpoint's own stats_weight (used only to locate its "
+                              "expected filename) -- named --ae-stats-weight here since it's "
+                              "paired with --ae-latent-channels, but stored as args.stats_weight "
+                              "to match train_lds()'s actual parameter name")
     parser.add_argument("--ae-checkpoint", type=Path, default=None)
-    parser.add_argument("--config", type=Path, default=Path("../../config.txt"))
+    parser.add_argument("--size", type=int, required=True,
+                         help="grid size (square only) -- locates base/<size>x<size>/, "
+                              "reading ITS OWN metadata.txt (not config.txt)")
     parser.add_argument("--base", type=Path, default=Path("../../datasets"))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -268,9 +285,9 @@ def main():
     args = parser.parse_args()
 
     train_lds(
-        config_path=args.config, base_path=args.base,
+        size=args.size, base_path=args.base,
         ae_checkpoint_path=args.ae_checkpoint, ae_latent_channels=args.ae_latent_channels,
-        ae_stats_weight=args.ae_stats_weight,
+        stats_weight=args.stats_weight,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,

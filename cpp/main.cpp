@@ -2,6 +2,7 @@
 #include <filesystem>
 
 #include "config.hpp"
+#include "snapshot_writer.hpp"
 #include "simulation.hpp"
 
 
@@ -11,12 +12,15 @@ int main(int argc, char* argv[])
 
     try
     {
+        // Rebuild datasets/*/metadata.txt for backward compatibility.
+        writer::rebuild_dataset_metadata("../datasets");
+
         std::cout << "Starting..." << '\n';
 
         // Loading config file
         Config cfg;
 
-        std::string filename = argc > 1 ? argv[1] : "../config.txt";
+        std::string filename = argc > 1 ? argv[1] : "config.txt";
         std::cout << "Loading " << filename << "...\n";
         cfg.load(filename);
 

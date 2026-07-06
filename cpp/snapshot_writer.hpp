@@ -61,4 +61,27 @@ namespace writer
                               int         seed,
                               std::string code_version,
                               bool        completed = false);
+    
+
+                              
+    // Write metadata file for each system size
+
+    // Called once before launching a sweep for one grid size.
+    // Creates datasets/128x128/metadata.txt if it does not exist.
+    void create_dataset_metadata(
+        const std::filesystem::path& dataset_dir,
+        int nx,
+        int ny,
+        const std::vector<double>& temperatures,
+        const std::vector<double>& noises,
+        const std::vector<int>&    seeds);
+
+    // Called after a run successfully finishes.
+    void register_completed_run(const std::filesystem::path& run_dir);
+
+    
+    // Rebuild datasets/*/metadata.txt by scanning the filesystem.
+    // Safe to call at startup for backward compatibility.
+    void rebuild_dataset_metadata(
+        const std::filesystem::path& datasets_root = "../datasets");
 }
