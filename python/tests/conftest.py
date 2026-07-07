@@ -1,0 +1,98 @@
+"""
+Shared pytest fixtures. Deliberately avoid needing a real trained
+checkpoint anywhere -- these are small, deterministic stand-ins whose
+only job is to have the right SHAPE and be cheap to run, so tests stay
+fast and don't depend on any particular training run having happened.
+"""
+import sys
+from pathlib import Path
+
+# Every module in this project (training/, models/, utils/) is meant to
+# be imported with python/ itself on sys.path -- true when running e.g.
+# `python -m training.train_ae` from python/, but NOT automatic for
+# pytest, which by default only adds tests/'s own directory. Without
+# this, `from training.losses import RolloutLoss` fails with
+# ModuleNotFoundError regardless of which directory pytest is invoked
+# from. conftest.py is always imported before any test file, so this
+# runs early enough regardless of pytest version.
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent
+if str(_PYTHON_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_ROOT))
+
+import torch
+import torch.nn as nn
+import pytest
+
+
+class FakeEncoder(nn.Module):
+    """
+    Maps (B, 1, size, size) -> (B, latent_channels, 8, 8) with a single
+    strided conv -- not meant to encode anything meaningful, just to be
+    a real nn.Module with the right input/output shape and (crucially)
+    real, trainable parameters, so gradient-flow tests are genuine.
+    """
+    def __init__(self, size: int = 64, latent_channels: int = 4):
+        super().__init__()
+        stride = size // 8
+        assert stride * 8 == size, "FakeEncoder assumes size is a multiple of 8"
+        self.conv = nn.Conv2d(1, latent_channels, kernel_size=stride, stride=stride)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+@pytest.fixture
+def fake_encoder():
+    return FakeEncoder(size=64, latent_channels=4)
+
+
+@pytest.fixture
+def tmp_run_dir(tmp_path):
+    """
+    A single fake run directory with a metadata.txt and real
+    binary snapshot files, in the ACTUAL format load.read_metadata/
+    read_phi_half/snapshot_filename expect (verified against their
+    source, not assumed) -- so dataset tests exercise the real
+    file-reading code path, not a mocked stand-in of it.
+    """
+    from utils import load_datasets as load
+
+    run_dir = tmp_path / "T800_n010_s1"
+    run_dir.mkdir()
+
+    steps = [0, 1000, 2000, 3000, 4000]
+    size = 64
+    metadata_text = "\n".join([
+        "directory = T800_n010_s1",
+        "code version = test",
+        "status = complete",
+        f"Nx = {size}",
+        f"Ny = {size}",
+        "dt = 0.05",
+        "steps = 4000",
+        f"save_steps = {' '.join(str(s) for s in steps)}",  # whitespace-separated, not comma
+        "a0 = 1.0",
+        "b = 1.0",
+        "T0 = 1.0",
+        "temperature = 0.8",
+        "kappa = 0.2",
+        "mobility = 0.05",
+        "phi0 = 0.0",
+        "noise = 0.01",
+        "seed = 1",
+        "equation = allen_cahn",
+        "solver = explicit",
+        "",
+    ])
+    (run_dir / "metadata.txt").write_text(metadata_text)
+
+    import numpy as np
+    for step in steps:
+        # Distinctive, checkable per-step value (constant field = step/10000),
+        # written as raw little-endian float16 -- the actual on-disk format
+        # (see read_phi_half's docstring), NOT a generic numpy .npy/.tofile
+        # dump in some other dtype.
+        arr = np.full((size, size), step / 10000.0, dtype="<f2")
+        arr.tofile(run_dir / load.snapshot_filename(step))
+
+    return run_dir, steps

@@ -11,7 +11,7 @@ The encoder terminates with a 1×1 convolution reducing the feature dimension to
 
 
 ### Using a U-Net?
-Using a U-Net instead of a pure AE would improve the decoding. But skip connections may interfere with the Latent Dynamics Surrogate (LDS). Since the decoder will have more information (latent representation + skips) than the LDS (only latent), the encoder-decoder pair may work even if the latent representation has little information (which would break the LDS). 
+Using a U-Net instead of a pure AE would improve the decoding. But skip connections can weaken the usefulness of the latent representation used by the Latent Dynamics Surrogate (LDS). Since the decoder will have more information (latent representation + skips) than the LDS (only latent), the encoder-decoder pair may work even if the latent representation has little information (which would break the LDS). 
 
 To avoid this, skip connections will be added and trained only after freezing the encoder. Step 4 (or separate step just before or after) now includes: train skip connections and retrain decoder (encoder still frozen). Possible to alternate in step 4: train encoder + decoder (+ skips) and train encoder + LDS?
 
@@ -38,11 +38,13 @@ There are five losses, which can be mixed and matched at different steps:
 
 | Stage                | Train     | Space | Loss                   |
 |----------------------|-----------|-------|------------------------|
-| 1. autoencoder       | (E, D, st)| real  | `L_recon + λ₁ L_stats`  |
+| 1. autoencoder       | (E, D, SH)| real  | `L_recon + λ₁ L_stats`  |
 | 2. latent validation | (E, D)    | both  | `L_recon + λ₁ L_stats + λ₁ L_interp` |
 | 3. LDS               | (f)       | latent| `L_1step` (3a), then `L_rollout` (3b) |
-| 4. encoder refinement| (E, f)    | latent| `L_rollout + ε L_recon + λ₁ L_stats` |
+| 4. encoder refinement| (E, f)    | latent| `L_rollout + ε L_recon + λ₁ L_stats |
 | 5. end-to-end        | (E, f, D) | real  | `L_recon + λ₁ L_stats + λ₂ L_rollout` |
+
+SH: `stats_head` 
 
 
 ### Reconstruction loss
@@ -52,9 +54,9 @@ This is done in real space. $L_1$ may be used if sharper interfaces are desired.
 
 
 ### Statistics loss
-Letting $s_i(x)$ denote the _i_-th (out of $N_s$) microstructural statistic and $w_i$ its weight,
-$$L_\mathrm{stats} = \sum_{i=1}^{N_s} w_i \left[g_i(x') - s_i(x)\right]^2$$
-in real space, or $g_i(\hat{z})$ instead of $g_i(x')$ in latent space. (See below for more details.)
+Letting $s_i(x)$ denote the _i_-th (out of $N_s$) microstructural statistic (measured, real), $g_i(z)$ the value of that statistic in the `stats_head` (latent) and $w_i$ its weight,
+$$L_\mathrm{stats} = \sum_{i=1}^{N_s} w_i \left[g_i(z) - s_i(x)\right]^2.$$
+(See below for more details.)
 
 
 ### Interpolation loss
@@ -83,7 +85,7 @@ The latent representation serves two purposes:
 - recover the microstructure in real space (decoder),
 - predict the microstructure at $t + \Delta t$.
 
-The reconstruction loss alone does not constrain the latent representation to preserve physically meaningful features. Auxiliary losses based on microstructural statistics nudge the encoder toward latent variables that capture characteristics such as phase fraction, interface density, anisotropy and characteristic length scales. This is expected to improve latent-space organization and, consequently, the accuracy and stability of the learned surrogate dynamics.
+The reconstruction loss alone does not constrain the latent representation to preserve physically meaningful features. Auxiliary losses in the `stats_head`, based on microstructural statistics, nudge the encoder toward latent variables that capture characteristics such as phase fraction, interface density, anisotropy and characteristic length scales. This is expected to improve latent-space organization and, consequently, the accuracy and stability of the learned surrogate dynamics.
 
 
 ### Statistics
@@ -100,7 +102,7 @@ The reconstruction loss alone does not constrain the latent representation to pr
 
 
 ### No live calculations
-I just have a small dense net with $N_s$ output cells and say: "the values of these must match the statistics calculated in real space", without recalculating the statistics on x' (let alone on $\hat{z}$). Statistics are auxiliary prediction targets rather than differentiable image-derived losses. And they can be used in latent space.
+I just have a small dense net (`stats_head`) with $N_s$ output cells and say: "the values of these must match the statistics calculated in real space", without recalculating the statistics on x' (let alone on $\hat{z}$). Statistics are auxiliary prediction targets rather than differentiable image-derived losses. The statistics head is trained in latent space, only from ground-truth statistics computed offline.
 
 ```text
   latent (1024)
@@ -125,6 +127,8 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 ## Latent-space validation (stage 2)
 Training the AE (stage 1) ensures that the initial state can be recovered. This proves that the latent representation $z$ somehow describes $x$, not that is a smooth and structured coordinate system. Doing arithmetic to predict the time evolution would be impossible in a jagged space. For that, latent representation must make sense.
 
+Coding analogy: stage 1 creates code that works (recovers the original), and stage 2 refactors it to make it suitable for stage 3.
+
 
 ### How stage 2 works
 In stage 1, there are two constraints: recovering the original (decoder) and getting statistics right (`stats_head`). In stage 2, we add a loss function on qualitative representation (interpolation, perturbation). 
@@ -133,7 +137,7 @@ In stage 2, we are changing the latent representation, so we need to change the 
 
 We also freeze the outter layers of both encoder and decoder (not those close to the latent space):
 - the coefficients of these layers changing dramatically in stage 2 would be a red flag;
-- freezing these layers also speeds up training.
+- freezing these layers also somewhat speeds up training.
 
 
 ### Working in latent space
@@ -154,11 +158,11 @@ Let $z_{\varepsilon} = z + \varepsilon \, \eta$, with $\eta \sim \mathcal{N}(0, 
 
 Perturbation is currently used as _post-hoc_ diagnostic, not as loss function.
 
-Variant: structured perturbations (directional latent shifts) instread of isotropic noise.
+Variant: structured perturbations (directional latent shifts) instead of isotropic noise.
 
 
 
 ## Encoder refinement (step 4) and end-to-end (stage 5)
 In stage 1 the encoder was trained for reconstruction and stats-accuracy, and in stage 2 for generic interpolation-smoothness. Stage 3 trained `f` to predict dynamics, with D frozen. Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). 
 
-D is frozen, even though `L_recon` is in the loss function: this is what distinguishes stage 4 from stage 5. D is a tether keeping E's output compatible with the existing decoder.
+D is frozen, even though `L_recon` is in the loss function: this is what distinguishes stage 4 from stage 5. D is a tether keeping E's output compatible with the existing decoder. (Since the encoder is no longer frozen, the latent representation of each sample cannot be cached, unlike in stage 3.)

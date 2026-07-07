@@ -804,7 +804,7 @@ def main():
     # if not args.params_files:
     #     raise ValueError("Provide at least one stage-parameters file (or --scan-only)")
 
-    for params_path in [Path("params/64x64-tiny.txt")]:
+    for params_path in [Path("params/64x64.txt")]:
         print("#" * 70)
         print(f"# {params_path}")
         print("#" * 70)

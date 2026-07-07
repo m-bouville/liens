@@ -2,12 +2,12 @@
 ## A latent-space neural surrogate for phase-field microstructure evolution
 
 
-This project uses neural network (NN) models in materials science and engineering (MSE). It investigates whether neural nets can learn a latent-space surrogate model for phase-field microstructure evolution. Instead of repeatedly solving the governing partial differential equations (PDE), a neural network learns the mapping between successive microstructures directly from simulation data. The objective is to accelerate phase-field simulations while preserving the underlying physics and microstructural evolution.
+This project investigates neural-network surrogate models for phase-field microstructure evolution in materials science and engineering (MSE). Instead of repeatedly solving the governing partial differential equations (PDE), a neural network (NN) learns a reduced-order representation of the phase-field state together with a surrogate evolution operator acting in that latent space. The objective is to use this mapping between successive microstructures to accelerate phase-field simulations while preserving the underlying physics.
 
 
 
 ## A quick introduction to phase field
-Phase-field simulates the evolution of microstructures without explicitly tracking sharp interfaces (e.g. grain boundaries). Instead the method introduces one or more continuous order parameters (OP) that vary smoothly across space, so that interfaces have a finite width. These fields take distinct values in different phases. The evolution of the system is typically governed by PDEs describing gradient flow of a free-energy functional: the Cahn-Hilliard equation is used for conserved OP (e.g. composition) and Allen-Cahn if not conserved (phases).
+Phase-field simulates the evolution of microstructures without explicitly tracking sharp interfaces (e.g. grain boundaries). Instead the method introduces one or more continuous order parameters (OP) that vary smoothly across space, so that interfaces have a finite width. These fields take different equilibrium values in different phases. The evolution of the system is typically governed by PDEs describing gradient flow of a free-energy functional: the Cahn-Hilliard equation is used for conserved OP (e.g. composition) and Allen-Cahn if not conserved (phases).
 
 For details (equations, implementation), see `./docs/phase_field.md`.
 
@@ -27,7 +27,7 @@ The convolutional autoencoder has a symmetric encoder–decoder architecture. Th
 ## Latent representation 
 The latent representation will also be used by a Latent Dynamics Surrogate (LDS) model to predict the microstructure at $t + \Delta t$: $z(t + \Delta t) = z(t) + f_\theta(z(t), \Delta t)$, with $\theta$ physical parameters (e.g. temperature). As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\Delta t$ a multiple of the phase-field time step).
 
-$f$ is largely linear: $f_\theta(z(t), \Delta t) \propto \Delta t$, so what we need to learn is the slope,
+For sufficiently small time intervals, the evolution is approximately linear in the time increment: $f_\theta(z(t), \Delta t) \propto \Delta t$, so what we need to learn is the slope,
 $$g_\theta(z(t)) = \dfrac{z(t + \Delta t) - z(t)}{\Delta t}.$$ 
 Then, $z(t + \Delta t) = z(t) + g_\theta(z(t))\,\Delta t$.
 
@@ -82,15 +82,11 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 
 ## Workflow
 0.	Generate hundreds of phase-field simulations. 
-1.	Train a CNN autoencoder on individual microstructures (no time evolution yet).
-2.  Latent-space validation: Latent Dynamics Surrogate (LDS) behaves like a smooth, structured coordinate system (see `./docs/neural_nets.md` for more details).
-3.	Freeze encoder and train latent dynamics to predict future microstructures in latent space.
-4.	Regularized encoder fine-tuning with small learning rate and latent consistency loss.
-5.	Fine-tune end-to-end.
-6.	Add a simple inverse-design demo?
-  - find process parameters from desired domain size, 
-
-Coding analogy: stage 1 creates code that works (recovers the original), and stage 2 refactors it to make it suitable for stage 3.
+1.	Train a CNN autoencoder on individual microstructures (no time evolution yet) to learn a latent representation that is reconstructive and physically descriptive.
+2.  Validate that the latent space behaves like a smooth, structured coordinate system (see `./docs/neural_nets.md` for more details).
+3.	Freeze the encoder and train the Latent Dynamics Surrogate (LDS) to predict future microstructures in latent space.
+4.	Fine-tune the encoder and the LDS for prediction, including a small input from reconstruction.
+5.	Fine-tune the latent representation and the LDS to both predict future microstructures and reconstruct the original microstructure.
 
 
 
@@ -105,8 +101,9 @@ Coding analogy: stage 1 creates code that works (recovers the original), and sta
 │   ├── models/
 │   ├── training/
 │   ├── evaluation/
+│   ├── checkpoints/
 │   ├── utils/
-│   └── checkpoints/
+│   └── tests/
 ├── datasets/
 │   ├── 64x64/
 │   ├── 128x128/
@@ -122,8 +119,7 @@ Coding analogy: stage 1 creates code that works (recovers the original), and sta
 
 - [X] C++ phase-field solver
 - [x] Dataset generation
-- [X] CNN autoencoder
-- [ ] Latent-space validation
-- [ ] Latent dynamics surrogate
-- [ ] End-to-end training
-- [ ] Inverse design
+- [X] 1. CNN autoencoder
+- [x] 2. Latent-space validation
+- [x] 3. Latent dynamics surrogate
+- [ ] 4-5. End-to-end training

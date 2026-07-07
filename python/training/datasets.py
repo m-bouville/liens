@@ -463,20 +463,34 @@ class MicrostructureSnapshotDataset(Dataset):
 
 class MicrostructureEvolutionDataset(Dataset):
     """
-    Sequences of consecutive latent codes z(t), for LDS training (stage
-    4+): z(t_k), z(t_k+dt_0), ..., z(t_k+dt_0+...+dt_{n-1}), each a
-    window of n_r+1 consecutive KEPT steps from a single run (never
+    Sequences of consecutive frames for LDS-family training. Two modes,
+    selected by whether encoder is given:
+
+    - encoder given (stage 3, frozen encoder): z(t) is computed ONCE per
+      kept step, upfront, and cached -- not re-encoded every batch.
+      Latents are tiny compared to raw images (e.g. a 4x8x8 latent is
+      ~200x smaller than a 64x64 snapshot), so caching every one is
+      cheap even for a large sweep. __getitem__ returns latent windows.
+
+    - encoder=None (stage 4/5, E is trainable): caching latents would be
+      wrong here -- gradient must flow through E fresh every forward
+      pass, and a value computed once under torch.no_grad() can't
+      provide that. __getitem__ instead returns RAW PIXEL windows;
+      encoding happens fresh in the training loop, every epoch. This is
+      substantially more expensive per epoch than the cached-latent
+      mode (a full E forward pass per frame per window, every epoch,
+      rather than once ever) -- expect smaller batch sizes than stage 3
+      needed.
+
+    Windows are n_r+1 consecutive KEPT steps from a single run (never
     crossing run boundaries -- a "sequence" spanning two different runs
-    isn't a real trajectory).
+    isn't a real trajectory), in either mode.
 
-    The encoder is frozen during this stage (per docs/neural_nets.md),
-    so z(t) is computed ONCE for every kept step, upfront, and cached --
-    not re-encoded from raw snapshots every batch. Latents are tiny
-    compared to raw images (e.g. a 4x8x8 latent is ~200x smaller than a
-    64x64 snapshot), so caching every one is cheap even for a large sweep.
-
-    __getitem__ returns (z_window, dt_window, theta):
-      z_window:  (n_r+1, latent_channels, 8, 8)
+    __getitem__ returns (window, dt_window, theta):
+      window:    (n_r+1, latent_channels, 8, 8) if encoder was given
+                 (a window of z's), or (n_r+1, 1, ny, nx) if encoder is
+                 None (a window of raw frames x, encoding deferred to
+                 the training loop).
       dt_window: (n_r,) float32, physical time between consecutive steps
                  in the window, i.e. (step_b - step_a) * metadata.dt.
       theta:     (1,) float32, currently [temperature - T0]. Per
@@ -520,15 +534,20 @@ class MicrostructureEvolutionDataset(Dataset):
     the same run_dirs.
     """
 
-    def __init__(self, run_dirs: list[str | Path], encoder: torch.nn.Module,
+    def __init__(self, run_dirs: list[str | Path], encoder: torch.nn.Module | None,
                  device: str | torch.device = "cpu", window_length: int = 5,
                  skip_bad: bool = True, min_step: int = 0,
                  min_stdev_phi: float | None = None, encode_batch_size: int = 256,
                  good_steps: dict[Path, list[int]] | None = None):
         """
+        encoder: pass a frozen encoder for the cached-latent mode (stage
+        3), or None for the raw-pixel mode (stage 4/5, E trainable) --
+        see class docstring.
+
         window_length: n_r + 1 (e.g. window_length=5 -> n_r=4 predicted steps).
-        encode_batch_size: batch size used only for the upfront encoding
-        pass, unrelated to LDS training batch size.
+        encode_batch_size: batch size for the upfront encoding pass when
+        encoder is given; unused (raw frames aren't encoded here) when
+        encoder is None.
         good_steps: a precomputed {run_dir: [kept_step, ...]} mapping
         from build_good_steps(), to skip re-scanning run_dirs when a
         paired MicrostructureSnapshotDataset over the same run_dirs
@@ -540,9 +559,11 @@ class MicrostructureEvolutionDataset(Dataset):
                               f"since a window needs at least one transition to predict")
 
         self.window_length = window_length
+        self.encoder_given = encoder is not None  # which mode __getitem__ operates in
         self._run_dirs: list[Path] = []         # run_dir per run_idx, for tracing samples back
         self._run_steps: list[list[int]] = []   # kept step numbers per run, in order
-        self._run_latents: list[torch.Tensor] = []  # (n_kept, latent_channels, 8, 8) per run, on CPU
+        self._run_data: list[torch.Tensor] = []  # per run, on CPU: latents (n_kept,C,8,8) if
+                                                   # encoder given, else raw frames (n_kept,1,ny,nx)
         self._run_dt_scale: list[float] = []    # metadata.dt per run
         self._run_theta: list[torch.Tensor] = []  # (n_theta,) physical params per run -- see class docstring
         self._index: list[tuple[int, int]] = []  # (run_idx, window_start_position)
@@ -551,7 +572,8 @@ class MicrostructureEvolutionDataset(Dataset):
         if good_steps is None:
             good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi)
 
-        encoder = encoder.to(device).eval()
+        if self.encoder_given:
+            encoder = encoder.to(device).eval()
         n_windowless_runs = 0
 
         for run_dir in run_dirs:
@@ -562,9 +584,9 @@ class MicrostructureEvolutionDataset(Dataset):
                 n_windowless_runs += 1
                 continue  # not enough consecutive kept steps for even one window
 
-            # Encode every kept step once, in batches (this is the only
-            # place raw snapshots are touched -- everything after this is
-            # pure latent-space bookkeeping).
+            # Read every kept step once (this is the only place raw
+            # snapshots are touched -- everything after this is pure
+            # bookkeeping over whichever of latents/frames we end up with).
             frames = torch.stack([
                 torch.from_numpy(load.read_phi_half(
                     run_dir / load.snapshot_filename(step), metadata.nx, metadata.ny
@@ -572,17 +594,20 @@ class MicrostructureEvolutionDataset(Dataset):
                 for step in kept_steps
             ])  # (n_kept, 1, ny, nx)
 
-            latents = []
-            with torch.no_grad():
-                for i in range(0, len(frames), encode_batch_size):
-                    batch = frames[i:i + encode_batch_size].to(device)
-                    latents.append(encoder(batch).cpu())
-            latents = torch.cat(latents, dim=0)  # (n_kept, latent_channels, 8, 8)
+            if self.encoder_given:
+                latents = []
+                with torch.no_grad():
+                    for i in range(0, len(frames), encode_batch_size):
+                        batch = frames[i:i + encode_batch_size].to(device)
+                        latents.append(encoder(batch).cpu())
+                run_data = torch.cat(latents, dim=0)  # (n_kept, latent_channels, 8, 8)
+            else:
+                run_data = frames  # (n_kept, 1, ny, nx) -- encoding deferred to the training loop
 
             run_idx = len(self._run_steps)
             self._run_dirs.append(run_dir)
             self._run_steps.append(kept_steps)
-            self._run_latents.append(latents)
+            self._run_data.append(run_data)
             self._run_dt_scale.append(metadata.dt)
             # T0 (metadata: "threshold temperature in Landau potential") is
             # the physically meaningful reference point, not 0 -- the whole
@@ -611,7 +636,7 @@ class MicrostructureEvolutionDataset(Dataset):
         run_idx, start = self._index[idx]
         end = start + self.window_length
 
-        z_window = self._run_latents[run_idx][start:end]  # (window_length, C, 8, 8)
+        window = self._run_data[run_idx][start:end]  # (window_length, C, 8, 8) or (window_length, 1, ny, nx)
 
         steps = self._run_steps[run_idx][start:end]
         dt_scale = self._run_dt_scale[run_idx]
@@ -622,16 +647,15 @@ class MicrostructureEvolutionDataset(Dataset):
 
         theta = self._run_theta[run_idx]  # (n_theta,) -- constant across the window (same run)
 
-        return z_window, dt_window, theta
+        return window, dt_window, theta
 
     def window_info(self, idx: int) -> tuple[Path, list[int]]:
         """
-        (run_dir, [step, ...]) for a given __getitem__ index -- the
-        dataset itself only caches latents (not raw pixels) to keep
-        memory small, so anything needing the actual snapshot files for
-        a sample (e.g. check_rollout.py decoding a prediction and
-        comparing against the real x(t+dt)) uses this to know which
-        files to re-read.
+        (run_dir, [step, ...]) for a given __getitem__ index. Even in
+        raw-pixel mode (encoder=None), this stays useful for tracing a
+        sample back to its exact source files/steps (e.g. check_rollout.py
+        decoding a prediction and comparing against the real x(t+dt)),
+        independent of which mode built this dataset.
         """
         run_idx, start = self._index[idx]
         end = start + self.window_length

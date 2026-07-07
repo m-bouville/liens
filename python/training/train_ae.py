@@ -90,7 +90,7 @@ def train_autoencoder(
 
     if checkpoint_path is None:
         name = ae_checkpoint_name(size, latent_channels, stats_weight)
-        checkpoint_path = Path(f"../output/ae_checkpoint_pt/{name}.pt")
+        checkpoint_path = Path(f"../checkpoints/stage1/{name}.pt")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
 
@@ -506,7 +506,7 @@ def train_stage2(
 
     if checkpoint_path is None:
         name = ae_checkpoint_name(size, model_cfg["latent_channels"], ancestor_stats_weight)
-        checkpoint_path = Path(f"../output/ae_checkpoint_pt/{name}-stage2.pt")
+        checkpoint_path = Path(f"../checkpoints/stage2/{name}-stage2.pt")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
 

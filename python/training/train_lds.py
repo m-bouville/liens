@@ -97,7 +97,7 @@ def train_lds(
                 "so the expected path can be reconstructed."
             )
         ae_name = ae_checkpoint_name(size, ae_latent_channels, stats_weight)
-        ae_checkpoint_path = Path(f"../output/ae_checkpoint_pt/{ae_name}.pt")
+        ae_checkpoint_path = Path(f"../checkpoints/stage2/{ae_name}.pt")
         print(f"Reconstructed AE checkpoint path: {ae_checkpoint_path}")
 
     # Load the frozen autoencoder. Only .encoder is ever used below --
@@ -126,7 +126,7 @@ def train_lds(
     if checkpoint_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
                                     stats_weight, n_rollout_steps)
-        checkpoint_path = Path(f"../output/lds_checkpoint_pt/{name}.pt")
+        checkpoint_path = Path(f"../checkpoints/stage3/{name}.pt")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}\n")
 
