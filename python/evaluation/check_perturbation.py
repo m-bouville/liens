@@ -1,35 +1,32 @@
 """
-Stage 3 latent validation: perturbation in LATENT space.
+Stage 2 latent validation: perturbation in LATENT space, measured via
+stats_head on BOTH sides -- never touching true (C++-computed) ground
+truth statistics, and never using the decoder.
 
-Real-space perturbation (x_eps = x + eps*eta, checking stats(z_eps)) was
-tried first and abandoned: stats_head predicts statistics for latents of
-REAL simulation snapshots, but x_eps is synthetic, off-manifold noise --
-stats_head(E(x_eps)) reflects whatever the LEARNED MODEL outputs for an
-input it was never trained on, not the TRUE physical statistics of that
-synthetic state (which would require running the actual C++ statistics
-computation, unavailable in Python). That conflates "is stats_head smooth"
-with "is the representation smooth", and there's no ground truth available
-to settle it either way.
+z_eps = z + eps*eta stays close to the real data manifold for small eps
+(unlike a real-space pixel blend, which is never physically plausible
+even for tiny eps). Comparing stats_head(z_eps) against stats_head(z)
+directly isolates latent-space GEOMETRY: any systematic error in
+stats_head's own predictions cancels out, since it's applied
+identically to both sides -- comparing against ground truth instead
+would conflate "is stats_head accurate" with "is the representation
+smooth", and discrepancies in real space say nothing about the latent
+representation itself.
 
-Perturbation in LATENT space avoids this entirely: z_eps = z + eps*eta
-stays close to the real data manifold for small eps (unlike a noisy
-pixel blend), and decoding gives x_eps = D(z_eps), a real image directly
-comparable in PIXEL SPACE -- no model standing in for missing ground
-truth, and no stats_head needed at all (this works even for an AE
-trained without a stats loss).
-
-For each real test frame x, z = E(x), baseline = D(z) (NOT the raw x --
-comparing against D(z) isolates decoder SMOOTHNESS specifically, without
-conflating it with the AE's own reconstruction error at eps=0, which
-would confound the intercept check below):
-    delta(eps) = || D(z + eps*eta) - D(z) ||   (real-space RMSE, averaged
-                                                  over several eta draws)
+For each real test frame x, z = E(x):
+    stats(z) = stats_head(z)
+    delta(eps) = || stats_head(z + eps*eta) - stats_head(z) ||
+                 (averaged over several eta draws, per eps)
 
 A linear regression of delta against eps, PER SAMPLE, gives both
 diagnostics from one fit:
   intercept ~ 0   -> no discontinuity right at eps=0
   R^2 ~ 1         -> response is genuinely linear (proportional to eps),
                      not curved/saturating
+
+check_perturbation() is importable -- see main.py, which calls it
+automatically after stage 2 with the checkpoint path it already has in
+hand. The CLI below is for standalone use.
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
@@ -44,6 +41,7 @@ import numpy as np
 import torch
 
 from models.autoencoder import Autoencoder
+from training.stats_head import StatsHead
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
 
@@ -58,62 +56,28 @@ def linear_fit(eps_values: np.ndarray, delta: np.ndarray) -> tuple[float, float,
     return dz, c, r_squared
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("../../config.txt"))
-    parser.add_argument("--size", type=int, default=None)
-    parser.add_argument("--latent-channels", type=int, default=8)
-    parser.add_argument("--stats-weight", type=float, default=None)
-    parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--n-samples", type=int, default=16,
-                         help="real test-set frames to perturb and average over")
-    parser.add_argument("--n-repeats", type=int, default=16,
-                         help="random eta draws per (sample, eps) -- averaged, to separate "
-                              "genuine eps-scaling from single-draw direction noise")
-    parser.add_argument("--eps-values", type=float, nargs="+",
-                         default=[0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4],
-                         help="sweep of LATENT perturbation magnitudes")
-    parser.add_argument("--pairwise-eps", type=float, nargs=2, default=[0.1, 0.3],
-                         metavar=("EPS1", "EPS2"),
-                         help="direct illustrative check: (delta(eps2))/(delta(eps1)) "
-                              "=? eps2/eps1, on the pooled mean -- the regression's R^2 "
-                              "already tests this more generally, this is just a concrete "
-                              "sanity-check number")
-    parser.add_argument("--min-step", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output", type=Path, default=None,
-            help="default: ../../output/perturbation_check_png/<checkpoint name>.png")
-    parser.add_argument("--device", type=str,
-                         default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+def check_perturbation(
+    checkpoint_path: Path, n_samples: int = 16, n_repeats: int = 16,
+    eps_values: list[float] | None = None, pairwise_eps: tuple[float, float] = (0.1, 0.3),
+    min_step: int = 4000, seed: int = 0,
+    output_path: Path | None = None, device: str | None = None,
+) -> Path:
+    """Saves the perturbation-response plot and returns its path."""
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    eps_values = np.array(eps_values or [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4])
 
-    if args.size is None or args.stats_weight is None or args.min_step is None:
-        config = load.read_config(args.config)
-        if args.size is None:
-            args.size = config.nx
-        if args.stats_weight is None:
-            args.stats_weight = config.stats_weight
-        if args.min_step is None:
-            args.min_step = config.min_step
+    if output_path is None:
+        output_path = Path(f"../output/perturbation_check_png/{checkpoint_path.stem}.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.checkpoint is None:
-        if args.latent_channels is None:
-            raise ValueError(
-                "Provide either --checkpoint directly, or --latent-channels (--size and "
-                "--stats-weight now default to config.txt's values if not given)."
-            )
-        name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
-        args.checkpoint = Path(f"../../output/ae_checkpoint_pt/{name}.pt")
-        print(f"Reconstructed checkpoint path: {args.checkpoint}")
-
-    if args.output is None:
-        args.output = Path(f"../../output/perturbation_check_png/{args.checkpoint.stem}.png")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    device = torch.device(args.device)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model_cfg = checkpoint["config"]
     print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, config={model_cfg}")
+
+    stats_config = checkpoint.get("stats_config")
+    if stats_config is None:
+        raise ValueError(f"{checkpoint_path} has no stats_head (trained with --stats-weight 0) "
+                          f"-- this check is built entirely around stats_head.")
 
     ae = Autoencoder(
         size=model_cfg["size"], channels=1,
@@ -122,9 +86,16 @@ def main():
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
 
+    stats_head = StatsHead(
+        latent_channels=model_cfg["latent_channels"], stat_names=stats_config["stat_names"],
+    ).to(device)
+    stats_head.load_state_dict(checkpoint["stats_head_state"])
+    stats_head.eval()
+    print(f"stats_head covers: {stats_config['stat_names']}")
+
     test_dirs = checkpoint.get("test_dirs") or []
     if not test_dirs:
-        raise ValueError(f"{args.checkpoint} has no saved test_dirs")
+        raise ValueError(f"{checkpoint_path} has no saved test_dirs")
     test_dirs = [Path(d) for d in test_dirs]
 
     nx = ny = model_cfg["size"]
@@ -134,38 +105,35 @@ def main():
         check = load.check_snapshots_saved(run_dir, metadata)
         bad_steps = set(check["missing"]) | set(check["bad_size"])
         for step in metadata.save_steps:
-            if step not in bad_steps and step >= args.min_step:
+            if step not in bad_steps and step >= min_step:
                 frames.append((run_dir, step))
     if not frames:
         raise ValueError("No usable test frames found")
 
-    generator = torch.Generator().manual_seed(args.seed)
-    idx = torch.randperm(len(frames), generator=generator)[:args.n_samples].tolist()
+    generator = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(len(frames), generator=generator)[:n_samples].tolist()
     chosen = [frames[i] for i in idx]
     print(f"Perturbing {len(chosen)} real test-set frames in LATENT space, "
-          f"{args.n_repeats} eta draws each")
+          f"{n_repeats} eta draws each")
 
-    eps_values = np.array(args.eps_values)
-    all_deltas = []  # (n_samples, n_eps), real-space RMSE
+    all_deltas = []  # (n_samples, n_eps), stats-space distance
 
     with torch.no_grad():
         for run_dir, step in chosen:
             x_np = load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny)
             x = torch.from_numpy(x_np).unsqueeze(0).unsqueeze(0).to(device)
             z = ae.encoder(x)
-            baseline = ae.decoder(z)  # D(z), NOT raw x -- isolates decoder smoothness
-                                       # specifically, without AE reconstruction error
-                                       # at eps=0 confounding the intercept check
+            stats_z = stats_head(z)  # baseline stats(z), NOT ground truth
 
             deltas = []
             for eps in eps_values:
                 delta_sum = 0.0
-                for _ in range(args.n_repeats):
+                for _ in range(n_repeats):
                     eta = torch.randn_like(z)
                     z_eps = z + eps * eta
-                    x_eps = ae.decoder(z_eps)
-                    delta_sum += (x_eps - baseline).pow(2).mean().sqrt().item()
-                deltas.append(delta_sum / args.n_repeats)
+                    stats_z_eps = stats_head(z_eps)
+                    delta_sum += (stats_z_eps - stats_z).norm(dim=1).item()
+                deltas.append(delta_sum / n_repeats)
             all_deltas.append(deltas)
 
     all_deltas = np.array(all_deltas)  # (n_samples, n_eps)
@@ -192,7 +160,7 @@ def main():
 
     # Concrete illustrative pairwise check on the pooled mean, at specific
     # requested eps values (not sweep endpoints).
-    eps1_target, eps2_target = args.pairwise_eps
+    eps1_target, eps2_target = pairwise_eps
     idx1 = np.argmin(np.abs(eps_values - eps1_target))
     idx2 = np.argmin(np.abs(eps_values - eps2_target))
     eps1, eps2 = eps_values[idx1], eps_values[idx2]
@@ -210,7 +178,7 @@ def main():
     ax.plot(eps_values, dz * eps_values + c, "--", color="gray",
             label=f"pooled fit (c={c:.4f}, R2={r_squared:.3f})")
     ax.set_xlabel("eps (latent space)")
-    ax.set_ylabel("||D(z+eps*eta) - D(z)|| (real space)")
+    ax.set_ylabel("||stats_head(z+eps*eta) - stats_head(z)||")
     ax.set_title(f"Perturbation response across {len(chosen)} real frames")
     ax.legend()
 
@@ -222,8 +190,58 @@ def main():
     axes[1].legend(fontsize=8)
 
     fig.tight_layout()
-    fig.savefig(args.output, dpi=120)
-    print(f"\nSaved plot to {args.output}")
+    fig.savefig(output_path, dpi=120)
+    print(f"\nSaved plot to {output_path}")
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--size", type=int, required=True,
+                         help="grid size (square only) -- config.txt is never read")
+    parser.add_argument("--latent-channels", type=int, default=None)
+    parser.add_argument("--stats-weight", type=float, default=None)
+    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--n-samples", type=int, default=16,
+                         help="real test-set frames to perturb and average over")
+    parser.add_argument("--n-repeats", type=int, default=16,
+                         help="random eta draws per (sample, eps) -- averaged, to separate "
+                              "genuine eps-scaling from single-draw direction noise")
+    parser.add_argument("--eps-values", type=float, nargs="+",
+                         default=[0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4],
+                         help="sweep of LATENT perturbation magnitudes")
+    parser.add_argument("--pairwise-eps", type=float, nargs=2, default=[0.1, 0.3],
+                         metavar=("EPS1", "EPS2"),
+                         help="direct illustrative check: (delta(eps2))/(delta(eps1)) "
+                              "=? eps2/eps1, on the pooled mean -- the regression's R^2 "
+                              "already tests this more generally, this is just a concrete "
+                              "sanity-check number")
+    parser.add_argument("--min-step", type=int, default=4000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output", type=Path, default=None,
+            help="default: ../../output/perturbation_check_png/<checkpoint name>.png")
+    parser.add_argument("--device", type=str,
+                         default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    if args.checkpoint is None:
+        if args.latent_channels is None or args.stats_weight is None:
+            raise ValueError(
+                "Provide either --checkpoint directly, or --latent-channels and "
+                "--stats-weight so the expected path can be reconstructed."
+            )
+        name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
+        args.checkpoint = Path(f"../../checkpoints/stage2/{name}.pt")
+        print(f"Reconstructed checkpoint path: {args.checkpoint}")
+
+    if args.output is None:
+        args.output = Path(f"../../output/perturbation_check_png/{args.checkpoint.stem}.png")
+
+    check_perturbation(
+        checkpoint_path=args.checkpoint, n_samples=args.n_samples, n_repeats=args.n_repeats,
+        eps_values=args.eps_values, pairwise_eps=tuple(args.pairwise_eps),
+        min_step=args.min_step, seed=args.seed, output_path=args.output, device=args.device,
+    )
 
 
 if __name__ == "__main__":

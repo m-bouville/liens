@@ -154,11 +154,18 @@ class RolloutLoss(nn.Module):
         else:
             self.step_weights = None
 
-    def forward(self, z_hat: torch.Tensor, z_true: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_hat: torch.Tensor, z_true: torch.Tensor,
+                return_per_step: bool = False):
         """
         z_hat, z_true: (B, n_r, C, H, W) -- predicted (chained) and true
         continuations, NOT including the shared starting point z0 (i.e.
         LatentDynamics.rollout()'s output with index 0 already dropped).
+
+        return_per_step: if True, ALSO returns the (n_r,) per-step
+        tensor (before averaging across steps) -- e.g. so a caller can
+        read off per_step[0] as L_1step for direct comparison against a
+        model trained with n_rollout_steps=1, without a second forward
+        pass or recomputing this diff.
         """
         diff = z_hat - z_true
         per_step = (diff ** 2).mean(dim=(0, 2, 3, 4)) if self.kind == "l2" \
@@ -166,5 +173,8 @@ class RolloutLoss(nn.Module):
 
         if self.step_weights is not None:
             w = self.step_weights
-            return (per_step * w).sum() / w.sum()
-        return per_step.mean()
+            loss = (per_step * w).sum() / w.sum()
+        else:
+            loss = per_step.mean()
+
+        return (loss, per_step) if return_per_step else loss

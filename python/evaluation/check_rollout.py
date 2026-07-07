@@ -239,12 +239,10 @@ def check_rollout(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("../../config.txt"),
-            help="source for --size/--stats-weight defaults")
-    parser.add_argument("--size", type=int, default=None, help="default: read from --config")
+    parser.add_argument("--size", type=int, required=True,
+                         help="grid size (square only) -- config.txt is never read")
     parser.add_argument("--latent-channels", type=int, default=None, help="see --size")
-    parser.add_argument("--stats-weight", type=float, default=None,
-            help="default: read from --config")
+    parser.add_argument("--stats-weight", type=float, default=None)
     parser.add_argument("--n-rollout-steps", type=int, default=None, help="see --size")
     parser.add_argument("--lds-checkpoint", type=Path, default=None,
             help="direct path override, if you'd rather specify the checkpoint this way "
@@ -275,22 +273,17 @@ def main():
     args = parser.parse_args()
 
     if args.lds_checkpoint is None:
-        if args.size is None or args.stats_weight is None:
-            config = load.read_config(args.config)
-            if args.size is None:
-                args.size = config.nx
-            if args.stats_weight is None:
-                args.stats_weight = config.stats_weight
         missing = [n for n, v in [("--latent-channels", args.latent_channels),
+                                   ("--stats-weight", args.stats_weight),
                                    ("--n-rollout-steps", args.n_rollout_steps)] if v is None]
         if missing:
             raise ValueError(
-                f"Provide either --lds-checkpoint directly, or --latent-channels and "
-                f"--n-rollout-steps (missing: {', '.join(missing)})."
+                f"Provide either --lds-checkpoint directly, or --latent-channels, "
+                f"--stats-weight, and --n-rollout-steps (missing: {', '.join(missing)})."
             )
         name = lds_checkpoint_name(args.size, args.latent_channels, args.stats_weight,
                                     args.n_rollout_steps)
-        args.lds_checkpoint = Path(f"../../output/lds_checkpoint_pt/{name}.pt")
+        args.lds_checkpoint = Path(f"../../checkpoints/stage3/{name}.pt")
         print(f"Reconstructed checkpoint path: {args.lds_checkpoint}")
 
     check_rollout(

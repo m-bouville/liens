@@ -21,7 +21,6 @@ import torch
 from models.autoencoder import Autoencoder
 from training.datasets import MicrostructureSnapshotDataset
 from training.losses import ReconLoss
-from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
 
 
@@ -115,13 +114,10 @@ def check_reconstruction(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("../../config.txt"),
-            help="source for --size/--stats-weight defaults")
-    parser.add_argument("--size", type=int, default=None, help="default: read from --config")
-    parser.add_argument("--latent-channels", type=int, default=None,
-            help="required -- not a sweep parameter, so config.txt has no value for this")
-    parser.add_argument("--stats-weight", type=float, default=None,
-            help="default: read from --config")
+    parser.add_argument("--size", type=int, required=True,
+                         help="grid size (square only) -- config.txt is never read")
+    parser.add_argument("--latent-channels", type=int, default=None)
+    parser.add_argument("--stats-weight", type=float, default=None)
     parser.add_argument("--checkpoint", type=Path, default=None,
             help="direct path override, instead of --size/--latent-channels/--stats-weight")
     parser.add_argument("--n-samples", type=int, default=6)
@@ -133,16 +129,13 @@ def main():
     args = parser.parse_args()
 
     if args.checkpoint is None:
-        if args.size is None or args.stats_weight is None:
-            config = load.read_config(args.config)
-            if args.size is None:
-                args.size = config.nx
-            if args.stats_weight is None:
-                args.stats_weight = config.stats_weight
-        if args.latent_channels is None:
-            raise ValueError("Provide either --checkpoint directly, or --latent-channels")
+        if args.latent_channels is None or args.stats_weight is None:
+            raise ValueError(
+                "Provide either --checkpoint directly, or both --latent-channels and "
+                "--stats-weight so the expected path can be reconstructed."
+            )
         name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
-        args.checkpoint = Path(f"../../output/ae_checkpoint_pt/{name}.pt")
+        args.checkpoint = Path(f"../../checkpoints/stage2/{name}.pt")
         print(f"Reconstructed checkpoint path: {args.checkpoint}")
 
     check_reconstruction(

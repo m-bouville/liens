@@ -42,6 +42,8 @@ def train_lds(
     lr_warmup_steps: int = 20, grad_clip: float = 1.0,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
+    resume_from: Path | None = None,
+    log_every_epoch: bool = True,
 ) -> Path:
     """
     Stage 3. Returns the path of the best checkpoint saved. Either give
@@ -50,9 +52,25 @@ def train_lds(
     reconstruct its expected filename -- must be given explicitly,
     config.txt no longer provides ML training defaults).
 
+    resume_from: optional previous LDS checkpoint to initialize
+    f_theta's weights from -- e.g. curriculum rollout, training first
+    with n_rollout_steps=1 (stable, fast) then resuming here with the
+    target n_rollout_steps (harder, more directly optimizes the actual
+    downstream chained-prediction use case), rather than jumping
+    straight to multi-step rollout training from scratch (which
+    produced an epoch-1 loss blowup to ~1e15 when tried that way).
+    Architecture (latent_channels/hidden_dim/n_hidden_layers) must
+    match the checkpoint being resumed from exactly.
+
     on_checkpoint_saved: optional callback(checkpoint_path, epoch),
     called immediately after EVERY checkpoint save, not just the final
     one -- see train_autoencoder()'s docstring for the rationale.
+
+    log_every_epoch: if False, only prints a line when a checkpoint is
+    actually saved (plus the early-stopping/final message) -- most
+    useful here specifically, given this stage commonly runs for
+    hundreds of epochs and per-epoch console output between
+    improvements is mostly noise.
     """
     if n_rollout_steps < 1:
         raise ValueError(f"n_rollout_steps must be >= 1 (got {n_rollout_steps})")
@@ -140,6 +158,35 @@ def train_lds(
     f_theta = LatentDynamics(latent_channels=ae_config["latent_channels"], n_theta=1,
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers).to(device)
 
+    if resume_from is not None:
+        # Curriculum rollout: train with n_rollout_steps=1 first (stable,
+        # fast, avoids the epoch-1 loss blowup a from-scratch jump straight
+        # to multi-step rollout produced), then resume here with the
+        # target n_rollout_steps. Architecture must match exactly --
+        # loading into a differently-shaped f_theta would either error
+        # confusingly deep in load_state_dict or silently mismatch.
+        prev_lds = torch.load(resume_from, map_location=device, weights_only=True)
+        prev_config = prev_lds["config"]
+        mismatch = [(k, prev_config[k], v) for k, v in
+                    [("latent_channels", ae_config["latent_channels"]),
+                     ("hidden_dim", hidden_dim), ("n_hidden_layers", n_hidden_layers)]
+                    if prev_config[k] != v]
+        if mismatch:
+            raise ValueError(f"{resume_from}'s architecture doesn't match the requested one: "
+                              + ", ".join(f"{k}={old} (checkpoint) vs {new} (requested)"
+                                          for k, old, new in mismatch))
+        f_theta.load_state_dict(prev_lds["model_state"])
+        prev_n_rollout = prev_lds.get("data_config", {}).get("n_rollout_steps")
+        print(f"Resumed f_theta from {resume_from} (epoch {prev_lds['epoch']}, "
+              f"val_loss={prev_lds['val_loss']:.6f}, trained at n_rollout_steps="
+              f"{prev_n_rollout if prev_n_rollout is not None else '?'})\n")
+        if prev_n_rollout is not None and n_rollout_steps <= prev_n_rollout:
+            print(f"WARNING: resuming from a checkpoint trained at n_rollout_steps="
+                  f"{prev_n_rollout}, but this run asks for n_rollout_steps="
+                  f"{n_rollout_steps} -- not larger, so this isn't the usual curriculum "
+                  f"direction (easy -> hard). Continuing anyway, but double-check this "
+                  f"is intentional.\n")
+
     rollout_loss = RolloutLoss()
     optimizer = torch.optim.Adam(f_theta.parameters(), lr=lr)
 
@@ -149,7 +196,7 @@ def train_lds(
             optimizer, start_factor=0.01, total_iters=lr_warmup_steps,
         )
 
-    def step(batch, train: bool) -> float:
+    def step(batch, train: bool) -> tuple[float, float]:
         z_window, dt_window, theta = batch
         z_window = z_window.to(device, non_blocking=True)
         dt_window = dt_window.to(device, non_blocking=True)
@@ -161,7 +208,15 @@ def train_lds(
         z_hat_full = f_theta.rollout(z0, dt_window, theta)
         z_hat = z_hat_full[:, 1:]
 
-        loss = rollout_loss(z_hat, z_true)
+        # per_step[0] is L_1step -- the loss restricted to just the first
+        # predicted step, directly comparable to a model trained with
+        # n_rollout_steps=1 (see RolloutLoss.forward()'s docstring: this
+        # is mathematically identical to computing L_1step independently
+        # on the same data, not an approximation). Purely a diagnostic
+        # here, not backpropagated separately -- `loss` (the full,
+        # possibly multi-step rollout loss) is still what's optimized.
+        loss, per_step = rollout_loss(z_hat, z_true, return_per_step=True)
+        l_1step = per_step[0]
 
         if train:
             optimizer.zero_grad()
@@ -172,32 +227,43 @@ def train_lds(
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-        return loss.item()
+        return loss.item(), l_1step.item()
 
     best_val_loss = float("inf")
     val_ema = None
     epochs_since_improvement = 0
 
+    show_1step = n_rollout_steps > 1  # at n=1, L_1step == L_rollout always -- redundant to show
+
     print(f"Starting {epochs} epochs (batches of {batch_size})...")
-    print(f"/{epochs:3d}  train    valid    ema")
+    if show_1step:
+        print(f"/{epochs:3d}  train  (1step)   valid  (1step)     ema")
+    else:
+        print(f"/{epochs:3d}  train    valid      ema")
 
     for epoch in range(1, epochs + 1):
         f_theta.train()
-        train_loss = 0.0
+        train_loss = train_1step = 0.0
         n_train = len(train_set)
         for batch in train_loader:
             bs = batch[0].size(0)
-            train_loss += step(batch, train=True) * bs
+            loss, l_1step = step(batch, train=True)
+            train_loss += loss * bs
+            train_1step += l_1step * bs
         train_loss /= n_train
+        train_1step /= n_train
 
         f_theta.eval()
-        val_loss = 0.0
+        val_loss = val_1step = 0.0
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0)
-                val_loss += step(batch, train=False) * bs
+                loss, l_1step = step(batch, train=False)
+                val_loss += loss * bs
+                val_1step += l_1step * bs
         val_loss /= n_val
+        val_1step /= n_val
 
         if epoch <= ema_warmup_epochs:
             criterion = val_loss
@@ -207,9 +273,14 @@ def train_lds(
             criterion = val_ema
 
         ema_str = f"{val_ema:.6f}" if val_ema is not None else "  (warmup)"
-        msg = f"{epoch:4d}  {train_loss:.6f}  {val_loss:.6f}  {ema_str}"
+        if show_1step:
+            msg = (f"{epoch:4d} {train_loss:7.3f} ({train_1step:6.3f}),"
+                   f"{val_loss:7.3f} ({val_1step:6.3f}) |{ema_str:>9}")
+        else:
+            msg = f"{epoch:4d} {train_loss:7.3f},{val_loss:7.3f} |{ema_str:>9}"
 
-        if criterion < best_val_loss:
+        saved_this_epoch = criterion < best_val_loss
+        if saved_this_epoch:
             best_val_loss = criterion
             epochs_since_improvement = 0
             torch.save({
@@ -225,7 +296,7 @@ def train_lds(
                 },
                 "data_config": {
                     "min_step": min_step, "min_stdev_phi": min_stdev_phi,
-                    "window_length": window_length,
+                    "window_length": window_length, "n_rollout_steps": n_rollout_steps,
                 },
             }, checkpoint_path)
             msg += "  -> saved"
@@ -234,7 +305,8 @@ def train_lds(
         else:
             epochs_since_improvement += 1
 
-        print(msg)
+        if log_every_epoch or saved_this_epoch:
+            print(msg)
 
         # Only counts post-warmup, since raw val_loss during warmup can be
         # wildly noisy by design (see ema_warmup_epochs) -- counting those
@@ -281,7 +353,15 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--resume-from", type=Path, default=None,
+                         help="previous LDS checkpoint to initialize f_theta from, e.g. for "
+                              "curriculum rollout (train n_rollout_steps=1 first, then resume "
+                              "here with the target n_rollout_steps)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--quiet", action="store_true",
+                         help="only print a line when a checkpoint is actually saved, instead "
+                              "of every epoch -- this stage commonly runs for hundreds of "
+                              "epochs, so this cuts console output down to what matters")
     args = parser.parse_args()
 
     train_lds(
@@ -298,6 +378,7 @@ def main():
         early_stopping_patience=args.early_stopping_patience,
         lr_warmup_steps=args.lr_warmup_steps, grad_clip=args.grad_clip,
         seed=args.seed, checkpoint_path=args.checkpoint, device=args.device,
+        resume_from=args.resume_from, log_every_epoch=not args.quiet,
     )
 
 

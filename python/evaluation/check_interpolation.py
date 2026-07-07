@@ -1,5 +1,5 @@
 """
-Stage 3 latent validation: interpolation, using ||z|| := mean(stats_head(z))
+Stage 2 latent validation: interpolation, using ||z|| := mean(stats_head(z))
 throughout -- comparing stats_head's output to ITSELF (via a different z),
 never mixing it with raw statistics.csv values.
 
@@ -22,11 +22,16 @@ physical instant whenever the two gaps differ:
     alpha = (t2 - t1) / (t3 - t1)
     z_tilde = (1-alpha)*z1 + alpha*z3
 
-Metric: (||z_tilde|| - ||z2||) / ||z2||, expected close to 0 for a
-sensible representation -- a large deviation means interpolation doesn't
-track the real trajectory, independent of overall AE reconstruction
-accuracy (both z_tilde and z2 are compared through the identical
-stats_head map, so this isolates representation GEOMETRY, not accuracy).
+Metric: ||stats(z_tilde) - stats(z2)|| / ||stats(z2)||, expected close to
+0 for a sensible representation -- a large deviation means interpolation
+doesn't track the real trajectory, independent of overall AE
+reconstruction accuracy (both z_tilde and z2 are compared through the
+identical stats_head map, so this isolates representation GEOMETRY, not
+accuracy).
+
+check_interpolation() is importable -- see main.py, which calls it
+automatically after stage 2 with the checkpoint path it already has in
+hand. The CLI below is for standalone use.
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
@@ -69,63 +74,25 @@ def find_all_triples(test_dirs: list[Path], min_step: int) -> list[tuple[Path, i
     return triples
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("../../config.txt"),
-            help="source for --size/--stats-weight/--min-step defaults")
-    parser.add_argument("--size", type=int, default=None,
-            help="default: read from --config's Nx/Ny")
-    parser.add_argument("--latent-channels", type=int, default=4,
-            help="required -- not a sweep parameter, so config.txt has no value for this")
-    parser.add_argument("--stats-weight", type=float, default=None,
-            help="default: read from --config's stats_weight")
-    parser.add_argument("--checkpoint", type=Path, default=None,
-            help="direct path override, instead of --size/--latent-channels/--stats-weight")
-    parser.add_argument("--n-samples", type=int, default=None,
-            help="default: use EVERY available (t1,t2,t3) triple in the test set")
-    parser.add_argument("--min-step", type=int, default=None,
-            help="default: read from --config's min_step")
-    parser.add_argument("--seed", type=int, default=0,
-                         help="only matters if --n-samples subsamples; ignored otherwise")
-    parser.add_argument("--fixed-triples", type=str, nargs="+", default=None,
-                         help="'run_dir:t1:t2:t3' (repeatable) for reproducible comparison")
-    parser.add_argument("--output", type=Path, default=None,
-            help="default: ../../output/interpolation_check_png/<checkpoint name>.png")
-    parser.add_argument("--device", type=str,
-                         default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+def check_interpolation(
+    checkpoint_path: Path, n_samples: int | None = None, min_step: int = 4000,
+    seed: int = 0, fixed_triples: list[str] | None = None,
+    output_path: Path | None = None, device: str | None = None,
+) -> Path:
+    """Saves the interpolation-consistency histogram and returns its path."""
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    if args.size is None or args.stats_weight is None or args.min_step is None:
-        config = load.read_config(args.config)
-        if args.size is None:
-            args.size = config.nx
-        if args.stats_weight is None:
-            args.stats_weight = config.stats_weight
-        if args.min_step is None:
-            args.min_step = config.min_step
+    if output_path is None:
+        output_path = Path(f"../output/interpolation_check_png/{checkpoint_path.stem}.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.checkpoint is None:
-        if args.latent_channels is None:
-            raise ValueError(
-                "Provide either --checkpoint directly, or --latent-channels (--size and "
-                "--stats-weight now default to config.txt's values if not given)."
-            )
-        name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
-        args.checkpoint = Path(f"../../output/ae_checkpoint_pt/{name}.pt")
-        print(f"Reconstructed checkpoint path: {args.checkpoint}")
-
-    if args.output is None:
-        args.output = Path(f"../../output/interpolation_check_png/{args.checkpoint.stem}.png")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    device = torch.device(args.device)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model_cfg = checkpoint["config"]
     print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, config={model_cfg}")
 
     stats_config = checkpoint.get("stats_config")
     if stats_config is None:
-        raise ValueError(f"{args.checkpoint} has no stats_head (trained with --stats-weight 0)")
+        raise ValueError(f"{checkpoint_path} has no stats_head (trained with --stats-weight 0)")
 
     ae = Autoencoder(
         size=model_cfg["size"], channels=1,
@@ -141,19 +108,19 @@ def main():
     stats_head.eval()
     print(f"stats_head covers: {stats_config['stat_names']}")
 
-    if args.fixed_triples:
-        triples = [parse_fixed_triple(s) for s in args.fixed_triples]
+    if fixed_triples:
+        triples = [parse_fixed_triple(s) for s in fixed_triples]
     else:
         test_dirs = checkpoint.get("test_dirs") or []
         if not test_dirs:
-            raise ValueError(f"{args.checkpoint} has no saved test_dirs")
+            raise ValueError(f"{checkpoint_path} has no saved test_dirs")
         test_dirs = [Path(d) for d in test_dirs]
-        triples = find_all_triples(test_dirs, args.min_step)
+        triples = find_all_triples(test_dirs, min_step)
         if not triples:
             raise ValueError("No consecutive (t1,t2,t3) triples found in test_dirs")
-        if args.n_samples is not None and args.n_samples < len(triples):
-            generator = torch.Generator().manual_seed(args.seed)
-            idx = torch.randperm(len(triples), generator=generator)[:args.n_samples].tolist()
+        if n_samples is not None and n_samples < len(triples):
+            generator = torch.Generator().manual_seed(seed)
+            idx = torch.randperm(len(triples), generator=generator)[:n_samples].tolist()
             triples = [triples[i] for i in idx]
         print(f"Using {len(triples)} (t1,t2,t3) triples from {len(test_dirs)} test dirs")
 
@@ -180,10 +147,13 @@ def main():
             z3 = ae.encoder(x3)
             z_tilde = (1 - alpha) * z1 + alpha * z3
 
-            norm_z_tilde = stats_head(z_tilde).mean().item()
-            norm_z2 = stats_head(z2).mean().item()
+            stats_z_tilde = stats_head(z_tilde)
+            stats_z2 = stats_head(z2)
 
-            relative_error[i] = (norm_z_tilde - norm_z2) / norm_z2 if abs(norm_z2) > 1e-3 else np.nan
+            diff_norm = (stats_z_tilde - stats_z2).norm(dim=1).item()
+            target_norm = stats_z2.norm(dim=1).item()
+
+            relative_error[i] = diff_norm / target_norm if target_norm > 1e-3 else np.nan
 
     valid = ~np.isnan(relative_error)
     n_dropped = n - valid.sum()
@@ -193,32 +163,74 @@ def main():
     rel_err = relative_error[valid]
     span_valid = elapsed_span[valid]
 
-    print(f"\n(||z_tilde|| - ||z2||) / ||z2||, across {valid.sum()} triples:")
-    print(f"  mean:   {rel_err.mean():.4f}   (systematic bias if far from 0)")
-    print(f"  median: {np.median(rel_err):.4f}")
-    print(f"  mean |error|: {np.abs(rel_err).mean():.4f}")
+    print(f"\n||stats(z_tilde) - stats(z2)|| / ||stats(z2)||, across {valid.sum()} triples:")
+    print(f"  mean:   {rel_err.mean():.4f}")
+    print(f"  median: {np.median(rel_err):.4f}   (mean >> median signals outlier-driven skew)")
     print(f"  std:    {rel_err.std():.4f}")
     if len(rel_err) >= 4:
-        corr = np.corrcoef(np.log(span_valid), np.abs(rel_err))[0, 1]
-        print(f"  corr(log elapsed_span, |error|) = {corr:.3f} "
+        corr = np.corrcoef(np.log(span_valid), rel_err)[0, 1]
+        print(f"  corr(log elapsed_span, error) = {corr:.3f} "
               f"(positive -> worse over longer spans)")
 
-    lo, hi = np.percentile(rel_err, [0.5, 99.5])
-    n_outside = int(((rel_err < lo) | (rel_err > hi)).sum())
+    lo, hi = 0.0, np.percentile(rel_err, 99.5)
+    n_outside = int((rel_err > hi).sum())
 
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.hist(rel_err, bins=np.linspace(lo, hi, 40), color="tab:blue")
     ax.axvline(0.0, color="red", linestyle="--", label="0 = perfect")
     ax.set_xlim(lo, hi)
-    ax.set_xlabel("(||z_tilde|| - ||z2||) / ||z2||")
+    ax.set_xlabel("||stats(z_tilde) - stats(z2)|| / ||stats(z2)||")
     ax.set_ylabel("count")
     ax.set_title(f"Distribution across {len(rel_err)} triples "
-                 f"(central 99% shown, {n_outside} outliers excluded from view)")
+                 f"(up to 99.5th percentile shown, {n_outside} outliers excluded from view)")
     ax.legend()
 
     fig.tight_layout()
-    fig.savefig(args.output, dpi=120)
-    print(f"\nSaved plot to {args.output}")
+    fig.savefig(output_path, dpi=120)
+    print(f"\nSaved plot to {output_path}")
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--size", type=int, required=True,
+                         help="grid size (square only) -- config.txt is never read")
+    parser.add_argument("--latent-channels", type=int, default=None,
+            help="required -- not a sweep parameter, so config.txt has no value for this")
+    parser.add_argument("--stats-weight", type=float, default=None)
+    parser.add_argument("--checkpoint", type=Path, default=None,
+            help="direct path override, instead of --size/--latent-channels/--stats-weight")
+    parser.add_argument("--n-samples", type=int, default=None,
+            help="default: use EVERY available (t1,t2,t3) triple in the test set")
+    parser.add_argument("--min-step", type=int, default=4000)
+    parser.add_argument("--seed", type=int, default=0,
+                         help="only matters if --n-samples subsamples; ignored otherwise")
+    parser.add_argument("--fixed-triples", type=str, nargs="+", default=None,
+                         help="'run_dir:t1:t2:t3' (repeatable) for reproducible comparison")
+    parser.add_argument("--output", type=Path, default=None,
+            help="default: ../../output/interpolation_check_png/<checkpoint name>.png")
+    parser.add_argument("--device", type=str,
+                         default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    if args.checkpoint is None:
+        if args.latent_channels is None or args.stats_weight is None:
+            raise ValueError(
+                "Provide either --checkpoint directly, or both --latent-channels and "
+                "--stats-weight so the expected path can be reconstructed."
+            )
+        name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
+        args.checkpoint = Path(f"../../checkpoints/stage2/{name}.pt")
+        print(f"Reconstructed checkpoint path: {args.checkpoint}")
+
+    if args.output is None:
+        args.output = Path(f"../../output/interpolation_check_png/{args.checkpoint.stem}.png")
+
+    check_interpolation(
+        checkpoint_path=args.checkpoint, n_samples=args.n_samples, min_step=args.min_step,
+        seed=args.seed, fixed_triples=args.fixed_triples, output_path=args.output,
+        device=args.device,
+    )
 
 
 if __name__ == "__main__":

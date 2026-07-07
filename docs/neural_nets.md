@@ -36,14 +36,13 @@ There are five losses, which can be mixed and matched at different steps:
 - one-step latent prediction loss: $L_\mathrm{1step}$,
 - multi-step rollout loss: $L_\mathrm{rollout}$.
 
-| Stage                | Train    | Space | Loss                   |
-|----------------------|----------|-------|------------------------|
-| 1. autoencoder       | (E, D)   | real  | `L_recon + λ₁ L_stats`  |
-| 2. latent validation | (E, D)   | latent| `L_recon + λ₁ L_interp` |
-| 3. Latent Dynamics   | (f)      | latent| `L_1step` 				|
-| 3'. &nbsp; &nbsp; Surrogate (LDS)| (f)      | latent| `L_rollout`    |
-| 4. encoder refinement| (E, f)   | latent| `L_rollout + ε L_recon + λ₁ L_stats` |
-| 5. end-to-end        | (E, f, D)| real  | `L_recon + λ₁ L_stats + λ₂ L_rollout` |
+| Stage                | Train     | Space | Loss                   |
+|----------------------|-----------|-------|------------------------|
+| 1. autoencoder       | (E, D, st)| real  | `L_recon + λ₁ L_stats`  |
+| 2. latent validation | (E, D)    | both  | `L_recon + λ₁ L_stats + λ₁ L_interp` |
+| 3. LDS               | (f)       | latent| `L_1step` (3a), then `L_rollout` (3b) |
+| 4. encoder refinement| (E, f)    | latent| `L_rollout + ε L_recon + λ₁ L_stats` |
+| 5. end-to-end        | (E, f, D) | real  | `L_recon + λ₁ L_stats + λ₂ L_rollout` |
 
 
 ### Reconstruction loss
@@ -59,7 +58,7 @@ in real space, or $g_i(\hat{z})$ instead of $g_i(x')$ in latent space. (See belo
 
 
 ### Interpolation loss
-See latent-space validation (step 2) below.
+See latent-space validation (step 2) below. Note: in stage 1 the small dense NN for the statistics is trained along the encoder and decoder, in 2 it is frozen.
 
 
 ### One-step latent prediction loss
@@ -124,44 +123,42 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 
 
 ## Latent-space validation (stage 2)
-We want to verify that latent space behaves like a smooth, structured coordinate system rather than a brittle compression code. Put simply: latent representation must make sense.
+Training the AE (stage 1) ensures that the initial state can be recovered. This proves that the latent representation $z$ somehow describes $x$, not that is a smooth and structured coordinate system. Doing arithmetic to predict the time evolution would be impossible in a jagged space. For that, latent representation must make sense.
 
-Inasmuch as possible, we work directly in latent space (to avoid having to rely on the decoder), where we cannot measure a direct distance between microstructures pixel by pixel: the calculation $z_2 - z_1$ has no meaning. Instead we use the statistics described above, a vector of norm $\|\mathrm{stats}(z)\|$.
 
-Note: $\mathrm{stats}(z)$ means statistics of $x$ in the real world, with $z=E(x)$: statistics cannot be calculated directly in the latent space.
+### How stage 2 works
+In stage 1, there are two constraints: recovering the original (decoder) and getting statistics right (`stats_head`). In stage 2, we add a loss function on qualitative representation (interpolation, perturbation). 
+
+In stage 2, we are changing the latent representation, so we need to change the encoder. And if the decoder did not change, it would no longer reconstruct properly, so we cannot freeze it either. Since neither E nor D is frozen, there could be a synchronized drift. We keep `stats_head` (with frozen coefficients) to prevent this.
+
+We also freeze the outter layers of both encoder and decoder (not those close to the latent space):
+- the coefficients of these layers changing dramatically in stage 2 would be a red flag;
+- freezing these layers also speeds up training.
+
+
+### Working in latent space
+We work directly in latent space to avoid relying on the decoder. But there, we cannot calculate physical statistics or measure a direct distance between microstructures pixel by pixel (the calculation $z_2 - z_1$ has no meaning). 
+
+In what follows $\mathrm{stats}(z)$ is the vector of statistics, of norm $\|\mathrm{stats}(z)\|$, calculated by the small dense NN described above. It cannot be the statistics of $x$ in the real world, since this would say nothing about latent representation.
 
 
 ### Interpolation
-One takes $t_1 < t_2 < t_3$ three successive time steps, with real states $x_i$ and latent representations $z_i = E(x_i)$. We compare $z_2$ to the interpolated $\tilde{z} = (1-\alpha) z_1 + \alpha z_3$, with $\alpha = (t_2−t_1) / (t_3−t_1)$. Interpolation should preserve physical plausibility, not just visual smoothness. More precisely, we measure 
-$$\frac{\|[(1-\alpha) \, \mathrm{stats}(z_1) + \alpha \, \mathrm{stats}(z_3)] - \mathrm{stats}(z_2)\|} {\|\mathrm{stats}(z_2)\|},$$
-which should be small.
+Interpolation in latent space should preserve physical plausibility, not just visual smoothness.
+One takes $t_1 < t_2 < t_3$ three successive time steps in the same simulation, with real states $x_i$ and latent representations $z_i = E(x_i)$. We compare $z_2$ to the interpolated $\tilde{z} = (1-\alpha) z_1 + \alpha z_3$, with $\alpha = (t_2-t_1) / (t_3-t_1)$: we measure and minimize $\|\mathrm{stats}(\tilde{z}) - \mathrm{stats}(z_2)\| \, / \, {\|\mathrm{stats}(z_2)\|}$.
 
 
-### Perturbation in latent space
-Let $z_{\varepsilon} = z + \varepsilon \times \eta$, with $\eta \sim \mathcal{N}(0, 1)$. Decoding, $x_{\varepsilon} = D(z_{\varepsilon})$ should be close to $x = D(z)$, with a distance proportional to $\varepsilon$. 
-
-Analogy to principal components analysis (PCA): if I perturb $X = \alpha_1 P_1 + \alpha_2 P_2$ to $\alpha_1(1 + \varepsilon_1) P_1 + \alpha_2(1 + \varepsilon_2) P_2$ I should retain a state which is (i) sensible and (ii) close to the $X$.
-
-A linear regression of $x_{\varepsilon}$ can verify if:
+### Perturbation
+Let $z_{\varepsilon} = z + \varepsilon \, \eta$, with $\eta \sim \mathcal{N}(0, 1)$. One expects that $\mathrm{stats}(z_{\varepsilon}) \approx \mathrm{stats}(z) + \varepsilon \Delta S$. So a linear regression of $\|\mathrm{stats}(z_{\varepsilon}) - \mathrm{stats}(z)\|$ with several values of $\varepsilon$ can nudge towards:
 - intercept $\approx 0$ (no discontinuity),
 - $R^2 \approx 1$ (e.g. not curvature). 
 
-Three issues:
-- we have to rely on the decoder,
-- $\mathrm{stats}(x_{\varepsilon})$ needs to be calculated afresh (it is a brand new state),
-- statistics are calculated is C++ and have not been ported to Python.
+Perturbation is currently used as _post-hoc_ diagnostic, not as loss function.
 
-Variants:
-- isotropic noise,
-- structured perturbations (directional latent shifts).
+Variant: structured perturbations (directional latent shifts) instread of isotropic noise.
 
 
-### Temporal consistency check:
-- Take real simulation sequences, $x(t)$ and $x(t+\Delta t)$, and encode both: $z(t) = E(x(t))$ and $z(t+\Delta t) = E(x(t+\Delta t))$. 
-- Compute latent displacement statistics, $\Delta z(t) = z(t+\Delta t) - z(t)$, and check that the distribution of $\Delta z(t)$ is smooth, bounded and not heavy-tailed and that $\Delta z$ is correlated over time (deterministic evolution rather than stochastic latent collapse).
-- check direction consistency: Are transitions consistent? For similar states: $\Delta z$ should be similar in direction/magnitude.
 
+## Encoder refinement (step 4) and end-to-end (stage 5)
+In stage 1 the encoder was trained for reconstruction and stats-accuracy, and in stage 2 for generic interpolation-smoothness. Stage 3 trained `f` to predict dynamics, with D frozen. Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). 
 
-### Reconstruction under partial corruption
-Mask random patches in input image, encode + decode, check if latent representation still reconstructs global structure (as opposed to local pixel memorization).
-
+D is frozen, even though `L_recon` is in the loss function: this is what distinguishes stage 4 from stage 5. D is a tether keeping E's output compatible with the existing decoder.

@@ -1,0 +1,62 @@
+
+base 		  = ../datasets	# optional -- falls back to --base if omitted
+
+Nx			  =  64
+Ny			  =  64
+
+
+# Stage 1
+#   autoencoder
+latent_channels=  8
+
+min_step 	  = 3000       	# skip snapshots earlier than this step
+min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
+stats_weight  = 0.01     	# weight of L_stats relative to L_recon
+
+epochs 		  = 100
+patience 	  =  20        	# renamed to early_stopping_patience internally
+batches		  =  64
+
+# force 	    = True     	# uncomment to always retrain this stage,
+							# even if a matching checkpoint already exists
+
+# Stage 2
+#   latent-space validation (interpolation-consistency fine-tuning)
+min_step 	  = same
+min_stdev_phi = same      	# inherit stage 1's value instead of repeating it
+
+stats_weight  = same     	# weight of L_stats relative to L_recon
+interp_weight = 0.001
+n_frozen_stages= 2
+
+epochs 		  =  200
+patience 	  =   40
+batches 	  = same
+# epochs 		= 0    		# uncomment to SKIP this stage entirely --
+							# stage 3 would then use stage 1's output directly
+
+
+# Stage 3a
+#   latent dynamics surrogate (1step)
+n_rollout_steps= 1
+stats_weight  = 0.01
+
+min_step 	  = same
+min_stdev_phi = same
+
+batches		  = 512
+epochs 		  =2000
+patience 	  = 100
+
+
+# Stage 3b
+#   latent dynamics surrogate (rollout)
+n_rollout_steps= 3
+stats_weight  = 0.01
+
+min_step 	  = 3000
+min_stdev_phi = 0.01
+
+batches		  = 512
+epochs 		  =2000
+patience 	  = 100

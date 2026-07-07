@@ -81,15 +81,16 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 
 
 ## Workflow
-0.	Generate tens or hundreds of phase-field simulations. 
+0.	Generate hundreds of phase-field simulations. 
 1.	Train a CNN autoencoder on individual microstructures (no time evolution yet).
-2.  Latent-space validation: latent space behaves like a smooth, structured coordinate system (see `./docs/neural_nets.md` for more details).
+2.  Latent-space validation: Latent Dynamics Surrogate (LDS) behaves like a smooth, structured coordinate system (see `./docs/neural_nets.md` for more details).
 3.	Freeze encoder and train latent dynamics to predict future microstructures in latent space.
 4.	Regularized encoder fine-tuning with small learning rate and latent consistency loss.
-5.	Fine-tune end-to-end 
+5.	Fine-tune end-to-end.
 6.	Add a simple inverse-design demo?
   - find process parameters from desired domain size, 
 
+Coding analogy: stage 1 creates code that works (recovers the original), and stage 2 refactors it to make it suitable for stage 3.
 
 
 
