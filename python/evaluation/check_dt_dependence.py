@@ -7,7 +7,8 @@ the degradation is smooth or a sharp threshold.
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
-    python -m evaluation.check_dt_dependence --lds-checkpoint ../output/lds_checkpoint.pt
+    python -m evaluation.check_dt_dependence \
+        --lds-checkpoint ../checkpoints/stage3/64x64.pt
 """
 
 import argparse
@@ -75,26 +76,18 @@ def fit_saturating_exponential(dt: np.ndarray, error: np.ndarray, n_grid: int = 
     return best_c, best_tau, r2_real, best_sse, pred_real
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lds-checkpoint", type=Path, required=True,
-            help="no default -- multiple LDS variants can now coexist under "
-                 "../../output/lds_checkpoint_pt/")
-    parser.add_argument("--min-step", type=int, default=None)
-    parser.add_argument("--min-stdev-phi", type=float, default=None)
-    parser.add_argument("--output", type=Path, default=None,
-            help="default: ../../output/dt_dependence_png/<lds checkpoint name>.png")
-    parser.add_argument("--device", type=str,
-                         default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+def check_dt_dependence(
+    lds_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
+    output_path: Path | None = None, device: str | None = None,
+) -> Path:
+    """Saves the dt-vs-error scatter/fit figure and returns its path."""
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    if args.output is None:
-        args.output = Path(f"../../output/dt_dependence_png/{args.lds_checkpoint.stem}.png")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if output_path is None:
+        output_path = Path(f"../../output/stage3/{lds_checkpoint_path.stem}-dt_dependence.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(args.device)
-
-    lds_checkpoint = torch.load(args.lds_checkpoint, map_location=device, weights_only=True)
+    lds_checkpoint = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
     lds_config = lds_checkpoint["config"]
 
     data_config = lds_checkpoint.get("data_config")
@@ -102,13 +95,13 @@ def main():
         print("WARNING: checkpoint has no saved data_config -- falling back to "
               "min_step=0, min_stdev_phi=None, window_length=2 (may not match training).")
         data_config = {"min_step": 0, "min_stdev_phi": None, "window_length": 2}
-    min_step = args.min_step if args.min_step is not None else data_config["min_step"]
-    min_stdev_phi = args.min_stdev_phi if args.min_stdev_phi is not None else data_config["min_stdev_phi"]
+    min_step = min_step if min_step is not None else data_config["min_step"]
+    min_stdev_phi = min_stdev_phi if min_stdev_phi is not None else data_config["min_stdev_phi"]
     window_length = data_config["window_length"]
 
     test_dirs = lds_checkpoint.get("test_dirs") or []
     if not test_dirs:
-        raise ValueError(f"{args.lds_checkpoint} has no saved test_dirs")
+        raise ValueError(f"{lds_checkpoint_path} has no saved test_dirs")
     test_dirs = [Path(d) for d in test_dirs]
 
     ae_checkpoint_path = Path(lds_checkpoint["ae_checkpoint"])
@@ -224,8 +217,28 @@ def main():
     axes[0].legend(fontsize=8)
 
     fig.tight_layout()
-    fig.savefig(args.output, dpi=120)
-    print(f"\nSaved scatter plot to {args.output}")
+    fig.savefig(output_path, dpi=120)
+    print(f"\nSaved scatter plot to {output_path}")
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lds-checkpoint", type=Path, required=True,
+            help="no default -- multiple LDS variants can now coexist under "
+                 "../checkpoints/stage3/")
+    parser.add_argument("--min-step", type=int, default=None)
+    parser.add_argument("--min-stdev-phi", type=float, default=None)
+    parser.add_argument("--output", type=Path, default=None,
+            help="default: ../../output/stage3/<lds checkpoint name>-dt_dependence.png")
+    parser.add_argument("--device", type=str,
+                         default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    check_dt_dependence(
+        lds_checkpoint_path=args.lds_checkpoint, min_step=args.min_step,
+        min_stdev_phi=args.min_stdev_phi, output_path=args.output, device=args.device,
+    )
 
 
 if __name__ == "__main__":

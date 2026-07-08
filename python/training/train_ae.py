@@ -25,6 +25,7 @@ from training.datasets import MicrostructureSnapshotDataset, MicrostructureTripl
 from training.losses import ReconLoss, StatsLoss
 from training.stats_head import StatsHead
 from utils.naming import ae_checkpoint_name
+from utils.plots import loss_curve
 
 
 def train_autoencoder(
@@ -39,6 +40,7 @@ def train_autoencoder(
     resume_from: Path | None = None, device: str | None = None,
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
     log_every_epoch: bool = True,
+    loss_curve_path: Path | None = None,
 ) -> Path:
     """
     Stage 1: train the AE on individual snapshots with L_recon, and (if
@@ -99,6 +101,15 @@ def train_autoencoder(
         checkpoint_path = Path(f"../checkpoints/stage1/{name}.pt")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
+
+    if loss_curve_path is None:
+        name = ae_checkpoint_name(size, latent_channels, stats_weight)
+        loss_curve_path = Path(f"../../output/stage1/{name}-loss_curve.png")
+
+    epoch_history: list[int] = []
+    train_loss_history: list[float] = []
+    val_loss_history: list[float] = []
+    best_so_far_history: list[float] = []
 
     run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
@@ -232,6 +243,15 @@ def train_autoencoder(
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
+
+        epoch_history.append(epoch)
+        train_loss_history.append(train_total)
+        val_loss_history.append(val_total)
+        best_so_far_history.append(tracker.best_val_loss)
+        loss_curve(
+            epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+            loss_curve_path, title="Stage 1 loss",
+        )
 
         msg = f"{epoch:4d}"
         if include_stats:
@@ -400,6 +420,7 @@ def train_stage2(
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
     n_frozen_stages: int = 0,
     log_every_epoch: bool = True,
+    loss_curve_path: Path | None = None,
 ) -> Path:
     """
     Stage 2 (latent-space validation): trains (E, D) on real (t1,t2,t3)
@@ -514,6 +535,15 @@ def train_stage2(
         checkpoint_path = Path(f"../checkpoints/stage2/{name}-stage2.pt")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
+
+    if loss_curve_path is None:
+        name = ae_checkpoint_name(size, model_cfg["latent_channels"], ancestor_stats_weight)
+        loss_curve_path = Path(f"../../output/stage2/{name}-stage2-loss_curve.png")
+
+    epoch_history: list[int] = []
+    train_loss_history: list[float] = []
+    val_loss_history: list[float] = []
+    best_so_far_history: list[float] = []
 
     run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
@@ -655,6 +685,15 @@ def train_stage2(
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
+
+        epoch_history.append(epoch)
+        train_loss_history.append(train_total)
+        val_loss_history.append(val_total)
+        best_so_far_history.append(tracker.best_val_loss)
+        loss_curve(
+            epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+            loss_curve_path, title="Stage 2 loss",
+        )
 
         msg = (f"{epoch:4d}|"
                f"{train_total*1_000:6.3f} ={train_recon*1_000:6.3f} "

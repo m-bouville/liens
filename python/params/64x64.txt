@@ -53,6 +53,7 @@ patience 	  = 100
 #   latent dynamics surrogate (rollout)
 n_rollout_steps= 3
 stats_weight  = 0.01
+one_step_weight= 0.
 
 min_step 	  = 3000
 min_stdev_phi = 0.01
@@ -90,5 +91,5 @@ min_step       = same
 min_stdev_phi  = same
 
 batches        = 256
-epochs         = 100
-patience       =  20
+epochs         =  50
+patience       =  10

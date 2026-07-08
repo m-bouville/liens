@@ -28,6 +28,7 @@ from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
+from utils.plots import loss_curve
 
 
 def train_lds(
@@ -46,6 +47,8 @@ def train_lds(
     resume_from: Path | None = None,
     log_every_epoch: bool = True,
     step_weights: list[float] | None = None,
+    loss_curve_path: Path | None = None,
+    one_step_weight: float = 0.0,
 ) -> Path:
     """
     Stage 3. Returns the path of the best checkpoint saved. Either give
@@ -87,6 +90,24 @@ def train_lds(
     point; there's no settled answer here yet on which direction is
     actually better in practice, just this tension to be aware of
     before picking one.
+
+    one_step_weight: adds epsilon*L_1step on top of the (possibly
+    step-weighted) rollout loss -- L = L_rollout + one_step_weight*L_1step,
+    optimized together, not just L_1step's existing diagnostic role
+    (per_step[0], already computed every step for the console/loss-curve
+    display regardless of this parameter). Distinct from step_weights
+    above: step_weights reweights terms INSIDE the existing rollout sum;
+    this adds an INDEPENDENT term on top, mirroring
+    compute_stage45_loss's own primary+epsilon*secondary structure.
+    Motivated by n_rollout_steps>1 runs' worst spikes looking like
+    compounding failures concentrated in step 2/3 specifically -- a
+    small, well-behaved 1-step anchor gives a second gradient signal
+    that shouldn't blow up the same way during those episodes, without
+    changing what's ultimately being optimized for (0.0, the default,
+    reproduces the exact previous behavior: L_1step stays diagnostic-only).
+    Should be small (epsilon), matching every other primary+epsilon*
+    secondary weight in this project -- not yet validated at any
+    specific value.
     """
     if n_rollout_steps < 1:
         raise ValueError(f"n_rollout_steps must be >= 1 (got {n_rollout_steps})")
@@ -109,6 +130,8 @@ def train_lds(
         raise ValueError(f"train_lds() requires {', '.join(missing)} to be given explicitly "
                           f"-- config.txt no longer provides ML training defaults.")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  stats_weight={stats_weight}")
+    print(f"n_rollout_steps={n_rollout_steps}  one_step_weight={one_step_weight}")
+    print(f"grad_clip={grad_clip}  lr_warmup_steps={lr_warmup_steps}")
 
     if ae_checkpoint_path is None:
         if ae_latent_channels is None:
@@ -149,6 +172,18 @@ def train_lds(
         checkpoint_path = Path(f"../checkpoints/stage3/{name}.pt")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}\n")
+
+    if loss_curve_path is None:
+        name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
+                                    stats_weight, n_rollout_steps)
+        loss_curve_path = Path(f"../../output/stage3/{name}-loss_curve.png")
+
+    epoch_history: list[int] = []
+    train_loss_history: list[float] = []
+    val_loss_history: list[float] = []
+    best_so_far_history: list[float] = []
+    train_1step_history: list[float] = []
+    val_1step_history: list[float] = []
 
     run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
@@ -237,22 +272,25 @@ def train_lds(
         # predicted step, directly comparable to a model trained with
         # n_rollout_steps=1 (see RolloutLoss.forward()'s docstring: this
         # is mathematically identical to computing L_1step independently
-        # on the same data, not an approximation). Purely a diagnostic
-        # here, not backpropagated separately -- `loss` (the full,
-        # possibly multi-step rollout loss) is still what's optimized.
+        # on the same data, not an approximation).
         loss, per_step = rollout_loss(z_hat, z_true, return_per_step=True)
         l_1step = per_step[0]
+        # total is what's actually optimized -- see one_step_weight's
+        # docstring. At the default one_step_weight=0.0, total is
+        # exactly loss (l_1step contributes nothing, backward()
+        # reproduces the prior, rollout-only behavior precisely).
+        total = loss + one_step_weight * l_1step
 
         if train:
             optimizer.zero_grad()
-            loss.backward()
+            total.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(f_theta.parameters(), grad_clip)
             optimizer.step()
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-        return loss.item(), l_1step.item()
+        return total.item(), l_1step.item()
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=ema_warmup_epochs,
                                           val_ema_decay=val_ema_decay)
@@ -291,6 +329,21 @@ def train_lds(
         val_1step /= n_val
 
         criterion, saved_this_epoch = tracker.update(epoch, val_loss)
+
+        epoch_history.append(epoch)
+        train_loss_history.append(train_loss)
+        val_loss_history.append(val_loss)
+        best_so_far_history.append(tracker.best_val_loss)
+        if show_1step:
+            train_1step_history.append(train_1step)
+            val_1step_history.append(val_1step)
+        loss_curve(
+            epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+            loss_curve_path, title="Stage 3 loss",
+            secondary_train=train_1step_history if show_1step else None,
+            secondary_val=val_1step_history if show_1step else None,
+            secondary_label="1step",
+        )
 
         ema_str = f"{tracker.val_ema:.6f}" if tracker.val_ema is not None else "  (warmup)"
         if show_1step:

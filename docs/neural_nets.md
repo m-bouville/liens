@@ -38,11 +38,11 @@ There are five losses, which can be mixed and matched at different steps:
 
 | Stage                | Train     | Space | Loss                   |
 |----------------------|-----------|-------|------------------------|
-| 1. autoencoder       | (E, D, SH)| real  | `L_recon + λ₁ L_stats`  |
-| 2. latent validation | (E, D)    | both  | `L_recon + λ₁ L_stats + λ₁ L_interp` |
-| 3. LDS               | (f)       | latent| `L_1step` (3a), then `L_rollout` (3b) |
-| 4. encoder refinement| (E, f)    | latent| `L_rollout + ε L_recon + λ₁ L_stats |
-| 5. end-to-end        | (E, f, D) | real  | `L_recon + λ₁ L_stats + λ₂ L_rollout` |
+| 1. autoencoder       | (E, D, SH)| real  | `L_recon + λ L_stats`  |
+| 2. latent validation | (E, D)    | both  | `L_recon + λ L_stats + λ' L_interp` |
+| 3. LDS               | (f)       | latent| `L_1step` (3a), then `L_rollout + ε L_1step` (3b) |
+| 4. encoder refinement| (E, f)    | latent| `L_rollout + ε L_recon + λ L_stats |
+| 5. end-to-end        | (E, f, D) | real  | `L_recon + λ L_stats + λ'' L_rollout` |
 
 SH: `stats_head` 
 
@@ -54,7 +54,7 @@ This is done in real space. $L_1$ may be used if sharper interfaces are desired.
 
 
 ### Statistics loss
-Letting $s_i(x)$ denote the _i_-th (out of $N_s$) microstructural statistic (measured, real), $g_i(z)$ the value of that statistic in the `stats_head` (latent) and $w_i$ its weight,
+Letting $s_i(x)$ denote the normalized _i_-th (out of $N_s$) microstructural statistic (measured, real), $g_i(z)$ the value of that normalized statistic in the `stats_head` (latent) and $w_i$ its weight,
 $$L_\mathrm{stats} = \sum_{i=1}^{N_s} w_i \left[g_i(z) - s_i(x)\right]^2.$$
 (See below for more details.)
 
@@ -135,9 +135,7 @@ In stage 1, there are two constraints: recovering the original (decoder) and get
 
 In stage 2, we are changing the latent representation, so we need to change the encoder. And if the decoder did not change, it would no longer reconstruct properly, so we cannot freeze it either. Since neither E nor D is frozen, there could be a synchronized drift. We keep `stats_head` (with frozen coefficients) to prevent this.
 
-We also freeze the outter layers of both encoder and decoder (not those close to the latent space):
-- the coefficients of these layers changing dramatically in stage 2 would be a red flag;
-- freezing these layers also somewhat speeds up training.
+We can also freeze the outter layers of both encoder and decoder (not those close to the latent space) for regularization.
 
 
 ### Working in latent space

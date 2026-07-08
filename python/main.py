@@ -122,6 +122,7 @@ import torch
 from evaluation.check_interpolation import check_interpolation
 from evaluation.check_perturbation import check_perturbation
 from evaluation.check_reconstruction import check_reconstruction
+from evaluation.check_dt_dependence import check_dt_dependence
 from evaluation.check_rollout import check_rollout
 from training.checkpoint_components import split_joint_checkpoint_for_evaluation
 from training.train_ae import train_autoencoder, train_stage2
@@ -673,11 +674,21 @@ def run_from_params_file(params_path: Path, default_base: Path,
             stage1_checkpoint = train_autoencoder(
                 size=size, base_path=base_path,
                 checkpoint_path=stage_output_path(1), device=device,
+                loss_curve_path=Path(f"../output/stage1/{stage_output_path(1).stem}-loss_curve.png"),
                 on_checkpoint_saved=_make_checkpoint_callback(registry1_path, signature1),
                 **stage1_kwargs,
             )
             print(f"\nStage 1 complete: {stage1_checkpoint}\n")
             _upsert_registry(registry1_path, stage1_checkpoint, signature1)
+
+            print("=" * 70)
+            print("Sanity check: reconstruction quality (stage 1 checkpoint)")
+            print("=" * 70)
+            check_reconstruction(
+                checkpoint_path=stage1_checkpoint, device=device,
+                output_path=Path(f"../output/stage1/{stage1_checkpoint.stem}-reconstruction.png"),
+            )
+            print()
 
     # ---- Stage 2: latent-space validation ----
     stage2_kwargs = _prepare_stage_kwargs(stages.get(2, {}))
@@ -705,6 +716,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 stage2_checkpoint = train_stage2(
                     base_path=base_path, resume_from=stage1_checkpoint,
                     checkpoint_path=stage_output_path(2), device=device,
+                    loss_curve_path=Path(f"../output/stage2/{stage_output_path(2).stem}-loss_curve.png"),
                     on_checkpoint_saved=_make_checkpoint_callback(registry2_path, signature2),
                     **stage2_kwargs,
                 )
@@ -754,18 +766,28 @@ def run_from_params_file(params_path: Path, default_base: Path,
         raise ValueError(f"{params_path}: give EITHER '# Stage 3' (single-phase) OR "
                           f"'# Stage 3a' + '# Stage 3b' (curriculum), not both.")
 
-    def run_lds_stage(stage_key: int | str, resume_from: Path | None = None) -> Path:
+    def run_lds_stage(stage_key: int | str, resume_from: Path | None = None,
+                       run_sanity_check: bool = True) -> Path:
         """Runs one train_lds() phase -- stage_key is 3 (single-phase),
         or '3a'/'3b' (curriculum). Caching/registry/logging are
         identical regardless of which phase this is; resume_from (only
         given for 3b) is recorded in the signature so a 3b result is
         correctly tied to the specific 3a checkpoint it built on, not
-        just its own hyperparameters."""
+        just its own hyperparameters. run_sanity_check=False for the 3a
+        call specifically -- 3a is an intermediate warmup phase, not the
+        final evaluated stage 3 result, so check_rollout only makes
+        sense for the bare-3 or 3b call."""
         kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}))
         force = kwargs.pop("force", False)
         kwargs = _strip_unrecognized_params(train_lds, kwargs, f"Stage {stage_key}")
+        # Default to quiet (only print on save/early-stop), not train_lds()'s
+        # own default of every-epoch -- stage 3 commonly runs hundreds of
+        # epochs, and setdefault respects an explicit log_every_epoch in
+        # the params file either way.
+        kwargs.setdefault("log_every_epoch", False)
         # BOTH ancestors recorded explicitly -- since two stage-2 checkpoints
         # can share identical stage-2 parameters while differing in stage 1
+        # (e.g. a quick vs a fully-trained stage 1), stage2_checkpoint alone
         # (e.g. a quick vs a fully-trained stage 1), stage2_checkpoint alone
         # already disambiguates for MATCHING purposes (it's produced by
         # exactly one stage-1 checkpoint), but recording stage1_checkpoint
@@ -788,28 +810,41 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 checkpoint = train_lds(
                     size=size, base_path=base_path, ae_checkpoint_path=stage2_checkpoint,
                     checkpoint_path=stage_output_path(stage_key), device=device,
+                    loss_curve_path=Path(
+                        f"../output/stage3/{stage_output_path(stage_key).stem}-loss_curve.png"
+                    ),
                     resume_from=resume_from,
                     on_checkpoint_saved=_make_checkpoint_callback(registry_path, signature),
                     **kwargs,
                 )
                 print(f"\nStage {stage_key} complete: {checkpoint}\n")
                 _upsert_registry(registry_path, checkpoint, signature)
+
+                if run_sanity_check:
+                    print("=" * 70)
+                    print("Sanity check: rollout quality (stage 3 checkpoint)")
+                    print("=" * 70)
+                    check_rollout(
+                        lds_checkpoint_path=checkpoint, device=device,
+                        output_path=Path(f"../output/stage3/{checkpoint.stem}-rollout.png"),
+                    )
+                    print()
+
+                    print("=" * 70)
+                    print("Sanity check: dt dependence (stage 3 checkpoint)")
+                    print("=" * 70)
+                    check_dt_dependence(
+                        lds_checkpoint_path=checkpoint, device=device,
+                        output_path=Path(f"../output/stage3/{checkpoint.stem}-dt_dependence.png"),
+                    )
+                    print()
         return checkpoint
 
     if has_3a:
-        stage3a_checkpoint = run_lds_stage("3a")
+        stage3a_checkpoint = run_lds_stage("3a", run_sanity_check=False)
         stage3_checkpoint = run_lds_stage("3b", resume_from=stage3a_checkpoint)
     else:
         stage3_checkpoint = run_lds_stage(3)
-
-    print("=" * 70)
-    print("Sanity check: rollout quality (stage 3 checkpoint)")
-    print("=" * 70)
-    check_rollout(
-        lds_checkpoint_path=stage3_checkpoint, device=device,
-        output_path=Path(f"../output/stage3/{stage3_checkpoint.stem}-rollout.png"),
-    )
-    print()
 
     # ---- Stage 4/5: encoder refinement / end-to-end -- both OPTIONAL,
     # unlike stages 1/2/3. Neither section present at all -> pipeline
@@ -927,10 +962,10 @@ def main():
         check_sweep_status(args.base)
         return
 
-    # if not args.params_files:
-    #     raise ValueError("Provide at least one stage-parameters file (or --scan-only)")
+    if not args.params_files:
+        raise ValueError("Provide at least one stage-parameters file (or --scan-only)")
 
-    for params_path in [Path("params/64x64.txt")]:
+    for params_path in args.params_files:
         print("#" * 70)
         print(f"# {params_path}")
         print("#" * 70)
