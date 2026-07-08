@@ -83,7 +83,7 @@ def check_interpolation(
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     if output_path is None:
-        output_path = Path(f"../output/interpolation_check_png/{checkpoint_path.stem}.png")
+        output_path = Path(f"../../output/interpolation_check_png/{checkpoint_path.stem}.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -220,7 +220,7 @@ def main():
                 "--stats-weight so the expected path can be reconstructed."
             )
         name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
-        args.checkpoint = Path(f"../../checkpoints/stage2/{name}.pt")
+        args.checkpoint = Path(f"../checkpoints/stage2/{name}.pt")
         print(f"Reconstructed checkpoint path: {args.checkpoint}")
 
     if args.output is None:

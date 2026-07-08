@@ -135,7 +135,7 @@ def main():
                 "--stats-weight so the expected path can be reconstructed."
             )
         name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
-        args.checkpoint = Path(f"../../checkpoints/stage2/{name}.pt")
+        args.checkpoint = Path(f"../checkpoints/stage2/{name}.pt")
         print(f"Reconstructed checkpoint path: {args.checkpoint}")
 
     check_reconstruction(

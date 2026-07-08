@@ -19,6 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.autoencoder import Autoencoder
+from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureSnapshotDataset, MicrostructureTripletDataset, \
                                complete_run_dirs, split_run_dirs
 from training.losses import ReconLoss, StatsLoss
@@ -76,10 +77,15 @@ def train_autoencoder(
     torch.manual_seed(seed)
 
     # config.txt is simulation-sweep-only now (Nx/Ny/dt/temperatures/...) --
-    # min_step/min_stdev_phi/stats_weight are ML training parameters and
-    # must be passed explicitly by the caller (e.g. from a stage-parameters
-    # file via main.py), not silently inferred from config.txt.
-    missing = [name for name, v in [("min_step", min_step), ("min_stdev_phi", min_stdev_phi),
+    # min_step/stats_weight are ML training parameters and must be passed
+    # explicitly by the caller (e.g. from a stage-parameters file via
+    # main.py), not silently inferred from config.txt. min_stdev_phi is
+    # NOT required to be non-None -- it's genuinely allowed to be None
+    # (no stdev-based filtering at all), unlike min_step/stats_weight,
+    # which have no meaningful None value (stats_weight is compared
+    # against a threshold just below; min_step feeds a plain int
+    # comparison at the dataset level).
+    missing = [name for name, v in [("min_step", min_step),
                                      ("stats_weight", stats_weight)] if v is None]
     if missing:
         raise ValueError(f"train_autoencoder() requires {', '.join(missing)} to be given "
@@ -183,8 +189,7 @@ def train_autoencoder(
 
         return total.item(), recon.item(), stats.item()
 
-    best_val_loss = float("inf")
-    val_ema = None
+    tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
     print(f"Starting {epochs} epochs (batches of {batch_size})...")
@@ -225,7 +230,8 @@ def train_autoencoder(
         val_recon /= n_val
         val_stats /= n_val
 
-        val_ema = val_total if val_ema is None else val_ema_decay * val_ema + (1 - val_ema_decay) * val_total
+        _, saved_this_epoch = tracker.update(epoch, val_total)
+        val_ema = tracker.val_ema
 
         msg = f"{epoch:4d}"
         if include_stats:
@@ -235,9 +241,7 @@ def train_autoencoder(
         else:
             msg += f"{train_total*1_000:7.2f} |{val_total*1_000:7.2f}  {val_ema*1_000:7.2f}"
 
-        saved_this_epoch = val_ema < best_val_loss
         if saved_this_epoch:
-            best_val_loss = val_ema
             epochs_since_improvement = 0
             checkpoint = {
                 "model_state": ae.state_dict(),
@@ -444,12 +448,13 @@ def train_stage2(
     torch.manual_seed(seed)
 
     # Same rationale as train_autoencoder(): config.txt is simulation-only
-    # now, these must be passed explicitly.
-    missing = [name for name, v in [("min_step", min_step), ("min_stdev_phi", min_stdev_phi)]
-               if v is None]
-    if missing:
-        raise ValueError(f"train_stage2() requires {', '.join(missing)} to be given "
-                          f"explicitly -- config.txt no longer provides ML training defaults.")
+    # now, min_step must be passed explicitly. min_stdev_phi is NOT
+    # required to be non-None -- it's genuinely allowed to be None (no
+    # stdev-based filtering at all), unlike min_step, which has no
+    # meaningful None value at the dataset level.
+    if min_step is None:
+        raise ValueError("train_stage2() requires min_step to be given explicitly -- "
+                          "config.txt no longer provides ML training defaults.")
 
     prev = torch.load(resume_from, map_location=device, weights_only=True)
     model_cfg = prev["config"]
@@ -596,8 +601,7 @@ def train_stage2(
 
         return total.item(), recon.item(), stats_loss_val.item(), interp_loss.item()
 
-    best_val_loss = float("inf")
-    val_ema = None
+    tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
     stats_label = "stats" if stats_weight > 0 else "stats_diag"
@@ -649,7 +653,8 @@ def train_stage2(
         val_stats /= n_val
         val_interp /= n_val
 
-        val_ema = val_total if val_ema is None else val_ema_decay * val_ema + (1 - val_ema_decay) * val_total
+        _, saved_this_epoch = tracker.update(epoch, val_total)
+        val_ema = tracker.val_ema
 
         msg = (f"{epoch:4d}|"
                f"{train_total*1_000:6.3f} ={train_recon*1_000:6.3f} "
@@ -658,9 +663,7 @@ def train_stage2(
                f"+{val_stats*1_000:6.2f} +{val_interp*1_000:6.1f} |"
                f"{val_ema*1_000:6.3f}")
 
-        saved_this_epoch = val_ema < best_val_loss
         if saved_this_epoch:
-            best_val_loss = val_ema
             epochs_since_improvement = 0
             torch.save({
                 "model_state": ae.state_dict(),

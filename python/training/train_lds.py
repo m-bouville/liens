@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 
 from models.autoencoder import Autoencoder
 from models.latent_dynamics import LatentDynamics
+from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
@@ -44,6 +45,7 @@ def train_lds(
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
     resume_from: Path | None = None,
     log_every_epoch: bool = True,
+    step_weights: list[float] | None = None,
 ) -> Path:
     """
     Stage 3. Returns the path of the best checkpoint saved. Either give
@@ -71,6 +73,20 @@ def train_lds(
     useful here specifically, given this stage commonly runs for
     hundreds of epochs and per-epoch console output between
     improvements is mostly noise.
+
+    step_weights: one weight per rollout step (length must equal
+    n_rollout_steps), passed straight through to RolloutLoss -- see
+    that class's docstring. WORTH READING BEFORE CHOOSING A DIRECTION:
+    the design intent recorded there is to weight LATER steps MORE
+    (long-term stability is what actually matters for real use), but
+    empirically, later steps are also where multi-step rollout training
+    instability concentrates (compounding error on the model's own,
+    increasingly off-manifold predictions) -- so weighting them more
+    heavily can directly worsen the instability it's trying to protect
+    against. None (default, uniform weighting) is a safe starting
+    point; there's no settled answer here yet on which direction is
+    actually better in practice, just this tension to be aware of
+    before picking one.
     """
     if n_rollout_steps < 1:
         raise ValueError(f"n_rollout_steps must be >= 1 (got {n_rollout_steps})")
@@ -81,9 +97,13 @@ def train_lds(
     print(f"device: {device}\n")
 
     # Same rationale as train_ae.py: config.txt is simulation-only now,
-    # these must be passed explicitly by the caller.
+    # these must be passed explicitly by the caller. min_stdev_phi is
+    # NOT in this list -- it's genuinely allowed to be None (meaning no
+    # stdev-based filtering at all, matching MicrostructureEvolutionDataset's
+    # own float|None semantics), unlike these three, which have no
+    # meaningful None value at all.
     missing = [name for name, v in [("size", size), ("stats_weight", stats_weight),
-                                     ("min_step", min_step), ("min_stdev_phi", min_stdev_phi)]
+                                     ("min_step", min_step)]
                if v is None]
     if missing:
         raise ValueError(f"train_lds() requires {', '.join(missing)} to be given explicitly "
@@ -187,7 +207,12 @@ def train_lds(
                   f"direction (easy -> hard). Continuing anyway, but double-check this "
                   f"is intentional.\n")
 
-    rollout_loss = RolloutLoss()
+    step_weights_tensor = torch.tensor(step_weights, dtype=torch.float32, device=device) \
+        if step_weights is not None else None
+    if step_weights_tensor is not None and step_weights_tensor.shape != (n_rollout_steps,):
+        raise ValueError(f"step_weights has {len(step_weights)} entries, but "
+                          f"n_rollout_steps={n_rollout_steps} -- need exactly one weight per step.")
+    rollout_loss = RolloutLoss(step_weights=step_weights_tensor)
     optimizer = torch.optim.Adam(f_theta.parameters(), lr=lr)
 
     lr_scheduler = None
@@ -229,8 +254,8 @@ def train_lds(
 
         return loss.item(), l_1step.item()
 
-    best_val_loss = float("inf")
-    val_ema = None
+    tracker = CheckpointCriterionTracker(ema_warmup_epochs=ema_warmup_epochs,
+                                          val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
     show_1step = n_rollout_steps > 1  # at n=1, L_1step == L_rollout always -- redundant to show
@@ -265,29 +290,22 @@ def train_lds(
         val_loss /= n_val
         val_1step /= n_val
 
-        if epoch <= ema_warmup_epochs:
-            criterion = val_loss
-        else:
-            val_ema = val_loss if val_ema is None else \
-                val_ema_decay * val_ema + (1 - val_ema_decay) * val_loss
-            criterion = val_ema
+        criterion, saved_this_epoch = tracker.update(epoch, val_loss)
 
-        ema_str = f"{val_ema:.6f}" if val_ema is not None else "  (warmup)"
+        ema_str = f"{tracker.val_ema:.6f}" if tracker.val_ema is not None else "  (warmup)"
         if show_1step:
             msg = (f"{epoch:4d} {train_loss:7.3f} ({train_1step:6.3f}),"
                    f"{val_loss:7.3f} ({val_1step:6.3f}) |{ema_str:>9}")
         else:
             msg = f"{epoch:4d} {train_loss:7.3f},{val_loss:7.3f} |{ema_str:>9}"
 
-        saved_this_epoch = criterion < best_val_loss
         if saved_this_epoch:
-            best_val_loss = criterion
             epochs_since_improvement = 0
             torch.save({
                 "model_state": f_theta.state_dict(),
                 "epoch": epoch,
                 "val_loss": val_loss,
-                "val_loss_ema": val_ema,
+                "val_loss_ema": tracker.val_ema,
                 "ae_checkpoint": str(Path(ae_checkpoint_path).resolve()),
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {

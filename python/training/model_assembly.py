@@ -1,0 +1,115 @@
+"""
+Turns componentized checkpoints (see checkpoint_components.py) into
+live nn.Modules ready for the stage 4/5 training loop -- the direct
+next step after loading, since nothing can train on a ComponentCheckpoint
+directly, only on real Autoencoder/StatsHead/LatentDynamics instances.
+"""
+import torch
+import torch.nn as nn
+
+from models.autoencoder import Autoencoder
+from models.latent_dynamics import LatentDynamics
+from training.checkpoint_components import ComponentCheckpoint
+from training.stats_head import StatsHead
+
+
+def build_models_from_components(
+    components: dict[str, ComponentCheckpoint], device: str | None = None,
+    freeze_decoder: bool = False, in_channels: int = 1,
+) -> tuple[Autoencoder, StatsHead | None, LatentDynamics, list[nn.Module]]:
+    """
+    freeze_decoder: sets requires_grad_(False) on every decoder
+    parameter and puts it in .eval() mode -- stage 4's mode (D stays
+    fixed, used only as a tether for L_recon). False for stage 5 (D
+    trains too). NOTE this does NOT reduce forward/backward compute
+    through D -- gradient still has to flow through it to reach E via
+    L_recon = ||D(E(x)) - x||. It only removes D's parameters from the
+    optimizer's own state.
+
+    stats_head, if present, is ALWAYS frozen regardless of
+    freeze_decoder -- a deliberate choice, not an oversight: it stays
+    the same fixed measuring instrument throughout stage 4/5 that it
+    was in stage 2, rather than being retrained at any point in this
+    pipeline.
+
+    in_channels: NOT recorded anywhere in the existing checkpoint
+    format (every checkpoint this project has ever produced used
+    grayscale, in_channels=1) -- exposed rather than silently
+    hardcoded, but defaults to 1 to match all of them.
+
+    Returns (ae, stats_head, f_theta, frozen_modules). frozen_modules
+    is for the training loop: ae.train() is recursive and would
+    otherwise flip any frozen BatchNorm layers back to train mode every
+    epoch (the exact bug fixed in stage 2's freeze_outer_layers) -- the
+    caller must re-apply .eval() to exactly this list right after every
+    ae.train() call.
+    """
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    frozen_modules: list[nn.Module] = []
+
+    encoder_cfg = components["encoder"].config
+    ae = Autoencoder(size=encoder_cfg["size"], channels=in_channels,
+                      base_channels=encoder_cfg["base_channels"],
+                      latent_channels=encoder_cfg["latent_channels"]).to(device)
+
+    # Reassemble the combined Autoencoder's state_dict by re-adding the
+    # "encoder."/"decoder." prefixes ComponentCheckpoint's _strip_prefix
+    # removed -- the exact inverse operation.
+    combined_state = {}
+    combined_state.update({f"encoder.{k}": v for k, v in components["encoder"].state_dict.items()})
+    combined_state.update({f"decoder.{k}": v for k, v in components["decoder"].state_dict.items()})
+    try:
+        result = ae.load_state_dict(combined_state, strict=False)
+    except RuntimeError as e:
+        # strict=False only relaxes missing/unexpected KEYS -- a SHAPE
+        # mismatch for a key present in both (the most likely symptom of
+        # a real version mismatch, e.g. latent_channels disagreement)
+        # still raises RuntimeError directly, before even reaching the
+        # missing/unexpected check below. Re-raised with the same clear
+        # message rather than left as a raw PyTorch error.
+        raise ValueError(
+            f"Reassembled Autoencoder state_dict doesn't match the current model "
+            f"definition (shape mismatch): {e}. Likely a version mismatch between "
+            f"this codebase and whatever produced the checkpoint."
+        ) from e
+    if result.missing_keys or result.unexpected_keys:
+        raise ValueError(
+            f"Reassembled Autoencoder state_dict doesn't match the current model "
+            f"definition -- missing keys: {result.missing_keys}, unexpected keys: "
+            f"{result.unexpected_keys}. Likely a version mismatch between this codebase "
+            f"and whatever produced the checkpoint."
+        )
+
+    if freeze_decoder:
+        for p in ae.decoder.parameters():
+            p.requires_grad_(False)
+        ae.decoder.eval()
+        frozen_modules.append(ae.decoder)
+
+    stats_head = None
+    if "stats_head" in components:
+        sh = components["stats_head"]
+        # hidden_dim isn't stored explicitly in the checkpoint (stage 1's
+        # stats_config only records stat_names/stats_mean/stats_std) --
+        # inferred from the saved weights' own shape instead, since a
+        # checkpoint could have used a non-default hidden_dim (e.g. the
+        # hidden_dim=16 experiment from a few turns back) and silently
+        # defaulting to 128 here would fail to load with a shape
+        # mismatch, or worse, load incorrectly if the shapes coincided.
+        hidden_dim = sh.state_dict["net.0.weight"].shape[0]
+        stats_head = StatsHead(latent_channels=sh.config["latent_channels"],
+                                stat_names=sh.config["stat_names"],
+                                hidden_dim=hidden_dim).to(device)
+        stats_head.load_state_dict(sh.state_dict)
+        stats_head.eval()
+        for p in stats_head.parameters():
+            p.requires_grad_(False)
+        frozen_modules.append(stats_head)
+
+    lds_cfg = components["lds"].config
+    f_theta = LatentDynamics(latent_channels=lds_cfg["latent_channels"], n_theta=lds_cfg["n_theta"],
+                              hidden_dim=lds_cfg["hidden_dim"],
+                              n_hidden_layers=lds_cfg["n_hidden_layers"]).to(device)
+    f_theta.load_state_dict(components["lds"].state_dict)
+
+    return ae, stats_head, f_theta, frozen_modules

@@ -17,9 +17,12 @@ those filters changes WHICH snapshots exist in the dataset at all, the
 same --seed does NOT guarantee the same underlying snapshots across
 runs with different filter settings, making before/after comparisons
 across parameter changes impossible. Every random run prints its exact
-picks as 'run_dir:step_t:step_next' triples; pass those back in via
---fixed-windows (repeatable) to see the EXACT SAME snapshots again,
-computed fresh from the raw files and the frozen encoder/decoder --
+picks as 'run_dir:step0:step1:...:stepN' (the full window, e.g. 4 steps
+for a checkpoint trained at n_rollout_steps=3 -- NOT just the first two
+steps, which would silently test only 1-step quality regardless of how
+many rollout steps the checkpoint was actually trained at); pass those
+back in via --fixed-windows (repeatable) to see the EXACT SAME snapshots
+again, computed fresh from the raw files and the frozen encoder/decoder --
 entirely bypassing dataset filtering, so it works regardless of what
 min_step/min_stdev_phi the comparison run uses.
 
@@ -29,13 +32,14 @@ being on sys.path):
         --size 64 --latent-channels 4 --stats-weight 0.01 --n-rollout-steps 3
     python -m evaluation.check_rollout \
         --size 64 --latent-channels 4 --stats-weight 0.01 --n-rollout-steps 3 \
-        --fixed-windows "../../datasets/64x64/T800_n050_s79:100000:120000" ...
+        --fixed-windows "../../datasets/64x64/T800_n050_s79:100000:110000:120000" ...
 """
 
 import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
 import torch
 
 from models.autoencoder import Autoencoder
@@ -46,15 +50,16 @@ from utils import load_datasets as load
 from utils.naming import lds_checkpoint_name
 
 
-def parse_fixed_window(s: str) -> tuple[Path, int, int]:
+def parse_fixed_window(s: str) -> tuple[Path, list[int]]:
     parts = s.split(":")
-    if len(parts) != 3:
-        raise ValueError(f"--fixed-windows entry must be 'run_dir:step_t:step_next', got '{s}'")
-    run_dir, step_t, step_next = parts
-    return Path(run_dir), int(step_t), int(step_next)
+    if len(parts) < 3:
+        raise ValueError(f"--fixed-windows entry must be 'run_dir:step0:step1:...:stepN' "
+                          f"(at least 3 colon-separated parts), got '{s}'")
+    run_dir, *step_strs = parts
+    return Path(run_dir), [int(s) for s in step_strs]
 
 
-def compute_sample(run_dir: Path, step_t: int, step_next: int, ae, f_theta,
+def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
                     ae_config: dict, device: torch.device):
     """
     Everything needed for one row of the comparison figure, computed
@@ -62,14 +67,26 @@ def compute_sample(run_dir: Path, step_t: int, step_next: int, ae, f_theta,
     no dependence on any MicrostructureEvolutionDataset filtering, so
     this works identically regardless of what min_step/min_stdev_phi a
     training run used.
+
+    steps: the FULL window (len == window_length, e.g. 4 steps for a
+    checkpoint trained at n_rollout_steps=3) -- chains f_theta.rollout()
+    across every intermediate transition (steps[0]->steps[1]->...->
+    steps[-1]), matching EXACTLY the multi-step prediction
+    n_rollout_steps>1 training actually optimizes. Previously this
+    always compared only steps[0]->steps[1] regardless of how many
+    rollout steps a checkpoint was trained at -- silently testing
+    1-step quality even for n_rollout_steps=3 checkpoints, never the
+    actual compounding behavior those checkpoints exist to improve.
+    Reports the comparison at the FINAL step (steps[0] -> steps[-1]),
+    the full cumulative prediction, exactly as decided.
     """
     metadata = load.read_metadata(run_dir / "metadata.txt")
     nx, ny = ae_config["size"], ae_config["size"]
 
-    x_t_raw = load.read_phi_half(run_dir / load.snapshot_filename(step_t), nx, ny)
-    x_next_raw = load.read_phi_half(run_dir / load.snapshot_filename(step_next), nx, ny)
+    x_t_raw = load.read_phi_half(run_dir / load.snapshot_filename(steps[0]), nx, ny)
+    x_next_raw = load.read_phi_half(run_dir / load.snapshot_filename(steps[-1]), nx, ny)
 
-    dt_val = (step_next - step_t) * metadata.dt
+    dt_val = (steps[-1] - steps[0]) * metadata.dt  # total elapsed span, for display only
     theta_val = metadata.temperature - metadata.T0  # see LatentDynamics/dataset docstrings
 
     with torch.no_grad():
@@ -79,16 +96,53 @@ def compute_sample(run_dir: Path, step_t: int, step_next: int, ae, f_theta,
         z_t = ae.encoder(x_t)
         z_next_true = ae.encoder(x_next_true_t)
 
-        dt = torch.tensor([dt_val], dtype=torch.float32, device=device)
+        # Per-TRANSITION dts, chained via rollout() -- NOT one big dt
+        # covering the whole span. A single f_theta call with a large
+        # dt is a fundamentally different (and untrained-for) operation
+        # from n_rollout_steps chained calls at the actual per-step dts.
+        dts = torch.tensor(
+            [[(steps[i + 1] - steps[i]) * metadata.dt for i in range(len(steps) - 1)]],
+            dtype=torch.float32, device=device,
+        )
         theta = torch.tensor([[theta_val]], dtype=torch.float32, device=device)
 
-        dz = f_theta(z_t, dt, theta)
-        z_next_pred = z_t + dz
+        z_hat_full = f_theta.rollout(z_t, dts, theta)
+        z_next_pred = z_hat_full[:, -1]
 
         x_next_pred = ae.decoder(z_next_pred)[0, 0].cpu().numpy()
         x_next_ae_baseline = ae.decoder(z_next_true)[0, 0].cpu().numpy()
 
     return x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_val
+
+
+def _padded_bounds(values, factor: float) -> tuple[float, float]:
+    """
+    (vmin, vmax) padded by `factor` beyond values' own actual range,
+    always including zero -- so a diverging colormap centered at 0
+    stays meaningful even for a one-sided distribution (e.g. Delta x
+    that happens to be mostly positive in a given window).
+
+    Deliberately asymmetric (NOT +-max(abs(...))): if real Delta x
+    ranges from -0.05 to +0.3, the padded range is [-0.06, +0.36], not
+    a symmetric +-0.36 that wastes half the color range on a side the
+    real data barely uses.
+
+    factor=1.2 gives 20% headroom beyond the real range, so a
+    prediction that's slightly too high or too negative still shows up
+    as a visible, readable color rather than being clipped at the very
+    edge of the scale.
+    """
+    lo, hi = float(values.min()), float(values.max())
+    vmin = factor * lo if lo < 0 else min(0.0, lo)
+    vmax = factor * hi if hi > 0 else max(0.0, hi)
+    # Guard against a degenerate all-one-sided (or all-zero) range,
+    # which would make vmin/vcenter/vmax non-strictly-increasing and
+    # break TwoSlopeNorm below.
+    if vmin >= 0:
+        vmin = -1e-6
+    if vmax <= 0:
+        vmax = 1e-6
+    return vmin, vmax
 
 
 def check_rollout(
@@ -149,9 +203,9 @@ def check_rollout(
             )
         test_dirs = [Path(d) for d in test_dirs]
 
-        # Only used to PICK representative (run_dir, step_t, step_next) triples
-        # from the actual filtered test distribution -- compute_sample() then
-        # does the real work fresh, independent of this dataset object.
+        # Only used to PICK representative (run_dir, steps) windows from the
+        # actual filtered test distribution -- compute_sample() then does
+        # the real work fresh, independent of this dataset object.
         dataset = MicrostructureEvolutionDataset(
             test_dirs, encoder=ae.encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi,
@@ -168,11 +222,11 @@ def check_rollout(
         windows = []
         for idx in indices:
             run_dir, steps = dataset.window_info(idx)
-            windows.append((run_dir, steps[0], steps[1]))
+            windows.append((run_dir, steps))
 
         print("\nSelected windows -- reuse via --fixed-windows for reproducible comparison:")
-        for run_dir, step_t, step_next in windows:
-            print(f"  {run_dir}:{step_t}:{step_next}")
+        for run_dir, steps in windows:
+            print(f"  {run_dir}:{':'.join(str(s) for s in steps)}")
         print()
 
     recon_loss = ReconLoss()
@@ -182,9 +236,9 @@ def check_rollout(
     if n_samples == 1:
         axes = axes[None, :]
 
-    for row, (run_dir, step_t, step_next) in enumerate(windows):
+    for row, (run_dir, steps) in enumerate(windows):
         x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_val = compute_sample(
-            run_dir, step_t, step_next, ae, f_theta, ae_config, device,
+            run_dir, steps, ae, f_theta, ae_config, device,
         )
 
         x_next_pred_t = torch.from_numpy(x_next_pred).unsqueeze(0).unsqueeze(0)
@@ -205,25 +259,39 @@ def check_rollout(
         error = predicted_delta - real_delta
 
         state_scale = max(abs(x_t_raw.min()), abs(x_t_raw.max()), 0.1)
-        delta_scale = max(abs(real_delta.min()), abs(real_delta.max()),
-                           abs(predicted_delta.min()), abs(predicted_delta.max()), 0.02)
-        error_scale = max(abs(error.min()), abs(error.max()), 1e-6)
+        # Scales derived ONLY from real_delta (never from predicted_delta
+        # or error) -- so they're predictable and directly comparable
+        # across different checkpoints/runs (e.g. with vs without stage
+        # 2), and a prediction that's genuinely off shows up as visible
+        # saturation against a fixed reference, rather than being hidden
+        # by a scale that stretches to accommodate however wrong it is.
+        delta_vmin, delta_vmax = _padded_bounds(real_delta, factor=1.2)
+        # Error is typically much smaller in magnitude than Delta x
+        # itself -- a quarter of the SAME real_delta range keeps the
+        # error panel sensitive and readable, while still being the
+        # same fixed, comparable reference across images.
+        error_vmin, error_vmax = _padded_bounds(real_delta, factor=0.25)
+        delta_norm = TwoSlopeNorm(vmin=delta_vmin, vcenter=0.0, vmax=delta_vmax)
+        error_norm = TwoSlopeNorm(vmin=error_vmin, vcenter=0.0, vmax=error_vmax)
 
         axes[row, 0].imshow(x_t_raw, cmap="RdBu", vmin=-state_scale, vmax=state_scale)
-        axes[row, 0].set_title(f"state(t)\n{run_dir.name}:{step_t}\ndt={dt_val:.1f}" if row == 0
-                                else f"{run_dir.name}:{step_t}\ndt={dt_val:.1f}", fontsize=9)
-        axes[row, 1].imshow(real_delta, cmap="RdBu", vmin=-delta_scale, vmax=delta_scale)
-        axes[row, 1].set_title(f"real \u0394x\nscale=+-{delta_scale:.3f}"
-                                if row == 0 else f"scale=+-{delta_scale:.3f}", fontsize=10)
-        axes[row, 2].imshow(predicted_delta, cmap="RdBu", vmin=-delta_scale, vmax=delta_scale)
+        n_steps_shown = len(steps) - 1
+        span_label = f"{run_dir.name}:{steps[0]}\u2192{steps[-1]} ({n_steps_shown} step{'s' if n_steps_shown != 1 else ''})"
+        axes[row, 0].set_title(f"state(t)\n{span_label}\ndt={dt_val:.1f}" if row == 0
+                                else f"{span_label}\ndt={dt_val:.1f}", fontsize=9)
+        axes[row, 1].imshow(real_delta, cmap="RdBu", norm=delta_norm)
+        axes[row, 1].set_title(f"real \u0394x\nscale=[{delta_vmin:.3f}, {delta_vmax:.3f}]"
+                                if row == 0 else f"scale=[{delta_vmin:.3f}, {delta_vmax:.3f}]",
+                                fontsize=10)
+        axes[row, 2].imshow(predicted_delta, cmap="RdBu", norm=delta_norm)
         axes[row, 2].set_title(
             f"predicted \u0394x\nloss={end_to_end_loss:.4f} (AE={ae_baseline_loss:.4f})"
             if row == 0 else
             f"loss={end_to_end_loss:.4f} (AE={ae_baseline_loss:.4f})", fontsize=10
         )
-        im_error = axes[row, 3].imshow(error, cmap="RdBu", vmin=-error_scale, vmax=error_scale)
-        axes[row, 3].set_title(f"error\nscale=+-{error_scale:.3f}" if row == 0
-                                else f"scale=+-{error_scale:.3f}", fontsize=10)
+        im_error = axes[row, 3].imshow(error, cmap="RdBu", norm=error_norm)
+        axes[row, 3].set_title(f"error\nscale=[{error_vmin:.3f}, {error_vmax:.3f}]" if row == 0
+                                else f"scale=[{error_vmin:.3f}, {error_vmax:.3f}]", fontsize=10)
         fig.colorbar(im_error, ax=axes[row, 3], fraction=0.046)
 
         for ax in axes[row]:
@@ -253,7 +321,7 @@ def main():
                               "is given), not the train/val/test split itself, which is "
                               "fixed and loaded from the checkpoint")
     parser.add_argument("--fixed-windows", type=str, nargs="+", default=None,
-                         help="exact 'run_dir:step_t:step_next' triples to display "
+                         help="exact 'run_dir:step0:step1:...:stepN' windows to display "
                               "(repeatable), bypassing random dataset-based selection "
                               "entirely -- for reproducible before/after comparisons across "
                               "different --min-step/--min-stdev-phi training runs. Every "
@@ -283,7 +351,7 @@ def main():
             )
         name = lds_checkpoint_name(args.size, args.latent_channels, args.stats_weight,
                                     args.n_rollout_steps)
-        args.lds_checkpoint = Path(f"../../checkpoints/stage3/{name}.pt")
+        args.lds_checkpoint = Path(f"../checkpoints/stage3/{name}.pt")
         print(f"Reconstructed checkpoint path: {args.lds_checkpoint}")
 
     check_rollout(

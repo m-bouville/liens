@@ -96,3 +96,38 @@ def tmp_run_dir(tmp_path):
         arr.tofile(run_dir / load.snapshot_filename(step))
 
     return run_dir, steps
+
+
+STAT_NAMES = ["angle", "avg_phi", "stdev_phi"]
+
+
+@pytest.fixture
+def tmp_run_dir_with_stats(tmp_run_dir):
+    """
+    Layers a real statistics.csv onto tmp_run_dir's run directory --
+    separate fixture (not folded into tmp_run_dir itself) since most
+    dataset tests don't need statistics.csv at all, and building it
+    needlessly would just be dead weight for those.
+
+    Values are deterministic and distinctive per step (stat value =
+    step/1000 for every column) so tests can check WHICH row ended up
+    associated with a given sample, the same way tmp_run_dir's own
+    snapshot values are. One step (2000) is deliberately given a NaN in
+    one column, specifically to test the NaN-guard that's supposed to
+    exclude any window starting there.
+    """
+    import pandas as pd
+
+    run_dir, steps = tmp_run_dir
+    rows = []
+    for step in steps:
+        row = {"step": step}
+        for name in STAT_NAMES:
+            row[name] = step / 1000.0
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    df.loc[df["step"] == 2000, "avg_phi"] = float("nan")  # deliberate NaN, for the guard test
+    df.to_csv(run_dir / "statistics.csv", index=False)
+
+    return run_dir, steps, STAT_NAMES
+

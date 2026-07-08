@@ -486,7 +486,9 @@ class MicrostructureEvolutionDataset(Dataset):
     crossing run boundaries -- a "sequence" spanning two different runs
     isn't a real trajectory), in either mode.
 
-    __getitem__ returns (window, dt_window, theta):
+    __getitem__ returns (window, dt_window, theta), or (window, dt_window,
+    theta, true_stats) if stat_names was given at construction (see
+    stat_names below -- only meaningful/available in raw-pixel mode):
       window:    (n_r+1, latent_channels, 8, 8) if encoder was given
                  (a window of z's), or (n_r+1, 1, ny, nx) if encoder is
                  None (a window of raw frames x, encoding deferred to
@@ -516,6 +518,11 @@ class MicrostructureEvolutionDataset(Dataset):
                  a dynamics-relevant conditioning variable. seed is pure
                  RNG choice, not physical, and is also excluded.
                  Constant across a window (one run), unlike dt_window.
+      true_stats: (n_stats,) RAW (not normalized) statistics.csv row for
+                 window[0] specifically -- the real STARTING frame, never
+                 a predicted one, same anchoring convention stage 1/2
+                 already use for L_stats. Only present if stat_names was
+                 given.
 
     dt is always computed from the ACTUAL kept step numbers, never
     assumed uniform: your save_steps are already irregularly spaced, and
@@ -538,7 +545,8 @@ class MicrostructureEvolutionDataset(Dataset):
                  device: str | torch.device = "cpu", window_length: int = 5,
                  skip_bad: bool = True, min_step: int = 0,
                  min_stdev_phi: float | None = None, encode_batch_size: int = 256,
-                 good_steps: dict[Path, list[int]] | None = None):
+                 good_steps: dict[Path, list[int]] | None = None,
+                 stat_names: list[str] | None = None):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
@@ -553,19 +561,43 @@ class MicrostructureEvolutionDataset(Dataset):
         paired MicrostructureSnapshotDataset over the same run_dirs
         already computed it with the same skip_bad/min_step/min_stdev_phi.
         Default None computes it here.
+
+        stat_names: if given, ALSO loads statistics.csv per run and
+        returns true_stats (see class docstring's __getitem__ section)
+        for stage 4/5's L_stats, which -- like stage 1/2's -- is always
+        anchored to a real, ground-truth-labeled frame, never a
+        prediction. Only meaningful in raw-pixel mode (encoder=None);
+        stage 3 never uses L_stats, so combining this with encoder-given
+        is treated as a caller mistake worth catching at construction
+        time, not something silently ignored. None (default): no
+        statistics.csv reads at all, __getitem__ returns the plain
+        3-tuple exactly as before this parameter existed. Like
+        MicrostructureTripletDataset's identical parameter, must match
+        the stage-2 checkpoint's stats_config exactly -- not
+        auto-detected, since silently resolving a different schema than
+        the already-trained stats_head expects would be a much worse
+        failure mode than requiring it explicitly.
         """
+        if stat_names is not None and encoder is not None:
+            raise ValueError(
+                "stat_names was given together with a real encoder (cached-latent, stage-3 "
+                "mode) -- stage 3 never uses L_stats, so this combination is almost certainly "
+                "a mistake. Pass encoder=None (raw-pixel mode) if you actually want true_stats."
+            )
         if window_length < 2:
             raise ValueError(f"window_length must be >= 2 (got {window_length}), "
                               f"since a window needs at least one transition to predict")
 
         self.window_length = window_length
         self.encoder_given = encoder is not None  # which mode __getitem__ operates in
+        self.stat_names = stat_names
         self._run_dirs: list[Path] = []         # run_dir per run_idx, for tracing samples back
         self._run_steps: list[list[int]] = []   # kept step numbers per run, in order
         self._run_data: list[torch.Tensor] = []  # per run, on CPU: latents (n_kept,C,8,8) if
                                                    # encoder given, else raw frames (n_kept,1,ny,nx)
         self._run_dt_scale: list[float] = []    # metadata.dt per run
         self._run_theta: list[torch.Tensor] = []  # (n_theta,) physical params per run -- see class docstring
+        self._stats_by_run = {}                 # run_dir -> statistics.csv DataFrame, only if stat_names given
         self._index: list[tuple[int, int]] = []  # (run_idx, window_start_position)
 
         run_dirs = [Path(d) for d in run_dirs]
@@ -583,6 +615,13 @@ class MicrostructureEvolutionDataset(Dataset):
             if len(kept_steps) < window_length:
                 n_windowless_runs += 1
                 continue  # not enough consecutive kept steps for even one window
+
+            if self.stat_names is not None:
+                stats_df = load.read_statistics_csv(run_dir / "statistics.csv")
+                missing = set(self.stat_names) - set(stats_df.columns)
+                if missing:
+                    raise ValueError(f"{run_dir}/statistics.csv is missing columns {missing}")
+                self._stats_by_run[run_dir] = stats_df
 
             # Read every kept step once (this is the only place raw
             # snapshots are touched -- everything after this is pure
@@ -621,6 +660,11 @@ class MicrostructureEvolutionDataset(Dataset):
             )
 
             for start in range(len(kept_steps) - window_length + 1):
+                if self.stat_names is not None:
+                    start_step = kept_steps[start]
+                    stats_df = self._stats_by_run[run_dir]
+                    if start_step not in stats_df.index or stats_df.loc[start_step, self.stat_names].isna().any():
+                        continue  # same NaN-guard rationale as MicrostructureTripletDataset
                 self._index.append((run_idx, start))
 
         if n_windowless_runs:
@@ -632,7 +676,7 @@ class MicrostructureEvolutionDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         run_idx, start = self._index[idx]
         end = start + self.window_length
 
@@ -647,7 +691,16 @@ class MicrostructureEvolutionDataset(Dataset):
 
         theta = self._run_theta[run_idx]  # (n_theta,) -- constant across the window (same run)
 
-        return window, dt_window, theta
+        if self.stat_names is None:
+            return window, dt_window, theta
+
+        run_dir = self._run_dirs[run_idx]
+        start_step = steps[0]  # window[0] is the real starting frame -- true_stats is always FOR it
+        true_stats = torch.tensor(
+            self._stats_by_run[run_dir].loc[start_step, self.stat_names].to_numpy(dtype=float),
+            dtype=torch.float32,
+        )
+        return window, dt_window, theta, true_stats
 
     def window_info(self, idx: int) -> tuple[Path, list[int]]:
         """

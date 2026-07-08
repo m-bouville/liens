@@ -23,7 +23,20 @@ Stage numbering (see docs/neural_nets.md):
        conventions run the exact same train_lds() function underneath
        (see run_lds_stage() below) -- 3a/3b is a params-file-level
        naming choice, not a separate code path.
-    4/5. Encoder refinement / end-to-end -- NOT YET IMPLEMENTED
+    4. Encoder refinement -- E/D trainable (D frozen as an L_recon
+       tether), f_theta trainable, on RAW PIXEL windows (encoding
+       happens fresh every epoch, unlike stage 3's frozen-encoder
+       cache) -- L_rollout (primary) + small L_recon anchor + optional
+       L_stats. Takes TWO ancestors (stage 2's checkpoint for E/D/
+       stats_head, stage 3's for f), unlike every earlier stage's
+       single predecessor -- see
+       checkpoint_components.assemble_joint_checkpoint.
+    5. End-to-end refinement -- same mechanism as stage 4 (one shared
+       train_refinement() function), but D also trainable and L_recon
+       primary (L_rollout becomes the small anchor instead). Continues
+       stage 4's own joint checkpoint (resume_from), not a fresh
+       assembly from stage 2/3 -- see
+       checkpoint_components.load_joint_refinement_checkpoint.
 
 config.txt is NOT read by this module AT ALL -- not even for grid size.
 Nx/Ny come directly from the stage-parameters file, and dataset directory
@@ -110,14 +123,18 @@ from evaluation.check_interpolation import check_interpolation
 from evaluation.check_perturbation import check_perturbation
 from evaluation.check_reconstruction import check_reconstruction
 from evaluation.check_rollout import check_rollout
+from training.checkpoint_components import split_joint_checkpoint_for_evaluation
 from training.train_ae import train_autoencoder, train_stage2
 from training.train_lds import train_lds
+from training.train_refinement import train_refinement
 from utils import load_datasets as load
 
 _STAGE_LABELS = {
     1: "stage 1 (autoencoder)",
     2: "stage 2 (latent-space validation)",
     3: "stage 3 (latent dynamics surrogate)",
+    4: "stage 4 (encoder refinement)",
+    5: "stage 5 (end-to-end refinement)",
 }
 _STAGE_LABELS["3a"] = _STAGE_LABELS["3b"] = _STAGE_LABELS[3]
 
@@ -133,7 +150,9 @@ _STAGE_DIRS = {1: _MAIN_DIR / "checkpoints" / "stage1",
                2: _MAIN_DIR / "checkpoints" / "stage2",
                3: _MAIN_DIR / "checkpoints" / "stage3",
                "3a": _MAIN_DIR / "checkpoints" / "stage3a",
-               "3b": _MAIN_DIR / "checkpoints" / "stage3b"}
+               "3b": _MAIN_DIR / "checkpoints" / "stage3b",
+               4: _MAIN_DIR / "checkpoints" / "stage4",
+               5: _MAIN_DIR / "checkpoints" / "stage5"}
 
 
 class _Tee:
@@ -182,6 +201,13 @@ def identify_checkpoint_stage(checkpoint: dict) -> str:
     instead of failing deep inside training with a confusing
     shape-mismatch, or silently training on the wrong starting point.
     """
+    if "ae_state" in checkpoint and "f_theta_state" in checkpoint:
+        # The stage 4/5 joint format -- distinguished from stage 3 by
+        # checking THIS first, since it also carries an "ae_checkpoint"
+        # provenance field (recording its own ancestor) that would
+        # otherwise satisfy the very next check below.
+        freeze_decoder = checkpoint.get("stage45_config", {}).get("freeze_decoder")
+        return _STAGE_LABELS[4] if freeze_decoder else _STAGE_LABELS[5]
     if "ae_checkpoint" in checkpoint:
         return _STAGE_LABELS[3]
     if "stage2_config" in checkpoint or "stage3_config" in checkpoint:
@@ -361,9 +387,15 @@ def _preceding_stages(stage: int | str | None) -> list[int | str]:
     """Stages that come before `stage` in the pipeline, NEAREST first --
     used for 'same' value inheritance. Stage 3 has two mutually
     exclusive conventions (bare 3 for single-phase, 3a/3b for the
-    curriculum -- see module docstring), both handled here."""
+    curriculum -- see module docstring), both handled here. Stage 4 and
+    5's chains list BOTH stage-3 conventions ("3b"/"3a" AND bare 3):
+    only one will actually exist in stages{} for any given params file,
+    and _resolve_same simply skips entries not present there, so
+    listing both here is harmless and correct regardless of which
+    convention that file actually used."""
     order: dict[int | str, list[int | str]] = {
         1: [], 2: [1], 3: [2, 1], "3a": [2, 1], "3b": ["3a", 2, 1],
+        4: ["3b", "3a", 3, 2, 1], 5: [4, "3b", "3a", 3, 2, 1],
     }
     return order.get(stage, [])
 
@@ -684,7 +716,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 check_reconstruction(
                     checkpoint_path=stage2_checkpoint, device=device,
-                    output_path=Path(f"../output/reconstruction_check_png/{stage2_checkpoint.stem}.png"),
+                    output_path=Path(f"../output/stage2/{stage2_checkpoint.stem}-reconstruction.png"),
                 )
                 print()
 
@@ -693,7 +725,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 check_interpolation(
                     checkpoint_path=stage2_checkpoint, device=device,
-                    output_path=Path(f"../output/interpolation_check_png/{stage2_checkpoint.stem}.png"),
+                    output_path=Path(f"../output/stage2/{stage2_checkpoint.stem}-interpolation.png"),
                 )
                 print()
 
@@ -702,7 +734,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 check_perturbation(
                     checkpoint_path=stage2_checkpoint, device=device,
-                    output_path=Path(f"../output/perturbation_check_png/{stage2_checkpoint.stem}.png"),
+                    output_path=Path(f"../output/stage2/{stage2_checkpoint.stem}-perturbation.png"),
                 )
                 print()
 
@@ -775,11 +807,105 @@ def run_from_params_file(params_path: Path, default_base: Path,
     print("=" * 70)
     check_rollout(
         lds_checkpoint_path=stage3_checkpoint, device=device,
-        output_path=Path(f"../output/rollout_check_png/{stage3_checkpoint.stem}.png"),
+        output_path=Path(f"../output/stage3/{stage3_checkpoint.stem}-rollout.png"),
     )
     print()
 
-    return stage3_checkpoint
+    # ---- Stage 4/5: encoder refinement / end-to-end -- both OPTIONAL,
+    # unlike stages 1/2/3. Neither section present at all -> pipeline
+    # stops at stage 3, exactly as before these stages existed. Stage 5
+    # requires stage 4 to have actually run (it resumes stage 4's own
+    # output, not a fresh assembly from stage 2/3 -- see
+    # train_refinement()'s docstring), so stage 5 without stage 4 is an
+    # error, not silently skipped. ----
+    has_stage4, has_stage5 = 4 in stages, 5 in stages
+    if has_stage5 and not has_stage4:
+        raise ValueError(f"{params_path}: '# Stage 5' requires '# Stage 4' to also be present "
+                          f"(stage 5 continues stage 4's own output, not a fresh assembly).")
+
+    def run_refinement_stage(stage_key: int, resume_from: Path | None = None) -> Path:
+        """Runs one train_refinement() phase -- stage_key is 4 or 5.
+        freeze_decoder is DERIVED from stage_key (4 -> True, 5 -> False),
+        not a params-file-settable option -- matching how 3a/3b's
+        n_rollout_steps is a regular param, but WHICH curriculum phase
+        this is comes from the section name itself, not a value inside
+        it."""
+        freeze_decoder = (stage_key == 4)
+        kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}))
+        force = kwargs.pop("force", False)
+        kwargs = _strip_unrecognized_params(train_refinement, kwargs, f"Stage {stage_key}")
+        if resume_from is not None:
+            signature = {"base_path": str(base_path), "resumed_from": str(resume_from),
+                          **extra_signature, **_signature_kwargs(kwargs)}
+        else:
+            # Both ancestors recorded explicitly, same rationale as
+            # run_lds_stage: full ancestry visible from this one
+            # registry, without following stage2_checkpoint into ITS
+            # own registry to find stage1_checkpoint, etc.
+            signature = {"base_path": str(base_path),
+                          "stage2_checkpoint": str(stage2_checkpoint),
+                          "stage3_checkpoint": str(stage3_checkpoint),
+                          **extra_signature, **_signature_kwargs(kwargs)}
+        checkpoint = resolve_checkpoint(stage_key, force, signature, kwargs.get("epochs"))
+        if checkpoint is None:
+            with _log_to_file(stage_output_path(stage_key).with_suffix(".log")):
+                print("=" * 70)
+                label = "encoder refinement" if freeze_decoder else "end-to-end refinement"
+                resume_note = f" (resuming from {resume_from})" if resume_from is not None else ""
+                print(f"STAGE {stage_key}: {label}{resume_note}")
+                print("=" * 70)
+                registry_path = _STAGE_DIRS[stage_key] / f"registry-stage{stage_key}.csv"
+                common_args = dict(
+                    base_path=base_path, freeze_decoder=freeze_decoder,
+                    checkpoint_path=stage_output_path(stage_key), device=device,
+                    loss_curve_path=Path(
+                        f"../output/stage{stage_key}/{stage_output_path(stage_key).stem}-loss_curve.png"
+                    ),
+                    on_checkpoint_saved=_make_checkpoint_callback(registry_path, signature),
+                    **kwargs,
+                )
+                if resume_from is not None:
+                    checkpoint = train_refinement(resume_from=resume_from, **common_args)
+                else:
+                    checkpoint = train_refinement(
+                        ae_checkpoint_path=stage2_checkpoint, lds_checkpoint_path=stage3_checkpoint,
+                        **common_args,
+                    )
+                print(f"\nStage {stage_key} complete: {checkpoint}\n")
+                _upsert_registry(registry_path, checkpoint, signature)
+
+                ae_view_path, lds_view_path = split_joint_checkpoint_for_evaluation(
+                    checkpoint, _STAGE_DIRS[stage_key] / "eval_views",
+                )
+
+                print("=" * 70)
+                print(f"Sanity check: reconstruction quality (stage {stage_key} checkpoint)")
+                print("=" * 70)
+                check_reconstruction(
+                    checkpoint_path=ae_view_path, device=device,
+                    output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-reconstruction.png"),
+                )
+                print()
+
+                print("=" * 70)
+                print(f"Sanity check: rollout quality (stage {stage_key} checkpoint)")
+                print("=" * 70)
+                check_rollout(
+                    lds_checkpoint_path=lds_view_path, device=device,
+                    output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-rollout.png"),
+                )
+                print()
+        return checkpoint
+
+    if not has_stage4:
+        return stage3_checkpoint
+
+    stage4_checkpoint = run_refinement_stage(4)
+    if not has_stage5:
+        return stage4_checkpoint
+
+    stage5_checkpoint = run_refinement_stage(5, resume_from=stage4_checkpoint)
+    return stage5_checkpoint
 
 
 def main():

@@ -13,9 +13,9 @@ min_step 	  = 3000       	# skip snapshots earlier than this step
 min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
 stats_weight  = 0.01     	# weight of L_stats relative to L_recon
 
-epochs 		  = 100
+epochs 		  = 100			# note: stage 1 is augmented
 patience 	  =  20        	# renamed to early_stopping_patience internally
-batches		  =  64
+batches		  = 128
 
 # force 	    = True     	# uncomment to always retrain this stage,
 							# even if a matching checkpoint already exists
@@ -29,7 +29,7 @@ stats_weight  = same     	# weight of L_stats relative to L_recon
 interp_weight = 0.001
 n_frozen_stages= 2
 
-epochs 		  =  200
+epochs 		  =  200		# note: stage 2 is not augmented
 patience 	  =   40
 batches 	  = same
 # epochs 		= 0    		# uncomment to SKIP this stage entirely --
@@ -60,3 +60,35 @@ min_stdev_phi = 0.01
 batches		  = 512
 epochs 		  =2000
 patience 	  = 100
+
+
+# Stage 4
+#   encoder refinement
+rollout_weight = 1.0        # primary term for stage 4 (matches the default, but explicit is safer)
+recon_weight   = 0.5       # small but NONZERO anchor -- pick a value, this is a real design choice
+stats_weight   = 0.01
+
+n_rollout_steps= 3
+
+min_step 	  = 3000
+min_stdev_phi = 0.01
+
+batches		  = 256
+epochs 		  = 100
+patience 	  =  20
+
+
+# Stage 5
+#   end-to-end refinement
+rollout_weight = 0.2        # now secondary -- see reasoning below
+recon_weight   = 1.0        # now primary, per the original design intent
+stats_weight   = 0.01
+
+n_rollout_steps= same      # match stage 4's -- same reasoning as before
+
+min_step       = same
+min_stdev_phi  = same
+
+batches        = 256
+epochs         = 100
+patience       =  20

@@ -7,6 +7,7 @@ Run from python/ (imports rely on that root being on sys.path):
     pytest tests/test_datasets.py -v
 """
 import torch
+import pytest
 
 from training.datasets import MicrostructureEvolutionDataset
 
@@ -126,3 +127,80 @@ def test_raw_mode_allows_gradient_flow(tmp_run_dir, fake_encoder):
     grad = fake_encoder.conv.weight.grad
     assert grad is not None, "gradient did not flow back into the encoder's parameters"
     assert torch.any(grad != 0), "gradient flowed but was all zero -- suspicious"
+
+
+def test_stat_names_none_returns_3tuple_unchanged(tmp_run_dir):
+    """Regression check: NOT passing stat_names must behave exactly as
+    before this parameter existed -- plain 3-tuple, no statistics.csv
+    read at all."""
+    run_dir, steps = tmp_run_dir
+    ds = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=3, min_step=0, min_stdev_phi=None,
+    )
+    item = ds[0]
+    assert len(item) == 3
+    assert ds.stat_names is None
+
+
+def test_stat_names_given_returns_4tuple_with_correct_true_stats(tmp_run_dir_with_stats):
+    """true_stats must correspond to window[0] specifically (the real
+    starting frame) -- checked against the fixture's known, distinctive
+    per-step values (stat value = step/1000), not just checked for the
+    right shape."""
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+    ds = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=2, min_step=0, min_stdev_phi=None,
+        stat_names=stat_names,
+    )
+    for idx in range(len(ds)):
+        window, dt_window, theta, true_stats = ds[idx]
+        _, window_steps = ds.window_info(idx)
+        start_step = window_steps[0]
+        expected = torch.tensor([start_step / 1000.0] * len(stat_names), dtype=torch.float32)
+        assert torch.allclose(true_stats, expected), (
+            f"idx {idx}: true_stats {true_stats} doesn't match the starting step "
+            f"{start_step}'s expected value {expected}"
+        )
+
+
+def test_stat_names_with_real_encoder_raises(tmp_run_dir_with_stats, fake_encoder):
+    """stat_names + a real encoder (cached-latent, stage-3 mode) is
+    treated as a caller mistake -- stage 3 never uses L_stats -- and
+    should be caught at construction, not silently ignored."""
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+    with pytest.raises(ValueError, match="never uses L_stats"):
+        MicrostructureEvolutionDataset(
+            [run_dir], encoder=fake_encoder, window_length=2, min_step=0, min_stdev_phi=None,
+            stat_names=stat_names,
+        )
+
+
+def test_nan_guard_excludes_windows_starting_at_nan_step(tmp_run_dir_with_stats):
+    """The fixture puts a NaN in step 2000's avg_phi column. With
+    window_length=3 over 5 steps, there are 3 possible windows
+    (starting at steps 0, 1000, 2000) -- the one starting at 2000 must
+    be excluded, leaving exactly 2."""
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+    ds_without_guard = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=3, min_step=0, min_stdev_phi=None,
+    )
+    ds_with_guard = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=3, min_step=0, min_stdev_phi=None,
+        stat_names=stat_names,
+    )
+    assert len(ds_without_guard) == 3  # 5 steps, window_length=3 -> 3 windows, no guard applied
+    assert len(ds_with_guard) == 2     # the window starting at step 2000 is correctly excluded
+
+    for idx in range(len(ds_with_guard)):
+        _, window_steps = ds_with_guard.window_info(idx)
+        assert window_steps[0] != 2000, "a window starting at the NaN step slipped through"
+
+
+def test_missing_stat_column_raises_clear_error(tmp_run_dir_with_stats):
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+    with pytest.raises(ValueError, match="missing columns"):
+        MicrostructureEvolutionDataset(
+            [run_dir], encoder=None, window_length=2, min_step=0, min_stdev_phi=None,
+            stat_names=stat_names + ["nonexistent_stat"],
+        )
+

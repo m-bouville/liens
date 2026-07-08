@@ -102,6 +102,7 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 │   ├── training/
 │   ├── evaluation/
 │   ├── checkpoints/
+│   │   └── stage<N>/
 │   ├── utils/
 │   └── tests/
 ├── datasets/

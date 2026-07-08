@@ -11,6 +11,74 @@ import matplotlib.pyplot as plt
 from . import load_datasets as load
 
 
+def loss_curve(
+    epochs: list[int], train_loss: list[float], val_loss: list[float],
+    best_so_far: list[float], output_path: Path, title: str = "",
+    secondary_train: list[float] | None = None, secondary_val: list[float] | None = None,
+    secondary_label: str = "1step",
+) -> Path:
+    """
+    Called from every stage's epoch loop (see train_ae.py/train_lds.py/
+    train_refinement.py) so the visualization and its y-axis-saturation
+    behavior stay in exactly one place rather than being reimplemented
+    slightly differently per stage.
+
+    train_loss/val_loss/best_so_far: one value per epoch so far, in
+    order -- best_so_far is the running minimum of val_loss's OWN
+    criterion (see CheckpointCriterionTracker), i.e. what actually
+    decides whether a checkpoint gets saved, not just min(val_loss) up
+    to that point (during a warmup phase the two can differ).
+
+    secondary_train/secondary_val: for stages with more than one loss
+    scale worth watching together (currently just train_lds() at
+    n_rollout_steps>1: 1step alongside the full rollout loss -- at
+    n_rollout_steps=1 the two are identical, so this is skipped, same
+    condition as the console's own show_1step). Plotted as thinner,
+    dashed lines so the primary loss stays visually dominant.
+
+    Y-axis capped at 2x the FIRST epoch's train_loss: multi-step
+    rollout training in particular is prone to large, transient early
+    spikes (seen repeatedly in this project's own stage-3b runs) that
+    would otherwise stretch the y-axis so far that the later, more
+    informative convergence behavior gets squashed into an unreadable
+    flat line near zero. Deliberately based on train_loss[0] specifically
+    (not the max seen so far) -- a fixed, predictable reference, same
+    reasoning as check_rollout.py's real-Delta-x-derived scales: capping
+    at the observed max would just chase whatever the worst spike happens
+    to be, defeating the point of a stable, comparable scale.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    ax.plot(epochs, train_loss, label="train", color="tab:blue", alpha=0.8)
+    ax.plot(epochs, val_loss, label="valid", color="tab:orange", alpha=0.8)
+    ax.plot(epochs, best_so_far, label="best so far", color="tab:green", linewidth=2)
+
+    if secondary_train is not None:
+        ax.plot(epochs, secondary_train, label=f"train ({secondary_label})",
+                color="tab:blue", linestyle="--", linewidth=1, alpha=0.5)
+    if secondary_val is not None:
+        ax.plot(epochs, secondary_val, label=f"valid ({secondary_label})",
+                color="tab:orange", linestyle="--", linewidth=1, alpha=0.5)
+
+    if train_loss and train_loss[0] > 0:
+        ax.set_ylim(top=2 * train_loss[0])
+    ax.set_ylim(bottom=0)
+
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    if title:
+        ax.set_title(title)
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(alpha=0.3)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=100)
+    plt.close(fig)
+    return output_path
+
+
 def show_snapshot(path: str | Path, nx: int, ny: int,
                    ax=None, cmap: str = "RdBu", vmin: float | None = None,
                    vmax: float | None = None, title: str | None = None):
