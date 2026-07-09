@@ -7,7 +7,7 @@ dt      = 0.05
 steps   = 200001		# 1000001 for 64x64, 600001 for 128x128, 300001 for 256x256, 200001 for 512x512
 
 # Threads
-max_threads=  8
+max_threads= 10
 
 # Landau potential 
 a0      = 1.0			# quadratic term in Landau potential

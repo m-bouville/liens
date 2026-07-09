@@ -20,8 +20,7 @@ The model will use an autoencoder (AE) based on convolutional neural networks (C
 - encode: $z = E(x)$,
 - decode: $x'= D(z)$, i.e. $D(E(x))$.
 
-The convolutional autoencoder has a symmetric encoder–decoder architecture. The latent representation retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. For details on the architecture of the autoencoder, see `./docs/neural_nets.md`.
-
+The convolutional autoencoder has a symmetric encoder–decoder architecture. The latent representation retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. For details on the architecture of the autoencoder, see `./docs/neural_nets.md` and `./docs/NN-code_structure.md`.
 
 
 ## Latent representation 
@@ -95,32 +94,31 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 ```text
 .
 ├── cpp/               # phase-field solver
-├── python/
-│   ├── main.py
-│   ├── params/
-│   ├── models/
-│   ├── training/
-│   ├── evaluation/
-│   ├── checkpoints/
-│   │   └── stage<N>/
-│   ├── utils/
-│   └── tests/
+├── python/            # neural network
 ├── datasets/
 │   ├── 64x64/
 │   ├── 128x128/
 │   └── 256x256/
 ├── output/
+│   └── stage<N>
 ├── docs/
 │   ├── phase_field.md
-│   └── neural_nets.md
+│   ├── neural_nets.md
+│   └── NN-code_structure.md
 └── README.md
 ```
+
+For more details on the structure of the `python` directory, see `./docs/NN-code_structure.md`.
+
+
 
 ## Current status
 
 - [X] C++ phase-field solver
-- [x] Dataset generation
+- [X] Dataset generation
 - [X] 1. CNN autoencoder
-- [x] 2. Latent-space validation
-- [x] 3. Latent dynamics surrogate
-- [ ] 4-5. End-to-end training
+- [X] 2. Latent-space validation
+- [X] 3. Latent dynamics surrogate
+- [X] 4-5. End-to-end training
+- [ ] Obtaining satisfactory results
+- [ ] Obtaining satisfying results

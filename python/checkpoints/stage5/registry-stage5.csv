@@ -1,0 +1,1 @@
+checkpoint_path,base_path,resumed_from,Nx,Ny,rollout_weight,recon_weight,stats_weight,n_rollout_steps,min_step,min_stdev_phi,epochs,early_stopping_patience
