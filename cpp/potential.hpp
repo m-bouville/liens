@@ -30,7 +30,10 @@ public:
           __b(b),
           __T0(T0)
     {}
-    
+
+
+    // `bulk_energy` and `derivative` calculate a(T) internally,
+    //    then call `__energy_one_pixel` and `__derivative_one_pixel` passing it
     double bulk_energy(const OrderParameter& order_para,
                              double          T) const override;
 
@@ -41,6 +44,7 @@ public:
     
     double minimum(double T) const;
 
+
 private:
     double __a0;
     double __b;
@@ -49,11 +53,11 @@ private:
     double __a(double T) const;
 
     double __energy_one_pixel(double phi,
-                              double T) const;
+                              double a) const;
 
     // derivative w.r.t. order parameter phi
     double __derivative_one_pixel(double phi,
-                                  double T) const;
+                                  double a) const;
 
 };
 

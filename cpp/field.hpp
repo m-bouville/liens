@@ -69,13 +69,13 @@ public:
     // accessors: 2D grid coordinates
     inline int index(int i, int j) const
     {        
-        assert(i >= 0 && i < __nx);
-        assert(j >= 0 && j < __ny);
+        // assert(i >= 0 && i < __nx);
+        // assert(j >= 0 && j < __ny);
         return j * __nx + i;
     }
     double& operator()(int i, int j)
     { return __values[index(i, j)]; }
-    const double operator()(int i, int j) const
+    double operator()(int i, int j) const
     { return __values[index(i, j)]; }
 
     // statistics

@@ -23,10 +23,11 @@ namespace FD
 
     // void gradient_x  (const Field& in, Field& out);
     // void gradient_y  (const Field& in, Field& out);
-    double gradient_sqr(const Field& phi, const Neighbors& nb);
     // void gradient_sqr(const Field& in, Field& out);
+    
     void laplacian   (const Field& in, Field& out, const Neighbors& nb);
 
+    double gradient_sqr(const Field& phi, const Neighbors& nb);
     double avg_gradient(const Field& phi, const FD::Neighbors& nb);
 
     // Memory management: avoid repeated reallocations

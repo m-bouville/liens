@@ -10,33 +10,41 @@ void FDSolver::step(     OrderParameter& op,
                    const FD::Neighbors&  neighbors,
                          double          T,
                          double          dt)
+{
+    const int grid_size = op.size();
+
+    // Local free-energy derivative
+    potential.derivative(op, T, __ws.df_dphi);
+
+    // ∇²φ
+    FD::laplacian(op.field(), __ws.laplacian_phi, neighbors);
+
+    
+    const double kappa = op.kappa();
+        const double scale = dt * op.mobility();
+
+
+    if (!op.is_conserved())      // Allen–Cahn
+        for (int i = 0; i < grid_size; ++i)
+        {
+            const double mu =
+                __ws.df_dphi[i] - kappa * __ws.laplacian_phi[i];
+
+            op[i] -= scale * mu;
+        }
+
+    else     // Cahn–Hilliard
     {
-        int grid_size = op.size();
+        for (int i = 0; i < grid_size; ++i)
+            __ws.mu[i] =
+                __ws.df_dphi[i] - kappa * __ws.laplacian_phi[i];
 
-        // Local free-energy derivative
-        potential.derivative(op, T, __ws.df_dphi);
-
-        // Gradient contribution
-       FD::laplacian(op.field(), __ws.laplacian_phi, neighbors);
+        FD::laplacian(__ws.mu, __ws.laplacian_mu, neighbors);
 
         for (int i = 0; i < grid_size; ++i)
-            __ws.mu[i] = __ws.df_dphi[i] - op.kappa() * __ws.laplacian_phi[i];
-
-
-        // Evolution equation
-        if (!op.is_conserved())  // Allen-Cahn
-        {
-            for (int i = 0; i < grid_size; ++i)
-                op[i] -= dt * op.mobility() * __ws.mu[i];
-        }
-        else  // Cahn-Hilliard
-        {
-           FD::laplacian(__ws.mu, __ws.laplacian_mu, neighbors);
-
-            for (int i = 0; i < grid_size; ++i)
-                op[i] += dt * op.mobility() * __ws.laplacian_mu[i];
-        }
+            op[i] += scale * __ws.laplacian_mu[i];
     }
+}
 
 
 double FDSolver::energy(const OrderParameter& op,

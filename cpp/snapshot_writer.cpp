@@ -88,7 +88,7 @@ writer::WriterStatistics writer::statistics(const OrderParameter& op,
                                                   int             step,
                                                   double          T, 
                                             const Potential&      potential, 
-                                            const Solver&         solver, 
+                                            const Solver&         solver,
                                             const FD::Neighbors&  neighbors)
 {
     WriterStatistics out;

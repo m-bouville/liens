@@ -144,8 +144,7 @@ void Simulation::__runOneSimulation(double T,
 
     for (int step = 0; step < __config.steps; ++step)
     {
-        solver.step(op, potential, neighbors,
-                    T, __config.dt);
+        solver.step(op, potential, neighbors, T, __config.dt);
 
         if (save_steps.contains(step))
         {
