@@ -7,14 +7,14 @@ Ny			  =  64
 
 # Stage 1
 #   autoencoder
-latent_channels=  8
+latent_channels= 16
 
 min_step 	  = 3000       	# skip snapshots earlier than this step
 min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
 stats_weight  = 0.01     	# weight of L_stats relative to L_recon
 
-epochs 		  = 100			# note: stage 1 is augmented
-patience 	  =  20        	# renamed to early_stopping_patience internally
+epochs 		  =  50			# note: stage 1 is augmented
+patience 	  =  10        	# renamed to early_stopping_patience internally
 batches		  = 128
 
 # force 	    = True     	# uncomment to always retrain this stage,
@@ -27,10 +27,10 @@ min_stdev_phi = same      	# inherit stage 1's value instead of repeating it
 
 stats_weight  = same     	# weight of L_stats relative to L_recon
 interp_weight = 0.001
-n_frozen_stages= 2
+n_frozen_stages= 0
 
-epochs 		  =  200		# note: stage 2 is not augmented
-patience 	  =   40
+epochs 		  =  100		# note: stage 2 is not augmented
+patience 	  =   20
 batches 	  = same
 # epochs 		= 0    		# uncomment to SKIP this stage entirely --
 							# stage 3 would then use stage 1's output directly
@@ -45,13 +45,12 @@ min_step 	  = same
 min_stdev_phi = same
 
 batches		  = 512
-epochs 		  =2000
-patience 	  = 100
-
+epochs 		  = 500
+patience 	  =  50
 
 # Stage 3b
 #   latent dynamics surrogate (rollout)
-n_rollout_steps= 3
+n_rollout_steps= 2
 stats_weight  = 0.01
 one_step_weight= 0.
 
@@ -59,8 +58,8 @@ min_step 	  = 3000
 min_stdev_phi = 0.01
 
 batches		  = 512
-epochs 		  =2000
-patience 	  = 100
+epochs 		  = 500
+patience 	  =  50
 
 
 # Stage 4
@@ -69,14 +68,14 @@ rollout_weight = 1.0        # primary term for stage 4 (matches the default, but
 recon_weight   = 0.5       # small but NONZERO anchor -- pick a value, this is a real design choice
 stats_weight   = 0.01
 
-n_rollout_steps= 3
+n_rollout_steps= same
 
 min_step 	  = 3000
 min_stdev_phi = 0.01
 
 batches		  = 256
-epochs 		  = 100
-patience 	  =  20
+epochs 		  =  50
+patience 	  =  10
 
 
 # Stage 5
@@ -91,5 +90,5 @@ min_step       = same
 min_stdev_phi  = same
 
 batches        = 256
-epochs         =  50
-patience       =  10
+epochs         =  30
+patience       =   5

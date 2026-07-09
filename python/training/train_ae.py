@@ -26,6 +26,8 @@ from training.losses import ReconLoss, StatsLoss
 from training.stats_head import StatsHead
 from utils.naming import ae_checkpoint_name
 from utils.plots import loss_curve
+from evaluation.check_interpolation import check_interpolation
+from evaluation.check_perturbation import check_perturbation
 
 
 def train_autoencoder(
@@ -203,7 +205,8 @@ def train_autoencoder(
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
-    print(f"Starting {epochs} epochs (batches of {batch_size})...")
+    print(f"Starting {epochs} epochs "
+          f"(early_stopping_patience: {early_stopping_patience}, batches of {batch_size})...")
     heading = f"/{epochs:3d} "
     heading += (f"train = recon +{stats_weight:6.3f} stats | valid = recon +{stats_weight:6.3f} "
                 f"stats  (e-3)  ema") if include_stats else "train | valid  (e-3)  ema"
@@ -255,11 +258,11 @@ def train_autoencoder(
 
         msg = f"{epoch:4d}"
         if include_stats:
-            msg += (f"{train_total*1_000:7.2f} ={train_recon*1_000:7.2f} +{train_stats*1_000:7.1f} |"
-                    f"{val_total*1_000:7.2f} ={val_recon*1_000:7.2f} +{val_stats*1_000:7.1f}"
-                    f"  {val_ema*1_000:7.2f}")
+            msg += (f"{train_total*1_000:7.3f} ={train_recon*1_000:7.3f} +{train_stats*1_000:7.1f} |"
+                    f"{val_total*1_000:7.3f} ={val_recon*1_000:7.3f} +{val_stats*1_000:7.1f} |"
+                    f"{val_ema*1_000:7.3f}")
         else:
-            msg += f"{train_total*1_000:7.2f} |{val_total*1_000:7.2f}  {val_ema*1_000:7.2f}"
+            msg += f"{train_total*1_000:7.3f} |{val_total*1_000:7.3f}  {val_ema*1_000:7.3f}"
 
         if saved_this_epoch:
             epochs_since_improvement = 0
@@ -459,6 +462,14 @@ def train_stage2(
     on_checkpoint_saved: see train_autoencoder(). log_every_epoch: see
     train_autoencoder() -- same behavior here.
 
+    Before any training happens, also runs check_interpolation/
+    check_perturbation on resume_from itself (stage 1's own checkpoint,
+    untouched at that point) and saves the result under output/stage1/ --
+    a direct before/after baseline against this same stage's own
+    post-training check_interpolation/check_perturbation output, to
+    answer "did stage 2 actually improve the latent representation"
+    rather than assuming it did.
+
     Always resumes from a stage-1 (or another stage-2) checkpoint --
     there's no "stage 2 from scratch". Grid size is read from that
     checkpoint's own config; ITS stats_weight is used only for
@@ -564,6 +575,33 @@ def train_stage2(
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
                              persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
 
+    # Baseline, BEFORE any stage 2 training happens: resume_from is
+    # exactly the model's current state right now (just loaded, untouched
+    # by this function), so it can be used directly -- no new checkpoint
+    # file needed. Stored under output/stage1/, not output/stage2/, since
+    # this reflects stage 1's own checkpoint. Deliberately
+    # check_interpolation/check_perturbation only, not check_reconstruction
+    # -- those two are what actually test latent GEOMETRY quality (the
+    # thing stage 2 exists to improve), whereas pixel-level reconstruction
+    # fidelity is already covered separately by stage 1's own sanity check
+    # in main.py. Comparing these against stage 2's own post-training
+    # check_interpolation/check_perturbation output (same tools, run again
+    # on the trained checkpoint) is the direct before/after answer to
+    # "did stage 2 actually improve the latent representation".
+    print("=" * 70)
+    print("Baseline (pre-stage-2): latent geometry of the stage 1 checkpoint")
+    print("=" * 70)
+    check_interpolation(
+        checkpoint_path=resume_from, min_step=min_step, device=device,
+        output_path=Path(f"../../output/stage1/{resume_from.stem}-pre_stage2-interpolation.png"),
+    )
+    print()
+    check_perturbation(
+        checkpoint_path=resume_from, min_step=min_step, device=device,
+        output_path=Path(f"../../output/stage1/{resume_from.stem}-pre_stage2-perturbation.png"),
+    )
+    print()
+
     # stats_head frozen (not optimized here); ae itself may also have
     # frozen outer layers (see freeze_outer_layers/n_frozen_stages) --
     # filter to only what's actually trainable.
@@ -635,7 +673,8 @@ def train_stage2(
     epochs_since_improvement = 0
 
     stats_label = "stats" if stats_weight > 0 else "stats_diag"
-    print(f"Stage 2: starting {epochs} epochs (batches of {batch_size}), "
+    print(f"Stage 2: starting {epochs} epochs (early_stopping_patience: "
+          f"{early_stopping_patience}, batches of {batch_size}), "
           f"interp_weight={interp_weight}, stats_weight={stats_weight}"
           f"{' (anchor active)' if stats_weight > 0 else ' (diagnostic only, not optimized)'}")
     print(f"/{epochs:3d} train = recon + {stats_weight}*{stats_label} + {interp_weight}*interp | "

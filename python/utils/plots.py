@@ -36,13 +36,19 @@ def loss_curve(
     condition as the console's own show_1step). Plotted as thinner,
     dashed lines so the primary loss stays visually dominant.
 
-    Y-axis capped at 2x the FIRST epoch's train_loss: multi-step
-    rollout training in particular is prone to large, transient early
-    spikes (seen repeatedly in this project's own stage-3b runs) that
-    would otherwise stretch the y-axis so far that the later, more
-    informative convergence behavior gets squashed into an unreadable
-    flat line near zero. Deliberately based on train_loss[0] specifically
-    (not the max seen so far) -- a fixed, predictable reference, same
+    Y-axis capped at 2x the FIRST epoch's train_loss, but ONLY when the
+    data actually exceeds that cap -- multi-step rollout training in
+    particular is prone to large, transient early spikes (seen
+    repeatedly in this project's own stage-3b runs) that would otherwise
+    stretch the y-axis so far that the later, more informative
+    convergence behavior gets squashed into an unreadable flat line near
+    zero. When nothing in the run actually reaches 2x the first epoch's
+    loss, the cap is skipped entirely and the axis auto-scales to the
+    real range instead -- always applying the cap regardless of whether
+    it was needed just stretches well-behaved runs unnecessarily, hiding
+    real (if small) variation in the same way an unwarranted spike-driven
+    stretch would. Deliberately based on train_loss[0] specifically (not
+    the max seen so far) -- a fixed, predictable reference, same
     reasoning as check_rollout.py's real-Delta-x-derived scales: capping
     at the observed max would just chase whatever the worst spike happens
     to be, defeating the point of a stable, comparable scale.
@@ -51,7 +57,7 @@ def loss_curve(
 
     ax.plot(epochs, train_loss, label="train", color="tab:blue", alpha=0.8)
     ax.plot(epochs, val_loss, label="valid", color="tab:orange", alpha=0.8)
-    ax.plot(epochs, best_so_far, label="best so far", color="tab:green", linewidth=2)
+    ax.plot(epochs, best_so_far, label="best EMA so far", color="tab:green", linewidth=2)
 
     if secondary_train is not None:
         ax.plot(epochs, secondary_train, label=f"train ({secondary_label})",
@@ -61,7 +67,18 @@ def loss_curve(
                 color="tab:orange", linestyle="--", linewidth=1, alpha=0.5)
 
     if train_loss and train_loss[0] > 0:
-        ax.set_ylim(top=2 * train_loss[0])
+        cap = 2 * train_loss[0]
+        all_series = [train_loss, val_loss, best_so_far]
+        if secondary_train is not None:
+            all_series.append(secondary_train)
+        if secondary_val is not None:
+            all_series.append(secondary_val)
+        observed_max = max(max(series) for series in all_series if series)
+        if observed_max > cap:
+            ax.set_ylim(top=cap)
+        # else: leave the top unset -- auto-scale to the real range,
+        # which is already <= cap and gives a tighter, more accurate
+        # bound than always stretching to a value nothing reaches.
     ax.set_ylim(bottom=0)
 
     ax.set_xlabel("epoch")

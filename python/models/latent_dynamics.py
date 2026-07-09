@@ -136,7 +136,7 @@ class LatentDynamics(nn.Module):
         over the WHOLE interval [t, t+dt] -- a first-order approximation
         that degrades for large dt, and the likely explanation for the
         systematic underestimation of |dz| observed at large dt in
-        check_rollout.py/check_dt_dependence.py. AB2 instead fits a line
+        check_rollout.py/check_parameter_dependence.py. AB2 instead fits a line
         through the previous and current rate estimates and integrates
         THAT forward, capturing whether the rate is increasing or
         decreasing rather than assuming it's flat -- formally

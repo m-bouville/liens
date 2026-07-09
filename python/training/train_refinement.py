@@ -210,7 +210,8 @@ def train_refinement(
                                           val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
-    print(f"Starting {epochs} epochs (batches of {batch_size})...")
+    print(f"Starting {epochs} epochs (early_stopping_patience: "
+          f"{early_stopping_patience}, batches of {batch_size})...")
     print(f"/{epochs:3d}  train      valid        ema")
 
     for epoch in range(1, epochs + 1):

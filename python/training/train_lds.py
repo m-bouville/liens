@@ -37,7 +37,7 @@ def train_lds(
     ae_latent_channels: int | None = None, stats_weight: float | None = None,
     epochs: int = 100, batch_size: int = 512, lr: float = 1e-3,
     hidden_dim: int = 256, n_hidden_layers: int = 2,
-    val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
+    val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 2,
     n_rollout_steps: int = 1, min_step: int | None = None, min_stdev_phi: float | None = None,
     encode_batch_size: int = 256, val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5,
     early_stopping_patience: int | None = None,
@@ -298,7 +298,8 @@ def train_lds(
 
     show_1step = n_rollout_steps > 1  # at n=1, L_1step == L_rollout always -- redundant to show
 
-    print(f"Starting {epochs} epochs (batches of {batch_size})...")
+    print(f"Starting {epochs} epochs (early_stopping_patience: "
+          f"{early_stopping_patience}, batches of {batch_size})...")
     if show_1step:
         print(f"/{epochs:3d}  train  (1step)   valid  (1step)     ema")
     else:

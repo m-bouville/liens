@@ -114,6 +114,7 @@ import csv
 import inspect
 import re
 import sys
+import gc
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -122,7 +123,7 @@ import torch
 from evaluation.check_interpolation import check_interpolation
 from evaluation.check_perturbation import check_perturbation
 from evaluation.check_reconstruction import check_reconstruction
-from evaluation.check_dt_dependence import check_dt_dependence
+from evaluation.check_parameter_dependence import check_parameter_dependence
 from evaluation.check_rollout import check_rollout
 from training.checkpoint_components import split_joint_checkpoint_for_evaluation
 from training.train_ae import train_autoencoder, train_stage2
@@ -811,7 +812,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                     size=size, base_path=base_path, ae_checkpoint_path=stage2_checkpoint,
                     checkpoint_path=stage_output_path(stage_key), device=device,
                     loss_curve_path=Path(
-                        f"../output/stage3/{stage_output_path(stage_key).stem}-loss_curve.png"
+                        f"../output/stage{stage_key}/{stage_output_path(stage_key).stem}-loss_curve.png"
                     ),
                     resume_from=resume_from,
                     on_checkpoint_saved=_make_checkpoint_callback(registry_path, signature),
@@ -822,20 +823,21 @@ def run_from_params_file(params_path: Path, default_base: Path,
 
                 if run_sanity_check:
                     print("=" * 70)
-                    print("Sanity check: rollout quality (stage 3 checkpoint)")
+                    print(f"Sanity check: rollout quality (stage {stage_key} checkpoint)")
                     print("=" * 70)
                     check_rollout(
                         lds_checkpoint_path=checkpoint, device=device,
-                        output_path=Path(f"../output/stage3/{checkpoint.stem}-rollout.png"),
+                        output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-rollout.png"),
                     )
                     print()
 
                     print("=" * 70)
-                    print("Sanity check: dt dependence (stage 3 checkpoint)")
+                    print("Sanity check: parameter dependence (dt, temperature, noise) "
+                          f"(stage {stage_key} checkpoint)")
                     print("=" * 70)
-                    check_dt_dependence(
+                    check_parameter_dependence(
                         lds_checkpoint_path=checkpoint, device=device,
-                        output_path=Path(f"../output/stage3/{checkpoint.stem}-dt_dependence.png"),
+                        output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-parameter_dependence.png"),
                     )
                     print()
         return checkpoint
@@ -930,6 +932,41 @@ def run_from_params_file(params_path: Path, default_base: Path,
                     output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-rollout.png"),
                 )
                 print()
+
+                # E is trainable here with stats_head frozen -- structurally
+                # the same anchor pattern as stage 2's own stats_weight
+                # anchor (see this module's docstring), and the same
+                # failure mode as D's checkerboard is possible in
+                # principle: E could drift into a region stats_head can no
+                # longer correctly interpret, without the combined loss
+                # alone revealing it. These are the diagnostics built
+                # specifically to check that, previously only run after
+                # stage 2 -- skipped gracefully (not an error) if the
+                # ancestor AE has no stats_head at all (stats_weight<=0
+                # back in stage 1), matching train_refinement()'s own
+                # graceful handling of that same condition.
+                try:
+                    print("=" * 70)
+                    print(f"Sanity check: interpolation consistency (stage {stage_key} checkpoint)")
+                    print("=" * 70)
+                    check_interpolation(
+                        checkpoint_path=ae_view_path, device=device,
+                        output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-interpolation.png"),
+                    )
+                    print()
+
+                    print("=" * 70)
+                    print(f"Sanity check: perturbation response (stage {stage_key} checkpoint)")
+                    print("=" * 70)
+                    check_perturbation(
+                        checkpoint_path=ae_view_path, device=device,
+                        output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-perturbation.png"),
+                    )
+                    print()
+                except ValueError as e:
+                    if "no stats_head" not in str(e):
+                        raise
+                    print(f"Skipping interpolation/perturbation sanity checks: {e}\n")
         return checkpoint
 
     if not has_stage4:
@@ -962,15 +999,24 @@ def main():
         check_sweep_status(args.base)
         return
 
-    if not args.params_files:
-        raise ValueError("Provide at least one stage-parameters file (or --scan-only)")
 
-    for params_path in args.params_files:
+    # if not args.params_files:
+    #     raise ValueError("Provide at least one stage-parameters file (or --scan-only)")
+
+    for params_path in [Path("params/64x64.txt")]:
         print("#" * 70)
         print(f"# {params_path}")
         print("#" * 70)
         run_from_params_file(params_path, default_base=args.base, device=args.device)
         print()
+
+
+    if torch.cuda.is_available():
+        # clear VRAM
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
 
 
 if __name__ == "__main__":

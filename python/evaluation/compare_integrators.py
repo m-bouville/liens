@@ -6,7 +6,7 @@ settle whether AB2 actually helps on this model/data, rather than
 reasoning about it in the abstract. Toy-ODE testing suggested AB2 can
 be WORSE than Euler for large steps (comparable to or bigger than the
 dynamics' own timescale), which is exactly the regime
-check_dt_dependence.py found to be worst -- this script checks whether
+check_parameter_dependence.py found to be worst -- this script checks whether
 that caution applies here.
 
 Needs window_length=3 (t-dt_prev, t, t+dt_curr triplets), unlike the
@@ -14,7 +14,7 @@ window_length=2 used for one-step training/checking.
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
-    python -m evaluation.compare_integrators --lds-checkpoint ../../output/lds_checkpoint.pt
+    python -m evaluation.compare_integrators --lds-checkpoint ../output/lds_checkpoint.pt
 """
 
 import argparse

@@ -70,8 +70,7 @@ exists at all (see below).
 - **`LatentDynamics`** (`f_theta`): predicts `dz` from `(z, dt, θ)`. `.rollout(z0, dts,
   theta)` chains multiple Euler steps (`z ← z + f_theta(z, dt, θ)`) given a *sequence* of
   per-transition `dt`s — this is the mechanism every multi-step rollout computation in the
-  project goes through (training and evaluation alike, after a real bug where evaluation
-  used to only ever check `steps[0]→steps[1]`, see Known Issues).
+  project goes through (training and evaluation alike).
   `θ` is `temperature - T0` (see `training/datasets.py`), not raw temperature — centering
   on the Landau potential's threshold temperature is what lets the whole sweep's
   subcritical dynamics condition on a single, physically meaningful scalar. `θ` could be extended to more parameters.
@@ -102,7 +101,7 @@ exists at all (see below).
 - `RolloutLoss`: `return_per_step=True` exposes each chained step's own loss, `step_weights` can reweight individual steps (not currently used).
 
 #### Checkpoint criterion (`checkpoint_criterion.py`)
-`CheckpointCriterionTracker` — the shared "when should a checkpoint be saved" state machine (raw `val_loss` during an initial warmup, switching to an EMA afterward), used by all five training functions. Extracted specifically after duplicated inline versions of this logic diverged and one variant had a real bug (a lucky warmup-era value could permanently block every later save).
+`CheckpointCriterionTracker` is the shared "when should a checkpoint be saved" state machine (raw `val_loss` during an initial warmup, switching to an EMA afterward), used by all five training functions.
 
 #### Checkpoint components (`checkpoint_components.py`)
 adapters between checkpoint *shapes*, needed only because stage 4/5 is the first point in the pipeline where checkpoints from independent lineages get combined:
@@ -132,10 +131,7 @@ learning to match it, since nothing else in the loss would catch it.
 
 #### Training loops
 - `train_ae.py` — `train_autoencoder()` (stage 1), `train_stage2()` (stage 2, includes
-  `freeze_outer_layers()` — despite an early assumption, freezing outer layers does
-  **not** meaningfully speed up training, since conv parameter count depends on channel
-  count not spatial size and the deepest stage dominates; it's a regularization knob, not
-  a speed optimization).
+  `freeze_outer_layers()`, a regularization knob).
 - `train_lds.py` — `train_lds()`, shared by stages 3a and 3b (`n_rollout_steps`
   distinguishes them; `resume_from` chains 3a→3b). Recently gained `one_step_weight`
   (adds `ε·L_1step` on top of `L_rollout`, hoping to regularize 3b's instability — tried
@@ -150,25 +146,13 @@ figure via `utils.plots.loss_curve`, early stopping) → save.
 
 ### `evaluation/` — standalone diagnostic scripts
 
-Each has a real, importable function (not just CLI logic) so `main.py` can call it
-directly, plus a thin `main()` CLI wrapper:
+Each has a real, importable function (not just CLI logic) so `main.py` can call it directly, plus a thin `main()` CLI wrapper:
 
 - **`check_reconstruction.py`** — AE reconstruction quality on held-out samples.
-- **`check_rollout.py`** — multi-step rollout comparison (`state(t)`, `real Δx`,
-  `predicted Δx`, `error`, over the full window chain via `f_theta.rollout()`). Also has
-  `_padded_bounds()` for predictable, comparable color scales across different
-  checkpoints/runs — derived only from the *real* data, never from the prediction, so a
-  bad prediction shows as visible saturation instead of stretching its own scale.
-- **`check_interpolation.py`** / **`check_perturbation.py`** — stage 2's two latent-space
-  diagnostics (the letter post-hoc only: not used as loss function).
-- **`check_dt_dependence.py`** — scatters one-step error against `dt` across the *whole*
-  test set (not a handful of samples), fitting both a power law and a saturating
-  exponential to check whether error growth with `dt` is smooth relaxation or something
-  else. Run in `main.py`'s stage 3 sanity checks alongside `check_rollout`.
-- **`compare_integrators.py`**, **`compare_rollout_training.py`** — one-off exploratory
-  comparison scripts, not part of the maintained by-stage output/checkpoint conventions;
-  treat as needing an explicit refactor-or-archive decision rather than assuming they stay
-  current automatically.
+- **`check_rollout.py`** — multi-step rollout comparison (`state(t)`, `real Δx`, `predicted Δx`, `error`, over the full window chain via `f_theta.rollout()`). Also has `_padded_bounds()` for predictable, comparable color scales across different checkpoints/runs — derived only from the *real* data, never from the prediction, so a bad prediction shows as visible saturation instead of stretching its own scale.
+- **`check_interpolation.py`** / **`check_perturbation.py`** — stage 2's two latent-space  diagnostics (the letter post-hoc only: not used as loss function).
+- **`check_parameter_dependence.py`** — scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `main.py`'s stage 3 sanity checks alongside `check_rollout`.
+- **`compare_integrators.py`**, **`compare_rollout_training.py`** — one-off exploratory   comparison scripts, not part of the maintained by-stage output/checkpoint conventions; treat as needing an explicit refactor-or-archive decision rather than assuming they stay current automatically.
 
 
 ### `utils/`
@@ -192,13 +176,9 @@ e.g. stage 4 checks `["3b", "3a", 3, 2, 1]` in order), then runs whichever stage
 present, in order, skipping any stage whose signature already matches an existing
 checkpoint (see Registry below).
 
-Every stage follows the same shape in `main.py`: build kwargs from the params file →
+Every stage follows the same shape in `main.py`: build `kwargs` from the params file →
 compute a cache-matching signature → `resolve_checkpoint()` (reuse if found) → train if
-not → sanity-check (only if freshly trained, not on reuse) → upsert registry. This
-symmetry across stages is deliberate and was explicitly audited for consistency (checkpoint
-path/loss-curve path construction, `force` handling, signature construction, registry
-naming, sanity-check gating) — one real gap found and fixed was stage 1 never getting a
-sanity check at all, unlike every other stage.
+not → sanity-check (only if freshly trained, not on reuse) → upsert registry.
 
 **Registry/caching**: each `checkpoints/stage<N>/` directory has a `registry-stage<N>.csv`
 mapping a parameter signature to a checkpoint path. `_upsert_registry()` writes an
@@ -220,23 +200,17 @@ whole-function integration test rather than isolated-helper tests, since
 `check_reconstruction()` has no small torch-free piece to extract the way the other three
 do. `main.py`'s own orchestration logic has no dedicated test file.
 
-One structural note: this development environment has no GPU and no `torch` installed, so
-every torch-dependent test in this project has been written and verified by careful manual
-tracing (and, where possible, numerical cross-checks using pure Python/numpy
-reproductions of the same arithmetic) rather than actually executed here — confirmed
-passing only once run in the user's own environment.
-
 
 
 ## Known issues and to do list
 
 - **Stage 3b is the pipeline's weak link.** Rollout training instability has not been
   resolved by curriculum (3a→3b, already in place) or by two attempts at a `one_step_weight`
-  regularizer (both made things worse). This is upstream of stages 4/5, so their results
+  regularizer (both made things worse). This is upstream of stages 4 and 5, so their results
   currently carry uncertainty about how much is the parameter being tested vs. run-to-run
-  variance in the 3b ancestor they're built on, despite being a genuine tunable knob.
+  variance in the 3b ancestor they are built on, despite being a genuine tunable knob.
 - **`compare_integrators.py`/`compare_rollout_training.py`** — stale relative to current
-  conventions (confirmed via `check_dt_dependence.py`'s own stale-path example); not
+  conventions (confirmed via `check_parameter_dependence.py`'s own stale-path example); not
   actively broken, but drifting.
 
 ### Todo
@@ -248,6 +222,6 @@ passing only once run in the user's own environment.
 
 
 ### Implemented but not currently used
-- **`use_skips`** — architecturally scaffolded, never enabled anywhere.
-- **`step_weights`** (`RolloutLoss`) — built, tested, never used in any real run.
-- **`n_frozen_stages`** — fixed at `2` in every params file ever seen in this project.
+- `use_skips`: architecturally scaffolded, never enabled anywhere.
+- `step_weights` (`RolloutLoss`): built, tested, never used in any real run.
+- `n_frozen_stages`: fixed at `2` in every params file ever seen in this project.

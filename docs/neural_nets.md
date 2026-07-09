@@ -38,15 +38,20 @@ There are five losses, which can be mixed and matched at the different stages:
 - one-step latent prediction loss: $L_\mathrm{1step}$,
 - multi-step rollout loss: $L_\mathrm{rollout}$.
 
-| \#| Stage             | Train   | Frozen| Space | Loss                            |
-|---|-------------------|---------|-------|-------|---------------------------------|
-| 1 | autoencoder       | E, D, SH|       | real  | `L_recon + λ L_stats`           |
-| 2 | latent validation | E, D    | SH    | both  | `L_recon + λ L_stats + λ₁ L_interp` |
-| 3 | LDS               | f       | E, D  | latent| `L_1step` (3a), then `L_rollout + ε L_1step` (3b) |
-| 4 | encoder refinement| E, f    | D   | lat + ε real| `L_rollout + λ L_stats + ε L_recon |
-| 5 | end-to-end        | E, f, D |    | real  | `L_recon + λ L_stats + λ₂ L_rollout` |
+| \#| Stage             | Trained |Frozen|Unused| Space | Loss                            |
+|---|-------------------|---------|------|------|-------|---------------------------------|
+| 1 | autoencoder       | E, D, SH|      | f    | real  | `L_recon + λ L_stats`           |
+| 2 | latent validation |E${}^*$, D${}^*$| SH   | f    | both  | `L_recon + λ L_stats + λ₁ L_interp` |
+| 3a| LDS               | f       | E, SH| D    | latent| `L_1step`                       |
+| 3b| LDS               | f       | E, SH| D    | latent| `L_rollout + ε L_1step`         |
+| 4 | encoder refinement| E, f    | D, SH|      | lat + ε real| `L_rollout + λ L_stats + ε L_recon` |
+| 5 | end-to-end        | E, f, D | SH   |      | real  | `L_recon + λ L_stats + λ₂ L_rollout` |
 
-SH: `stats_head` 
+SH: `stats_head`; ${}^*$: outter layers frozen.
+
+
+
+![structure of stages and checkpoints](/assets/docs/liens_stage_checkpoint_flow.png "structure of stages and checkpoints")
 
 
 ### Reconstruction loss

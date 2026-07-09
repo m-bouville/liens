@@ -63,6 +63,39 @@ def test_y_axis_capped_at_2x_first_train_loss(tmp_path, monkeypatch):
     assert ymax < max(val_loss), "the cap should be far below the actual spike -- confirms it's a real cap"
 
 
+def test_y_axis_not_capped_when_nothing_exceeds_it(tmp_path, monkeypatch):
+    """The new behavior this test guards: a well-behaved run where
+    nothing ever reaches 2x the first epoch's loss should NOT have its
+    axis artificially stretched to that unused cap -- it should
+    auto-scale to the real (tighter) range instead, same rendered-axis
+    verification approach as the capped case above."""
+    epochs = list(range(1, 6))
+    train_loss = [10.0, 8.0, 6.0, 5.0, 4.0]  # smooth decline, no spike
+    val_loss = [11.0, 9.0, 7.0, 6.0, 5.0]
+    best_so_far = [11.0, 9.0, 7.0, 6.0, 5.0]
+    out = tmp_path / "loss_curve.png"
+
+    captured_axes = {}
+    real_subplots = plt.subplots
+
+    def spy_subplots(*args, **kwargs):
+        fig, ax = real_subplots(*args, **kwargs)
+        captured_axes["ax"] = ax
+        return fig, ax
+
+    monkeypatch.setattr(plt, "subplots", spy_subplots)
+
+    plots.loss_curve(epochs, train_loss, val_loss, best_so_far, out)
+
+    ax = captured_axes["ax"]
+    ymin, ymax = ax.get_ylim()
+    unused_cap = 2 * train_loss[0]  # 20.0 -- nothing in this run reaches it
+    assert ymax < unused_cap, (
+        f"axis should auto-scale below the unused cap ({unused_cap}), got ymax={ymax}"
+    )
+    assert ymin == 0
+
+
 def test_secondary_lines_do_not_crash_and_produce_a_file(tmp_path):
     epochs = list(range(1, 6))
     train_loss = [4.0, 3.5, 3.0, 2.8, 2.6]
