@@ -29,6 +29,18 @@ from utils.plots import loss_curve
 from evaluation.check_interpolation import check_interpolation
 from evaluation.check_perturbation import check_perturbation
 
+# GENERAL POLICY (matches training/train_refinement.py's own
+# _PYTHON_ROOT): every checkpoint/output/dataset path is built from
+# THIS anchor, never from a bare relative string like "../output/...".
+# Relative strings resolve against the process's CWD at invocation
+# time, which silently differs across bare CLI, `python -m`, and being
+# imported and called from another module (e.g. main.py calling
+# train_autoencoder) -- exactly the recurring "output ended up in the
+# wrong place" bug hit repeatedly on this project. Path(__file__) is
+# anchored to THIS FILE's own on-disk location instead, which is
+# invariant regardless of how/from-where the process was launched.
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_ae.py -> python/
+
 
 def train_autoencoder(
     size: int, base_path: Path,
@@ -69,13 +81,13 @@ def train_autoencoder(
 
     resume_from: optional checkpoint to initialize model_state/
     stats_head_state from before training starts (e.g. to continue stage
-    2 training itself with more epochs -- NOT how stage 3 works, which
+    1 training itself with more epochs -- NOT how stage 2 works, which
     is a separate function with a different loss/data structure).
 
     early_stopping_patience: stop once val_ema hasn't improved for this
     many consecutive epochs, instead of always running the full `epochs`
     budget -- a data-driven stopping signal rather than a guessed epoch
-    count for "stage 2 is done".
+    count for "stage 1 is done".
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(seed)
@@ -100,13 +112,13 @@ def train_autoencoder(
 
     if checkpoint_path is None:
         name = ae_checkpoint_name(size, latent_channels, stats_weight)
-        checkpoint_path = Path(f"../checkpoints/stage1/{name}.pt")
+        checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage1" / f"{name}.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
 
     if loss_curve_path is None:
         name = ae_checkpoint_name(size, latent_channels, stats_weight)
-        loss_curve_path = Path(f"../output/stage1/{name}-loss_curve.png")
+        loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage1" / f"{name}-loss_curve.png"
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
@@ -543,13 +555,13 @@ def train_stage2(
 
     if checkpoint_path is None:
         name = ae_checkpoint_name(size, model_cfg["latent_channels"], ancestor_stats_weight)
-        checkpoint_path = Path(f"../checkpoints/stage2/{name}-stage2.pt")
+        checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage2" / f"{name}-stage2.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
 
     if loss_curve_path is None:
         name = ae_checkpoint_name(size, model_cfg["latent_channels"], ancestor_stats_weight)
-        loss_curve_path = Path(f"../output/stage2/{name}-stage2-loss_curve.png")
+        loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage2" / f"{name}-stage2-loss_curve.png"
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
@@ -593,12 +605,14 @@ def train_stage2(
     print("=" * 70)
     check_interpolation(
         checkpoint_path=resume_from, min_step=min_step, device=device,
-        output_path=Path(f"../output/stage1/{resume_from.stem}-pre_stage2-interpolation.png"),
+        output_path=(_PYTHON_ROOT.parent / "output" / "stage1"
+                     / f"{resume_from.stem}-pre_stage2-interpolation.png"),
     )
     print()
     check_perturbation(
         checkpoint_path=resume_from, min_step=min_step, device=device,
-        output_path=Path(f"../output/stage1/{resume_from.stem}-pre_stage2-perturbation.png"),
+        output_path=(_PYTHON_ROOT.parent / "output" / "stage1"
+                     / f"{resume_from.stem}-pre_stage2-perturbation.png"),
     )
     print()
 
@@ -808,7 +822,7 @@ def main():
     parser.add_argument("--size", type=int, required=True,
                          help="grid size (square only) -- locates base/<size>x<size>/, "
                               "reading ITS OWN metadata.txt (not config.txt)")
-    parser.add_argument("--base", type=Path, default=Path("../datasets"))
+    parser.add_argument("--base", type=Path, default=_PYTHON_ROOT.parent / "datasets")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)

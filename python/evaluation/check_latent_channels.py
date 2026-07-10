@@ -40,6 +40,18 @@ from training.datasets import MicrostructureSnapshotDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
 
+# GENERAL POLICY (matches training/train_refinement.py's own
+# _PYTHON_ROOT): every default checkpoint/output path is built from
+# THIS anchor, never from a bare relative string like "../../output/...".
+# Relative strings resolve against the process's CWD at invocation
+# time, which silently differs across bare CLI, `python -m`, and being
+# imported and called from another module (e.g. main.py calling this
+# function) -- exactly the recurring "output ended up in the wrong
+# place" bug hit repeatedly on this project. Path(__file__) is anchored
+# to THIS FILE's own on-disk location instead, which is invariant
+# regardless of how/from-where the process was launched.
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/
+
 
 def parse_fixed_frame(s: str) -> tuple[Path, int]:
     """
@@ -120,7 +132,8 @@ def check_latent_channels(
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     if output_path is None:
-        output_path = Path(f"../../output/stage2/{ae_checkpoint_path.stem}-latent_channels.png")
+        output_path = (_PYTHON_ROOT.parent / "output" / "stage2"
+                       / f"{ae_checkpoint_path.stem}-latent_channels.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)

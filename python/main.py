@@ -148,14 +148,24 @@ _KEY_RENAMES = {"patience": "early_stopping_patience", "batches": "batch_size"}
 # from the cache-matching signature -- a run with a different batch_size
 # but otherwise identical parameters still counts as "the same" checkpoint.
 _NON_SIGNATURE_KEYS = {"batch_size", "log_every_epoch"}
-_MAIN_DIR = Path(__file__).resolve().parent
-_STAGE_DIRS = {1: _MAIN_DIR / "checkpoints" / "stage1",
-               2: _MAIN_DIR / "checkpoints" / "stage2",
-               3: _MAIN_DIR / "checkpoints" / "stage3",
-               "3a": _MAIN_DIR / "checkpoints" / "stage3a",
-               "3b": _MAIN_DIR / "checkpoints" / "stage3b",
-               4: _MAIN_DIR / "checkpoints" / "stage4",
-               5: _MAIN_DIR / "checkpoints" / "stage5"}
+# GENERAL POLICY (matches training/train_refinement.py's own
+# _PYTHON_ROOT): every checkpoint/output path is built from THIS
+# anchor, never from a bare relative string like "../output/...".
+# Relative strings resolve against the process's CWD at invocation
+# time, which silently differs across bare CLI, `python -m`, and being
+# imported and called from another module (e.g. main.py calling a
+# check_*.py function) -- exactly the recurring "output ended up in
+# the wrong place" bug hit repeatedly on this project. Path(__file__)
+# is anchored to THIS FILE's own on-disk location instead, which is
+# invariant regardless of how/from-where the process was launched.
+_PYTHON_ROOT = Path(__file__).resolve().parent  # python/main.py -> python/
+_STAGE_DIRS = {1: _PYTHON_ROOT / "checkpoints" / "stage1",
+               2: _PYTHON_ROOT / "checkpoints" / "stage2",
+               3: _PYTHON_ROOT / "checkpoints" / "stage3",
+               "3a": _PYTHON_ROOT / "checkpoints" / "stage3a",
+               "3b": _PYTHON_ROOT / "checkpoints" / "stage3b",
+               4: _PYTHON_ROOT / "checkpoints" / "stage4",
+               5: _PYTHON_ROOT / "checkpoints" / "stage5"}
 
 
 class _Tee:
@@ -442,7 +452,7 @@ def _prepare_stage_kwargs(raw_params: dict[str, str]) -> dict:
 
 
 _CHECKPOINT_ANCESTRY_KEY = re.compile(r"^stage(\d+)_checkpoint$")
-_CHECKPOINTS_ROOT = _MAIN_DIR / "checkpoints"
+_CHECKPOINTS_ROOT = _PYTHON_ROOT / "checkpoints"
 
 
 def _resolve_path_in_checkpoints(value: str, stage_num: int) -> str:
@@ -676,7 +686,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             stage1_checkpoint = train_autoencoder(
                 size=size, base_path=base_path,
                 checkpoint_path=stage_output_path(1), device=device,
-                loss_curve_path=Path(f"../output/stage1/{stage_output_path(1).stem}-loss_curve.png"),
+                loss_curve_path=_PYTHON_ROOT.parent / "output" / f"stage1/{stage_output_path(1).stem}-loss_curve.png",
                 on_checkpoint_saved=_make_checkpoint_callback(registry1_path, signature1),
                 **stage1_kwargs,
             )
@@ -689,7 +699,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             check_reconstruction(
                 checkpoint_path=stage1_checkpoint, device=device,
                 min_step=stage1_kwargs.get("min_step", 0),
-                output_path=Path(f"../output/stage1/{stage1_checkpoint.stem}-reconstruction.png"),
+                output_path=_PYTHON_ROOT.parent / "output" / f"stage1/{stage1_checkpoint.stem}-reconstruction.png",
             )
             print()
 
@@ -719,7 +729,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 stage2_checkpoint = train_stage2(
                     base_path=base_path, resume_from=stage1_checkpoint,
                     checkpoint_path=stage_output_path(2), device=device,
-                    loss_curve_path=Path(f"../output/stage2/{stage_output_path(2).stem}-loss_curve.png"),
+                    loss_curve_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage_output_path(2).stem}-loss_curve.png",
                     on_checkpoint_saved=_make_checkpoint_callback(registry2_path, signature2),
                     **stage2_kwargs,
                 )
@@ -732,7 +742,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 check_reconstruction(
                     checkpoint_path=stage2_checkpoint, device=device,
                     min_step=stage2_kwargs.get("min_step", 0),
-                    output_path=Path(f"../output/stage2/{stage2_checkpoint.stem}-reconstruction.png"),
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-reconstruction.png",
                 )
                 print()
 
@@ -742,7 +752,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 check_latent_channels(
                     ae_checkpoint_path=stage2_checkpoint, device=device,
                     min_step=stage2_kwargs.get("min_step", 0),
-                    output_path=Path(f"../output/stage2/{stage2_checkpoint.stem}-latent_channels.png"),
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-latent_channels.png",
                 )
                 print()
 
@@ -751,7 +761,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 check_interpolation(
                     checkpoint_path=stage2_checkpoint, device=device,
-                    output_path=Path(f"../output/stage2/{stage2_checkpoint.stem}-interpolation.png"),
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-interpolation.png",
                 )
                 print()
 
@@ -760,7 +770,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 check_perturbation(
                     checkpoint_path=stage2_checkpoint, device=device,
-                    output_path=Path(f"../output/stage2/{stage2_checkpoint.stem}-perturbation.png"),
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-perturbation.png",
                 )
                 print()
 
@@ -835,8 +845,9 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 checkpoint = train_lds(
                     size=size, base_path=base_path, ae_checkpoint_path=stage2_checkpoint,
                     checkpoint_path=stage_output_path(stage_key), device=device,
-                    loss_curve_path=Path(
-                        f"../output/stage{stage_key}/{stage_output_path(stage_key).stem}-loss_curve.png"
+                    loss_curve_path=(
+                        _PYTHON_ROOT.parent / "output" / f"stage{stage_key}"
+                        / f"{stage_output_path(stage_key).stem}-loss_curve.png"
                     ),
                     resume_from=resume_from,
                     on_checkpoint_saved=_make_checkpoint_callback(registry_path, signature),
@@ -851,7 +862,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                     print("=" * 70)
                     check_rollout(
                         lds_checkpoint_path=checkpoint, device=device,
-                        output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-rollout.png"),
+                        output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-rollout.png",
                     )
                     print()
 
@@ -861,7 +872,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                     print("=" * 70)
                     check_parameter_dependence(
                         lds_checkpoint_path=checkpoint, device=device,
-                        output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-parameter_dependence.png"),
+                        output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-parameter_dependence.png",
                     )
                     print()
         return checkpoint, freshly_trained
@@ -896,7 +907,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print("=" * 70)
             _, shared_windows = check_rollout(
                 lds_checkpoint_path=stage3_checkpoint, device=device,
-                output_path=Path(f"../output/stage3b/{stage3_checkpoint.stem}-rollout.png"),
+                output_path=_PYTHON_ROOT.parent / "output" / f"stage3b/{stage3_checkpoint.stem}-rollout.png",
             )
             print()
 
@@ -906,7 +917,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             check_rollout(
                 lds_checkpoint_path=stage3a_checkpoint, device=device,
                 fixed_windows=shared_windows,
-                output_path=Path(f"../output/stage3a/{stage3a_checkpoint.stem}-rollout.png"),
+                output_path=_PYTHON_ROOT.parent / "output" / f"stage3a/{stage3a_checkpoint.stem}-rollout.png",
             )
             print()
 
@@ -916,7 +927,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print("=" * 70)
             check_parameter_dependence(
                 lds_checkpoint_path=stage3_checkpoint, device=device,
-                output_path=Path(f"../output/stage3b/{stage3_checkpoint.stem}-parameter_dependence.png"),
+                output_path=_PYTHON_ROOT.parent / "output" / f"stage3b/{stage3_checkpoint.stem}-parameter_dependence.png",
             )
             print()
 
@@ -926,7 +937,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print("=" * 70)
             check_parameter_dependence(
                 lds_checkpoint_path=stage3a_checkpoint, device=device,
-                output_path=Path(f"../output/stage3a/{stage3a_checkpoint.stem}-parameter_dependence.png"),
+                output_path=_PYTHON_ROOT.parent / "output" / f"stage3a/{stage3a_checkpoint.stem}-parameter_dependence.png",
             )
             print()
     else:
@@ -979,8 +990,9 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 common_args = dict(
                     base_path=base_path, freeze_decoder=freeze_decoder,
                     checkpoint_path=stage_output_path(stage_key), device=device,
-                    loss_curve_path=Path(
-                        f"../output/stage{stage_key}/{stage_output_path(stage_key).stem}-loss_curve.png"
+                    loss_curve_path=(
+                        _PYTHON_ROOT.parent / "output" / f"stage{stage_key}"
+                        / f"{stage_output_path(stage_key).stem}-loss_curve.png"
                     ),
                     on_checkpoint_saved=_make_checkpoint_callback(registry_path, signature),
                     **kwargs,
@@ -1005,7 +1017,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 check_reconstruction(
                     checkpoint_path=ae_view_path, device=device,
                     min_step=kwargs.get("min_step", 0),
-                    output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-reconstruction.png"),
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-reconstruction.png",
                 )
                 print()
 
@@ -1015,7 +1027,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 check_latent_channels(
                     ae_checkpoint_path=ae_view_path, device=device,
                     min_step=kwargs.get("min_step", 0),
-                    output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-latent_channels.png"),
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-latent_channels.png",
                 )
                 print()
 
@@ -1024,7 +1036,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 check_rollout(
                     lds_checkpoint_path=lds_view_path, device=device,
-                    output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-rollout.png"),
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-rollout.png",
                 )
                 print()
 
@@ -1046,7 +1058,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                     print("=" * 70)
                     check_interpolation(
                         checkpoint_path=ae_view_path, device=device,
-                        output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-interpolation.png"),
+                        output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-interpolation.png",
                     )
                     print()
 
@@ -1055,7 +1067,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                     print("=" * 70)
                     check_perturbation(
                         checkpoint_path=ae_view_path, device=device,
-                        output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-perturbation.png"),
+                        output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-perturbation.png",
                     )
                     print()
                 except ValueError as e:
@@ -1081,7 +1093,7 @@ def main():
     parser.add_argument("params_files", type=Path, nargs="*",
                          help="one or more stage-parameters file paths -- the pipeline runs "
                               "once per file, in order given")
-    parser.add_argument("--base", type=Path, default=Path("../datasets"),
+    parser.add_argument("--base", type=Path, default=_PYTHON_ROOT.parent / "datasets",
                          help="fallback dataset base path, only used if a params file "
                               "doesn't specify its own 'base = ...' in its global section")
     parser.add_argument("--scan-only", action="store_true",

@@ -30,6 +30,18 @@ from training.losses import RolloutLoss
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
 from utils.plots import loss_curve
 
+# GENERAL POLICY (matches training/train_refinement.py's own
+# _PYTHON_ROOT): every checkpoint/output/dataset path is built from
+# THIS anchor, never from a bare relative string like "../output/...".
+# Relative strings resolve against the process's CWD at invocation
+# time, which silently differs across bare CLI, `python -m`, and being
+# imported and called from another module (e.g. main.py calling
+# train_lds) -- exactly the recurring "output ended up in the wrong
+# place" bug hit repeatedly on this project. Path(__file__) is anchored
+# to THIS FILE's own on-disk location instead, which is invariant
+# regardless of how/from-where the process was launched.
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_lds.py -> python/
+
 
 def train_lds(
     size: int, base_path: Path,
@@ -140,7 +152,7 @@ def train_lds(
                 "so the expected path can be reconstructed."
             )
         ae_name = ae_checkpoint_name(size, ae_latent_channels, stats_weight)
-        ae_checkpoint_path = Path(f"../checkpoints/stage2/{ae_name}.pt")
+        ae_checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage2" / f"{ae_name}.pt"
         print(f"Reconstructed AE checkpoint path: {ae_checkpoint_path}")
 
     # Load the frozen autoencoder. Only .encoder is ever used below --
@@ -169,14 +181,14 @@ def train_lds(
     if checkpoint_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
                                     stats_weight, n_rollout_steps)
-        checkpoint_path = Path(f"../checkpoints/stage3/{name}.pt")
+        checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage3" / f"{name}.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}\n")
 
     if loss_curve_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
                                     stats_weight, n_rollout_steps)
-        loss_curve_path = Path(f"../output/stage3/{name}-loss_curve.png")
+        loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage3" / f"{name}-loss_curve.png"
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
@@ -405,7 +417,7 @@ def main():
     parser.add_argument("--size", type=int, required=True,
                          help="grid size (square only) -- locates base/<size>x<size>/, "
                               "reading ITS OWN metadata.txt (not config.txt)")
-    parser.add_argument("--base", type=Path, default=Path("../../datasets"))
+    parser.add_argument("--base", type=Path, default=_PYTHON_ROOT.parent / "datasets")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-3)

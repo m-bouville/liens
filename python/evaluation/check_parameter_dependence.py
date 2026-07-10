@@ -31,6 +31,18 @@ from training.datasets import MicrostructureEvolutionDataset
 from training.losses import OneStepLoss, ReconLoss
 from utils import load_datasets as load
 
+# GENERAL POLICY (matches training/train_refinement.py's own
+# _PYTHON_ROOT): every default checkpoint/output path is built from
+# THIS anchor, never from a bare relative string like "../../output/...".
+# Relative strings resolve against the process's CWD at invocation
+# time, which silently differs across bare CLI, `python -m`, and being
+# imported and called from another module (e.g. main.py calling this
+# function) -- exactly the recurring "output ended up in the wrong
+# place" bug hit repeatedly on this project. Path(__file__) is anchored
+# to THIS FILE's own on-disk location instead, which is invariant
+# regardless of how/from-where the process was launched.
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/
+
 
 def max_autocorr_dist(nx: int, ny: int) -> int:
     """
@@ -142,69 +154,130 @@ def _print_binned_summary(name: str, values: np.ndarray, latent_losses: np.ndarr
               f"{latent_losses[mask].mean():.6f}         {pixel_losses[mask].mean():.6f}")
 
 
-def _boxplot_by_x(ax, x_values: np.ndarray, y_values: np.ndarray, log_x: bool = False):
+def _boxplot_by_x(ax, x_values: np.ndarray, y_values: np.ndarray, log_x: bool = False,
+                   round_decimals: int = 6):
     """
-    Boxplot of y_values grouped by each unique value in x_values.
-    Appropriate here specifically because dt/temperature/noise each
-    take a small, discrete set of values within one sweep (unlike a
-    genuinely continuous variable) -- at a given x, a scatter's
-    overlapping points obscure the actual distribution (median, IQR,
-    outliers), which a boxplot shows directly.
+    Boxplot of y_values grouped by each unique value in x_values, with
+    boxes positioned at their LITERAL value -- honest, in both the
+    log_x=True (dt) and log_x=False (temperature/noise) cases. An
+    earlier version of this positioned temperature/noise boxes at
+    evenly-spaced CATEGORICAL indices instead, discarding their real
+    value spacing entirely to avoid crowding -- that's misleading, not
+    a readability trade-off: it makes two boxes close in value and two
+    boxes far apart in value look identically spaced, which is a false
+    impression of the underlying sweep, not just a cosmetic
+    simplification. Reverted.
 
-    log_x: widths are set PROPORTIONAL to position (not constant) so
-    boxes look visually consistent across a log-scale axis -- a
-    constant width would be imperceptibly thin at small x and absurdly
-    wide at large x. Verified numerically: width=position*k gives an
-    identical hi/lo ratio at every position, i.e. genuinely constant
-    apparent width on a log axis, not just at a glance.
+    dt (log_x=True) was never the problem: its sweep is naturally close
+    to geometric (roughly x2 between consecutive values), so an honest
+    log axis at literal values already looks close to evenly spaced --
+    nothing special is done for it, it just doesn't need anything
+    special. temperature/noise are swept roughly linearly, so a linear
+    axis at literal values will only look evenly spread if the sweep
+    itself actually is -- if it isn't (or if the ACTUAL unique-value
+    count is much larger than the intended sweep grid; see
+    round_decimals below), no amount of axis trickery makes that
+    honest AND uniformly readable at the same time. The two things
+    below address the two real, non-misleading ways to reduce crowding:
+
+    1. round_decimals: values are rounded to this many decimals before
+       computing uniqueness. Temperature/noise round-trip through a
+       text metadata file -- float parsing can turn what's meant to be
+       the same nominal sweep value (e.g. 0.55) into many
+       bit-distinct floats (0.5500000001, 0.5499999998, ...) across
+       different runs, which np.unique would count as genuinely
+       different x positions, silently exploding the apparent sweep
+       size far beyond the real number of distinct settings. Rounding
+       merges those back into one honest value rather than plotting
+       dozens of near-duplicate boxes that were never meant to be
+       distinguishable. This does NOT round away real distinctions --
+       a human-designed sweep grid isn't going to have two genuinely
+       different settings within 1e-6 of each other.
+    2. Per-box width from that box's own LOCAL neighbor gaps, not a
+       single global minimum gap. The old width = min(all gaps) * 0.6
+       meant one closely-spaced pair anywhere in the sweep forced every
+       box everywhere to be that thin, including ones with plenty of
+       room -- using each box's own local spacing gives genuinely
+       sparse boxes their actual available width instead.
+
+    Tick labels are still thinned (not every value gets text) once
+    there are more than max_labeled_ticks distinct values, since even
+    honestly-positioned boxes can have more values than can be legibly
+    labeled -- but the BOXES themselves are never merged or
+    repositioned, only which ones get a text label underneath.
     """
+    x_values = np.round(x_values, round_decimals)
     unique_x = np.unique(x_values)
     groups = [y_values[x_values == x] for x in unique_x]
+    print(f"  ({len(unique_x)} distinct x values after rounding to {round_decimals} "
+          f"decimals -- if this looks far larger than the intended sweep grid, "
+          f"floating-point round-trip noise is the likely cause)")
 
     if log_x:
         widths = unique_x * 0.15
     else:
-        min_gap = np.min(np.diff(unique_x)) if len(unique_x) > 1 else 1.0
-        widths = np.full(len(unique_x), min_gap * 0.6)
+        widths = _local_widths(unique_x)
 
     ax.boxplot(groups, positions=unique_x, widths=widths, showfliers=True,
                patch_artist=True, boxprops=dict(facecolor="tab:blue", alpha=0.4),
                medianprops=dict(color="black"),
                flierprops=dict(markersize=3, alpha=0.3, markeredgecolor="tab:blue"))
+
+    # matplotlib's boxplot() applies its OWN default x margin -- +-0.5
+    # around the position range -- regardless of what scale the
+    # positions are actually on. That's a reasonable margin for
+    # categorical integer positions (0, 1, 2, ...), and a wildly
+    # disproportionate one for small real-valued positions: verified
+    # numerically for a noise-like sweep spanning [0.005, 0.05] (range
+    # 0.045), the default autoscale gives xlim=(-0.495, 0.55) -- a
+    # range over 23x wider than the actual data, squeezing every box
+    # into a sliver in the middle of mostly blank axis. Overriding xlim
+    # explicitly, proportional to the REAL data range, fixes this for
+    # any parameter's scale rather than relying on matplotlib's
+    # categorical-position assumption.
+    if log_x:
+        ax.set_xlim(unique_x.min() / 1.5, unique_x.max() * 1.5)
+    else:
+        data_range = unique_x.max() - unique_x.min() if len(unique_x) > 1 else widths[0]
+        pad = max(data_range * 0.1, widths.max() * 0.75)
+        ax.set_xlim(unique_x.min() - pad, unique_x.max() + pad)
+
     if log_x:
         ax.set_xscale("log")
+        return
+
+    # Value-evenly-spaced tick TARGETS, nearest-snapped to real data --
+    # only decides which of the (honestly, literally positioned) boxes
+    # get a text label, never moves or merges a box itself.
+    max_labeled_ticks = 15
+    if len(unique_x) > max_labeled_ticks:
+        targets = np.linspace(unique_x.min(), unique_x.max(), max_labeled_ticks)
+        indices = np.clip(np.searchsorted(unique_x, targets), 0, len(unique_x) - 1)
+        for i, t in enumerate(targets):
+            idx = indices[i]
+            if idx > 0 and abs(unique_x[idx - 1] - t) < abs(unique_x[idx] - t):
+                indices[i] = idx - 1
+        tick_positions = np.unique(unique_x[indices])
     else:
-        # boxplot's default behavior is ALWAYS one labeled tick per
-        # position, regardless of how many there are -- fine for a
-        # handful of values, unreadable once a finer sweep grid (more
-        # runs revealing more distinct values) produces dozens of them.
-        # log-scale panels don't need this: set_xscale("log") replaces
-        # boxplot's explicit tick locator with a log-appropriate one as
-        # a side effect; nothing does that for the linear case, so it's
-        # handled explicitly here instead.
-        #
-        # Ticks are spaced evenly across the VALUE range, not the index
-        # range -- striding unique_x by index caps the tick COUNT but not
-        # their spread: if unique_x is non-uniformly distributed (many
-        # closely-spaced values in one region, few elsewhere), an
-        # index-based stride picks nearly all ticks from the dense
-        # region, leaving them visually clustered despite being capped
-        # at max_labeled_ticks. Confirmed this reproduces the exact
-        # "still compressed" symptom with a synthetic dense-then-sparse
-        # value set before switching to this approach.
-        max_labeled_ticks = 15
-        if len(unique_x) > max_labeled_ticks:
-            targets = np.linspace(unique_x.min(), unique_x.max(), max_labeled_ticks)
-            indices = np.clip(np.searchsorted(unique_x, targets), 0, len(unique_x) - 1)
-            for i, t in enumerate(targets):
-                idx = indices[i]
-                if idx > 0 and abs(unique_x[idx - 1] - t) < abs(unique_x[idx] - t):
-                    indices[i] = idx - 1
-            tick_positions = np.unique(unique_x[indices])
-        else:
-            tick_positions = unique_x
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels([f"{v:.3g}" for v in tick_positions], rotation=90, fontsize=8)
+        tick_positions = unique_x
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels([f"{v:.3g}" for v in tick_positions], rotation=90, fontsize=8)
+
+
+def _local_widths(unique_x: np.ndarray, factor: float = 0.6) -> np.ndarray:
+    """
+    Per-position box width from that position's OWN nearest-neighbor
+    gap (left or right, whichever is smaller), not a single global
+    min-gap applied everywhere. A box in a sparse region gets a width
+    that reflects the room it actually has, instead of being forced
+    down to match the tightest pair anywhere else in the sweep.
+    """
+    if len(unique_x) == 1:
+        return np.array([max(abs(unique_x[0]) * 0.1, 1e-3)])
+    gaps = np.diff(unique_x)
+    left_gap = np.concatenate([[gaps[0]], gaps])
+    right_gap = np.concatenate([gaps, [gaps[-1]]])
+    return np.minimum(left_gap, right_gap) * factor
 
 
 def check_parameter_dependence(
@@ -215,7 +288,8 @@ def check_parameter_dependence(
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     if output_path is None:
-        output_path = Path(f"../../output/stage3/{lds_checkpoint_path.stem}-parameter_dependence.png")
+        output_path = (_PYTHON_ROOT.parent / "output" / "stage3"
+                       / f"{lds_checkpoint_path.stem}-parameter_dependence.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     lds_checkpoint = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
@@ -370,9 +444,7 @@ def check_parameter_dependence(
     # microstructures failing outright while a much finer-grained
     # texture reconstructs cleanly, raising the question of whether the
     # 8x8 latent bottleneck is under-resolving a specific length-scale
-    # regime rather than "coarse features = easy". Linear-space, like
-    # temperature/noise (autocorr_length doesn't span orders of
-    # magnitude the way dt does within one sweep).
+    # regime rather than "coarse features = easy".
     #
     # SATURATED VALUES EXCLUDED: the C++ simulation caps autocorr_length
     # at max_autocorr_dist(Nx, Ny) -- distances beyond that are an
@@ -551,7 +623,7 @@ def main():
     parser.add_argument("--min-step", type=int, default=None)
     parser.add_argument("--min-stdev-phi", type=float, default=None)
     parser.add_argument("--output", type=Path, default=None,
-            help="default: ../../output/stage3/<lds checkpoint name>-parameter_dependence.png")
+            help="default: <repo root>/output/stage3/<lds checkpoint name>-parameter_dependence.png")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()

@@ -45,6 +45,18 @@ from training.stats_head import StatsHead
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
 
+# GENERAL POLICY (matches training/train_refinement.py's own
+# _PYTHON_ROOT): every default checkpoint/output path is built from
+# THIS anchor, never from a bare relative string like "../../output/...".
+# Relative strings resolve against the process's CWD at invocation
+# time, which silently differs across bare CLI, `python -m`, and being
+# imported and called from another module (e.g. main.py or train_ae.py
+# calling this function) -- exactly the recurring "output ended up in
+# the wrong place" bug hit repeatedly on this project. Path(__file__)
+# is anchored to THIS FILE's own on-disk location instead, which is
+# invariant regardless of how/from-where the process was launched.
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/check_perturbation.py -> python/
+
 
 def linear_fit(eps_values: np.ndarray, delta: np.ndarray) -> tuple[float, float, float]:
     """delta = dz*eps + c via least squares. Returns (dz, c, r_squared)."""
@@ -67,7 +79,8 @@ def check_perturbation(
     eps_values = np.array(eps_values or [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4])
 
     if output_path is None:
-        output_path = Path(f"../../output/perturbation_check_png/{checkpoint_path.stem}.png")
+        output_path = (_PYTHON_ROOT.parent / "output" / "perturbation_check_png"
+                       / f"{checkpoint_path.stem}.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -219,7 +232,7 @@ def main():
     parser.add_argument("--min-step", type=int, default=4000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, default=None,
-            help="default: ../../output/perturbation_check_png/<checkpoint name>.png")
+            help="default: <repo root>/output/perturbation_check_png/<checkpoint name>.png")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -231,11 +244,12 @@ def main():
                 "--stats-weight so the expected path can be reconstructed."
             )
         name = ae_checkpoint_name(args.size, args.latent_channels, args.stats_weight)
-        args.checkpoint = Path(f"../checkpoints/stage2/{name}.pt")
+        args.checkpoint = _PYTHON_ROOT / "checkpoints" / "stage2" / f"{name}.pt"
         print(f"Reconstructed checkpoint path: {args.checkpoint}")
 
     if args.output is None:
-        args.output = Path(f"../../output/perturbation_check_png/{args.checkpoint.stem}.png")
+        args.output = (_PYTHON_ROOT.parent / "output" / "perturbation_check_png"
+                       / f"{args.checkpoint.stem}.png")
 
     check_perturbation(
         checkpoint_path=args.checkpoint, n_samples=args.n_samples, n_repeats=args.n_repeats,

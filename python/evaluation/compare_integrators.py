@@ -29,13 +29,28 @@ from models.latent_dynamics import LatentDynamics
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import OneStepLoss
 
+# GENERAL POLICY (matches training/train_refinement.py's own
+# _PYTHON_ROOT): every default checkpoint/output path is built from
+# THIS anchor, never from a bare relative string like "../../output/...".
+# Relative strings resolve against the process's CWD at invocation
+# time, which silently differs across bare CLI and `python -m` --
+# exactly the bug visible right in this file's own docstring above
+# (its usage example uses "../output/...", one level, while the actual
+# argparse defaults below used "../../output/...", two levels -- the
+# two were never actually consistent with each other). Path(__file__)
+# is anchored to THIS FILE's own on-disk location instead, which is
+# invariant regardless of how/from-where the process was launched.
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/compare_integrators.py -> python/
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lds-checkpoint", type=Path, default=Path("../../output/lds_checkpoint.pt"))
+    parser.add_argument("--lds-checkpoint", type=Path,
+                         default=_PYTHON_ROOT.parent / "output" / "lds_checkpoint.pt")
     parser.add_argument("--min-step", type=int, default=None)
     parser.add_argument("--min-stdev-phi", type=float, default=None)
-    parser.add_argument("--output", type=Path, default=Path("../../output/integrator_comparison.png"))
+    parser.add_argument("--output", type=Path,
+                         default=_PYTHON_ROOT.parent / "output" / "integrator_comparison.png")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()

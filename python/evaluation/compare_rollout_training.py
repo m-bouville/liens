@@ -1,10 +1,13 @@
 """
 Compare two LDS checkpoints (e.g. one-step-trained vs rollout-trained)
 on their ACTUAL target: chained multi-step rollout error, where each
-model's own prediction feeds into the next step -- not one-step
-prediction error (which check_rollout.py measures, and which a
-rollout-trained model can legitimately be worse at while still being
-BETTER at what it was actually trained for).
+model's own prediction feeds into the next step. check_rollout.py ALSO
+chains a full rollout (see its own docstring) -- the difference is
+scope: check_rollout.py reports only the FINAL step, visually, in pixel
+space, for ONE checkpoint at a time; this script tracks the full
+PER-STEP error progression, in latent space, for TWO checkpoints side
+by side, specifically to see whether/how fast error accumulates
+differently between them over the rollout horizon.
 
 For each fixed window (run_dir + a list of consecutive steps), both
 models' rollout() is run from the same true starting latent, and the
@@ -31,6 +34,16 @@ import torch
 from models.autoencoder import Autoencoder
 from models.latent_dynamics import LatentDynamics
 from utils import load_datasets as load
+
+# GENERAL POLICY (matches training/train_refinement.py's own
+# _PYTHON_ROOT): every default checkpoint/output path is built from
+# THIS anchor, never from a bare relative string like "../../output/...".
+# Relative strings resolve against the process's CWD at invocation
+# time, which silently differs across bare CLI and `python -m`.
+# Path(__file__) is anchored to THIS FILE's own on-disk location
+# instead, which is invariant regardless of how/from-where the process
+# was launched.
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/compare_rollout_training.py -> python/
 
 
 def parse_fixed_window(s: str) -> tuple[Path, list[int]]:
@@ -99,7 +112,8 @@ def main():
     parser.add_argument("--label-b", type=str, default="B")
     parser.add_argument("--fixed-windows", type=str, nargs="+", required=True,
                          help="'run_dir:step0:step1:...:stepN' (repeatable)")
-    parser.add_argument("--output", type=Path, default=Path("../../output/rollout_vs_onestep.png"))
+    parser.add_argument("--output", type=Path,
+                         default=_PYTHON_ROOT.parent / "output" / "rollout_vs_onestep.png")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()

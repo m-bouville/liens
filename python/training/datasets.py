@@ -212,7 +212,7 @@ class MicrostructureSnapshotDataset(Dataset):
     """
     Flat collection of individual microstructure snapshots x(t), pooled
     across one or more complete run directories. For AE-only training
-    (stage 2) -- no time dynamics, so cross-run/cross-time order doesn't
+    (stage 1) -- no time dynamics, so cross-run/cross-time order doesn't
     matter, everything is just one big pool of frames.
 
     Each item is read from disk on access, not cached in memory unless
@@ -797,9 +797,9 @@ class MicrostructureEvolutionDataset(Dataset):
 
 class MicrostructureTripletDataset(Dataset):
     """
-    Real-pixel (t1, t2, t3) triplets for stage 3 (interpolation-consistency
+    Real-pixel (t1, t2, t3) triplets for stage 2 (interpolation-consistency
     fine-tuning). UNLIKE MicrostructureEvolutionDataset, this does NOT
-    precompute/cache latents under a frozen encoder: stage 3 continues
+    precompute/cache latents under a frozen encoder: stage 2 continues
     training the encoder (and stats_head), so gradients must flow through
     z1/z2/z3 every forward pass. Returns raw pixels; encoding happens
     fresh in the training loop.

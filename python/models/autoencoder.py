@@ -18,8 +18,9 @@ class Autoencoder(nn.Module):
     and norm actually agree between the two.
 
     forward() returns (x_recon, z): both are needed downstream (z feeds
-    the LDS training in stage 4; x_recon feeds the reconstruction loss),
-    so returning just one and forcing a second call would waste compute.
+    LDS training -- stage 3 onward, refined jointly with the encoder in
+    stage 4/5; x_recon feeds the reconstruction loss), so returning
+    just one and forcing a second call would waste compute.
     """
 
     def __init__(

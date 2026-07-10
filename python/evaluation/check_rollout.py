@@ -46,9 +46,10 @@ being on sys.path):
 
 import argparse
 from pathlib import Path
-import numpy as np
+
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
+import numpy as np
 import torch
 
 from models.autoencoder import Autoencoder
@@ -57,6 +58,18 @@ from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
 from utils.naming import lds_checkpoint_name
+
+# GENERAL POLICY (matches training/train_refinement.py's own
+# _PYTHON_ROOT): every default checkpoint/output path is built from
+# THIS anchor, never from a bare relative string like "../../output/...".
+# Relative strings resolve against the process's CWD at invocation
+# time, which silently differs across bare CLI, `python -m`, and being
+# imported and called from another module (e.g. main.py calling this
+# function) -- exactly the recurring "output ended up in the wrong
+# place" bug hit repeatedly on this project. Path(__file__) is anchored
+# to THIS FILE's own on-disk location instead, which is invariant
+# regardless of how/from-where the process was launched.
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/
 
 
 def _is_int(s: str) -> bool:
@@ -251,7 +264,8 @@ def check_rollout(
 
     if output_path is None:
         suffix = "" if fixed_windows else f"-seed{seed}"
-        output_path = Path(f"../../output/rollout_check_png/{lds_checkpoint_path.stem}{suffix}.png")
+        output_path = (_PYTHON_ROOT.parent / "output" / "rollout_check_png"
+                       / f"{lds_checkpoint_path.stem}{suffix}.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     lds_checkpoint = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
@@ -475,7 +489,7 @@ def main():
                          help="override the checkpoint's recorded min_stdev_phi, if given "
                               "(ignored if --fixed-windows is given)")
     parser.add_argument("--output", type=Path, default=None,
-            help="default: ../../output/rollout_check_png/<lds checkpoint name>"
+            help="default: <repo root>/output/rollout_check_png/<lds checkpoint name>"
                  "[-seed<N> if random-sampling].png -- named after the checkpoint "
                  "(and seed) so different checks don't collide")
     parser.add_argument("--device", type=str,
@@ -493,7 +507,7 @@ def main():
             )
         name = lds_checkpoint_name(args.size, args.latent_channels, args.stats_weight,
                                     args.n_rollout_steps)
-        args.lds_checkpoint = Path(f"../checkpoints/stage3/{name}.pt")
+        args.lds_checkpoint = _PYTHON_ROOT / "checkpoints" / "stage3" / f"{name}.pt"
         print(f"Reconstructed checkpoint path: {args.lds_checkpoint}")
 
     check_rollout(
