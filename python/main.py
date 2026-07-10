@@ -121,6 +121,7 @@ from pathlib import Path
 import torch
 
 from evaluation.check_interpolation import check_interpolation
+from evaluation.check_latent_channels import check_latent_channels
 from evaluation.check_perturbation import check_perturbation
 from evaluation.check_reconstruction import check_reconstruction
 from evaluation.check_parameter_dependence import check_parameter_dependence
@@ -687,6 +688,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print("=" * 70)
             check_reconstruction(
                 checkpoint_path=stage1_checkpoint, device=device,
+                min_step=stage1_kwargs.get("min_step", 0),
                 output_path=Path(f"../output/stage1/{stage1_checkpoint.stem}-reconstruction.png"),
             )
             print()
@@ -729,7 +731,18 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 check_reconstruction(
                     checkpoint_path=stage2_checkpoint, device=device,
+                    min_step=stage2_kwargs.get("min_step", 0),
                     output_path=Path(f"../output/stage2/{stage2_checkpoint.stem}-reconstruction.png"),
+                )
+                print()
+
+                print("=" * 70)
+                print("Sanity check: latent channel activations (stage 2 checkpoint)")
+                print("=" * 70)
+                check_latent_channels(
+                    ae_checkpoint_path=stage2_checkpoint, device=device,
+                    min_step=stage2_kwargs.get("min_step", 0),
+                    output_path=Path(f"../output/stage2/{stage2_checkpoint.stem}-latent_channels.png"),
                 )
                 print()
 
@@ -768,16 +781,26 @@ def run_from_params_file(params_path: Path, default_base: Path,
                           f"'# Stage 3a' + '# Stage 3b' (curriculum), not both.")
 
     def run_lds_stage(stage_key: int | str, resume_from: Path | None = None,
-                       run_sanity_check: bool = True) -> Path:
+                       run_sanity_check: bool = True) -> tuple[Path, bool]:
         """Runs one train_lds() phase -- stage_key is 3 (single-phase),
         or '3a'/'3b' (curriculum). Caching/registry/logging are
         identical regardless of which phase this is; resume_from (only
         given for 3b) is recorded in the signature so a 3b result is
         correctly tied to the specific 3a checkpoint it built on, not
-        just its own hyperparameters. run_sanity_check=False for the 3a
-        call specifically -- 3a is an intermediate warmup phase, not the
-        final evaluated stage 3 result, so check_rollout only makes
-        sense for the bare-3 or 3b call."""
+        just its own hyperparameters. run_sanity_check=False for the 3a/
+        3b curriculum calls specifically -- their sanity checks are done
+        together, with shared samples, right after both exist (see
+        has_3a branch below); for the bare-3 case, run_sanity_check
+        defaults True and check_rollout picks its own random samples as
+        before, no comparison partner to match.
+
+        Returns (checkpoint, freshly_trained) -- freshly_trained is
+        False on a cache hit (resolve_checkpoint found an existing
+        match), True if train_lds() actually ran this call. The has_3a
+        branch uses this to decide whether the shared-sample comparison
+        needs regenerating, matching every other stage's convention of
+        not re-running sanity checks against a checkpoint that was
+        already reused from the registry, not retrained this run."""
         kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}))
         force = kwargs.pop("force", False)
         kwargs = _strip_unrecognized_params(train_lds, kwargs, f"Stage {stage_key}")
@@ -801,6 +824,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                       **({"resumed_from": str(resume_from)} if resume_from is not None else {}),
                       **extra_signature, **_signature_kwargs(kwargs)}
         checkpoint = resolve_checkpoint(stage_key, force, signature, kwargs.get("epochs"))
+        freshly_trained = checkpoint is None
         if checkpoint is None:
             with _log_to_file(stage_output_path(stage_key).with_suffix(".log")):
                 print("=" * 70)
@@ -840,13 +864,73 @@ def run_from_params_file(params_path: Path, default_base: Path,
                         output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-parameter_dependence.png"),
                     )
                     print()
-        return checkpoint
+        return checkpoint, freshly_trained
 
     if has_3a:
-        stage3a_checkpoint = run_lds_stage("3a", run_sanity_check=False)
-        stage3_checkpoint = run_lds_stage("3b", resume_from=stage3a_checkpoint)
+        stage3a_checkpoint, fresh_3a = run_lds_stage("3a", run_sanity_check=False)
+        stage3_checkpoint, fresh_3b = run_lds_stage("3b", resume_from=stage3a_checkpoint,
+                                                     run_sanity_check=False)
+
+        # 3a and 3b sanity-checked TOGETHER with the SAME windows, so the
+        # two rollout figures are a direct side-by-side comparison rather
+        # than each stage picking its own independent random sample (see
+        # check_rollout module docstring: "COMPARING CHECKPOINTS AT
+        # DIFFERENT n_rollout_steps"). 3b runs first (random selection)
+        # since it needs the longer window_length (n_rollout_steps+1);
+        # check_rollout's own truncation then lets 3a's figure reuse the
+        # identical (run_dir, step0) windows at its shorter length.
+        #
+        # Only regenerated if at least one of the two was freshly trained
+        # this run -- matches every other stage's convention of not
+        # re-running sanity checks against a cache-hit checkpoint. NOTE:
+        # unlike the single-stage sanity check above, this isn't wrapped
+        # in _log_to_file -- that helper opens in overwrite ("w") mode,
+        # and both stage3a_checkpoint's and stage3_checkpoint's own
+        # per-stage logs were already written (possibly just now, above)
+        # under stage_output_path("3a"/"3b").with_suffix(".log");
+        # reusing either path here would silently erase that training
+        # log. Prints to console only for now.
+        if fresh_3a or fresh_3b:
+            print("=" * 70)
+            print("Sanity check: rollout quality (stage 3b checkpoint)")
+            print("=" * 70)
+            _, shared_windows = check_rollout(
+                lds_checkpoint_path=stage3_checkpoint, device=device,
+                output_path=Path(f"../output/stage3b/{stage3_checkpoint.stem}-rollout.png"),
+            )
+            print()
+
+            print("=" * 70)
+            print("Sanity check: rollout quality (stage 3a checkpoint, same samples as 3b)")
+            print("=" * 70)
+            check_rollout(
+                lds_checkpoint_path=stage3a_checkpoint, device=device,
+                fixed_windows=shared_windows,
+                output_path=Path(f"../output/stage3a/{stage3a_checkpoint.stem}-rollout.png"),
+            )
+            print()
+
+            print("=" * 70)
+            print("Sanity check: parameter dependence (dt, temperature, noise) "
+                  "(stage 3b checkpoint)")
+            print("=" * 70)
+            check_parameter_dependence(
+                lds_checkpoint_path=stage3_checkpoint, device=device,
+                output_path=Path(f"../output/stage3b/{stage3_checkpoint.stem}-parameter_dependence.png"),
+            )
+            print()
+
+            print("=" * 70)
+            print("Sanity check: parameter dependence (dt, temperature, noise) "
+                  "(stage 3a checkpoint)")
+            print("=" * 70)
+            check_parameter_dependence(
+                lds_checkpoint_path=stage3a_checkpoint, device=device,
+                output_path=Path(f"../output/stage3a/{stage3a_checkpoint.stem}-parameter_dependence.png"),
+            )
+            print()
     else:
-        stage3_checkpoint = run_lds_stage(3)
+        stage3_checkpoint, _ = run_lds_stage(3)
 
     # ---- Stage 4/5: encoder refinement / end-to-end -- both OPTIONAL,
     # unlike stages 1/2/3. Neither section present at all -> pipeline
@@ -920,7 +1004,18 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 check_reconstruction(
                     checkpoint_path=ae_view_path, device=device,
+                    min_step=kwargs.get("min_step", 0),
                     output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-reconstruction.png"),
+                )
+                print()
+
+                print("=" * 70)
+                print(f"Sanity check: latent channel activations (stage {stage_key} checkpoint)")
+                print("=" * 70)
+                check_latent_channels(
+                    ae_checkpoint_path=ae_view_path, device=device,
+                    min_step=kwargs.get("min_step", 0),
+                    output_path=Path(f"../output/stage{stage_key}/{checkpoint.stem}-latent_channels.png"),
                 )
                 print()
 

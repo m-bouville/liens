@@ -16,7 +16,7 @@ Run from python/ (imports rely on that root being on sys.path):
 import numpy as np
 import pytest
 
-from evaluation.check_rollout import _padded_bounds, parse_fixed_window
+from evaluation.check_rollout import _padded_bounds, parse_fixed_window, _correlation_pct, _format_small
 
 
 def test_padded_bounds_asymmetric_case():
@@ -65,6 +65,84 @@ def test_padded_bounds_never_degenerate():
     assert vmin < 0 < vmax
 
 
+def test_padded_bounds_symmetric_mixed_sign():
+    """symmetric=True uses +-max(|lo|, |hi|) * factor, unlike the
+    default asymmetric mode -- same vals as the asymmetric test above,
+    but here both bounds are set by the larger-magnitude side (0.3)."""
+    vals = np.array([-0.05, 0.1, 0.3, -0.02])
+    vmin, vmax = _padded_bounds(vals, factor=1.2, symmetric=True)
+    assert vmin == pytest.approx(-0.36)
+    assert vmax == pytest.approx(0.36)
+
+
+def test_padded_bounds_symmetric_all_positive_case():
+    """THE case this was built for: real Delta x that's entirely
+    one-signed (e.g. a purely shrinking domain). The default asymmetric
+    mode would collapse vmin to ~0, so any negative PREDICTED value
+    saturates to the same extreme color regardless of magnitude.
+    symmetric=True instead mirrors the positive side, keeping negative
+    predictions resolvable."""
+    vals = np.array([0.1, 0.2, 0.5])
+    vmin, vmax = _padded_bounds(vals, factor=1.2, symmetric=True)
+    assert vmin == pytest.approx(-0.6)
+    assert vmax == pytest.approx(0.6)
+
+
+def test_padded_bounds_symmetric_all_negative_case():
+    vals = np.array([-0.1, -0.2, -0.5])
+    vmin, vmax = _padded_bounds(vals, factor=1.2, symmetric=True)
+    assert vmin == pytest.approx(-0.6)
+    assert vmax == pytest.approx(0.6)
+
+
+def test_padded_bounds_symmetric_never_degenerate():
+    vals = np.array([0.0, 0.0, 0.0])
+    vmin, vmax = _padded_bounds(vals, factor=1.2, symmetric=True)
+    assert vmin < 0 < vmax
+
+
+def test_format_small_matches_example_from_the_conversation():
+    """The exact case that motivated this: '.4f' rendered AE=0.0003 as
+    hard-to-scan '0.0003' -- fixed-exponent notation makes it '0.3e-3'
+    instead."""
+    assert _format_small(0.0003) == "0.3e-3"
+
+
+def test_format_small_zero():
+    assert _format_small(0.0) == "0.0e-3"
+
+
+def test_format_small_rounds_to_one_decimal():
+    assert _format_small(0.00124) == "1.2e-3"
+
+
+def test_correlation_pct_perfect_positive():
+    """Same shape, different (positive) scale -- Pearson correlation is
+    scale-invariant, which is exactly why it's a useful COMPLEMENT to
+    the (scale-sensitive) loss: a 'right direction but weak' prediction
+    scores high here even though its loss is middling."""
+    predicted = np.array([[2.0, 4.0], [6.0, 8.0]])
+    real = np.array([[1.0, 2.0], [3.0, 4.0]])
+    assert _correlation_pct(predicted, real) == pytest.approx(100.0)
+
+
+def test_correlation_pct_perfect_negative():
+    predicted = np.array([[4.0, 3.0], [2.0, 1.0]])
+    real = np.array([[1.0, 2.0], [3.0, 4.0]])
+    assert _correlation_pct(predicted, real) == pytest.approx(-100.0)
+
+
+def test_correlation_pct_none_for_constant_array():
+    """Correlation is undefined (zero std -> division by zero) when
+    either array is numerically constant -- must return None, not nan
+    or a misleading 0, so the caller can render 'n/a' instead of a
+    fake-looking number."""
+    real = np.array([[1.0, 2.0], [3.0, 4.0]])
+    constant = np.array([[1.0, 1.0], [1.0, 1.0]])
+    assert _correlation_pct(constant, real) is None
+    assert _correlation_pct(real, constant) is None
+
+
 def test_parse_fixed_window_two_steps():
     from pathlib import Path
     run_dir, steps = parse_fixed_window("../../datasets/64x64/T800_n050_s79:100000:120000")
@@ -94,6 +172,42 @@ def test_parse_fixed_window_rejects_single_step():
     least a start and an end."""
     with pytest.raises(ValueError):
         parse_fixed_window("some/run_dir:100000")
+
+
+def test_parse_fixed_window_windows_drive_letter():
+    """Regression test: a Windows path's OWN colon (after the drive
+    letter, e.g. 'D:\\work\\...') must not be mistaken for the
+    run_dir/step delimiter. Before the fix, split(':') sliced this into
+    ('D', '\\work\\...\\T950_n020_s79', '400000', ...), and int() on the
+    path segment crashed -- this is the exact error report that motivated
+    parse_fixed_window's rewrite to scan from the right for the trailing
+    integer step numbers instead of naively splitting on every ':'."""
+    from pathlib import Path
+    run_dir, steps = parse_fixed_window(
+        r"D:\work\NN\phase_field\datasets\64x64\T950_n020_s79:400000:600000:800000"
+    )
+    assert run_dir == Path(r"D:\work\NN\phase_field\datasets\64x64\T950_n020_s79")
+    assert steps == [400000, 600000, 800000]
+
+
+def test_parse_fixed_window_windows_drive_letter_two_steps():
+    """Same Windows-colon regression, but the minimal 2-step case (the
+    shape main.py's own truncation-for-3a reuse produces from a 3-step
+    3b window)."""
+    from pathlib import Path
+    run_dir, steps = parse_fixed_window(r"D:\work\datasets\64x64\T625_n005_s191:100000:120000")
+    assert run_dir == Path(r"D:\work\datasets\64x64\T625_n005_s191")
+    assert steps == [100000, 120000]
+
+
+def test_parse_fixed_window_rejects_all_numeric_parts():
+    """Edge case inherent to the right-to-left scan heuristic: if EVERY
+    colon-separated part parses as an int, there's no run_dir left at
+    all. Documents the (rare, not expected in this project's T<temp>_
+    n<noise>_s<seed>-shaped directory names) failure mode rather than
+    silently returning a nonsense empty path."""
+    with pytest.raises(ValueError, match="run_dir:step0:step1"):
+        parse_fixed_window("100000:200000:300000")
 
 
 def test_compute_sample_chains_through_full_window(tmp_run_dir):

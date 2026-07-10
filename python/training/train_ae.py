@@ -106,7 +106,7 @@ def train_autoencoder(
 
     if loss_curve_path is None:
         name = ae_checkpoint_name(size, latent_channels, stats_weight)
-        loss_curve_path = Path(f"../../output/stage1/{name}-loss_curve.png")
+        loss_curve_path = Path(f"../output/stage1/{name}-loss_curve.png")
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
@@ -205,8 +205,8 @@ def train_autoencoder(
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
-    print(f"Starting {epochs} epochs "
-          f"(early_stopping_patience: {early_stopping_patience}, batches of {batch_size})...")
+    print(f"Starting {epochs} epochs (early_stopping_patience: "
+          f"{early_stopping_patience}, batches of {batch_size})...")
     heading = f"/{epochs:3d} "
     heading += (f"train = recon +{stats_weight:6.3f} stats | valid = recon +{stats_weight:6.3f} "
                 f"stats  (e-3)  ema") if include_stats else "train | valid  (e-3)  ema"
@@ -549,7 +549,7 @@ def train_stage2(
 
     if loss_curve_path is None:
         name = ae_checkpoint_name(size, model_cfg["latent_channels"], ancestor_stats_weight)
-        loss_curve_path = Path(f"../../output/stage2/{name}-stage2-loss_curve.png")
+        loss_curve_path = Path(f"../output/stage2/{name}-stage2-loss_curve.png")
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
@@ -593,12 +593,12 @@ def train_stage2(
     print("=" * 70)
     check_interpolation(
         checkpoint_path=resume_from, min_step=min_step, device=device,
-        output_path=Path(f"../../output/stage1/{resume_from.stem}-pre_stage2-interpolation.png"),
+        output_path=Path(f"../output/stage1/{resume_from.stem}-pre_stage2-interpolation.png"),
     )
     print()
     check_perturbation(
         checkpoint_path=resume_from, min_step=min_step, device=device,
-        output_path=Path(f"../../output/stage1/{resume_from.stem}-pre_stage2-perturbation.png"),
+        output_path=Path(f"../output/stage1/{resume_from.stem}-pre_stage2-perturbation.png"),
     )
     print()
 

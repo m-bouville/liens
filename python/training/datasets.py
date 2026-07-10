@@ -10,6 +10,18 @@ from torch.utils.data import Dataset
 
 from utils import load_datasets as load
 
+# Spatial size of the AE's latent bottleneck. This is NOT a real source
+# of truth -- it's a magic number (8) copy-pasted from encoder.py's own
+# inline `input_size / 8` (see Encoder.__init__), duplicated here only
+# because MicrostructureSnapshotDataset's translation augmentation (see
+# _augment_item) needs it too and has no access to a live Encoder
+# instance to read it from. TODO: this duplication should go -- e.g.
+# expose it as a real shared constant (models/encoder.py or a small
+# shared config module) that both this file and encoder.py import,
+# rather than two independently-maintained "8"s that could silently
+# drift apart if the bottleneck size ever changes.
+_LATENT_SPATIAL_SIZE = 8
+
 
 def _dihedral_transform(x: torch.Tensor, k: int, flip: bool) -> torch.Tensor:
     """
@@ -209,11 +221,42 @@ class MicrostructureSnapshotDataset(Dataset):
     up front by default.
 
     augment: if True, expands the pooled dataset by the 8 elements of D4
-    (see _dihedral_transform) combined with 4 periodic translations --
-    (0,0), (Nx/2,0), (0,Ny/2), (Nx/2,Ny/2) -- for a 32x expansion of the
-    effective frame count. The cache (if enabled) still stores only the
-    base frames; augmentation is applied after cache lookup, so memory
-    use is unaffected by the expansion factor.
+    (see _dihedral_transform) combined with 4 periodic translations, for
+    a 32x expansion of the effective frame count. The cache (if enabled)
+    still stores only the base frames; augmentation is applied after
+    cache lookup, so memory use is unaffected by the expansion factor.
+
+    TRANSLATION PHASES: the bottleneck latent is always 8x8 regardless of
+    Nx/Ny (encoder depth scales with input size specifically to always
+    reach this exactly -- see models/encoder.py's own `input_size / 8`),
+    which means the decoder reconstructs each (Nx/8, Ny/8)-pixel latent
+    CELL through the same fixed sequence of non-overlapping 2x
+    ConvTranspose2d upsamplings. A checkerboard/tiling reconstruction
+    artifact was traced to this: for thin, sharp interfaces specifically,
+    the artifact's period matches the latent cell size exactly (confirmed
+    empirically: 8px period on 64x64, i.e. Nx/8), consistent with the
+    decoder relying on a fixed within-cell spatial template rather than
+    deriving sub-cell interface position purely from latent content.
+
+    The old translation set -- (0,0), (Nx/2,0), (0,Ny/2), (Nx/2,Ny/2) --
+    never exercised this: since Nx/2 (and Ny/2) are exact multiples of the
+    8x8 grid's cell size for every size used in this project, all 4 shifts
+    land on the IDENTICAL sub-cell phase relative to the latent grid (only
+    large-scale position varies, never the phase within one cell). So 32x
+    augmentation never once forced the decoder to be consistent under a
+    sub-cell shift of the interface -- a plausible reason the fixed
+    template could survive training undisturbed.
+
+    The translations below keep the same large-scale repositioning (still
+    offset by ~Nx/2, ~Ny/2, so features move well away from their
+    original location) but add a HALF-CELL offset (cell_size // 2) to one
+    or both axes on 3 of the 4 shifts, chosen so the 4 shifts land on 4
+    distinct sub-cell phases -- (0,0), (0,half), (half,0), (half,half) --
+    instead of 1 phase repeated 4 times. This doesn't fix the artifact by
+    itself (the decoder architecture/training is unchanged), but it means
+    augmentation actually samples the phase relationship the artifact
+    depends on, which the previous grid-aligned-only shifts structurally
+    could not do.
 
     Train/val/test independence: this class itself does NOT split --
     use split_run_dirs() on the run directory list BEFORE constructing
@@ -409,7 +452,44 @@ class MicrostructureSnapshotDataset(Dataset):
         x = _dihedral_transform(x, k=k, flip=bool(flip))
 
         _, _, nx, ny = self._index[base_idx]
-        shifts = [(0, 0), (0, nx // 2), (ny // 2, 0), (ny // 2, nx // 2)]
+        # Sub-cell offset, used to spread the 4 translations across
+        # distinct sub-cell phases instead of the single phase the old
+        # Nx/2-only shifts all shared (see _LATENT_SPATIAL_SIZE's
+        # docstring for the underlying artifact this addresses).
+        #
+        # THIRDS, NOT HALVES: an earlier version of this used
+        # _LATENT_SPATIAL_SIZE // 2 (a literal half-cell offset) for all
+        # 3 non-identity shifts, which seemed like the natural choice --
+        # but half of a cell added to itself returns to 0 mod cell_size
+        # (half + half = cell_size == 0 mod cell_size), so the 4 shifts'
+        # residues -- (0,0), (0,half), (half,0), (half,half) -- form a
+        # closed 2-element {0, half} subgroup under addition. That's a
+        # DEGENERATE, lower-diversity phase set in disguise (effectively
+        # period cell_size/2, not a genuine spread across the full
+        # cell), not the 4 independent phases it looks like at a glance.
+        # Thirds avoid this: cell_size//3 and (cell_size*2)//3 aren't
+        # related by any such small-order closure, so the 4 shifts'
+        # residues don't accidentally collapse onto a smaller repeating
+        # subset the way the half-based ones did.
+        #
+        # NOTE -- this is only exactly a THIRD of a cell
+        # (nx/_LATENT_SPATIAL_SIZE pixels wide) when
+        # nx == _LATENT_SPATIAL_SIZE**2 (64 for _LATENT_SPATIAL_SIZE=8),
+        # which is the only size actually run through this dataset
+        # today. For any other size (e.g. a future 128x128), the true
+        # cell size is nx // _LATENT_SPATIAL_SIZE and this constant
+        # offset would land at a different fraction of the cell instead
+        # -- still a distinct, non-degenerate phase per the reasoning
+        # above, just not exactly "a third" by name. Tracked in the same
+        # magic-number TODO as _LATENT_SPATIAL_SIZE itself.
+        third = _LATENT_SPATIAL_SIZE // 3
+        two_thirds = (_LATENT_SPATIAL_SIZE * 2) // 3
+        shifts = [
+            (0, 0),
+            (0, nx // 2 + third),
+            (ny // 2 + third, 0),
+            (ny // 2 + two_thirds, nx // 2 + two_thirds),
+        ]
         shift_y, shift_x = shifts[translation_idx]
         x = _translate(x, shift_y, shift_x)
         return x, k, bool(flip)

@@ -4,10 +4,10 @@ Ny      = 128
 
 # Time integration
 dt      = 0.05
-steps   = 600001		# 1000001 for 64x64, 600001 for 128x128, 300001 for 256x256, 200001 for 512x512
+steps   = 2500001		# 3000001 for 64x64, 2500001 for 128x128, 2000001 for 256x256, 1500001 for 512x512
 
 # Threads
-max_threads= 10
+max_threads= 6
 
 # Landau potential 
 a0      = 1.0			# quadratic term in Landau potential
@@ -19,7 +19,7 @@ kappa   = 0.2			# coefficient of gradient in free energy
 M       = 0.05			# mobility
 
 # Parameter sweep
-temperatures= 0.8, 0.9, 0.95, 0.99, 0.85, 0.7, 0.98, 0.6, 0.75, 0.65, 0.55, 0.625, 0.995, 0.575, 0.675
+temperatures= 0.8, 0.9, 0.95, 0.99, 0.85, 0.7, 0.98, 0.6, 0.75, 0.97, 0.65, 0.55, 0.625, 0.995, 0.575, 0.675
 noises  = 0.05, 0.02, 0.01, 0.03, 0.005, 0.015, 0.04
 seeds   = 79, 97, 123, 131, 191, 401, 599
 

@@ -26,6 +26,15 @@ again, computed fresh from the raw files and the frozen encoder/decoder --
 entirely bypassing dataset filtering, so it works regardless of what
 min_step/min_stdev_phi the comparison run uses.
 
+COMPARING CHECKPOINTS AT DIFFERENT n_rollout_steps (e.g. 3a vs 3b): pass
+the SAME --fixed-windows list to both runs. Each checkpoint truncates
+every window down to its own window_length (n_rollout_steps+1) before
+use, so a longer window (e.g. 3b's own 3-timestep picks) works directly
+against a checkpoint that needs fewer steps (e.g. 3a's 2) -- both figures
+then start from the identical (run_dir, step0), for a true side-by-side
+comparison, rather than each stage picking its own independent random
+samples.
+
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
     python -m evaluation.check_rollout \
@@ -37,7 +46,7 @@ being on sys.path):
 
 import argparse
 from pathlib import Path
-
+import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 import torch
@@ -50,13 +59,41 @@ from utils import load_datasets as load
 from utils.naming import lds_checkpoint_name
 
 
+def _is_int(s: str) -> bool:
+    try:
+        int(s)
+        return True
+    except ValueError:
+        return False
+
+
 def parse_fixed_window(s: str) -> tuple[Path, list[int]]:
+    """
+    'run_dir:step0:step1:...:stepN' -> (Path(run_dir), [step0, ..., stepN]).
+
+    NOT a naive split(':') -- run_dir itself can contain a colon (e.g. a
+    Windows path like 'D:\\work\\...\\T950_n020_s79'), which would
+    otherwise be sliced apart from the rest of the path and misread as
+    if it were a step number. Instead, split on ':' and then scan from
+    the RIGHT, greedily taking trailing parts that parse as int (the
+    step numbers); everything before that point is the run_dir, rejoined
+    with ':'. This relies on run directory names in this project never
+    being purely numeric themselves (they're always 'T<temp>_n<noise>_
+    s<seed>'-shaped) -- a directory literally named e.g. '12345' would
+    be misparsed as an extra step instead, but that never occurs here.
+    """
     parts = s.split(":")
-    if len(parts) < 3:
+    split_idx = len(parts)
+    for i in range(len(parts) - 1, -1, -1):
+        if _is_int(parts[i]):
+            split_idx = i
+        else:
+            break
+    path_parts, step_strs = parts[:split_idx], parts[split_idx:]
+    if len(step_strs) < 2 or not path_parts:
         raise ValueError(f"--fixed-windows entry must be 'run_dir:step0:step1:...:stepN' "
-                          f"(at least 3 colon-separated parts), got '{s}'")
-    run_dir, *step_strs = parts
-    return Path(run_dir), [int(s) for s in step_strs]
+                          f"(a run_dir followed by at least 2 step numbers), got '{s}'")
+    return Path(":".join(path_parts)), [int(x) for x in step_strs]
 
 
 def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
@@ -115,17 +152,66 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
     return x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_val
 
 
-def _padded_bounds(values, factor: float) -> tuple[float, float]:
+def _correlation_pct(predicted, real) -> float | None:
+    """
+    Pearson correlation (as a percentage) between predicted and real
+    Delta x, flattened. Deliberately separate from the loss (L1,
+    magnitude-sensitive): a prediction that gets the SHAPE right but
+    the magnitude weak or wrong -- a real failure mode seen in practice
+    ('right direction but weak') -- can show high correlation despite a
+    middling loss, which the loss number alone doesn't distinguish from
+    a prediction that's wrong in both shape and magnitude.
+
+    Returns None (not nan or 0) if either array is numerically constant
+    -- correlation is undefined there (zero std, division by zero),
+    and a real number would misleadingly suggest a meaningful value.
+    """
+    predicted_flat, real_flat = predicted.flatten(), real.flatten()
+    if np.std(predicted_flat) < 1e-12 or np.std(real_flat) < 1e-12:
+        return None
+    return float(np.corrcoef(predicted_flat, real_flat)[0, 1]) * 100
+
+
+def _format_small(value: float, exponent: int = -3) -> str:
+    """
+    Formats a small loss value at a FIXED power of ten (default 1e-3),
+    e.g. 0.0003 -> '0.3e-3' -- more legible than '%.4f' (0.0003) for
+    values that are all clustered in the same 1e-4..1e-3 order of
+    magnitude, which is what AE (autoencoder reconstruction baseline)
+    loss values look like throughout this pipeline's logs. A fixed
+    exponent (rather than each value picking its own, e.g. '%.1e') also
+    keeps mantissas directly comparable across panels/figures at a
+    glance, without each one needing to be re-normalized by eye first.
+    """
+    return f"{value / (10 ** exponent):.1f}e{exponent}"
+
+
+def _padded_bounds(values, factor: float, symmetric: bool = False) -> tuple[float, float]:
     """
     (vmin, vmax) padded by `factor` beyond values' own actual range,
     always including zero -- so a diverging colormap centered at 0
     stays meaningful even for a one-sided distribution (e.g. Delta x
     that happens to be mostly positive in a given window).
 
-    Deliberately asymmetric (NOT +-max(abs(...))): if real Delta x
-    ranges from -0.05 to +0.3, the padded range is [-0.06, +0.36], not
-    a symmetric +-0.36 that wastes half the color range on a side the
-    real data barely uses.
+    Default (symmetric=False) is deliberately asymmetric (NOT
+    +-max(abs(...))): if real Delta x ranges from -0.05 to +0.3, the
+    padded range is [-0.06, +0.36], not a symmetric +-0.36 that wastes
+    half the color range on a side the real data barely uses.
+
+    symmetric=True instead returns (-M, +M) with M = factor *
+    max(|lo|, |hi|). Needed specifically for the real/predicted-Delta-x
+    scale these two panels share: when real Delta x is (near-)entirely
+    one-signed -- e.g. a purely shrinking domain, real Delta x >= 0
+    everywhere -- the default asymmetric bounds correctly reflect that
+    real Delta x doesn't use the other side, but PREDICTED Delta x can
+    and does land on that other side (over/undershoot), and every such
+    value then saturates to the same extreme color regardless of
+    magnitude -- a -0.01 miss and a -0.08 miss become visually
+    identical. Symmetric bounds keep both signs fully resolved for the
+    prediction panel, at the cost of the real-Delta-x panel visibly not
+    using half the colormap when real Delta x genuinely is one-sided --
+    an intentional trade favoring the prediction panel's readability,
+    not an oversight.
 
     factor=1.2 gives 20% headroom beyond the real range, so a
     prediction that's slightly too high or too negative still shows up
@@ -133,6 +219,9 @@ def _padded_bounds(values, factor: float) -> tuple[float, float]:
     edge of the scale.
     """
     lo, hi = float(values.min()), float(values.max())
+    if symmetric:
+        magnitude = max(abs(lo), abs(hi), 1e-6)
+        return -factor * magnitude, factor * magnitude
     vmin = factor * lo if lo < 0 else min(0.0, lo)
     vmax = factor * hi if hi > 0 else max(0.0, hi)
     # Guard against a degenerate all-one-sided (or all-zero) range,
@@ -150,8 +239,14 @@ def check_rollout(
     fixed_windows: list[str] | None = None,
     min_step: int | None = None, min_stdev_phi: float | None = None,
     output_path: Path | None = None, device: str | None = None,
-) -> Path:
-    """Saves a visual rollout-comparison figure and returns its path."""
+) -> tuple[Path, list[str]]:
+    """Saves a visual rollout-comparison figure and returns
+    (output_path, window_strings) -- window_strings is the exact list of
+    'run_dir:step0:...:stepN' windows actually used (whether freshly
+    randomly selected or the given fixed_windows, after any truncation),
+    in the same format --fixed-windows accepts, so a caller can pass it
+    straight into a second check_rollout() call against a DIFFERENT
+    checkpoint for a same-samples comparison (see module docstring)."""
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     if output_path is None:
@@ -181,11 +276,39 @@ def check_rollout(
     f_theta.load_state_dict(lds_checkpoint["model_state"])
     f_theta.eval()
 
+    data_config = lds_checkpoint.get("data_config")
+
     if fixed_windows:
         windows = [parse_fixed_window(s) for s in fixed_windows]
+        # Lets the SAME --fixed-windows list (e.g. 3b's own 3-timestep
+        # picks) be reused across checkpoints trained at DIFFERENT
+        # n_rollout_steps for direct, same-starting-point comparison
+        # (e.g. 3a vs 3b) -- rather than requiring separately-truncated
+        # window lists per checkpoint. Truncates to *this* checkpoint's
+        # own window_length so compute_sample() still chains exactly the
+        # number of transitions this checkpoint was trained/evaluated at
+        # -- e.g. a 3a checkpoint (window_length=2) sees only steps[0:2]
+        # from a longer window, reporting its real 1-step quality from
+        # that same starting point, not silently testing 2-step rollout
+        # on a checkpoint that never trained for it.
+        if data_config and "window_length" in data_config:
+            target_len = data_config["window_length"]
+            truncated = []
+            for run_dir, steps in windows:
+                if len(steps) > target_len:
+                    print(f"  truncating {run_dir}:{':'.join(str(s) for s in steps)} to "
+                          f"first {target_len} steps (this checkpoint's own window_length)")
+                    steps = steps[:target_len]
+                elif len(steps) < target_len:
+                    raise ValueError(
+                        f"--fixed-windows entry for {run_dir} has only {len(steps)} steps, "
+                        f"but this checkpoint needs window_length={target_len} "
+                        f"(n_rollout_steps={data_config.get('n_rollout_steps')})"
+                    )
+                truncated.append((run_dir, steps))
+            windows = truncated
         print(f"Using {len(windows)} fixed windows (dataset filtering bypassed entirely)")
     else:
-        data_config = lds_checkpoint.get("data_config")
         if data_config is None:
             print("WARNING: this checkpoint has no saved data_config -- falling back to "
                   "min_step=0, min_stdev_phi=None, window_length=2, which may NOT match "
@@ -265,9 +388,24 @@ def check_rollout(
         # 2), and a prediction that's genuinely off shows up as visible
         # saturation against a fixed reference, rather than being hidden
         # by a scale that stretches to accommodate however wrong it is.
-        delta_vmin, delta_vmax = _padded_bounds(real_delta, factor=1.2)
-        # Error is typically much smaller in magnitude than Delta x
-        # itself -- a quarter of the SAME real_delta range keeps the
+        #
+        # symmetric=True: real Delta x is often (near-)entirely
+        # one-signed for a given window (e.g. a purely shrinking
+        # domain), but the PREDICTED Delta x can land on the other side
+        # regardless -- an asymmetric scale then collapses that whole
+        # side down near zero, and every such over/undershoot saturates
+        # to the same extreme color no matter its actual magnitude.
+        # Symmetric bounds cost the real-Delta-x panel visibly not
+        # using half the colormap when real Delta x really is
+        # one-sided -- an intentional trade for column 3's readability.
+        # See _padded_bounds' own docstring for the full reasoning.
+        delta_vmin, delta_vmax = _padded_bounds(real_delta, factor=1.2, symmetric=True)
+        # Error is intrinsically signed (predicted - real can go either
+        # way regardless of which side real_delta itself favors), so it
+        # does NOT get the symmetric treatment above -- asymmetric
+        # bounds derived from real_delta remain the right reference
+        # here. Error is typically much smaller in magnitude than Delta
+        # x itself -- a quarter of the SAME real_delta range keeps the
         # error panel sensitive and readable, while still being the
         # same fixed, comparable reference across images.
         error_vmin, error_vmax = _padded_bounds(real_delta, factor=0.25)
@@ -284,10 +422,13 @@ def check_rollout(
                                 if row == 0 else f"scale=[{delta_vmin:.3f}, {delta_vmax:.3f}]",
                                 fontsize=10)
         axes[row, 2].imshow(predicted_delta, cmap="RdBu", norm=delta_norm)
+        corr_pct = _correlation_pct(predicted_delta, real_delta)
+        corr_str = f"{corr_pct:.0f}%" if corr_pct is not None else "n/a"
+        ae_str = _format_small(ae_baseline_loss)
         axes[row, 2].set_title(
-            f"predicted \u0394x\nloss={end_to_end_loss:.4f} (AE={ae_baseline_loss:.4f})"
+            f"predicted \u0394x\nloss={end_to_end_loss:.4f} (AE={ae_str}), corr={corr_str}"
             if row == 0 else
-            f"loss={end_to_end_loss:.4f} (AE={ae_baseline_loss:.4f})", fontsize=10
+            f"loss={end_to_end_loss:.4f} (AE={ae_str}), corr={corr_str}", fontsize=10
         )
         im_error = axes[row, 3].imshow(error, cmap="RdBu", norm=error_norm)
         axes[row, 3].set_title(f"error\nscale=[{error_vmin:.3f}, {error_vmax:.3f}]" if row == 0
@@ -302,7 +443,8 @@ def check_rollout(
     fig.subplots_adjust(wspace=0.3, hspace=0.4)
     fig.savefig(output_path, dpi=120)
     print(f"Saved rollout comparison to {output_path} ({n_samples} samples)")
-    return output_path
+    window_strings = [f"{run_dir}:{':'.join(str(s) for s in steps)}" for run_dir, steps in windows]
+    return output_path, window_strings
 
 
 def main():

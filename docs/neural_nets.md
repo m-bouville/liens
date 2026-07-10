@@ -26,7 +26,8 @@ From each snapshot, more are created through
 - mirror (horizontal and vertical);
 - rotation by $\pm$90 °, 180°;
 - transposing;
-- translation by (Nx/2, 0), (0, Ny/2), (Nx/2, Ny/2) thanks to periodic boundaries.
+- translation by (Nx/2, 4), (4, Ny/2), (Nx/2+4, Ny/2+4) thanks to periodic boundaries
+  - +4: shifts by half the size of the latent channels, so the translations are not in phase (to reduce the 8x8 checkerboard artifact).
 
 
 ### Training Stages

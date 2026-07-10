@@ -61,9 +61,7 @@ exists at all (see below).
 - **`Decoder`**: mirrors the encoder; `UpBlock` uses `ConvTranspose2d(kernel_size=2,
   stride=2)` — a deliberately non-overlapping 2× expansion, chosen specifically to avoid
   the classic checkerboard-artifact failure mode of mismatched kernel/stride ratios.
-  (A checkerboard artifact *did* appear during stage 4 development regardless — traced to
-  `D`'s frozen weights having a latent grid-sensitivity that only became visible once `E`'s
-  outputs drifted, not to this geometry.)
+  (A checkerboard artifact *did* appear during stage 4 development regardless — working on it.)
 - **`Autoencoder`**: composes Encoder + Decoder; `ae.encoder`/`ae.decoder` are the
   attributes checkpoint-splitting code (below) relies on when stripping/re-adding
   `"encoder."`/`"decoder."` prefixes from a combined `state_dict()`.

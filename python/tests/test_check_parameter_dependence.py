@@ -29,6 +29,18 @@ def fit_power_law(dt, error):
     return a, b, r2_log, sse_real, pred_real
 
 
+def fit_exponential(x, error):
+    log_err = np.log(np.clip(error, 1e-12, None))
+    a, b = np.polyfit(x, log_err, 1)
+    pred_log = a * x + b
+    ss_res_log = np.sum((log_err - pred_log) ** 2)
+    ss_tot_log = np.sum((log_err - log_err.mean()) ** 2)
+    r2_log = 1 - ss_res_log / ss_tot_log if ss_tot_log > 0 else float("nan")
+    pred_real = np.exp(pred_log)
+    sse_real = np.sum((error - pred_real) ** 2)
+    return a, b, r2_log, sse_real, pred_real
+
+
 def fit_saturating_exponential(dt, error, n_grid=200):
     tau_grid = np.logspace(np.log10(dt.min() / 10), np.log10(dt.max() * 10), n_grid)
     best_sse, best_tau, best_c = np.inf, None, None
@@ -66,11 +78,44 @@ def _aggregate_per_run(run_dirs, temperatures, noises, latent_losses):
     return per_run
 
 
+def max_autocorr_dist(nx, ny):
+    return min(nx * 2 // 3, ny * 2 // 3)
+
+
+def test_max_autocorr_dist_matches_cpp_formula():
+    """The C++ side computes int max_dist = std::min(Nx*2/3, Ny*2/3) --
+    integer division. Python's // matches C++'s truncating int division
+    for non-negative operands, so this must reproduce the exact same
+    sentinel value the simulation actually wrote out, not an
+    approximation (e.g. round() would give 43 for Nx=64, not 42)."""
+    assert max_autocorr_dist(64, 64) == 42  # 64*2=128, 128//3=42 (not 42.67 rounded)
+    assert max_autocorr_dist(128, 128) == 85
+
+
+def test_max_autocorr_dist_takes_the_smaller_axis():
+    assert max_autocorr_dist(64, 32) == 21  # min(42, 21) -> limited by the shorter axis
+
+
 def test_fit_power_law_recovers_known_exponent():
     dt = np.array([1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0])
     true_a, true_b = 0.7, -2.0
     error = np.exp(true_b) * dt ** true_a  # exact power law, no noise
     a, b, r2_log, sse_real, pred_real = fit_power_law(dt, error)
+    assert a == pytest.approx(true_a, abs=1e-6)
+    assert b == pytest.approx(true_b, abs=1e-6)
+    assert r2_log == pytest.approx(1.0, abs=1e-9)
+    assert sse_real < 1e-9
+
+
+def test_fit_exponential_recovers_known_params():
+    """The semi-log analogue of the power-law test above -- x itself
+    (not log(x)) is linear in log(error), appropriate for a panel like
+    length_scale's (linear x-axis, log-scaled error), where fit_power_law
+    would fit a curve rather than the straight line this is built for."""
+    x = np.linspace(0, 40, 50)
+    true_a, true_b = 0.05, -3.0
+    error = np.exp(true_a * x + true_b)  # exact exponential, no noise
+    a, b, r2_log, sse_real, pred_real = fit_exponential(x, error)
     assert a == pytest.approx(true_a, abs=1e-6)
     assert b == pytest.approx(true_b, abs=1e-6)
     assert r2_log == pytest.approx(1.0, abs=1e-9)

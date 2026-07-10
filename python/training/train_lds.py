@@ -37,7 +37,7 @@ def train_lds(
     ae_latent_channels: int | None = None, stats_weight: float | None = None,
     epochs: int = 100, batch_size: int = 512, lr: float = 1e-3,
     hidden_dim: int = 256, n_hidden_layers: int = 2,
-    val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 2,
+    val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int = 1, min_step: int | None = None, min_stdev_phi: float | None = None,
     encode_batch_size: int = 256, val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5,
     early_stopping_patience: int | None = None,
@@ -176,7 +176,7 @@ def train_lds(
     if loss_curve_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
                                     stats_weight, n_rollout_steps)
-        loss_curve_path = Path(f"../../output/stage3/{name}-loss_curve.png")
+        loss_curve_path = Path(f"../output/stage3/{name}-loss_curve.png")
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []

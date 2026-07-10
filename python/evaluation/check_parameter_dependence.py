@@ -32,6 +32,24 @@ from training.losses import OneStepLoss, ReconLoss
 from utils import load_datasets as load
 
 
+def max_autocorr_dist(nx: int, ny: int) -> int:
+    """
+    The C++ simulation caps autocorr_length's search at
+    min(Nx*2/3, Ny*2/3) (integer division) -- distances beyond that are
+    deemed artifacts of the periodic-boundary autocorrelation wrapping
+    around on itself, not a genuine length scale. Any window whose
+    autocorrelation never decays within that search range gets this
+    exact value back as a SENTINEL, not a real measurement -- and it's
+    common enough (near-critical/smooth microstructures in particular)
+    to distort both the plot and any regression fit through it if left
+    in as if it were real data. Mirrors the C++ integer-division
+    formula exactly (Python's // matches C++'s truncating int division
+    for non-negative operands), so this returns the same sentinel value
+    the simulation actually produced, not an approximation of it.
+    """
+    return min(nx * 2 // 3, ny * 2 // 3)
+
+
 def fit_power_law(dt: np.ndarray, error: np.ndarray):
     """
     log(error) = a*log(dt) + b via least squares. Returns (a, b, r2_log,
@@ -44,6 +62,29 @@ def fit_power_law(dt: np.ndarray, error: np.ndarray):
     log_err = np.log(np.clip(error, 1e-12, None))
     a, b = np.polyfit(log_dt, log_err, 1)
     pred_log = a * log_dt + b
+    ss_res_log = np.sum((log_err - pred_log) ** 2)
+    ss_tot_log = np.sum((log_err - log_err.mean()) ** 2)
+    r2_log = 1 - ss_res_log / ss_tot_log if ss_tot_log > 0 else float("nan")
+    pred_real = np.exp(pred_log)
+    sse_real = np.sum((error - pred_real) ** 2)
+    return a, b, r2_log, sse_real, pred_real
+
+
+def fit_exponential(x: np.ndarray, error: np.ndarray):
+    """
+    log(error) = a*x + b via least squares (x itself, NOT log(x)) --
+    i.e. error = exp(b) * exp(a*x). The semi-log analogue of
+    fit_power_law: appropriate for a panel with a LINEAR x-axis and
+    log-scaled error axis (like length_scale's), where fit_power_law's
+    form would plot as a curve rather than a straight line and so
+    wouldn't give the same at-a-glance visual fit-quality check that it
+    does on a genuinely log-log panel (like dt's). Same
+    sse_real/pred_real convention as fit_power_law, for direct SSE
+    comparison against fit_saturating_exponential.
+    """
+    log_err = np.log(np.clip(error, 1e-12, None))
+    a, b = np.polyfit(x, log_err, 1)
+    pred_log = a * x + b
     ss_res_log = np.sum((log_err - pred_log) ** 2)
     ss_tot_log = np.sum((log_err - log_err.mean()) ** 2)
     r2_log = 1 - ss_res_log / ss_tot_log if ss_tot_log > 0 else float("nan")
@@ -223,19 +264,28 @@ def check_parameter_dependence(
     # metadata.txt read once per run_dir, not once per window -- most
     # runs contribute several windows, and temperature/noise are
     # constant across all of them (unlike dt, which varies per window
-    # even within the same run).
+    # even within the same run). statistics.csv similarly cached per
+    # run_dir, for the autocorr_length lookup below -- unlike
+    # temperature/noise, autocorr_length is NOT constant across a run's
+    # windows (a run's own dominant length scale coarsens over time as
+    # the microstructure evolves), so it's looked up per-window at that
+    # window's own starting step, not cached at the run level itself.
     metadata_cache: dict[Path, object] = {}
+    stats_cache: dict[Path, object] = {}
 
-    dts, temperatures, noises, run_dirs = [], [], [], []
+    dts, temperatures, noises, run_dirs, length_scales = [], [], [], [], []
     latent_losses, pixel_losses = [], []
 
     with torch.no_grad():
         for idx in range(len(dataset)):
             z_window, dt_window, theta = dataset[idx]
-            run_dir, _steps = dataset.window_info(idx)
+            run_dir, steps = dataset.window_info(idx)
             if run_dir not in metadata_cache:
                 metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
             metadata = metadata_cache[run_dir]
+            if run_dir not in stats_cache:
+                stats_cache[run_dir] = load.read_statistics_csv(run_dir / "statistics.csv")
+            stats_df = stats_cache[run_dir]
 
             z_t = z_window[0:1].to(device)
             z_next_true = z_window[1:2].to(device)
@@ -255,12 +305,20 @@ def check_parameter_dependence(
             temperatures.append(metadata.temperature)
             noises.append(metadata.noise)
             run_dirs.append(run_dir)
+            # Ground-truth length scale (first peak in the autocorrelation
+            # function), read from the SIMULATION's own precomputed
+            # statistics.csv -- not re-derived from the (possibly
+            # decoder-distorted) reconstructed frame -- at the window's
+            # starting step, i.e. the length scale of the microstructure
+            # this rollout step is actually predicting FROM.
+            length_scales.append(stats_df.loc[steps[0], "autocorr_length"])
             latent_losses.append(latent_loss)
             pixel_losses.append(pixel_loss)
 
     dts = np.array(dts)
     temperatures = np.array(temperatures)
     noises = np.array(noises)
+    length_scales = np.array(length_scales, dtype=float)
     latent_losses = np.array(latent_losses)
     pixel_losses = np.array(pixel_losses)
 
@@ -304,6 +362,70 @@ def check_parameter_dependence(
     print(f"correlation(noise, log10(latent_loss))       = {corr_noise_latent:.3f}")
     _print_binned_summary("temperature", temperatures, latent_losses, pixel_losses)
     _print_binned_summary("noise", noises, latent_losses, pixel_losses)
+
+    # ---- length scale (first peak in autocorrelation): DIAGNOSTIC for
+    # whether error tracks the microstructure's own dominant length
+    # scale rather than (or in addition to) dt/temperature/noise --
+    # motivated by rollout figures showing large-scale, visually "easy"
+    # microstructures failing outright while a much finer-grained
+    # texture reconstructs cleanly, raising the question of whether the
+    # 8x8 latent bottleneck is under-resolving a specific length-scale
+    # regime rather than "coarse features = easy". Linear-space, like
+    # temperature/noise (autocorr_length doesn't span orders of
+    # magnitude the way dt does within one sweep).
+    #
+    # SATURATED VALUES EXCLUDED: the C++ simulation caps autocorr_length
+    # at max_autocorr_dist(Nx, Ny) -- distances beyond that are an
+    # artifact of periodic-boundary wraparound, not a real length scale.
+    # This sentinel value is common (near-critical/smooth microstructures
+    # in particular never show a decaying autocorrelation within range),
+    # and left in as if real it distorts both the correlation and the
+    # fit below -- a cluster of fake "very large length scale" points
+    # that are actually "the true length scale is unknown/unbounded".
+    # Treated as N/A: excluded from the correlation, the binned summary,
+    # BOTH fits, and the scatter -- not just visually hidden.
+    max_dist = max_autocorr_dist(ae_config["size"], ae_config["size"])
+    saturated = length_scales >= max_dist
+    n_saturated = int(saturated.sum())
+    print(f"\n{n_saturated}/{len(length_scales)} windows have autocorr_length >= "
+          f"{max_dist} (the C++ search cap) -- treated as N/A (not a real length "
+          f"scale, just 'never decayed within range') and excluded below.")
+    length_scales_valid = length_scales[~saturated]
+    latent_losses_for_length = latent_losses[~saturated]
+    log_latent_for_length = log_latent[~saturated]
+
+    corr_length_latent = np.corrcoef(length_scales_valid, log_latent_for_length)[0, 1]
+    print(f"correlation(length_scale, log10(latent_loss)) = {corr_length_latent:.3f} "
+          f"(n={len(length_scales_valid)}, excluding saturated)")
+    print("(if this is the dominant driver, error should track length_scale more "
+          "cleanly than it tracks dt/temperature/noise individually above)")
+    _print_binned_summary("length_scale", length_scales_valid, latent_losses_for_length,
+                           pixel_losses[~saturated])
+
+    # UNLIKE dt (log-log panel, where fit_power_law's straight-line form
+    # is the natural visual fit check), the length_scale panel is
+    # semi-log: length_scale itself is plotted on a LINEAR axis (it's a
+    # continuous, per-window-computed quantity -- not a small discrete
+    # sweep grid like temperature/noise -- so it's shown as a raw
+    # scatter, not a boxplot), against a log-scaled error axis. A power
+    # law would plot as a curve there, not a line, and wouldn't give the
+    # same at-a-glance fit-quality read. fit_exponential (log(error)
+    # linear in length_scale itself, not log(length_scale)) is the
+    # correct semi-log analogue -- it's what actually draws straight on
+    # this panel. Compared against the same saturating-exponential
+    # candidate as dt (that model isn't tied to either axis convention).
+    print("\nModel comparison (latent_loss vs length_scale): exponential vs saturating exponential")
+    a_len, b_len, r2_len, sse_exp_len, pred_exp_len = fit_exponential(
+        length_scales_valid, latent_losses_for_length
+    )
+    c_len, tau_len, r2_sat_len, sse_sat_len, pred_sat_len = fit_saturating_exponential(
+        length_scales_valid, latent_losses_for_length
+    )
+    print(f"  exponential:    error ~ exp({a_len:.4f} * length_scale), SSE(real space)={sse_exp_len:.6f}")
+    print(f"  saturating exp: error -> {c_len:.4f} with timescale tau={tau_len:.1f}, "
+          f"SSE(real space)={sse_sat_len:.6f}")
+    better_len = "saturating exponential" if sse_sat_len < sse_exp_len else "exponential"
+    print(f"  -> {better_len} fits better (lower SSE).")
 
     # ---- per-run aggregation for the 2D (temperature, noise) view --
     # the most directly actionable panel: raw per-WINDOW points at the
@@ -367,7 +489,53 @@ def check_parameter_dependence(
         ax.set_ylabel("latent-space one-step error")
         ax.set_title(f"{name}\ncorr({name}, log error) = {corr:.3f}")
 
-    axes[1, 2].axis("off")
+    # Scatter, NOT a boxplot: temperature/noise are discrete because
+    # they're SWEEP INPUTS (a handful of fixed values chosen for the
+    # simulation grid); length_scale is continuous because it's
+    # CALCULATED per window from the actual microstructure, with a
+    # different value nearly every time. Binning it first (as an
+    # earlier version of this plot did) manufactures artificial
+    # discreteness that isn't really there in the underlying data.
+    #
+    # Uses length_scales_valid/latent_losses_for_length (saturated
+    # points already excluded above) -- NOT the full arrays -- so the
+    # plot matches the correlation and fit exactly, rather than showing
+    # points the regression itself was never fit against.
+    axes[1, 2].scatter(length_scales_valid, latent_losses_for_length, s=8, alpha=0.35,
+                        color="tab:blue", edgecolors="none")
+    axes[1, 2].set_yscale("log")
+    axes[1, 2].set_xlabel("length scale (autocorr_length)")
+    axes[1, 2].set_ylabel("latent-space one-step error")
+    axes[1, 2].set_title("length scale\n"
+                          f"corr(length_scale, log error) = {corr_length_latent:.3f}")
+    order_len = np.argsort(length_scales_valid)
+    axes[1, 2].plot(length_scales_valid[order_len], pred_exp_len[order_len], "--", color="tab:red",
+                     label=f"exponential (SSE={sse_exp_len:.4f})")
+    axes[1, 2].plot(length_scales_valid[order_len], pred_sat_len[order_len], "--", color="tab:green",
+                     label=f"saturating exp, tau={tau_len:.1f} (SSE={sse_sat_len:.4f})")
+    axes[1, 2].legend(fontsize=8)
+    # y-axis explicitly matched to the temperature/noise panels (rather
+    # than left to its own autoscale) -- all three show the same
+    # quantity (latent-space one-step error), and excluding the
+    # saturated length_scale points above narrows this panel's own y
+    # range slightly, which would otherwise make the panels subtly
+    # harder to visually compare side by side.
+    axes[1, 2].set_ylim(axes[1, 0].get_ylim())
+    # Reference line at the latent bottleneck's own cell size in pixels
+    # (Nx / 8 -- the SAME magic-number 8 duplicated in encoder.py's
+    # `input_size / 8` and training/datasets.py's own
+    # _LATENT_SPATIAL_SIZE; see that constant's docstring/TODO). Not
+    # imported from either -- both are private to their own modules --
+    # so this is a THIRD independent copy of the same number, same
+    # caveat applies. Purely visual: makes it possible to see by eye
+    # whether error spikes specifically for length scales at or below
+    # one latent cell, rather than reading that off the correlation
+    # coefficient alone (which -- like temperature's -- may not be
+    # trustworthy if the true relationship isn't linear/monotonic).
+    cell_size_px = ae_config["size"] / 8
+    axes[1, 2].axvline(cell_size_px, color="black", linestyle=":", linewidth=1)
+    axes[1, 2].text(cell_size_px, axes[1, 2].get_ylim()[1], " latent cell size",
+                     fontsize=7, ha="left", va="top", rotation=90)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
