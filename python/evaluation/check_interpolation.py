@@ -30,8 +30,9 @@ identical stats_head map, so this isolates representation GEOMETRY, not
 accuracy).
 
 check_interpolation() is importable -- see main.py, which calls it
-automatically after stage 2 with the checkpoint path it already has in
-hand. The CLI below is for standalone use.
+automatically after stage 2 AND after stage 4/5 (skipped gracefully
+there if the ancestor AE has no stats_head at all) with the checkpoint
+path it already has in hand. The CLI below is for standalone use.
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
@@ -65,12 +66,36 @@ from utils.naming import ae_checkpoint_name
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/check_interpolation.py -> python/
 
 
+def _is_int(s: str) -> bool:
+    try:
+        int(s)
+        return True
+    except ValueError:
+        return False
+
+
 def parse_fixed_triple(s: str) -> tuple[Path, int, int, int]:
+    """
+    'run_dir:t1:t2:t3' -> (Path(run_dir), t1, t2, t3).
+
+    NOT a naive split(':') -- same reasoning as
+    check_rollout.parse_fixed_window / check_latent_channels.
+    parse_fixed_frame (this had the identical bug independently, not
+    fixed alongside them originally): run_dir itself can contain a
+    colon on Windows (e.g. 'D:\\work\\...\\T800_n050_s79'), which a
+    naive split(':') misreads as if it were one of the step numbers --
+    split from the right instead, taking the final 3 colon-separated
+    parts as the step numbers regardless of how many colons run_dir
+    itself contains.
+    """
     parts = s.split(":")
-    if len(parts) != 4:
+    if len(parts) < 4:
         raise ValueError(f"expected 'run_dir:t1:t2:t3', got '{s}'")
-    run_dir, t1, t2, t3 = parts
-    return Path(run_dir), int(t1), int(t2), int(t3)
+    *path_parts, t1_str, t2_str, t3_str = parts
+    if not path_parts or not all(_is_int(x) for x in (t1_str, t2_str, t3_str)):
+        raise ValueError(f"expected 'run_dir:t1:t2:t3', got '{s}'")
+    run_dir = Path(":".join(path_parts))
+    return run_dir, int(t1_str), int(t2_str), int(t3_str)
 
 
 def find_all_triples(test_dirs: list[Path], min_step: int) -> list[tuple[Path, int, int, int]]:

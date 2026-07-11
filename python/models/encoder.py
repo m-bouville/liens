@@ -9,14 +9,17 @@ import torch
 import torch.nn as nn
 
 from .blocks import DownBlock
+from .constants import LATENT_SPATIAL_SIZE
 
 
 class Encoder(nn.Module):
     """
-    Repeated DownBlocks halving spatial resolution down to an 8x8
-    bottleneck, then a 1x1 conv reducing to latent_channels. Depth is
-    derived from input_size so 8x8 is reached exactly: 3 stages for
-    64x64, 5 for 256x256, matching docs/neural_nets.md.
+    Repeated DownBlocks halving spatial resolution down to a
+    latent_spatial_size x latent_spatial_size bottleneck (8x8 by
+    default -- see constants.LATENT_SPATIAL_SIZE), then a 1x1 conv
+    reducing to latent_channels. Depth is derived from input_size so
+    the bottleneck is reached exactly: 3 stages for 64x64 at the
+    default 8x8, 5 for 256x256, matching docs/neural_nets.md.
 
     Skip connections (the pre-downsampling features at each level) are
     always computed by DownBlock at negligible extra cost, but are only
@@ -31,19 +34,22 @@ class Encoder(nn.Module):
         in_channels: int = 1,
         base_channels: int = 32,
         latent_channels: int = 16,
+        latent_spatial_size: int = LATENT_SPATIAL_SIZE,
         norm: str = "batch",
         use_skips: bool = False,
     ):
         super().__init__()
 
-        n_stages = math.log2(input_size / 8)
+        n_stages = math.log2(input_size / latent_spatial_size)
         if not n_stages.is_integer() or n_stages < 1:
             raise ValueError(
-                f"input_size must be 8 * 2^k for integer k >= 1, got {input_size}"
+                f"input_size must be latent_spatial_size * 2^k for integer k >= 1 "
+                f"(latent_spatial_size={latent_spatial_size}), got input_size={input_size}"
             )
         n_stages = int(n_stages)
 
         self.input_size = input_size
+        self.latent_spatial_size = latent_spatial_size
         self.n_stages = n_stages
         self.use_skips = use_skips
 

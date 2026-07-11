@@ -19,6 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.autoencoder import Autoencoder
+from models.constants import LATENT_SPATIAL_SIZE
 from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureSnapshotDataset, MicrostructureTripletDataset, \
                                complete_run_dirs, split_run_dirs
@@ -46,6 +47,7 @@ def train_autoencoder(
     size: int, base_path: Path,
     epochs: int = 100, batch_size: int = 64, lr: float = 1e-3,
     base_channels: int = 32, latent_channels: int = 8,
+    latent_spatial_size: int = LATENT_SPATIAL_SIZE,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     min_step: int | None = None, min_stdev_phi: float | None = None,
     stat_names: list[str] | None = None, stats_weight: float | None = None,
@@ -165,7 +167,8 @@ def train_autoencoder(
     )
 
     ae = Autoencoder(size=size, channels=1, base_channels=base_channels,
-                      latent_channels=latent_channels).to(device)
+                      latent_channels=latent_channels,
+                      latent_spatial_size=latent_spatial_size).to(device)
 
     recon_loss = ReconLoss()
     params = list(ae.parameters())
@@ -173,7 +176,8 @@ def train_autoencoder(
     stats_head = None
     stats_loss_fn = None
     if include_stats:
-        stats_head = StatsHead(latent_channels=latent_channels, stat_names=train_set.stat_names).to(device)
+        stats_head = StatsHead(latent_channels=latent_channels, stat_names=train_set.stat_names,
+                                latent_spatial=latent_spatial_size).to(device)
         mean, std = train_set.stats_normalization()
         stats_loss_fn = StatsLoss(mean.to(device), std.to(device), stat_names=train_set.stat_names)
         params += list(stats_head.parameters())
@@ -288,7 +292,8 @@ def train_autoencoder(
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
                     "size": size, "base_channels": base_channels,
-                    "latent_channels": latent_channels, "stats_weight": stats_weight,
+                    "latent_channels": latent_channels, "latent_spatial_size": latent_spatial_size,
+                    "stats_weight": stats_weight,
                 },
                 "stats_config": {
                     "stat_names": train_set.stat_names,
@@ -517,7 +522,9 @@ def train_stage2(
           f"ancestor_stats_weight={ancestor_stats_weight}, this stage's stats_weight={stats_weight})")
 
     ae = Autoencoder(size=size, channels=1, base_channels=model_cfg["base_channels"],
-                      latent_channels=model_cfg["latent_channels"]).to(device)
+                      latent_channels=model_cfg["latent_channels"],
+                      latent_spatial_size=model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
+                      ).to(device)
     ae.load_state_dict(prev["model_state"])
     frozen_modules = freeze_outer_layers(ae, n_frozen_stages)
     if n_frozen_stages > 0:
@@ -533,7 +540,9 @@ def train_stage2(
     initial_params = {k: v.clone().cpu() for k, v in ae.named_parameters()}
     initial_buffers = {k: v.clone().cpu() for k, v in ae.named_buffers()}
 
-    stats_head = StatsHead(latent_channels=model_cfg["latent_channels"], stat_names=stat_names).to(device)
+    stats_head = StatsHead(latent_channels=model_cfg["latent_channels"], stat_names=stat_names,
+                            latent_spatial=model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
+                            ).to(device)
     stats_head.load_state_dict(prev["stats_head_state"])
     # FROZEN during stage 2: the table's stage-2 loss (L_recon + lambda1*
     # L_interp) has no L_stats term, meaning stats_head would otherwise
@@ -766,7 +775,9 @@ def train_stage2(
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
                     "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],
-                    "latent_channels": model_cfg["latent_channels"], "stats_weight": ancestor_stats_weight,
+                    "latent_channels": model_cfg["latent_channels"],
+                    "latent_spatial_size": model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
+                    "stats_weight": ancestor_stats_weight,
                 },
                 "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
                 "stage2_config": {"interp_weight": interp_weight, "stats_weight": stats_weight,

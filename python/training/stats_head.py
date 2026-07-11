@@ -9,6 +9,8 @@ loaded from statistics.csv.
 import torch
 import torch.nn as nn
 
+from models.constants import LATENT_SPATIAL_SIZE
+
 
 class StatsHead(nn.Module):
     """
@@ -23,7 +25,7 @@ class StatsHead(nn.Module):
     """
 
     def __init__(self, latent_channels: int, stat_names: list[str],
-                 latent_spatial: int = 8, hidden_dim: int = 16):
+                 latent_spatial: int = LATENT_SPATIAL_SIZE, hidden_dim: int = 16):
         super().__init__()
         self.stat_names = list(stat_names)
         in_dim = latent_channels * latent_spatial * latent_spatial

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from models.autoencoder import Autoencoder
+from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_dynamics import LatentDynamics
 from training.checkpoint_components import ComponentCheckpoint
 from training.stats_head import StatsHead
@@ -50,7 +51,9 @@ def build_models_from_components(
     encoder_cfg = components["encoder"].config
     ae = Autoencoder(size=encoder_cfg["size"], channels=in_channels,
                       base_channels=encoder_cfg["base_channels"],
-                      latent_channels=encoder_cfg["latent_channels"]).to(device)
+                      latent_channels=encoder_cfg["latent_channels"],
+                      latent_spatial_size=encoder_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
+                      ).to(device)
 
     # Reassemble the combined Autoencoder's state_dict by re-adding the
     # "encoder."/"decoder." prefixes ComponentCheckpoint's _strip_prefix
@@ -99,6 +102,7 @@ def build_models_from_components(
         hidden_dim = sh.state_dict["net.0.weight"].shape[0]
         stats_head = StatsHead(latent_channels=sh.config["latent_channels"],
                                 stat_names=sh.config["stat_names"],
+                                latent_spatial=sh.config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                                 hidden_dim=hidden_dim).to(device)
         stats_head.load_state_dict(sh.state_dict)
         stats_head.eval()
@@ -108,6 +112,7 @@ def build_models_from_components(
 
     lds_cfg = components["lds"].config
     f_theta = LatentDynamics(latent_channels=lds_cfg["latent_channels"], n_theta=lds_cfg["n_theta"],
+                              latent_spatial=lds_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=lds_cfg["hidden_dim"],
                               n_hidden_layers=lds_cfg["n_hidden_layers"]).to(device)
     f_theta.load_state_dict(components["lds"].state_dict)

@@ -23,6 +23,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.autoencoder import Autoencoder
+from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_dynamics import LatentDynamics
 from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
@@ -160,7 +161,9 @@ def train_lds(
     ae_checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
     ae_config = ae_checkpoint["config"]
     ae = Autoencoder(size=ae_config["size"], channels=1, base_channels=ae_config["base_channels"],
-                      latent_channels=ae_config["latent_channels"]).to(device)
+                      latent_channels=ae_config["latent_channels"],
+                      latent_spatial_size=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
+                      ).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     encoder = ae.encoder
     encoder.eval()
@@ -223,6 +226,7 @@ def train_lds(
                              persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
 
     f_theta = LatentDynamics(latent_channels=ae_config["latent_channels"], n_theta=1,
+                              latent_spatial=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers).to(device)
 
     if resume_from is not None:
@@ -234,10 +238,14 @@ def train_lds(
         # confusingly deep in load_state_dict or silently mismatch.
         prev_lds = torch.load(resume_from, map_location=device, weights_only=True)
         prev_config = prev_lds["config"]
+        prev_latent_spatial_size = prev_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
+        current_latent_spatial_size = ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
         mismatch = [(k, prev_config[k], v) for k, v in
                     [("latent_channels", ae_config["latent_channels"]),
                      ("hidden_dim", hidden_dim), ("n_hidden_layers", n_hidden_layers)]
                     if prev_config[k] != v]
+        if prev_latent_spatial_size != current_latent_spatial_size:
+            mismatch.append(("latent_spatial_size", prev_latent_spatial_size, current_latent_spatial_size))
         if mismatch:
             raise ValueError(f"{resume_from}'s architecture doesn't match the requested one: "
                               + ", ".join(f"{k}={old} (checkpoint) vs {new} (requested)"
@@ -376,6 +384,7 @@ def train_lds(
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
                     "latent_channels": ae_config["latent_channels"], "n_theta": 1,
+                    "latent_spatial_size": ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                     "hidden_dim": hidden_dim, "n_hidden_layers": n_hidden_layers,
                 },
                 "data_config": {

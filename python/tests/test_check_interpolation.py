@@ -25,6 +25,19 @@ def test_parse_fixed_triple_rejects_wrong_part_count():
         parse_fixed_triple("only:two:parts")
 
 
+def test_parse_fixed_triple_windows_drive_letter():
+    """Regression test, same class of bug fixed in
+    check_rollout.parse_fixed_window and check_latent_channels.
+    parse_fixed_frame: a Windows path's OWN colon (after the drive
+    letter) must not be mistaken for one of the run_dir/t1/t2/t3
+    delimiters."""
+    run_dir, t1, t2, t3 = parse_fixed_triple(
+        r"D:\work\NN\phase_field\datasets\64x64\T800_n050_s79:100000:120000:140000"
+    )
+    assert run_dir == Path(r"D:\work\NN\phase_field\datasets\64x64\T800_n050_s79")
+    assert (t1, t2, t3) == (100000, 120000, 140000)
+
+
 def test_find_all_triples_over_real_fixture(tmp_run_dir):
     """tmp_run_dir has 5 kept steps ([0, 1000, 2000, 3000, 4000], all
     valid/complete) -- 5 steps should yield exactly 3 consecutive

@@ -6,6 +6,7 @@ their shapes are guaranteed to line up.
 import torch
 import torch.nn as nn
 
+from .constants import LATENT_SPATIAL_SIZE
 from .decoder import Decoder
 from .encoder import Encoder
 
@@ -15,7 +16,7 @@ class Autoencoder(nn.Module):
     Constructs Encoder and Decoder together from a single set of
     hyperparameters -- unlike building them separately, where nothing
     enforces that input_size/output_size, base_channels, latent_channels,
-    and norm actually agree between the two.
+    latent_spatial_size, and norm actually agree between the two.
 
     forward() returns (x_recon, z): both are needed downstream (z feeds
     LDS training -- stage 3 onward, refined jointly with the encoder in
@@ -29,6 +30,7 @@ class Autoencoder(nn.Module):
         channels: int = 1,
         base_channels: int = 32,
         latent_channels: int = 16,
+        latent_spatial_size: int = LATENT_SPATIAL_SIZE,
         norm: str = "batch",
         use_skips: bool = False,
     ):
@@ -37,6 +39,7 @@ class Autoencoder(nn.Module):
         self.size = size
         self.channels = channels
         self.latent_channels = latent_channels
+        self.latent_spatial_size = latent_spatial_size
         self.use_skips = use_skips
 
         self.encoder = Encoder(
@@ -44,6 +47,7 @@ class Autoencoder(nn.Module):
             in_channels=channels,
             base_channels=base_channels,
             latent_channels=latent_channels,
+            latent_spatial_size=latent_spatial_size,
             norm=norm,
             use_skips=use_skips,
         )
@@ -52,6 +56,7 @@ class Autoencoder(nn.Module):
             out_channels=channels,
             base_channels=base_channels,
             latent_channels=latent_channels,
+            latent_spatial_size=latent_spatial_size,
             norm=norm,
             use_skips=use_skips,
         )

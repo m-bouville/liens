@@ -8,19 +8,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 
+from models.constants import LATENT_SPATIAL_SIZE as _LATENT_SPATIAL_SIZE
 from utils import load_datasets as load
-
-# Spatial size of the AE's latent bottleneck. This is NOT a real source
-# of truth -- it's a magic number (8) copy-pasted from encoder.py's own
-# inline `input_size / 8` (see Encoder.__init__), duplicated here only
-# because MicrostructureSnapshotDataset's translation augmentation (see
-# _augment_item) needs it too and has no access to a live Encoder
-# instance to read it from. TODO: this duplication should go -- e.g.
-# expose it as a real shared constant (models/encoder.py or a small
-# shared config module) that both this file and encoder.py import,
-# rather than two independently-maintained "8"s that could silently
-# drift apart if the bottleneck size ever changes.
-_LATENT_SPATIAL_SIZE = 8
 
 
 def _dihedral_transform(x: torch.Tensor, k: int, flip: bool) -> torch.Tensor:
@@ -480,8 +469,15 @@ class MicrostructureSnapshotDataset(Dataset):
         # cell size is nx // _LATENT_SPATIAL_SIZE and this constant
         # offset would land at a different fraction of the cell instead
         # -- still a distinct, non-degenerate phase per the reasoning
-        # above, just not exactly "a third" by name. Tracked in the same
-        # magic-number TODO as _LATENT_SPATIAL_SIZE itself.
+        # above, just not exactly "a third" by name. Also worth noting:
+        # this uses the model's DEFAULT bottleneck size (see
+        # models/constants.py) -- if a particular checkpoint was built
+        # with a non-default latent_spatial_size (now genuinely
+        # configurable), this augmentation phase-spread wouldn't match
+        # ITS actual cell size. Augmentation happens before/independent
+        # of any specific model though, so there's no natural single
+        # "right" value to read here instead; the default is the
+        # reasonable general-purpose choice.
         third = _LATENT_SPATIAL_SIZE // 3
         two_thirds = (_LATENT_SPATIAL_SIZE * 2) // 3
         shifts = [

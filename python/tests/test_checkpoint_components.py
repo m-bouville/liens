@@ -16,24 +16,33 @@ from training.checkpoint_components import (
     validate_component_compatibility, assemble_joint_checkpoint,
     split_joint_checkpoint_for_evaluation,
 )
+from models.constants import LATENT_SPATIAL_SIZE
 
 
-def _make_ae_checkpoint(latent_channels=8, include_stats_head=True):
-    """Synthetic stage-1/2-shaped checkpoint (same shape either way)."""
+def _make_ae_checkpoint(latent_channels=8, include_stats_head=True, latent_spatial_size=None):
+    """Synthetic stage-1/2-shaped checkpoint (same shape either way).
+    latent_spatial_size=None (default) omits the key entirely, matching
+    a pre-latent_spatial_size checkpoint -- load_ae_components should
+    then fall back to models.constants.LATENT_SPATIAL_SIZE. Pass a real
+    value to test that an EXPLICIT, non-default size actually
+    propagates instead of always silently defaulting."""
     state = {
         "encoder.down_blocks.0.conv1.weight": torch.randn(4, 1, 3, 3),
         "encoder.bottleneck.weight": torch.randn(latent_channels, 4, 1, 1),
         "decoder.unbottleneck.weight": torch.randn(4, latent_channels, 1, 1),
         "decoder.output_conv.weight": torch.randn(1, 4, 3, 3),
     }
+    config = {"size": 64, "base_channels": 4, "latent_channels": latent_channels,
+              "stats_weight": 0.01}
+    if latent_spatial_size is not None:
+        config["latent_spatial_size"] = latent_spatial_size
     checkpoint = {
         "model_state": state,
         "epoch": 12,
         "val_loss": 0.0021,
         "val_loss_ema": 0.0025,
         "test_dirs": ["/fake/run1", "/fake/run2"],
-        "config": {"size": 64, "base_channels": 4, "latent_channels": latent_channels,
-                   "stats_weight": 0.01},
+        "config": config,
     }
     if include_stats_head:
         checkpoint["stats_head_state"] = {"fc.weight": torch.randn(12, latent_channels * 64)}
@@ -86,10 +95,27 @@ def test_load_ae_components_config_and_provenance(tmp_path):
 
     components = load_ae_components(path)
 
-    assert components["encoder"].config == {"size": 64, "base_channels": 4, "latent_channels": 8}
+    assert components["encoder"].config == {
+        "size": 64, "base_channels": 4, "latent_channels": 8,
+        "latent_spatial_size": LATENT_SPATIAL_SIZE,
+    }
     assert components["encoder"].provenance["epoch"] == 12
     assert components["encoder"].provenance["val_loss"] == pytest.approx(0.0021)
     assert str(path.resolve()) == components["encoder"].provenance["source_checkpoint"]
+
+
+def test_load_ae_components_propagates_explicit_latent_spatial_size(tmp_path):
+    """THE case backward-compat fallback alone doesn't cover: a
+    checkpoint that DOES specify a non-default latent_spatial_size must
+    have that real value come through, not silently default."""
+    checkpoint = _make_ae_checkpoint(latent_spatial_size=4)
+    path = tmp_path / "fake-stage2-smaller-bottleneck.pt"
+    torch.save(checkpoint, path)
+
+    components = load_ae_components(path)
+
+    assert components["encoder"].config["latent_spatial_size"] == 4
+    assert components["decoder"].config["latent_spatial_size"] == 4
 
 
 def test_load_ae_components_omits_stats_head_when_absent(tmp_path):

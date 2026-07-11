@@ -23,6 +23,7 @@ python/
 │   ├── train_lds.py               Stage 3
 │   ├── train_refinement.py        Stage 4 and 5
 │   └── ...
+├── orchestration/         [code]  
 ├── evaluation/            [code]  Standalone diagnostic scripts (check_*.py, compare_*.py)
 ├── utils/                 [code]  Dataset/metadata I/O, naming, plotting
 ├── tests/                 [code]  pytest suite (see Testing section)

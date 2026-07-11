@@ -6,6 +6,8 @@ evolves over time, without solving the discretized phase-field PDE.
 import torch
 import torch.nn as nn
 
+from .constants import LATENT_SPATIAL_SIZE
+
 
 class LatentDynamics(nn.Module):
     """
@@ -38,7 +40,8 @@ class LatentDynamics(nn.Module):
     """
 
     def __init__(self, latent_channels: int, n_theta: int = 1,
-                 latent_spatial: int = 8, hidden_dim: int = 256, n_hidden_layers: int = 2):
+                 latent_spatial: int = LATENT_SPATIAL_SIZE, hidden_dim: int = 256,
+                 n_hidden_layers: int = 2):
         super().__init__()
         self.latent_channels = latent_channels
         self.latent_spatial = latent_spatial

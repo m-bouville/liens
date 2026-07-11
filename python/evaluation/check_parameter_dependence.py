@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from models.autoencoder import Autoencoder
+from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_dynamics import LatentDynamics
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import OneStepLoss, ReconLoss
@@ -315,6 +316,7 @@ def check_parameter_dependence(
     ae = Autoencoder(
         size=ae_config["size"], channels=1,
         base_channels=ae_config["base_channels"], latent_channels=ae_config["latent_channels"],
+        latent_spatial_size=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
     ).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     ae.eval()
@@ -594,17 +596,18 @@ def check_parameter_dependence(
     # harder to visually compare side by side.
     axes[1, 2].set_ylim(axes[1, 0].get_ylim())
     # Reference line at the latent bottleneck's own cell size in pixels
-    # (Nx / 8 -- the SAME magic-number 8 duplicated in encoder.py's
-    # `input_size / 8` and training/datasets.py's own
-    # _LATENT_SPATIAL_SIZE; see that constant's docstring/TODO). Not
-    # imported from either -- both are private to their own modules --
-    # so this is a THIRD independent copy of the same number, same
-    # caveat applies. Purely visual: makes it possible to see by eye
-    # whether error spikes specifically for length scales at or below
-    # one latent cell, rather than reading that off the correlation
-    # coefficient alone (which -- like temperature's -- may not be
-    # trustworthy if the true relationship isn't linear/monotonic).
-    cell_size_px = ae_config["size"] / 8
+    # (Nx / latent_spatial_size). Uses THIS checkpoint's own actual
+    # latent_spatial_size (falling back to the shared default,
+    # models.constants.LATENT_SPATIAL_SIZE, for older checkpoints saved
+    # before that field existed) -- no longer an independently
+    # duplicated magic number, see models/constants.py. Purely visual:
+    # makes it possible to see by eye whether error spikes specifically
+    # for length scales at or below one latent cell, rather than
+    # reading that off the correlation coefficient alone (which -- like
+    # temperature's -- may not be trustworthy if the true relationship
+    # isn't linear/monotonic).
+    latent_spatial_size = ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
+    cell_size_px = ae_config["size"] / latent_spatial_size
     axes[1, 2].axvline(cell_size_px, color="black", linestyle=":", linewidth=1)
     axes[1, 2].text(cell_size_px, axes[1, 2].get_ylim()[1], " latent cell size",
                      fontsize=7, ha="left", va="top", rotation=90)

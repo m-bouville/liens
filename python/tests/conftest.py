@@ -23,18 +23,26 @@ import torch
 import torch.nn as nn
 import pytest
 
+from models.constants import LATENT_SPATIAL_SIZE
+
 
 class FakeEncoder(nn.Module):
     """
-    Maps (B, 1, size, size) -> (B, latent_channels, 8, 8) with a single
-    strided conv -- not meant to encode anything meaningful, just to be
-    a real nn.Module with the right input/output shape and (crucially)
-    real, trainable parameters, so gradient-flow tests are genuine.
+    Maps (B, 1, size, size) -> (B, latent_channels, LATENT_SPATIAL_SIZE,
+    LATENT_SPATIAL_SIZE) with a single strided conv -- not meant to
+    encode anything meaningful, just to be a real nn.Module with the
+    right input/output shape and (crucially) real, trainable
+    parameters, so gradient-flow tests are genuine. Uses the SAME
+    shared constant the real Encoder derives its bottleneck size from
+    (models.constants.LATENT_SPATIAL_SIZE), not an independently
+    hardcoded 8 -- so this fixture can't silently drift from the real
+    architecture's actual bottleneck size the way it previously could.
     """
     def __init__(self, size: int = 64, latent_channels: int = 4):
         super().__init__()
-        stride = size // 8
-        assert stride * 8 == size, "FakeEncoder assumes size is a multiple of 8"
+        stride = size // LATENT_SPATIAL_SIZE
+        assert stride * LATENT_SPATIAL_SIZE == size, \
+            "FakeEncoder assumes size is a multiple of LATENT_SPATIAL_SIZE"
         self.conv = nn.Conv2d(1, latent_channels, kernel_size=stride, stride=stride)
 
     def forward(self, x):

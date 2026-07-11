@@ -9,7 +9,8 @@ from pathlib import Path
 
 
 _STAGE_HEADER = re.compile(r"^\s*#\s*Stage\s+(\d+[a-zA-Z]?)\s*$", re.IGNORECASE)
-_KEY_RENAMES = {"patience": "early_stopping_patience", "batches": "batch_size"}
+_KEY_RENAMES = {"patience": "early_stopping_patience", "batches": "batch_size",
+                 "latent_size": "latent_spatial_size"}
 
 
 def parse_stage_params(path: Path) -> tuple[dict[str, str], dict[int | str, dict[str, str]]]:

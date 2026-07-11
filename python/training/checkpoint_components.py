@@ -18,6 +18,8 @@ from pathlib import Path
 
 import torch
 
+from models.constants import LATENT_SPATIAL_SIZE
+
 
 @dataclass
 class ComponentCheckpoint:
@@ -73,6 +75,7 @@ def load_ae_components(checkpoint_path: str | Path,
     ae_component_config = {
         "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],
         "latent_channels": model_cfg["latent_channels"],
+        "latent_spatial_size": model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
     }
 
     components = {
@@ -94,6 +97,7 @@ def load_ae_components(checkpoint_path: str | Path,
         components["stats_head"] = ComponentCheckpoint(
             state_dict=stats_head_state,
             config={"latent_channels": model_cfg["latent_channels"],
+                    "latent_spatial_size": model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                     "stat_names": stats_config["stat_names"]},
             provenance={**shared_provenance, "stats_mean": stats_config["stats_mean"],
                         "stats_std": stats_config["stats_std"]},
@@ -120,9 +124,18 @@ def load_lds_component(checkpoint_path: str | Path, device: str | None = None) -
 
 def validate_component_compatibility(components: dict[str, ComponentCheckpoint]) -> None:
     """
-    Cross-checks that every component agrees on latent_channels -- the
-    one thing that MUST match for the encoder's output to be a valid
-    input to f_theta, and for the decoder to be able to invert it.
+    Cross-checks that every component agrees on latent_channels AND
+    latent_spatial_size -- together, the two things that MUST match for
+    the encoder's output to be a valid input to f_theta, and for the
+    decoder to be able to invert it. (latent_spatial_size defaults to
+    models.constants.LATENT_SPATIAL_SIZE almost everywhere it's read,
+    so in practice this mostly catches an OLD LDS checkpoint -- saved
+    before this field existed, so load_lds_component's wholesale
+    dict(checkpoint["config"]) copy genuinely has no key for it at all,
+    unlike encoder/decoder/stats_head which always get it injected via
+    a fallback default at read time -- being combined with a NEWER
+    ancestor that used a non-default value; see the "in c.config" guard
+    below, mirroring latent_channels' own.)
 
     This check is NEW: stages 1->2->3 are a strict linear chain (one
     ancestor each), so nothing before stage 4 ever needed to verify that
@@ -137,6 +150,17 @@ def validate_component_compatibility(components: dict[str, ComponentCheckpoint])
         detail = ", ".join(f"{name}={n}" for name, n in sorted(latent_channels.items()))
         raise ValueError(
             f"Components disagree on latent_channels: {detail}. Check that the AE and LDS "
+            f"checkpoints being combined actually came from the same pipeline run (or "
+            f"deliberately compatible ones)."
+        )
+
+    latent_spatial_size = {name: c.config["latent_spatial_size"] for name, c in components.items()
+                            if "latent_spatial_size" in c.config}
+    distinct_spatial = set(latent_spatial_size.values())
+    if len(distinct_spatial) > 1:
+        detail = ", ".join(f"{name}={n}" for name, n in sorted(latent_spatial_size.items()))
+        raise ValueError(
+            f"Components disagree on latent_spatial_size: {detail}. Check that the AE and LDS "
             f"checkpoints being combined actually came from the same pipeline run (or "
             f"deliberately compatible ones)."
         )
@@ -189,6 +213,7 @@ def load_joint_refinement_checkpoint(checkpoint_path: str | Path,
     ae_component_config = {
         "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],
         "latent_channels": model_cfg["latent_channels"],
+        "latent_spatial_size": model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
     }
 
     components = {
@@ -216,6 +241,7 @@ def load_joint_refinement_checkpoint(checkpoint_path: str | Path,
         components["stats_head"] = ComponentCheckpoint(
             state_dict=stats_head_state,
             config={"latent_channels": model_cfg["latent_channels"],
+                    "latent_spatial_size": model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                     "stat_names": stats_config["stat_names"]},
             provenance={**shared_provenance, "stats_mean": stats_config["stats_mean"],
                         "stats_std": stats_config["stats_std"]},

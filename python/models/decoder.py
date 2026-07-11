@@ -9,20 +9,23 @@ import torch
 import torch.nn as nn
 
 from .blocks import UpBlock
+from .constants import LATENT_SPATIAL_SIZE
 
 
 class Decoder(nn.Module):
     """
     A 1x1 conv expands latent_channels back to the encoder's final
-    channel count (spatial stays 8x8), then repeated UpBlocks double
+    channel count (spatial stays at latent_spatial_size x
+    latent_spatial_size, 8x8 by default), then repeated UpBlocks double
     spatial resolution back up to output_size, mirroring Encoder's
     DownBlocks in reverse.
 
-    IMPORTANT: output_size, base_channels, latent_channels, and norm
-    must match the paired Encoder's construction arguments exactly, or
-    shapes won't line up. This isn't enforced here (Decoder is built
-    standalone) -- autoencoder.py should be the single place that
-    constructs both from one shared config.
+    IMPORTANT: output_size, base_channels, latent_channels,
+    latent_spatial_size, and norm must match the paired Encoder's
+    construction arguments exactly, or shapes won't line up. This isn't
+    enforced here (Decoder is built standalone) -- autoencoder.py
+    should be the single place that constructs both from one shared
+    config.
 
     Skip connections: accepted as a `skips` argument for forward-API
     compatibility with the future U-Net path, but NOT wired up yet.
@@ -40,19 +43,22 @@ class Decoder(nn.Module):
         out_channels: int = 1,
         base_channels: int = 32,
         latent_channels: int = 16,
+        latent_spatial_size: int = LATENT_SPATIAL_SIZE,
         norm: str = "batch",
         use_skips: bool = False,
     ):
         super().__init__()
 
-        n_stages = math.log2(output_size / 8)
+        n_stages = math.log2(output_size / latent_spatial_size)
         if not n_stages.is_integer() or n_stages < 1:
             raise ValueError(
-                f"output_size must be 8 * 2^k for integer k >= 1, got {output_size}"
+                f"output_size must be latent_spatial_size * 2^k for integer k >= 1 "
+                f"(latent_spatial_size={latent_spatial_size}), got output_size={output_size}"
             )
         n_stages = int(n_stages)
 
         self.output_size = output_size
+        self.latent_spatial_size = latent_spatial_size
         self.n_stages = n_stages
         self.use_skips = use_skips
 
@@ -84,8 +90,10 @@ class Decoder(nn.Module):
                                       padding_mode="circular")
 
     def forward(self, z: torch.Tensor, skips: list[torch.Tensor] | None = None) -> torch.Tensor:
-        if z.shape[-2:] != (8, 8):
-            raise ValueError(f"Decoder expects an 8x8 latent map, got {tuple(z.shape[-2:])}")
+        expected_shape = (self.latent_spatial_size, self.latent_spatial_size)
+        if z.shape[-2:] != expected_shape:
+            raise ValueError(f"Decoder expects a {expected_shape[0]}x{expected_shape[1]} "
+                              f"latent map, got {tuple(z.shape[-2:])}")
 
         x = self.unbottleneck(z)
 
