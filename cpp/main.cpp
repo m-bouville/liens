@@ -35,6 +35,7 @@ int main(int argc, char* argv[])
 
 
         // run several simulations
+        std::cout << "Starting " << cfg.max_threads << " simulations.\n";
         Simulation sim(cfg);
         sim.run();
     }

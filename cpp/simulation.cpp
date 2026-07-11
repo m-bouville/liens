@@ -20,6 +20,13 @@
 
 // BS::thread_pool pool(6);
 
+struct SimulationParameters
+{
+    double T;
+    double noise;
+    int    seed;
+};
+
 
 void Simulation::run()
 {
@@ -29,26 +36,49 @@ void Simulation::run()
 
     // std::cout <<  __config.save << '\n';
 
+
+    // How many simulations are (in)complete?
+    std::size_t nb_done     = 0;
+    std::size_t nb_remaining= 0;
+    std::vector<SimulationParameters> simulations_to_run;
+
+
     for (int seed : __config.seeds)
         for (double noise : __config.noises)
             for (double T : __config.temperatures)
             {
-                futures.push_back(
-                    std::async(std::launch::async,
-                        &Simulation::__runOneSimulation,
-                        this, T, noise, seed)
-                );
+                std::filesystem::path outdir = writer::make_dir_name(
+                        __config.Nx, __config.Ny, T, noise, seed);
 
-                if (futures.size() >= max_threads)
-                {
-                    futures.front().get();
-                    futures.erase(futures.begin());
-                }
-
-                // pool.submit_task([=, this] {
-                    // __runOneSimulation(T, noise, seed);
-                // }
+                if (!std::filesystem::exists(outdir / "COMPLETE")) {
+                    ++nb_remaining;
+                    simulations_to_run.push_back({T, noise, seed});
+                    // std::cout << "Not done yet: " << outdir << '\n';
+                } else
+                    ++nb_done;
             }
+
+    std::cout << nb_done << " simulations done, " << nb_remaining << " still need to run.\n";
+
+    
+    // run what needs to be run
+    for (const auto& sim : simulations_to_run)
+    {
+        futures.push_back(
+            std::async(std::launch::async,
+                &Simulation::__runOneSimulation,
+                this,
+                sim.T,
+                sim.noise,
+                sim.seed)
+        );
+
+        if (futures.size() >= max_threads)
+        {
+            futures.front().get();
+            futures.erase(futures.begin());
+        }
+    }
 
     for (auto &f : futures)
         f.get();
@@ -61,22 +91,10 @@ void Simulation::__runOneSimulation(double T,
     std::filesystem::path outdir = 
             writer::make_dir_name(__config.Nx, __config.Ny, T, noise, seed);
 
-    std::ostringstream os_start;
-    if (std::filesystem::exists(outdir / "COMPLETE"))
-    {
-        os_start << "Skipping completed run for " << 
-                "T: " << T << ", noise: " << noise << ", seed: " << seed << '\n';
-        return;
-    }
-    else 
-    {
-        os_start << "Starting run for " << "T: " << T << ", noise: " << noise << 
-                ", seed: " << seed << '\n';
-    }
-        
     {
         std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << os_start.str();
+        std::cout << "Starting run for " << "T: " << T << ", noise: " << noise << 
+                ", seed: " << seed << '\n';
     }
   
     std::filesystem::create_directories(outdir);
