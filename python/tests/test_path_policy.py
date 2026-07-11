@@ -24,13 +24,15 @@ from pathlib import Path
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent
 
 # Every directory that has historically had this bug, or could
-# plausibly grow a new instance of it: the orchestrator, training
-# scripts, and evaluation/diagnostic scripts. NOT models/ or utils/,
-# which don't build checkpoint/output paths themselves (checked: no
-# hits there either, but they're a different KIND of module -- pure
-# architecture/IO helpers -- with no obvious reason to ever need this
-# pattern, unlike training/evaluation scripts which all save something).
-_SCAN_DIRS = ["training", "evaluation"]
+# plausibly grow a new instance of it: the orchestrator (now split into
+# orchestration/, see main.py's own refactor), training scripts, and
+# evaluation/diagnostic scripts. NOT models/ or utils/, which don't
+# build checkpoint/output paths themselves (checked: no hits there
+# either, but they're a different KIND of module -- pure architecture/
+# IO helpers -- with no obvious reason to ever need this pattern,
+# unlike training/evaluation/orchestration scripts which all save
+# something).
+_SCAN_DIRS = ["orchestration", "training", "evaluation"]
 _SCAN_FILES = ["main.py"]
 
 # Matches Path("..  or  Path(f"..  -- a bare relative-string literal
@@ -86,20 +88,28 @@ def test_no_bare_relative_checkpoint_or_output_paths():
 def test_scripts_that_define_output_paths_have_the_anchor():
     """Every scanned file that actually constructs a checkpoint/output
     path (i.e. references "checkpoints" or "output" as a path component
-    anywhere) must define its own _PYTHON_ROOT -- catches a file being
-    given a fixed relative-string replacement without ever gaining the
-    anchor those replacements depend on (a plain NameError at import
-    time in practice, but worth failing here with a clearer message
-    than that)."""
+    anywhere) must have access to a real _PYTHON_ROOT-style anchor --
+    EITHER by defining its own (the original per-file pattern, still
+    used by orchestration/paths.py itself and every training/evaluation
+    script), OR by importing it from orchestration.paths (the pattern
+    main.py and the rest of the orchestration/ package use instead,
+    specifically so there's ONE shared anchor rather than N
+    independently-computed copies that could drift apart -- see
+    orchestration/paths.py's own docstring). Catches a file being given
+    a fixed relative-string replacement without ever gaining a working
+    anchor either way (a plain NameError/ImportError in practice, but
+    worth failing here with a clearer message than that)."""
     anchor_pattern = re.compile(r"_PYTHON_ROOT\s*=\s*Path\(__file__\)\.resolve\(\)")
+    shared_anchor_import = re.compile(r"from orchestration\.paths import\b")
     missing = []
     for path in _project_python_files():
         text = path.read_text()
         builds_a_path = ('"checkpoints"' in text) or ('"output"' in text) \
             or ("/ \"checkpoints\"" in text) or ("/ \"output\"" in text)
-        if builds_a_path and not anchor_pattern.search(text):
+        has_anchor = bool(anchor_pattern.search(text)) or bool(shared_anchor_import.search(text))
+        if builds_a_path and not has_anchor:
             missing.append(str(path.relative_to(_PYTHON_ROOT)))
     assert not missing, (
-        "these files reference checkpoints/output paths but never define "
-        "_PYTHON_ROOT:\n  " + "\n  ".join(missing)
+        "these files reference checkpoints/output paths but never define or "
+        "import _PYTHON_ROOT:\n  " + "\n  ".join(missing)
     )

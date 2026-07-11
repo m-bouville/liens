@@ -53,6 +53,19 @@ exists at all (see below).
 
 ## Core modules
 
+`main.py` reads a params file in `/params` (`# Stage <N>` sections, key=value pairs, `same` inheritance from the nearest preceding stage or global section — the inheritance chain is hardcoded per stage, e.g. stage 4 checks `["3b", "3a", 3, 2, 1]` in order), then runs whichever stages are present, in order, skipping any stage whose signature already matches an existing checkpoint (see Registry below).
+
+Every stage follows the same shape in `main.py`: build `kwargs` from the params file →
+compute a cache-matching signature → `resolve_checkpoint()` (reuse if found) → train if
+not → sanity-check (only if freshly trained, not on reuse) → upsert registry.
+
+**Registry/caching**: each `checkpoints/stage<N>/` directory has a `registry-stage<N>.csv`
+mapping a parameter signature to a checkpoint path. `_upsert_registry()` writes an
+in-progress entry on every intermediate save (so a killed run doesn't falsely appear
+"complete" to a later resume attempt) and a final entry with the true epoch count at the
+end.
+
+
 ### `models/` — architecture only, no training logic
 - **`Encoder`**: depth scales with input size so the spatial bottleneck is always 8×8 (3
   stages for 64×64, 5 for 256×256). Can optionally return skip-connection features
@@ -128,29 +141,65 @@ forward pass — without this, `E` could trivially collapse to a constant with `
 learning to match it, since nothing else in the loss would catch it.
 
 #### Training loops
-- `train_ae.py` — `train_autoencoder()` (stage 1), `train_stage2()` (stage 2, includes
+- **`train_ae.py`**: `train_autoencoder()` (stage 1), `train_stage2()` (stage 2, includes
   `freeze_outer_layers()`, a regularization knob).
-- `train_lds.py` — `train_lds()`, shared by stages 3a and 3b (`n_rollout_steps`
+- **`train_lds.py`**: `train_lds()`, shared by stages 3a and 3b (`n_rollout_steps`
   distinguishes them; `resume_from` chains 3a→3b). Recently gained `one_step_weight`
   (adds `ε·L_1step` on top of `L_rollout`, hoping to regularize 3b's instability — tried
   at two different weights, both made rollout quality *worse*, not better, on most test
   windows; not resolved as of this writing).
-- `train_refinement.py` — `train_refinement()`, shared by stages 4 and 5.
+- **`train_refinement.py`**: `train_refinement()`, shared by stages 4 and 5.
 
 All three training-loop modules follow the same shape: resolve ancestor checkpoint(s) →
 build dataset(s) → epoch loop (train/val split, `CheckpointCriterionTracker`, loss-curve
 figure via `utils.plots.loss_curve`, early stopping) → save.
 
 
+### `orchestration/` — pipeline orchestration, split out of `main.py`
+`main.py` itself is now a thin CLI entry point (argument parsing, then a call into
+`pipeline.run_from_params_file()`) — every other name it used to define locally lives here
+instead, split along natural seams:
+- **`pipeline.py`** is the actual orchestrator: `run_from_params_file()` runs stages
+  1→2→3(a/b)→4→5 as specified by one params file, stopping early and returning whichever
+  checkpoint is the last one actually produced. See the **Orchestration** section below for
+  the caching/registry mechanics this drives.
+- **`paths.py`**: `_PYTHON_ROOT`/`_STAGE_DIRS`/`_CHECKPOINTS_ROOT`, the anchor every other
+  file in this package (and `main.py`) imports rather than each computing its own copy —
+  one shared source of truth instead of N independently-computed ones that could drift
+  apart (see the project's own path-policy history for why that's not hypothetical).
+- **`stage_params.py`** parses a stage-parameters file into per-stage kwargs:
+  `parse_stage_params()` (section headers, `key=value`, inline `#` comments),
+  `same`-inheritance resolution (`_preceding_stages()`'s hardcoded per-stage chain, e.g.
+  stage 4 checks `["3b", "3a", 3, 2, 1]` in order), and best-effort str→bool/int/float
+  conversion.
+- **`checkpoint_registry.py`** matches a requested configuration against
+  `registry-stage<N>.csv` (`_find_matching_checkpoint()`), and recording new entries as
+  training proceeds (`_upsert_registry()`, called on every intermediate save so a killed
+  run doesn't falsely look "complete" to a later resume attempt, not just once at the end).
+  Also resolves a `stageN_checkpoint` registry field to a concrete, canonical path
+  regardless of whether the CSV holds a bare filename, a relative path, or an absolute one.
+- **`checkpoint_identification.py`**: `identify_checkpoint_stage()` inspects a loaded
+  checkpoint's *structure* (not its filename) to determine which stage actually produced
+  it, so a mismatched file is caught with a clear error instead of failing deep inside
+  training with a confusing shape-mismatch. Recognizes `stage3_config` as well as
+  `stage2_config` for stage 2, so a checkpoint trained before the stage-renumbering doesn't
+  need retraining just to be correctly identified.
+- **`logging_utils.py`**: `_log_to_file()`, tees stdout/stderr into a per-stage log file
+  in addition to the console for the duration of a training call.
+- **`sweep_status.py`**: `check_sweep_status()` (`main.py --scan-only`), reports
+  COMPLETE/INCOMPLETE/missing run directories per grid size, reading each size's own
+  `metadata.txt` rather than depending on `config.txt`.
+
+
 ### `evaluation/` — standalone diagnostic scripts
 
 Each has a real, importable function (not just CLI logic) so `main.py` can call it directly, plus a thin `main()` CLI wrapper:
 
-- **`check_reconstruction.py`** — AE reconstruction quality on held-out samples.
-- **`check_rollout.py`** — multi-step rollout comparison (`state(t)`, `real Δx`, `predicted Δx`, `error`, over the full window chain via `f_theta.rollout()`). Also has `_padded_bounds()` for predictable, comparable color scales across different checkpoints/runs — derived only from the *real* data, never from the prediction, so a bad prediction shows as visible saturation instead of stretching its own scale.
-- **`check_interpolation.py`** / **`check_perturbation.py`** — stage 2's two latent-space  diagnostics (the letter post-hoc only: not used as loss function).
-- **`check_parameter_dependence.py`** — scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `main.py`'s stage 3 sanity checks alongside `check_rollout`.
-- **`compare_integrators.py`**, **`compare_rollout_training.py`** — one-off exploratory   comparison scripts, not part of the maintained by-stage output/checkpoint conventions; treat as needing an explicit refactor-or-archive decision rather than assuming they stay current automatically.
+- **`check_reconstruction.py`**: AE reconstruction quality on held-out samples.
+- **`check_rollout.py`**: multi-step rollout comparison (`state(t)`, `real Δx`, `predicted Δx`, `error`, over the full window chain via `f_theta.rollout()`). Also has `_padded_bounds()` for predictable, comparable color scales across different checkpoints/runs — derived only from the *real* data, never from the prediction, so a bad prediction shows as visible saturation instead of stretching its own scale.
+- **`check_interpolation.py`** and **`check_perturbation.py`** are stage 2's two latent-space  diagnostics (the letter post-hoc only: not used as loss function).
+- **`check_parameter_dependence.py`** scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `main.py`'s stage 3 sanity checks alongside `check_rollout`.
+- **`compare_integrators.py`** and **`compare_rollout_training.py`** are one-off exploratory   comparison scripts, not part of the maintained by-stage output/checkpoint conventions; treat as needing an explicit refactor-or-archive decision rather than assuming they stay current automatically.
 
 
 ### `utils/`
@@ -163,26 +212,6 @@ Each has a real, importable function (not just CLI logic) so `main.py` can call 
 - `plots.py`
   -  `show_snapshot`: raw-snapshot visualization;
   - `loss_curve()`: shared by all five training stages (y-axis capped so early instability spikes don't squash the rest of the curve).
-
-
-
-## Orchestration: `main.py`
-
-Reads a params file in `/params` (`# Stage <N>` sections, key=value pairs, `same` inheritance from the
-nearest preceding stage or global section — the inheritance chain is hardcoded per stage,
-e.g. stage 4 checks `["3b", "3a", 3, 2, 1]` in order), then runs whichever stages are
-present, in order, skipping any stage whose signature already matches an existing
-checkpoint (see Registry below).
-
-Every stage follows the same shape in `main.py`: build `kwargs` from the params file →
-compute a cache-matching signature → `resolve_checkpoint()` (reuse if found) → train if
-not → sanity-check (only if freshly trained, not on reuse) → upsert registry.
-
-**Registry/caching**: each `checkpoints/stage<N>/` directory has a `registry-stage<N>.csv`
-mapping a parameter signature to a checkpoint path. `_upsert_registry()` writes an
-in-progress entry on every intermediate save (so a killed run doesn't falsely appear
-"complete" to a later resume attempt) and a final entry with the true epoch count at the
-end.
 
 
 

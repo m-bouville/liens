@@ -1,10 +1,10 @@
 # Grid
-Nx      = 128
-Ny      = 128
+Nx      = 256
+Ny      = 256
 
 # Time integration
 dt      = 0.05
-steps   = 2500001		# 3000001 for 64x64, 2500001 for 128x128, 2000001 for 256x256, 1500001 for 512x512
+steps   = 2000001		# 3000001 for 64x64, 2500001 for 128x128, 2000001 for 256x256, 1500001 for 512x512
 
 # Threads
 max_threads= 6
