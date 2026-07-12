@@ -10,6 +10,9 @@
 #include <unordered_set>
 #include <cstdint>
 
+#include <chrono>
+#include <ctime>
+
 #include <future>
 // #include "BS_thread_pool.hpp"
 
@@ -58,8 +61,8 @@ void Simulation::run()
                     ++nb_done;
             }
 
-    std::cout << nb_done << " simulations done, " << nb_remaining << " still need to run.\n";
-
+    std::cout << nb_done << " simulations done, " << nb_remaining << " to run.\n";
+    std::cout << "Running on " << __config.max_threads << " threads.\n";
     
     // run what needs to be run
     for (const auto& sim : simulations_to_run)
@@ -93,8 +96,13 @@ void Simulation::__runOneSimulation(double T,
 
     {
         std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "Starting run for " << "T: " << T << ", noise: " << noise << 
-                ", seed: " << seed << '\n';
+        
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+
+        std::cout << "Starting run for " << "T:"  << std::setw(6) << T << 
+                ", noise:"  << std::setw(6) << noise << ", seed:"  << std::setw(4) << seed <<
+                " at " << std::put_time(std::localtime(&now_c), "%H:%M") << '\n';
     }
   
     std::filesystem::create_directories(outdir);
@@ -133,28 +141,32 @@ void Simulation::__runOneSimulation(double T,
 
 
     std::ostringstream log;
-    log << '\n' << "T: " << T << ", noise: " << noise << 
-                ", seed: " << seed << '\n';
-    log << "minimum at " << potential.minimum(T) << '\n';
-    log << std::left
-            << std::setw( 8) << "step"
-            << std::setw(28) << "   order parameter (%)"
-            << std::setw(14) << "  gradient"
-            << std::setw(11) << "autocorrel"
-            << std::setw(11) << "   anisotropy"
-            << std::setw( 8) << "total"
-            << '\n';  
-    log << std::left
-            << std::setw( 8) << " "
-            << std::setw( 7) << "min" << std::setw( 7) << "avg" << std::setw( 7) << "max"
-            << std::setw( 7) << "stdev"
-            << std::setw( 7) << "<|g|>"   << std::setw( 7) << "<g^2>"
-            << std::setw( 7) << "value" << std::setw( 4) << "at"
-            // << std::setw( 7) << "trace" << std::setw( 7)  // identical to <g^2>
-            << "diff" << std::setw( 4) << "ang"
-            << std::setw( 8) << "energy"
-            << '\n';          
-    log << std::string(90, '-') << '\n';
+    // log << '\n';
+    log << "T:"  << std::setw(6) << T << 
+           ", noise:" << std::setw(6) << noise << 
+           ", seed:"  << std::setw(4) << seed;
+        //   << " (minimum at " << potential.minimum(T)*100 << "%)" << '\n';
+
+    // // header (on two lines)
+    // log << std::left
+    //         << std::setw( 8) << "step"
+    //         << std::setw(21) << "   order parameter (%)"
+    //         << std::setw(14) << "  gradient"
+    //         << std::setw(11) << "autocorrel"
+    //         << std::setw(11) << "   anisotropy"
+    //         << std::setw( 8) << "total"
+    //         << '\n';  
+    // log << std::left
+    //         << std::setw( 8) << " "
+    //         << std::setw( 7) << "min"   << std::setw( 7) << "avg" << std::setw( 7) << "max"
+    //         << std::setw( 7) << "stdev"
+    //         << std::setw( 7) << "<|g|>" << std::setw( 7) << "<g^2>"
+    //         << std::setw( 7) << "value" << std::setw( 4) << "at"
+    //         // << std::setw( 7) << "trace" // identical to <g^2>
+    //         << std::setw( 7) << "diff" << std::setw( 4)  << "ang"
+    //         << std::setw( 8) << "energy"
+    //         << '\n';          
+    // log << std::string(90, '-') << '\n';
 
 
     std::filesystem::path file;
@@ -194,8 +206,12 @@ void Simulation::__runOneSimulation(double T,
 
     writer::register_completed_run(outdir);
 
-    {
+    {        
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+
         std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << log.str() << '\n';  
+        std::cout << log.str() << " DONE at " << 
+                std::put_time(std::localtime(&now_c), "%H:%M") << '\n';  // << '\n';  
     }
 }

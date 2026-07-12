@@ -15,7 +15,7 @@ int main(int argc, char* argv[])
         // Rebuild datasets/*/metadata.txt for backward compatibility.
         writer::rebuild_dataset_metadata("../datasets");
 
-        std::cout << "Starting..." << '\n';
+        // std::cout << "Starting..." << '\n';
 
         // Loading config file
         Config cfg;
@@ -24,18 +24,17 @@ int main(int argc, char* argv[])
         std::cout << "Loading " << filename << "...\n";
         cfg.load(filename);
 
-        std::cout << "Validating...\n";
+        // std::cout << "Validating...\n";
         cfg.validate();
 
         std::cout << "dimensions: "     << cfg.Nx << " x " << cfg.Ny << '\n';
         std::cout << cfg.temperatures.size() << " temperatures * " << 
                      cfg.noises.size() << " noises * " <<                      
                      cfg.seeds.size() << " seeds = " <<                    
-                     cfg.temperatures.size() * cfg.seeds.size() * cfg.noises.size() << " simulations.\n"; 
-
+                     cfg.temperatures.size() * cfg.seeds.size() * cfg.noises.size() << 
+                     " simulations in total.\n";
 
         // run several simulations
-        std::cout << "Starting " << cfg.max_threads << " simulations.\n";
         Simulation sim(cfg);
         sim.run();
     }

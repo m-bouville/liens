@@ -135,25 +135,25 @@ writer::WriterStatistics writer::statistics(const OrderParameter& op,
     // energy
     out.energy = solver.energy(op, potential, neighbors, T);
 
-    // display statistics to console
-    log << std::left
-        << std::setw(8) << step
-        << std::setw(7) << std::fixed << std::setprecision(1)
-        << stats.min * 100 
-        << std::setw(7) << stats.average * 100 
-        << std::setw(7) << stats.max * 100 
-        << std::setw(7) << stats.stdev * 100 
-        << std::setw(7) << out.avg_gradient*100 << std::setw(7) << out.gradient_sqr*100
-        << std::setw(7) << std::setprecision(2) << out.autocorr_correl*100
-        << std::setw(4) << out.autocorr_length
-        // << std::setw(7) << out.trace*100   
-        << std::setw(7) << out.anisotropy*100   
-        << std::setw(7) << std::setprecision(0) << out.angle*180/std::numbers::pi
-        << std::setw(8) << std::setprecision(1) << out.energy << '\n';
+    // // display statistics to console
+    // log << std::left
+    //     << std::setw(8) << step
+    //     << std::setw(7) << std::fixed << std::setprecision(1)
+    //     << stats.min * 100 
+    //     << std::setw(7) << stats.average * 100 
+    //     << std::setw(7) << stats.max * 100 
+    //     << std::setw(7) << stats.stdev * 100 
+    //     << std::setw(7) << out.avg_gradient*100 << std::setw(7) << out.gradient_sqr*100
+    //     << std::setw(7) << std::setprecision(2) << out.autocorr_correl*100
+    //     << std::setw(4) << out.autocorr_length
+    //     // << std::setw(7) << out.trace*100   
+    //     << std::setw(7) << out.anisotropy*100   
+    //     << std::setw(7) << std::setprecision(0) << out.angle*180/std::numbers::pi
+    //     << std::setw(8) << std::setprecision(1) << out.energy << '\n';
 
-    // reset (important if more printing follows)
-    log.unsetf(std::ios::fixed);
-    log << std::setprecision(6);
+    // // reset (important if more printing follows)
+    // log.unsetf(std::ios::fixed);
+    // log << std::setprecision(6);
 
     return out;
 }
