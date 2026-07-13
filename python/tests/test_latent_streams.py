@@ -16,10 +16,12 @@ architecture.
 """
 import torch
 import pytest
+import warnings
 
 from models.latent_streams import (
     LatentStreamConfig, LatentStreamMode, autoencode_stream,
-    build_stream_configs, decode_stream,
+    build_stream_configs, cross_check_stream_configs_against_state_dict, decode_stream,
+    resolve_stream_configs_from_checkpoint_config,
 )
 
 
@@ -199,8 +201,200 @@ def test_build_stream_configs_warns_on_multiple_autoencoder_streams():
     reconstruction wrapper needs a single unambiguous stream) -- a
     config mistake worth warning about, not silently accepting, but
     not necessarily fatal either (raw Encoder/Decoder use doesn't care)."""
-    with pytest.warns(UserWarning, match="multiple streams"):
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
         build_stream_configs(
             names=["a", "b"], modes=["autoencoder", "autoencoder"],
             channels_decoder=8, spatial_decoder=8,
         )
+    assert any(issubclass(x.category, UserWarning) and "multiple streams" in str(x.message)
+               for x in w), f"expected a 'multiple streams' UserWarning, got: {[str(x.message) for x in w]}"
+
+
+# ---- resolve_stream_configs_from_checkpoint_config -----------------------
+# Never had dedicated tests before -- exercised only indirectly through
+# every production file that calls it. Given how many rounds of bugs
+# this whole area caused, worth pinning down directly.
+
+def test_resolve_stream_configs_falls_back_for_pre_redesign_checkpoint():
+    """A checkpoint saved before the multi-stream redesign has neither
+    'stream_configs' nor 'recon_stream_name' -- must fall back to
+    exactly the single implicit 'autoencoder'-mode stream it always
+    had, built from the flat latent_channels/latent_spatial_size keys
+    that DO exist on every checkpoint this project has ever saved."""
+    model_cfg = {"size": 64, "base_channels": 32, "latent_channels": 16,
+                 "latent_spatial_size": 8, "stats_weight": 0.01}
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    assert recon_stream_name == "state"
+    assert list(stream_configs.keys()) == ["state"]
+    assert stream_configs["state"].channels == 16
+    assert stream_configs["state"].spatial_size == 8
+    assert stream_configs["state"].mode == LatentStreamMode.AUTOENCODER
+
+
+def test_resolve_stream_configs_missing_latent_spatial_size_uses_default():
+    """latent_spatial_size itself can ALSO be missing (an even older
+    checkpoint, or one saved before that specific field existed) --
+    falls back to the shared LATENT_SPATIAL_SIZE default, not a crash."""
+    model_cfg = {"size": 64, "base_channels": 32, "latent_channels": 16}
+    stream_configs, _ = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    assert stream_configs["state"].spatial_size == 8  # models.constants.LATENT_SPATIAL_SIZE
+
+
+def test_resolve_stream_configs_reads_real_multi_stream_metadata():
+    """A checkpoint saved by the current code, with real stream_configs
+    -- read back exactly, not re-derived or approximated."""
+    model_cfg = {
+        "size": 64, "base_channels": 32,
+        "stream_configs": {
+            "state": {"channels": 8, "spatial_size": 8, "mode": "autoencoder"},
+            "deriv": {"channels": 8, "spatial_size": 8, "mode": "decoder"},
+        },
+        "recon_stream_name": "state",
+    }
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    assert recon_stream_name == "state"
+    assert set(stream_configs.keys()) == {"state", "deriv"}
+    assert stream_configs["deriv"].mode == LatentStreamMode.DECODER
+
+
+# ---- cross_check_stream_configs_against_state_dict ------------------------
+# THE bug from this session's own troubleshooting: a checkpoint whose
+# encoder weights genuinely contain a second stream (training succeeded
+# with the CONSTRUCTION fix in place), but whose saved "config" doesn't
+# say so (saved by a version of the code before the separate
+# checkpoint-SAVE fix landed) -- no amount of correctly reading stale
+# metadata can fix this; only reading the real weights can.
+
+class _FakeTensor:
+    """Minimal stand-in for a torch.Tensor -- only .shape is needed by
+    the function under test, so this avoids requiring torch here."""
+    def __init__(self, shape):
+        self.shape = shape
+
+
+def test_cross_check_is_a_noop_when_metadata_already_matches():
+    """The common, correct case: state_dict's own stream names already
+    match what stream_configs claims -- returned unchanged, not
+    rebuilt, and no warning (nothing to warn about)."""
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=4, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+    }
+    state_dict = {
+        "encoder.bottlenecks.state.weight": _FakeTensor((4, 64, 1, 1)),
+        "encoder.bottlenecks.state.bias": _FakeTensor((4,)),
+    }
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        corrected, recon_name = cross_check_stream_configs_against_state_dict(
+            stream_configs, "state", state_dict,
+        )
+        assert len(w) == 0
+    assert corrected is stream_configs
+    assert recon_name == "state"
+
+
+def test_cross_check_corrects_stale_metadata_missing_a_real_stream():
+    """THE actual bug: metadata claims only 'state', but the encoder's
+    OWN weights also contain 'deriv' -- must be detected and added,
+    with a warning (this is a real inconsistency worth surfacing, even
+    though it's handled gracefully rather than raised as an error)."""
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=4, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+    }
+    state_dict = {
+        "encoder.down_blocks.0.conv1.weight": _FakeTensor((4, 1, 3, 3)),
+        "encoder.bottlenecks.state.weight": _FakeTensor((4, 64, 1, 1)),
+        "encoder.bottlenecks.state.bias": _FakeTensor((4,)),
+        "encoder.bottlenecks.deriv.weight": _FakeTensor((4, 64, 1, 1)),
+        "encoder.bottlenecks.deriv.bias": _FakeTensor((4,)),
+    }
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        corrected, recon_name = cross_check_stream_configs_against_state_dict(
+            stream_configs, "state", state_dict,
+        )
+    assert any(issubclass(x.category, UserWarning) and "stale" in str(x.message) for x in w), \
+        f"expected a 'stale' UserWarning, got: {[str(x.message) for x in w]}"
+    assert set(corrected.keys()) == {"state", "deriv"}
+    assert recon_name == "state"  # unchanged -- the recon stream was never in question
+    # Channel count read from the ACTUAL weight tensor, not assumed:
+    assert corrected["deriv"].channels == 4
+    # Spatial size can't be read from a 1x1 conv's weight shape --
+    # assumed to match the recon stream's own, per this project's
+    # decodable-streams-share-one-size design constraint.
+    assert corrected["deriv"].spatial_size == 8
+    # Mode assumed DECODER (not AUTOENCODER) for a stream the
+    # metadata never claimed as the reconstruction target -- the
+    # safer default, since at most one AUTOENCODER-mode stream is
+    # meaningful and recon_stream_name already identifies it.
+    assert corrected["deriv"].mode == LatentStreamMode.DECODER
+    # The original stream's own config is untouched:
+    assert corrected["state"].channels == 4
+    assert corrected["state"].mode == LatentStreamMode.AUTOENCODER
+
+
+def test_cross_check_infers_correct_channel_count_from_weight_shape():
+    """The inferred stream's channel count must come from its ACTUAL
+    weight tensor shape, not copy the recon stream's -- different
+    streams could plausibly have different channel counts (nothing
+    about this function assumes they must match)."""
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=4, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+    }
+    state_dict = {
+        "encoder.bottlenecks.state.weight": _FakeTensor((4, 64, 1, 1)),
+        "encoder.bottlenecks.deriv.weight": _FakeTensor((6, 64, 1, 1)),  # DIFFERENT channel count
+    }
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        corrected, _ = cross_check_stream_configs_against_state_dict(
+            stream_configs, "state", state_dict,
+        )
+    assert any(issubclass(x.category, UserWarning) for x in w)
+    assert corrected["deriv"].channels == 6  # read from ITS OWN weight, not copied from state's 4
+
+
+def test_cross_check_does_not_remove_a_stream_metadata_claims_but_state_dict_lacks():
+    """A DIFFERENT, stranger kind of inconsistency (metadata claims a
+    stream the weights don't have) is deliberately NOT auto-corrected
+    -- this function only ADDS what the weights prove exists, never
+    REMOVES what the metadata claims; that's a different failure this
+    function doesn't try to silently paper over."""
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=4, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+        "deriv": LatentStreamConfig(name="deriv", channels=4, spatial_size=8,
+                                     mode=LatentStreamMode.DECODER),
+    }
+    state_dict = {
+        "encoder.bottlenecks.state.weight": _FakeTensor((4, 64, 1, 1)),
+        # no "deriv" keys at all in the state_dict
+    }
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        corrected, recon_name = cross_check_stream_configs_against_state_dict(
+            stream_configs, "state", state_dict,
+        )
+        assert len(w) == 0  # not this function's job to flag this case
+    assert set(corrected.keys()) == {"state", "deriv"}  # unchanged, still claims both
+
+
+def test_cross_check_no_bottleneck_keys_at_all_is_a_noop():
+    """A state_dict with no 'bottlenecks.' keys at all (e.g. a decoder-
+    only state_dict passed by mistake, or some other unrelated shape)
+    -- returns the original stream_configs unchanged rather than
+    misinterpreting the absence of any match as anything meaningful."""
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=4, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+    }
+    state_dict = {"decoder.output_conv.weight": _FakeTensor((1, 4, 3, 3))}
+    corrected, recon_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, "state", state_dict,
+    )
+    assert corrected is stream_configs
+    assert recon_name == "state"

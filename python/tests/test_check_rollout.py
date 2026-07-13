@@ -225,10 +225,15 @@ def test_compute_sample_chains_through_full_window(tmp_run_dir):
     call to f_theta.rollout() with the same per-transition dts, using
     the real models -- not just trusted from reading the source.
 
-    NOT EXECUTED in this sandbox (no torch available) -- traced by hand
-    against the actual fixture values and the real Autoencoder/
-    LatentDynamics/rollout() implementations instead. Should be run for
-    real via `pytest tests/test_check_rollout.py -v` to confirm.
+    Originally written without being run (no torch in that sandbox) --
+    traced by hand against the fixture values and the real
+    Autoencoder/LatentDynamics/rollout() implementations. Confirmed
+    against a real run since: it caught exactly the kind of gap hand-
+    tracing can't -- ae_config here was minimal (just {"size": 64}),
+    adequate for compute_sample() at the time this was written, but a
+    LATER change (compute_sample resolving stream_configs from
+    ae_config internally) started requiring latent_channels too, and
+    nothing caught the mismatch until this test actually executed.
     """
     import torch
     from models.autoencoder import Autoencoder
@@ -241,7 +246,7 @@ def test_compute_sample_chains_through_full_window(tmp_run_dir):
     ae.eval()
     f_theta = LatentDynamics(latent_channels=4, n_theta=1, hidden_dim=16, n_hidden_layers=1)
     f_theta.eval()
-    ae_config = {"size": 64}
+    ae_config = {"size": 64, "latent_channels": 4, "latent_spatial_size": 8}
     device = torch.device("cpu")
 
     window = steps[:4]  # [0, 1000, 2000, 3000] -- a 3-step window, matching n_rollout_steps=3

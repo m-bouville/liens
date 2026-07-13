@@ -23,6 +23,7 @@ def compute_stage45_loss(
     theta: torch.Tensor, rollout_weight: float = 1.0, recon_weight: float = 0.0,
     stats_weight: float = 0.0, stats_loss_fn: StatsLoss | None = None,
     true_stats: torch.Tensor | None = None, return_components: bool = False,
+    recon_stream_name: str = DEFAULT_STREAM_NAME,
 ):
     """
     x_window: (B, n_r+1, 1, ny, nx) raw pixel window -- x_window[:,0] is
@@ -68,7 +69,7 @@ def compute_stage45_loss(
     # single default stream, so it unwraps explicitly rather than
     # silently assuming a bare-tensor return. Will need revisiting once
     # this function itself is redesigned to use more than one stream.
-    z0 = ae.encoder(x0)[DEFAULT_STREAM_NAME]
+    z0 = ae.encoder(x0)[recon_stream_name]
 
     # z_true: the L_rollout TARGET, built entirely under no_grad. This
     # is the critical collapse-prevention mechanism (discussed at
@@ -84,7 +85,7 @@ def compute_stage45_loss(
     # resulting cost-model change from stage 3).
     with torch.no_grad():
         x_future_flat = x_future.reshape(batch_size * n_rollout_steps, *x_future.shape[2:])
-        z_true_flat = ae.encoder(x_future_flat)[DEFAULT_STREAM_NAME]
+        z_true_flat = ae.encoder(x_future_flat)[recon_stream_name]
     z_true = z_true_flat.reshape(batch_size, n_rollout_steps, *z_true_flat.shape[1:])
 
     z_hat_full = f_theta.rollout(z0, dt_window, theta)

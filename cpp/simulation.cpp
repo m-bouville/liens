@@ -96,7 +96,7 @@ void Simulation::__runOneSimulation(double T,
 
     
     std::ostringstream para_display;
-    para_display << "Run for {T:"  << std::setw(6) << T << 
+    para_display << "Simulation for {T:"  << std::setw(6) << T << 
            ", noise:" << std::setw(6) << noise << 
            ", seed:"  << std::setw(4) << seed << '}';
 
@@ -202,12 +202,14 @@ void Simulation::__runOneSimulation(double T,
     writer::write_metadata(outdir / "metadata.txt", __config,
                             T, noise, seed,
                             "2026-07-03",
-                            true);
+                            true);    
+    // std::cout << "writer::write_metadata(" << outdir << "metadata.txt, ...)\n";
 
     op.save_as_png(file.replace_extension(".png"));
     writer::write_csv(outdir / "statistics.csv", all_stats);
 
     writer::register_completed_run(outdir);
+    // std::cout << "writer::register_completed_run(" << outdir << ")\n";
 
     {        
         auto now = std::chrono::system_clock::now();

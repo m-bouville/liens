@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
 from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
@@ -114,6 +115,7 @@ def train_refinement(
     ae, stats_head, f_theta, frozen_modules = build_models_from_components(
         components, device=device, freeze_decoder=freeze_decoder,
     )
+    _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(components["encoder"].config)
     size = components["encoder"].config["size"]
     print(f"Stage {'4' if freeze_decoder else '5'}: loaded {ancestor_note}")
     print(f"size={size}, latent_channels={components['encoder'].config['latent_channels']}, "
@@ -197,6 +199,7 @@ def train_refinement(
             ae, f_theta, stats_head, x_window, dt_window, theta,
             rollout_weight=rollout_weight, recon_weight=recon_weight, stats_weight=stats_weight,
             stats_loss_fn=stats_loss_fn, true_stats=true_stats,
+            recon_stream_name=recon_stream_name,
         )
         if train:
             optimizer.zero_grad()

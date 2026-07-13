@@ -124,7 +124,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("params_files", type=Path, nargs="*",
-                         default=[_PYTHON_ROOT / "params" / "64x64.txt"],
+                         default=[_PYTHON_ROOT / "params" / "32x32.txt"],
                          help="one or more stage-parameters file paths -- the pipeline runs "
                               "once per file, in order given. Defaults to "
                               "params/64x64.txt if none given (e.g. hitting Run in an IDE "

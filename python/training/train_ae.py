@@ -18,9 +18,14 @@ import gc
 import torch
 from torch.utils.data import DataLoader
 
-from models.autoencoder import Autoencoder
+from models.autoencoder import Autoencoder, EncoderDecoderPair
 from models.constants import LATENT_SPATIAL_SIZE
-from models.latent_streams import DEFAULT_STREAM_NAME
+from models.decoder import Decoder
+from models.encoder import Encoder
+from models.latent_streams import (
+    DEFAULT_STREAM_NAME, LatentStreamConfig, LatentStreamMode, build_stream_configs,
+    cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
+)
 from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureSnapshotDataset, MicrostructureTripletDataset, \
                                complete_run_dirs, split_run_dirs
@@ -49,6 +54,8 @@ def train_autoencoder(
     epochs: int = 100, batch_size: int = 64, lr: float = 1e-3,
     base_channels: int = 32, latent_channels: int = 8,
     latent_spatial_size: int = LATENT_SPATIAL_SIZE,
+    latent_names: list[str] | None = None, latent_modes: list[str] | None = None,
+    latent_channels_decoder: int | None = None, latent_spatial_decoder: int | None = None,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     min_step: int | None = None, min_stdev_phi: float | None = None,
     stat_names: list[str] | None = None, stats_weight: float | None = None,
@@ -91,6 +98,25 @@ def train_autoencoder(
     many consecutive epochs, instead of always running the full `epochs`
     budget -- a data-driven stopping signal rather than a guessed epoch
     count for "stage 1 is done".
+
+    latent_names/latent_modes/latent_channels_decoder/latent_spatial_decoder:
+    optional multi-stream (C0/C1 redesign) syntax -- see
+    models.latent_streams.build_stream_configs for the exact format.
+    If latent_names is None (default), behaves EXACTLY as before this
+    syntax existed: a single stream, sized by latent_channels/
+    latent_spatial_size, built via Autoencoder directly. If given,
+    latent_channels_decoder/latent_spatial_decoder (falling back to
+    latent_channels/latent_spatial_size if not given) size every
+    decodable stream, and training runs against whichever ONE stream
+    is declared mode=autoencoder (exactly one is required). NOTE: this
+    only wires the >1-stream MODEL through -- it does NOT yet implement
+    the actual alternating C0/C1 training strategy from the project's
+    own design doc (that's a separate, not-yet-built training loop);
+    right now every stream OTHER than the autoencoder-mode one gets
+    zero gradient all run, staying at its random initialization, since
+    nothing in this loss touches it. This is a deliberate, scoped
+    step -- confirming a multi-stream model actually builds and trains
+    without crashing -- not the finished strategy.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(seed)
@@ -167,9 +193,50 @@ def train_autoencoder(
         persistent_workers=num_workers > 0, pin_memory=device.type == "cuda",
     )
 
-    ae = Autoencoder(size=size, channels=1, base_channels=base_channels,
-                      latent_channels=latent_channels,
-                      latent_spatial_size=latent_spatial_size).to(device)
+    # See this function's own docstring for the full behavior. Backward
+    # compat is exact: latent_names=None (the default -- no params file
+    # written before this syntax existed will ever set it) takes this
+    # whole block down to a single line, byte-identical to before.
+    if latent_names is not None:
+        if latent_modes is None:
+            raise ValueError("latent_names was given without latent_modes -- both are "
+                              "required together (see build_stream_configs)")
+        stream_configs = build_stream_configs(
+            names=latent_names, modes=latent_modes,
+            channels_decoder=(latent_channels_decoder if latent_channels_decoder is not None
+                               else latent_channels),
+            spatial_decoder=(latent_spatial_decoder if latent_spatial_decoder is not None
+                              else latent_spatial_size),
+        )
+    else:
+        stream_configs = {DEFAULT_STREAM_NAME: LatentStreamConfig(
+            name=DEFAULT_STREAM_NAME, channels=latent_channels, spatial_size=latent_spatial_size,
+            mode=LatentStreamMode.AUTOENCODER,
+        )}
+
+    autoencoder_stream_names = [n for n, c in stream_configs.items()
+                                 if c.mode == LatentStreamMode.AUTOENCODER]
+    if len(autoencoder_stream_names) != 1:
+        raise ValueError(
+            f"train_autoencoder() needs exactly one autoencoder-mode stream to train "
+            f"L_recon/L_stats against (this function trains the reconstruction "
+            f"objective only -- see this function's own docstring), got "
+            f"{len(autoencoder_stream_names)}: {autoencoder_stream_names}"
+        )
+    recon_stream_name = autoencoder_stream_names[0]
+    recon_stream = stream_configs[recon_stream_name]
+
+    if len(stream_configs) == 1:
+        ae = Autoencoder(size=size, channels=1, base_channels=base_channels,
+                          latent_channels=recon_stream.channels,
+                          latent_spatial_size=recon_stream.spatial_size).to(device)
+    else:
+        encoder = Encoder(input_size=size, in_channels=1, base_channels=base_channels,
+                           stream_configs=stream_configs)
+        decoder = Decoder(output_size=size, out_channels=1, base_channels=base_channels,
+                           latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder).to(device)
 
     recon_loss = ReconLoss()
     params = list(ae.parameters())
@@ -177,8 +244,8 @@ def train_autoencoder(
     stats_head = None
     stats_loss_fn = None
     if include_stats:
-        stats_head = StatsHead(latent_channels=latent_channels, stat_names=train_set.stat_names,
-                                latent_spatial=latent_spatial_size).to(device)
+        stats_head = StatsHead(latent_channels=recon_stream.channels, stat_names=train_set.stat_names,
+                                latent_spatial=recon_stream.spatial_size).to(device)
         mean, std = train_set.stats_normalization()
         stats_loss_fn = StatsLoss(mean.to(device), std.to(device), stat_names=train_set.stat_names)
         params += list(stats_head.parameters())
@@ -201,7 +268,11 @@ def train_autoencoder(
             x = batch.to(device, non_blocking=True)
             stats_target = None
 
-        x_recon, z = ae(x)
+        if len(stream_configs) == 1:
+            x_recon, z = ae(x)
+        else:
+            z = ae.encoder(x)[recon_stream_name]
+            x_recon = ae.decoder(z)
         recon = recon_loss(x_recon, x)
 
         if include_stats:
@@ -275,8 +346,8 @@ def train_autoencoder(
 
         msg = f"{epoch:4d}"
         if include_stats:
-            msg += (f"{train_total*1_000:7.3f} ={train_recon*1_000:7.3f} +{train_stats*1_000:7.1f} |"
-                    f"{val_total*1_000:7.3f} ={val_recon*1_000:7.3f} +{val_stats*1_000:7.1f} |"
+            msg += (f"{train_total*1_000:7.3f} ={train_recon*1_000:7.3f} +{stats_weight*train_stats*1_000:7.3f} |"
+                    f"{val_total*1_000:7.3f} ={val_recon*1_000:7.3f} +{stats_weight*val_stats*1_000:7.3f} |"
                     f"{val_ema*1_000:7.3f}")
         else:
             msg += f"{train_total*1_000:7.3f} |{val_total*1_000:7.3f}  {val_ema*1_000:7.3f}"
@@ -293,8 +364,24 @@ def train_autoencoder(
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
                     "size": size, "base_channels": base_channels,
-                    "latent_channels": latent_channels, "latent_spatial_size": latent_spatial_size,
+                    "latent_channels": recon_stream.channels,
+                    "latent_spatial_size": recon_stream.spatial_size,
                     "stats_weight": stats_weight,
+                    # Plain dicts/strings, not the LatentStreamConfig/
+                    # LatentStreamMode objects themselves -- this
+                    # project loads every checkpoint with
+                    # weights_only=True (see the project's own
+                    # torch.load convention), which only allow-lists a
+                    # fixed set of safe types; custom dataclasses/Enums
+                    # aren't in it. recon_stream_name identifies which
+                    # entry the flat latent_channels/latent_spatial_size
+                    # above describes.
+                    "stream_configs": {
+                        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
+                               "mode": cfg.mode.value}
+                        for name, cfg in stream_configs.items()
+                    },
+                    "recon_stream_name": recon_stream_name,
                 },
                 "stats_config": {
                     "stat_names": train_set.stat_names,
@@ -522,10 +609,23 @@ def train_stage2(
     print(f"Resuming from {resume_from} (stat_names={stat_names}, "
           f"ancestor_stats_weight={ancestor_stats_weight}, this stage's stats_weight={stats_weight})")
 
-    ae = Autoencoder(size=size, channels=1, base_channels=model_cfg["base_channels"],
-                      latent_channels=model_cfg["latent_channels"],
-                      latent_spatial_size=model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
-                      ).to(device)
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, prev["model_state"],
+    )
+    recon_stream = stream_configs[recon_stream_name]
+
+    if len(stream_configs) == 1:
+        ae = Autoencoder(size=size, channels=1, base_channels=model_cfg["base_channels"],
+                          latent_channels=recon_stream.channels,
+                          latent_spatial_size=recon_stream.spatial_size).to(device)
+    else:
+        encoder = Encoder(input_size=size, in_channels=1, base_channels=model_cfg["base_channels"],
+                           stream_configs=stream_configs)
+        decoder = Decoder(output_size=size, out_channels=1, base_channels=model_cfg["base_channels"],
+                           latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder).to(device)
     ae.load_state_dict(prev["model_state"])
     frozen_modules = freeze_outer_layers(ae, n_frozen_stages)
     if n_frozen_stages > 0:
@@ -541,9 +641,8 @@ def train_stage2(
     initial_params = {k: v.clone().cpu() for k, v in ae.named_parameters()}
     initial_buffers = {k: v.clone().cpu() for k, v in ae.named_buffers()}
 
-    stats_head = StatsHead(latent_channels=model_cfg["latent_channels"], stat_names=stat_names,
-                            latent_spatial=model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
-                            ).to(device)
+    stats_head = StatsHead(latent_channels=recon_stream.channels, stat_names=stat_names,
+                            latent_spatial=recon_stream.spatial_size).to(device)
     stats_head.load_state_dict(prev["stats_head_state"])
     # FROZEN during stage 2: the table's stage-2 loss (L_recon + lambda1*
     # L_interp) has no L_stats term, meaning stats_head would otherwise
@@ -640,9 +739,9 @@ def train_stage2(
         alpha = alpha.to(device, non_blocking=True).view(-1, 1, 1, 1)
         true_stats = true_stats.to(device, non_blocking=True)
 
-        z1 = ae.encoder(x1)[DEFAULT_STREAM_NAME]
-        z2 = ae.encoder(x2)[DEFAULT_STREAM_NAME]
-        z3 = ae.encoder(x3)[DEFAULT_STREAM_NAME]
+        z1 = ae.encoder(x1)[recon_stream_name]
+        z2 = ae.encoder(x2)[recon_stream_name]
+        z3 = ae.encoder(x3)[recon_stream_name]
         z_tilde = (1 - alpha) * z1 + alpha * z3
 
         x2_recon = ae.decoder(z2)
@@ -760,9 +859,9 @@ def train_stage2(
 
         msg = (f"{epoch:4d}|"
                f"{train_total*1_000:6.3f} ={train_recon*1_000:6.3f} "
-               f"+{train_stats*1_000:6.2f} +{train_interp*1_000:6.1f} |"
+               f"+{stats_weight*train_stats*1_000:6.3f} +{interp_weight*train_interp*1_000:6.3f} |"
                f"{val_total*1_000:6.3f} ={val_recon*1_000:6.3f}"
-               f"+{val_stats*1_000:6.2f} +{val_interp*1_000:6.1f} |"
+               f"+{stats_weight*val_stats*1_000:6.3f} +{interp_weight*val_interp*1_000:6.3f} |"
                f"{val_ema*1_000:6.3f}")
 
         if saved_this_epoch:
@@ -776,9 +875,15 @@ def train_stage2(
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
                     "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],
-                    "latent_channels": model_cfg["latent_channels"],
-                    "latent_spatial_size": model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
+                    "latent_channels": recon_stream.channels,
+                    "latent_spatial_size": recon_stream.spatial_size,
                     "stats_weight": ancestor_stats_weight,
+                    "stream_configs": {
+                        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
+                               "mode": cfg.mode.value}
+                        for name, cfg in stream_configs.items()
+                    },
+                    "recon_stream_name": recon_stream_name,
                 },
                 "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
                 "stage2_config": {"interp_weight": interp_weight, "stats_weight": stats_weight,

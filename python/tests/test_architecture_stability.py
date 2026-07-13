@@ -64,6 +64,7 @@ import torch
 import torch.nn.functional as F
 
 from models.autoencoder import Autoencoder
+from models.latent_streams import remap_pre_multistream_state_dict_key as _remap_key
 
 # Deliberately tiny: smallest valid size for the default
 # latent_spatial_size=8 is 16 (n_stages = log2(16/8) = 1) -- small
@@ -176,37 +177,6 @@ def capture(output_path: Path = _FIXTURE_PATH, force: bool = False) -> Path:
     return output_path
 
 
-def _remap_key(key: str) -> str:
-    """
-    Maps an OLD (fixture-era) state_dict/param/grad key name to
-    whatever the CURRENT code calls the same thing -- the ONE place
-    that knows about renames, used by BOTH loading the fixture's saved
-    weights into a fresh current-code model AND comparing the
-    fixture's saved grads/final-weights against what current code
-    produces (previously only the loading path applied this, so the
-    comparison path was looking up OLD names in results keyed by NEW
-    names and reporting every renamed parameter as a false mismatch --
-    exactly the bug that motivated pulling this out as one shared
-    function instead of two independently-maintained copies of the
-    same mapping).
-
-    THIS FUNCTION IS EXPECTED TO NEED EDITING at each step of the
-    C0/C1 redesign that renames or restructures state_dict keys --
-    that's the ONE seam meant to absorb those renames, so the rest of
-    this harness (capture, comparison, the fixture itself) doesn't
-    need to change alongside it.
-
-    Multi-stream Encoder rewrite (this step): encoder.bottleneck.* (a
-    single nn.Conv2d) became encoder.bottlenecks.state.* (one entry --
-    named "state", matching Autoencoder's own single-stream default --
-    of an nn.ModuleDict, needed so each stream's projection can be
-    frozen/unfrozen independently later). Every other key
-    (decoder.*, encoder.down_blocks.*) is unchanged, since neither
-    Decoder nor the shared trunk changed in this step.
-    """
-    if key.startswith("encoder.bottleneck."):
-        return key.replace("encoder.bottleneck.", "encoder.bottlenecks.state.", 1)
-    return key
 
 
 def _load_state_dict_into_current_model(ae: Autoencoder, saved_state_dict: dict) -> None:

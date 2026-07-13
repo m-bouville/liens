@@ -22,9 +22,14 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from models.autoencoder import Autoencoder
+from models.autoencoder import Autoencoder, EncoderDecoderPair
 from models.constants import LATENT_SPATIAL_SIZE
+from models.decoder import Decoder
+from models.encoder import Encoder
 from models.latent_dynamics import LatentDynamics
+from models.latent_streams import (
+    cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
+)
 from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss
@@ -160,10 +165,23 @@ def train_lds(
     # the decoder is irrelevant to stage 3 training.
     ae_checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
     ae_config = ae_checkpoint["config"]
-    ae = Autoencoder(size=ae_config["size"], channels=1, base_channels=ae_config["base_channels"],
-                      latent_channels=ae_config["latent_channels"],
-                      latent_spatial_size=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
-                      ).to(device)
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, ae_checkpoint["model_state"],
+    )
+    recon_stream = stream_configs[recon_stream_name]
+
+    if len(stream_configs) == 1:
+        ae = Autoencoder(size=ae_config["size"], channels=1, base_channels=ae_config["base_channels"],
+                          latent_channels=recon_stream.channels,
+                          latent_spatial_size=recon_stream.spatial_size).to(device)
+    else:
+        _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
+                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        _decoder_module = Decoder(output_size=ae_config["size"], out_channels=1,
+                                   base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+                                   latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(_encoder_module, _decoder_module).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     encoder = ae.encoder
     encoder.eval()

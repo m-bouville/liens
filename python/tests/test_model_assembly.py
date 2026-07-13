@@ -161,8 +161,17 @@ def test_version_mismatch_shape_error_raises_clear_error(tmp_path):
     # Corrupt the encoder's reported config to claim a different
     # latent_channels than the actual saved weights have -- simulates
     # a version mismatch between the checkpoint and this codebase.
+    # Both the legacy flat key AND stream_configs (which
+    # resolve_stream_configs_from_checkpoint_config now reads FIRST,
+    # since load_ae_components always populates it -- see that
+    # function's own self-healing logic) need corrupting, or the
+    # resolution would just use the still-correct stream_configs value
+    # and this corruption would silently do nothing.
     components["encoder"].config["latent_channels"] = 999
     components["decoder"].config["latent_channels"] = 999
+    recon_name = components["encoder"].config["recon_stream_name"]
+    components["encoder"].config["stream_configs"][recon_name]["channels"] = 999
+    components["decoder"].config["stream_configs"][recon_name]["channels"] = 999
     with pytest.raises(ValueError, match="doesn't match the current model definition"):
         build_models_from_components(components, device="cpu")
 

@@ -102,3 +102,34 @@ class Autoencoder(nn.Module):
             z = self.encode(x)
             x_recon = self.decode(z)
         return x_recon, z
+
+
+class EncoderDecoderPair(nn.Module):
+    """
+    Minimal container bundling an Encoder+Decoder pair as ONE nn.Module
+    -- giving .parameters()/.state_dict()/.to(device)/.train()/.eval()
+    uniformly, matching Autoencoder's own convenience, via .encoder/
+    .decoder ATTRIBUTE access (not a plain nn.ModuleDict, which only
+    supports bracket access -- so callers can use ae.encoder/ae.decoder
+    identically regardless of whether ae is a real Autoencoder or this
+    container).
+
+    Used for the >1-stream case: Autoencoder itself structurally cannot
+    apply there (it only ever knows about ONE AUTOENCODER-mode stream
+    -- see this file's own Autoencoder docstring). Deliberately does
+    NOT implement Autoencoder's forward()/encode()/decode() -- those
+    are single-stream-specific; callers go through .encoder(x)/
+    .decoder(z) directly instead, unwrapping whichever stream they need
+    from Encoder's dict return themselves (see latent_streams.py's
+    decode_stream for the guarded way to do that unwrap).
+
+    A real, shared class (not duplicated per call site) specifically so
+    every multi-stream consumer -- train_ae.py's training loop,
+    check_reconstruction.py's diagnostic, and whatever else needs to
+    reconstruct a saved multi-stream checkpoint -- builds the exact
+    same state_dict key shape (encoder.*/decoder.*) the same way.
+    """
+    def __init__(self, encoder: Encoder, decoder: Decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder

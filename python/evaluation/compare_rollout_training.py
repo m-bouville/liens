@@ -31,8 +31,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder
+from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.constants import LATENT_SPATIAL_SIZE
+from models.decoder import Decoder
+from models.encoder import Encoder
 from models.latent_dynamics import LatentDynamics
+from models.latent_streams import (
+    cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
+)
 from utils import load_datasets as load
 
 # GENERAL POLICY (matches training/train_refinement.py's own
@@ -64,6 +70,7 @@ def load_lds(checkpoint_path: Path, device: torch.device):
     config = checkpoint["config"]
     f_theta = LatentDynamics(
         latent_channels=config["latent_channels"], n_theta=config["n_theta"],
+        latent_spatial=config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=config["hidden_dim"], n_hidden_layers=config["n_hidden_layers"],
     ).to(device)
     f_theta.load_state_dict(checkpoint["model_state"])
@@ -72,7 +79,8 @@ def load_lds(checkpoint_path: Path, device: torch.device):
 
 
 def rollout_errors(run_dir: Path, steps: list[int], encoder, f_theta,
-                    ae_config: dict, device: torch.device) -> np.ndarray:
+                    ae_config: dict, device: torch.device,
+                    recon_stream_name: str = "state") -> np.ndarray:
     """
     Encode the TRUE trajectory at every step, then chain f_theta's own
     predictions forward from steps[0] only -- comparing against the
@@ -88,7 +96,7 @@ def rollout_errors(run_dir: Path, steps: list[int], encoder, f_theta,
     ]).to(device)  # (n_steps+1, 1, ny, nx)
 
     with torch.no_grad():
-        z_true = encoder(frames)  # (n_steps+1, C, 8, 8)
+        z_true = encoder(frames)[recon_stream_name]  # (n_steps+1, C, 8, 8)
 
     dts = torch.tensor(
         [[(steps[i + 1] - steps[i]) * metadata.dt for i in range(len(steps) - 1)]],
@@ -132,10 +140,24 @@ def main():
 
     ae_checkpoint = torch.load(ae_checkpoint_path_a, map_location=device, weights_only=True)
     ae_config = ae_checkpoint["config"]
-    ae = Autoencoder(
-        size=ae_config["size"], channels=1,
-        base_channels=ae_config["base_channels"], latent_channels=ae_config["latent_channels"],
-    ).to(device)
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, ae_checkpoint["model_state"],
+    )
+    recon_stream = stream_configs[recon_stream_name]
+    if len(stream_configs) == 1:
+        ae = Autoencoder(
+            size=ae_config["size"], channels=1,
+            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+            latent_spatial_size=recon_stream.spatial_size,
+        ).to(device)
+    else:
+        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        decoder = Decoder(output_size=ae_config["size"], out_channels=1,
+                           base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     ae.eval()
 
@@ -148,8 +170,10 @@ def main():
 
     all_errors_a, all_errors_b = [], []
     for run_dir, steps in windows:
-        errors_a = rollout_errors(run_dir, steps, ae.encoder, f_theta_a, ae_config, device)
-        errors_b = rollout_errors(run_dir, steps, ae.encoder, f_theta_b, ae_config, device)
+        errors_a = rollout_errors(run_dir, steps, ae.encoder, f_theta_a, ae_config, device,
+                                   recon_stream_name=recon_stream_name)
+        errors_b = rollout_errors(run_dir, steps, ae.encoder, f_theta_b, ae_config, device,
+                                   recon_stream_name=recon_stream_name)
         all_errors_a.append(errors_a)
         all_errors_b.append(errors_b)
         print(f"{run_dir}:{':'.join(map(str, steps))}")

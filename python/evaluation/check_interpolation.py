@@ -48,8 +48,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder
-from models.latent_streams import DEFAULT_STREAM_NAME
+from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.decoder import Decoder
+from models.encoder import Encoder
+from models.latent_streams import (
+    cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
+)
 from training.stats_head import StatsHead
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
@@ -133,15 +137,31 @@ def check_interpolation(
     if stats_config is None:
         raise ValueError(f"{checkpoint_path} has no stats_head (trained with --stats-weight 0)")
 
-    ae = Autoencoder(
-        size=model_cfg["size"], channels=1,
-        base_channels=model_cfg["base_channels"], latent_channels=model_cfg["latent_channels"],
-    ).to(device)
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, checkpoint["model_state"],
+    )
+    recon_stream = stream_configs[recon_stream_name]
+
+    if len(stream_configs) == 1:
+        ae = Autoencoder(
+            size=model_cfg["size"], channels=1,
+            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
+            latent_spatial_size=recon_stream.spatial_size,
+        ).to(device)
+    else:
+        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs)
+        decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
+                           base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder).to(device)
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
 
     stats_head = StatsHead(
-        latent_channels=model_cfg["latent_channels"], stat_names=stats_config["stat_names"],
+        latent_channels=recon_stream.channels, stat_names=stats_config["stat_names"],
+        latent_spatial=recon_stream.spatial_size,
     ).to(device)
     stats_head.load_state_dict(checkpoint["stats_head_state"])
     stats_head.eval()
@@ -181,9 +201,9 @@ def check_interpolation(
             x2 = torch.from_numpy(x2_np).unsqueeze(0).unsqueeze(0).to(device)
             x3 = torch.from_numpy(x3_np).unsqueeze(0).unsqueeze(0).to(device)
 
-            z1 = ae.encoder(x1)[DEFAULT_STREAM_NAME]
-            z2 = ae.encoder(x2)[DEFAULT_STREAM_NAME]
-            z3 = ae.encoder(x3)[DEFAULT_STREAM_NAME]
+            z1 = ae.encoder(x1)[recon_stream_name]
+            z2 = ae.encoder(x2)[recon_stream_name]
+            z3 = ae.encoder(x3)[recon_stream_name]
             z_tilde = (1 - alpha) * z1 + alpha * z3
 
             stats_z_tilde = stats_head(z_tilde)

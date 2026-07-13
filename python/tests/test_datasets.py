@@ -10,6 +10,7 @@ import torch
 import pytest
 
 from training.datasets import MicrostructureEvolutionDataset, MicrostructureSnapshotDataset
+from models.latent_streams import DEFAULT_STREAM_NAME
 
 
 def test_cached_mode_window_shape(tmp_run_dir, fake_encoder):
@@ -136,7 +137,7 @@ def test_cross_mode_consistency(tmp_run_dir, fake_encoder):
         raw_window, raw_dt, raw_theta = raw_ds[idx]
 
         with torch.no_grad():
-            manually_encoded = fake_encoder(raw_window)  # (window_length, latent_channels, 8, 8)
+            manually_encoded = fake_encoder(raw_window)[DEFAULT_STREAM_NAME]  # (window_length, latent_channels, 8, 8)
 
         assert torch.allclose(cached_window, manually_encoded, atol=1e-5), \
             f"idx {idx}: cached-mode latents don't match manually-encoding the raw-mode window"
@@ -157,7 +158,7 @@ def test_raw_mode_allows_gradient_flow(tmp_run_dir, fake_encoder):
         [run_dir], encoder=None, window_length=3, min_step=0, min_stdev_phi=None,
     )
     window, _, _ = raw_ds[0]
-    encoded = fake_encoder(window)
+    encoded = fake_encoder(window)[DEFAULT_STREAM_NAME]
     loss = encoded.sum()
     loss.backward()
 

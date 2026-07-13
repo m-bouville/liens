@@ -182,11 +182,11 @@ void writer::write_csv(const std::filesystem::path&         filename,
 
 void writer::write_metadata(const std::filesystem::path& file,
                             const Config& config,
-                            double      T,
-                            double      noise,
-                            int         seed,
-                            std::string code_version,
-                            bool        completed)
+                                  double      T,
+                                  double      noise,
+                                  int         seed,
+                                  std::string code_version,
+                                  bool        completed)
 {
     std::ofstream out(file);
     if (!out)
@@ -246,11 +246,11 @@ namespace
 
 void writer::create_dataset_metadata(
     const std::filesystem::path& dataset_dir,
-    int nx,
-    int ny,
+          int nx,
+          int ny,
     const std::vector<double>& temperatures,
     const std::vector<double>& noises,
-    const std::vector<int>& seeds)
+    const std::vector<int>&    seeds)
 {
     namespace fs = std::filesystem;
 

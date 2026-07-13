@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import Dataset
 
 from models.constants import LATENT_SPATIAL_SIZE as _LATENT_SPATIAL_SIZE
+from models.latent_streams import DEFAULT_STREAM_NAME
 from utils import load_datasets as load
 
 
@@ -740,7 +741,7 @@ class MicrostructureEvolutionDataset(Dataset):
                 with torch.no_grad():
                     for i in range(0, len(frames), encode_batch_size):
                         batch = frames[i:i + encode_batch_size].to(device)
-                        latents.append(encoder(batch).cpu())
+                        latents.append(encoder(batch)[DEFAULT_STREAM_NAME].cpu())
                 run_data = torch.cat(latents, dim=0)  # (n_kept, latent_channels, 8, 8)
             else:
                 run_data = frames  # (n_kept, 1, ny, nx) -- encoding deferred to the training loop

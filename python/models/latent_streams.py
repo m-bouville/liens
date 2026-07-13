@@ -7,7 +7,10 @@ latent stream is and what it's allowed to be used for.
 """
 from dataclasses import dataclass
 from enum import Enum
+import re
 import warnings
+
+from .constants import LATENT_SPATIAL_SIZE
 
 # The single AUTOENCODER-mode stream's conventional name, when there's
 # only one -- e.g. Autoencoder's own internal single-stream config, and
@@ -187,3 +190,135 @@ def build_stream_configs(
         )
 
     return configs
+
+
+def remap_pre_multistream_state_dict_key(key: str) -> str:
+    """
+    Maps an Encoder/Autoencoder state_dict key from BEFORE the
+    multi-stream redesign to what current code calls the same
+    parameter -- the ONE place this rename lives, shared by both
+    tests/test_architecture_stability.py's golden-master comparison
+    and migrate_checkpoint_to_multistream.py's real checkpoint
+    migration, rather than each maintaining its own independent copy
+    of the same mapping (the exact class of duplication this whole
+    redesign has been eliminating elsewhere -- see e.g.
+    constants.LATENT_SPATIAL_SIZE, DEFAULT_STREAM_NAME above).
+
+    encoder.bottleneck.* (a single nn.Conv2d) became
+    encoder.bottlenecks.state.* (one entry -- named "state", matching
+    Autoencoder's own single-stream default -- of an nn.ModuleDict,
+    needed so each stream's projection can be frozen/unfrozen
+    independently). Every other key (decoder.*, encoder.down_blocks.*)
+    is unchanged, since neither Decoder nor the shared trunk changed.
+    """
+    if key.startswith("encoder.bottleneck."):
+        return key.replace("encoder.bottleneck.", f"encoder.bottlenecks.{DEFAULT_STREAM_NAME}.", 1)
+    return key
+
+
+def resolve_stream_configs_from_checkpoint_config(model_cfg: dict) -> tuple[dict[str, "LatentStreamConfig"], str]:
+    """
+    (stream_configs, recon_stream_name) from a checkpoint's saved
+    "config" dict -- the ONE shared place this resolution happens, used
+    by every consumer that needs to rebuild a checkpoint's actual
+    architecture (train_ae.py's train_stage2, when resuming from a
+    stage 1 ancestor; evaluation/check_reconstruction.py, when
+    visualizing any checkpoint), rather than each maintaining its own
+    copy of the same fallback logic.
+
+    "stream_configs"/"recon_stream_name" are NEW checkpoint fields (see
+    train_ae.py's train_autoencoder) -- checkpoints saved before they
+    existed have neither, and fall back here to exactly the single
+    "autoencoder"-mode stream they've always implicitly had, built from
+    the flat latent_channels/latent_spatial_size keys those older
+    checkpoints DO have (matching this project's usual
+    .get(..., default) backward-compat convention rather than requiring
+    every old checkpoint to be migrated just to be read).
+    """
+    recon_stream_name = model_cfg.get("recon_stream_name", DEFAULT_STREAM_NAME)
+    stream_configs_raw = model_cfg.get("stream_configs") or {
+        recon_stream_name: {
+            "channels": model_cfg["latent_channels"],
+            "spatial_size": model_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
+            "mode": LatentStreamMode.AUTOENCODER.value,
+        }
+    }
+    stream_configs = {
+        name: LatentStreamConfig(name=name, channels=cfg["channels"],
+                                  spatial_size=cfg["spatial_size"], mode=LatentStreamMode(cfg["mode"]))
+        for name, cfg in stream_configs_raw.items()
+    }
+    return stream_configs, recon_stream_name
+
+
+def cross_check_stream_configs_against_state_dict(
+    stream_configs: dict[str, LatentStreamConfig], recon_stream_name: str,
+    encoder_state_dict: dict,
+) -> tuple[dict[str, LatentStreamConfig], str]:
+    """
+    Cross-checks (and corrects, if needed) a checkpoint's already-
+    resolved stream_configs against what its OWN encoder state_dict
+    actually contains -- specifically for a checkpoint whose saved
+    config metadata is stale or incomplete relative to its real
+    weights. This is a genuine failure mode this project hit: an
+    intermediate version of the code could train a genuinely
+    multi-stream model correctly (the CONSTRUCTION fix was in place)
+    without yet recording that fact in the saved checkpoint config
+    (the SEPARATE checkpoint-SAVE fix landed later) -- producing a
+    checkpoint whose weights are completely valid but whose own
+    self-description undercounts its streams, which no amount of
+    correctly reading that description can fix. Only reading the
+    weights themselves can.
+
+    encoder_state_dict: keys as saved directly under "model_state"/
+    "ae_state" (still "encoder."-prefixed, e.g.
+    "encoder.bottlenecks.state.weight") -- NOT yet prefix-stripped.
+
+    Returns stream_configs/recon_stream_name UNCHANGED if the
+    state_dict's own bottleneck stream names already match (the
+    common, correct case -- this is a cheap no-op then). Only adds
+    streams the metadata was missing; never removes one the metadata
+    claims but the state_dict doesn't have (a stranger, different kind
+    of corruption this function doesn't try to fix).
+    """
+    found_names = set()
+    for key in encoder_state_dict:
+        m = re.match(r"encoder\.bottlenecks\.([^.]+)\.", key)
+        if m:
+            found_names.add(m.group(1))
+
+    if not found_names or found_names == set(stream_configs):
+        return stream_configs, recon_stream_name
+
+    missing = found_names - set(stream_configs)
+    if not missing:
+        return stream_configs, recon_stream_name
+
+    # Channel count is read directly from the actual weight tensor
+    # (out_channels of a 1x1 conv, shape[0]) -- a real value, not
+    # assumed. Spatial size can't be recovered the same way (1x1 convs
+    # don't encode it), so an inferred stream is assumed to share the
+    # recon stream's own spatial_size, matching this project's own
+    # decodable-streams-share-one-size design constraint (see
+    # build_stream_configs). Mode is assumed DECODER, not AUTOENCODER
+    # -- the safer default for a stream the metadata never claimed as
+    # the reconstruction target; at most one AUTOENCODER-mode stream
+    # is meaningful, and recon_stream_name already correctly identifies
+    # whichever one that is.
+    recon_stream = stream_configs[recon_stream_name]
+    corrected = dict(stream_configs)
+    for name in sorted(missing):
+        weight_key = f"encoder.bottlenecks.{name}.weight"
+        channels = encoder_state_dict[weight_key].shape[0]
+        corrected[name] = LatentStreamConfig(
+            name=name, channels=channels, spatial_size=recon_stream.spatial_size,
+            mode=LatentStreamMode.DECODER,
+        )
+    warnings.warn(
+        f"checkpoint's saved config only described streams {sorted(stream_configs)}, but its "
+        f"encoder weights also contain {sorted(missing)} -- likely a checkpoint saved by an "
+        f"intermediate version of this codebase (weights correct, config metadata stale). "
+        f"Corrected automatically; consider retraining this checkpoint fresh when convenient "
+        f"so its saved config matches its weights without needing this correction."
+    )
+    return corrected, recon_stream_name

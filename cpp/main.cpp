@@ -12,10 +12,11 @@ int main(int argc, char* argv[])
 
     try
     {
+        // std::cout << "Starting..." << '\n';
+
         // Rebuild datasets/*/metadata.txt for backward compatibility.
         writer::rebuild_dataset_metadata("../datasets");
-
-        // std::cout << "Starting..." << '\n';
+        // std::cout << "writer::rebuild_dataset_metadata(\'../datasets\')\n";
 
         // Loading config file
         Config cfg;
@@ -26,6 +27,15 @@ int main(int argc, char* argv[])
 
         // std::cout << "Validating...\n";
         cfg.validate();
+
+        
+        // create directory before running `write_dataset_metadata`
+        std::ostringstream dataset_dir;
+        dataset_dir << "../datasets/" << cfg.Nx << "x"  << cfg.Ny << "/";
+        std::filesystem::create_directories(dataset_dir.str());
+        writer::create_dataset_metadata(
+            dataset_dir.str(), cfg.Nx, cfg.Ny, cfg.temperatures, cfg.noises, cfg.seeds);
+
 
         std::cout << "dimensions: "     << cfg.Nx << " x " << cfg.Ny << '\n';
         std::cout << cfg.temperatures.size() << " temperatures * " << 

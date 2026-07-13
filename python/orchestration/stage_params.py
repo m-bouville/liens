@@ -96,13 +96,27 @@ def _convert_value(value: str):
     return value
 
 
+# Keys that need a LIST of strings (comma-separated in the params
+# file), not the normal scalar bool/int/float conversion above --
+# currently just the two stream-config keys (see
+# models/latent_streams.build_stream_configs). A fixed set of key
+# NAMES, not a generic "does the value contain a comma" heuristic,
+# specifically so this doesn't misfire on some future unrelated param
+# that happens to also use commas for a different reason.
+_LIST_VALUED_KEYS = {"latent_names", "latent_modes"}
+
+
 def _prepare_stage_kwargs(raw_params: dict[str, str]) -> dict:
     """Converts a parsed stage's raw string params into typed kwargs,
     renaming a few keys (e.g. patience -> early_stopping_patience) to
     match the underlying function's actual parameter names."""
     kwargs = {}
     for key, value in raw_params.items():
-        kwargs[_KEY_RENAMES.get(key, key)] = _convert_value(value)
+        renamed_key = _KEY_RENAMES.get(key, key)
+        if renamed_key in _LIST_VALUED_KEYS:
+            kwargs[renamed_key] = [part.strip() for part in value.split(",")]
+        else:
+            kwargs[renamed_key] = _convert_value(value)
     return kwargs
 
 def _strip_unrecognized_params(func, kwargs: dict, label: str) -> dict:

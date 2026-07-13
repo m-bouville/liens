@@ -35,8 +35,13 @@ import numpy as np
 import torch
 
 from evaluation.check_rollout import _format_small, _padded_bounds
-from models.autoencoder import Autoencoder
-from models.latent_streams import DEFAULT_STREAM_NAME
+from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.decoder import Decoder
+from models.encoder import Encoder
+from models.latent_streams import (
+    DEFAULT_STREAM_NAME, cross_check_stream_configs_against_state_dict,
+    resolve_stream_configs_from_checkpoint_config,
+)
 from training.datasets import MicrostructureSnapshotDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
@@ -77,8 +82,33 @@ def parse_fixed_frame(s: str) -> tuple[Path, int]:
     return Path(":".join(parts[:-1])), step
 
 
+def _find_paired_step(step: int, save_steps: list[int]) -> int | None:
+    """
+    The real step to pair with `step` for a finite-difference
+    derivative -- the NEXT saved step (forward difference) when one
+    exists, the PREVIOUS one (backward difference) for a run's LAST
+    saved step, since there's nothing to look forward to there. None
+    if `step` is the run's only saved step at all (nothing to pair
+    with either direction).
+
+    Sign is handled by the caller via (x_paired - x_step) /
+    ((paired_step - step) * metadata.dt) -- this works correctly for
+    EITHER direction without needing a separate forward/backward
+    branch there: a negative (paired_step - step) for the backward
+    case correctly flips the numerator's sign back to a normal
+    forward-looking rate, not a silently sign-flipped one.
+    """
+    idx = save_steps.index(step)
+    if idx < len(save_steps) - 1:
+        return save_steps[idx + 1]
+    elif idx > 0:
+        return save_steps[idx - 1]
+    return None
+
+
 def rank_channel_importance(
     ae, dataset, device, n_samples: int = 200, seed: int = 0,
+    recon_stream_name: str = DEFAULT_STREAM_NAME,
 ) -> np.ndarray:
     """
     Per-channel ABLATION importance: for a random sample of the real
@@ -106,7 +136,7 @@ def rank_channel_importance(
     with torch.no_grad():
         for idx in indices:
             x = dataset[idx].unsqueeze(0).to(device)
-            z = ae.encoder(x)[DEFAULT_STREAM_NAME]
+            z = ae.encoder(x)[recon_stream_name]
             if latent_channels is None:
                 latent_channels = z.shape[1]
                 total_delta = np.zeros(latent_channels)
@@ -139,15 +169,37 @@ def check_latent_channels(
 
     checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
     ae_config = checkpoint["config"]
-    ae = Autoencoder(
-        size=ae_config["size"], channels=1,
-        base_channels=ae_config["base_channels"], latent_channels=ae_config["latent_channels"],
-    ).to(device)
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, checkpoint["model_state"],
+    )
+    recon_stream = stream_configs[recon_stream_name]
+
+    if len(stream_configs) == 1:
+        ae = Autoencoder(
+            size=ae_config["size"], channels=1,
+            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+            latent_spatial_size=recon_stream.spatial_size,
+        ).to(device)
+    else:
+        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        decoder = Decoder(output_size=ae_config["size"], out_channels=1,
+                           base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder).to(device)
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
 
     nx, ny = ae_config["size"], ae_config["size"]
-    latent_channels = ae_config["latent_channels"]
+
+    # Every stream gets shown, not just the recon one -- recon stream
+    # first (it's "the" state, most familiar to read), then the rest in
+    # whatever order stream_configs provides, sorted for determinism.
+    other_stream_names = sorted(n for n in stream_configs if n != recon_stream_name)
+    stream_order = [recon_stream_name] + other_stream_names
+    channels_per_stream = {name: stream_configs[name].channels for name in stream_order}
+    latent_channels = channels_per_stream[recon_stream_name]  # kept for the final print's wording
 
     # Test dataset built regardless of whether --fixed-frames was given
     # -- fixed_frames only decides which frames get VISUALIZED; ablation
@@ -185,72 +237,159 @@ def check_latent_channels(
     # channel directly comparable frame-to-frame (down a column), which
     # is the whole point ("what triggers this channel"). A per-frame
     # scale would auto-normalize away genuine differences in how
-    # strongly a channel responds to different inputs.
-    all_x, all_z = [], []
+    # strongly a channel responds to different inputs. z is now a dict
+    # per frame (one array per stream), not a single array -- every
+    # stream is encoded from the SAME single forward pass (one encode
+    # per frame, not one per stream), since Encoder already produces
+    # every stream's bottleneck output together.
+    all_x, all_z, all_deriv = [], [], []
+    metadata_cache: dict[Path, object] = {}
     with torch.no_grad():
         for run_dir, step in frames:
             x_raw = load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny)
             x = torch.from_numpy(x_raw).unsqueeze(0).unsqueeze(0).to(device)
-            z = ae.encoder(x)[DEFAULT_STREAM_NAME][0].cpu().numpy()  # (latent_channels, 8, 8)
+            z_dict = ae.encoder(x)
             all_x.append(x_raw)
-            all_z.append(z)
-    all_z_arr = np.stack(all_z, axis=0)  # (n_frames, latent_channels, 8, 8)
+            all_z.append({name: z_dict[name][0].cpu().numpy() for name in stream_order})
 
-    # symmetric=True (see check_rollout._padded_bounds' own docstring):
-    # a channel's activation can be positive or negative with no
-    # particular reason to expect one side dominates, so a symmetric
-    # +-M scale keeps both signs equally resolvable rather than an
-    # asymmetric scale (appropriate for real_delta, which check_rollout
-    # uses this same helper for) potentially collapsing one side.
-    channel_bounds = [
-        _padded_bounds(all_z_arr[:, c], factor=1.1, symmetric=True)
-        for c in range(latent_channels)
-    ]
-    # Cross-frame std per channel -- a quick, at-a-glance way to spot
-    # channels that vary a lot across inputs vs staying near-constant.
-    # NOT the same question as importance below: a channel can vary a
-    # lot without the decoder actually relying on that variation, or
-    # vary little while still being load-bearing (e.g. a near-constant
-    # offset the decoder needs to get right). See rank_channel_importance.
-    channel_std = all_z_arr.std(axis=(0, 2, 3))
+            real_deriv_np = None
+            if other_stream_names:
+                if run_dir not in metadata_cache:
+                    metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
+                metadata = metadata_cache[run_dir]
+                paired_step = _find_paired_step(step, metadata.save_steps)
+                if paired_step is not None:
+                    x_paired_raw = load.read_phi_half(
+                        run_dir / load.snapshot_filename(paired_step), nx, ny,
+                    )
+                    signed_dt = (paired_step - step) * metadata.dt
+                    real_deriv_np = (x_paired_raw - x_raw) / signed_dt
+            all_deriv.append(real_deriv_np)
+
+    # Per-stream: (n_frames, channels, 8, 8) each, and per-stream bounds/std,
+    # matching the original per-channel logic exactly, just looped once
+    # per stream instead of assuming there's only one.
+    channel_bounds, channel_std = {}, {}
+    for name in stream_order:
+        arr = np.stack([z[name] for z in all_z], axis=0)  # (n_frames, channels, 8, 8)
+        # symmetric=True (see check_rollout._padded_bounds' own docstring):
+        # a channel's activation can be positive or negative with no
+        # particular reason to expect one side dominates, so a symmetric
+        # +-M scale keeps both signs equally resolvable rather than an
+        # asymmetric scale (appropriate for real_delta, which check_rollout
+        # uses this same helper for) potentially collapsing one side.
+        channel_bounds[name] = [
+            _padded_bounds(arr[:, c], factor=1.1, symmetric=True)
+            for c in range(channels_per_stream[name])
+        ]
+        # Cross-frame std per channel -- a quick, at-a-glance way to spot
+        # channels that vary a lot across inputs vs staying near-constant.
+        # NOT the same question as importance below: a channel can vary a
+        # lot without the decoder actually relying on that variation, or
+        # vary little while still being load-bearing (e.g. a near-constant
+        # offset the decoder needs to get right). See rank_channel_importance.
+        channel_std[name] = arr.std(axis=(0, 2, 3))
+
     print("\nChannel activity (std across shown frames' 8x8 maps, sorted descending):")
-    for c in np.argsort(channel_std)[::-1]:
-        print(f"  channel {c:2d}: std={channel_std[c]:.4f}")
+    for name in stream_order:
+        print(f"  stream '{name}':")
+        for c in np.argsort(channel_std[name])[::-1]:
+            print(f"    channel {c:2d}: std={channel_std[name][c]:.4f}")
 
+    # Ablation importance is RECON-STREAM ONLY -- it ablates a channel,
+    # decodes, and compares against the real INPUT PIXELS, which is a
+    # question that only makes sense for the recon stream (see
+    # autoencode_stream's own docstring on why routing a non-recon
+    # stream through a reconstruction-shaped comparison is exactly the
+    # kind of silently-wrong comparison this project has been careful
+    # to avoid elsewhere). A DERIVATIVE stream's own importance would
+    # need to compare against the real finite-difference target
+    # instead, which needs PAIRED frames (x(t), x(t+dt)) -- this
+    # function only loads single snapshots. Extending it that way is a
+    # real, separate piece of work, not something to fold in silently
+    # here; the recon-stream importance shown below is a real number,
+    # just not (yet) matched by an equivalent for other streams.
     channel_importance = None
     if not skip_importance and test_dataset is not None:
         channel_importance = rank_channel_importance(
             ae, test_dataset, device, n_samples=n_importance_samples, seed=seed,
+            recon_stream_name=recon_stream_name,
         )
-        print(f"\nChannel importance (mean recon-loss increase from zero-ablation, "
-              f"n={min(n_importance_samples, len(test_dataset))} test frames, sorted descending):")
+        print(f"\nChannel importance, stream '{recon_stream_name}' only (mean recon-loss "
+              f"increase from zero-ablation, n={min(n_importance_samples, len(test_dataset))} "
+              f"test frames, sorted descending):")
         for c in np.argsort(channel_importance)[::-1]:
             print(f"  channel {c:2d}: delta_loss={_format_small(channel_importance[c])}")
+        if other_stream_names:
+            print(f"  (no importance ranking for {other_stream_names} -- would need "
+                  f"averaging over many paired-frame samples across the whole test set, "
+                  f"not just the few frames shown in the figure; not yet implemented)")
     elif not skip_importance:
         print("\n(skipping channel importance ranking -- no test set available)")
 
-    n_cols = latent_channels + 1
+    total_channels = sum(channels_per_stream.values())
+    has_deriv_column = bool(other_stream_names)
+    n_cols = total_channels + 1 + (1 if has_deriv_column else 0)
     n_rows = len(frames)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.0 * n_cols, 2.2 * n_rows))
     if n_rows == 1:
         axes = axes[None, :]
 
-    for row, ((run_dir, step), x_raw, z) in enumerate(zip(frames, all_x, all_z)):
+    for row, ((run_dir, step), x_raw, z, real_deriv_np) in enumerate(
+        zip(frames, all_x, all_z, all_deriv)
+    ):
         state_scale = max(abs(x_raw.min()), abs(x_raw.max()), 0.1)
         axes[row, 0].imshow(x_raw, cmap="RdBu", vmin=-state_scale, vmax=state_scale)
         axes[row, 0].set_ylabel(f"{run_dir.name}:{step}", fontsize=8)
         if row == 0:
             axes[row, 0].set_title("input", fontsize=9)
 
-        for c in range(latent_channels):
-            vmin, vmax = channel_bounds[c]
-            axes[row, c + 1].imshow(z[c], cmap="RdBu", vmin=vmin, vmax=vmax,
-                                     interpolation="nearest")
-            if row == 0:
-                title = f"ch{c}\nstd={channel_std[c]:.3f}"
-                if channel_importance is not None:
-                    title += f"\nimp={_format_small(channel_importance[c])}"
-                axes[row, c + 1].set_title(title, fontsize=8)
+        col = 1
+        for name in stream_order:
+            for c in range(channels_per_stream[name]):
+                vmin, vmax = channel_bounds[name][c]
+                axes[row, col].imshow(z[name][c], cmap="RdBu", vmin=vmin, vmax=vmax,
+                                       interpolation="nearest")
+                if row == 0:
+                    # Stream name prefixed on EVERY column (not just a
+                    # section header) -- section headers get lost once
+                    # the figure is scrolled/cropped, but a per-column
+                    # label never does.
+                    title = f"{name} ch{c}\nstd={channel_std[name][c]:.3f}"
+                    if channel_importance is not None and name == recon_stream_name:
+                        title += f"\nimp={_format_small(channel_importance[c])}"
+                    axes[row, col].set_title(title, fontsize=8)
+                col += 1
+
+            # The real derivative column goes right here -- between the
+            # recon stream's channel block (just finished above) and
+            # the NEXT stream's block (about to start on the next loop
+            # iteration) -- letting a viewer directly compare "what the
+            # real dx/dt looks like" against "what the deriv stream's
+            # own channels look like", positioned immediately next to
+            # each other, the same way "input" sits immediately before
+            # the state channels for the same reason. Only inserted
+            # once, after the recon stream specifically (not between
+            # every pair of streams -- if there were ever 3+ streams,
+            # this would need revisiting, but there are only 2 today).
+            if has_deriv_column and name == recon_stream_name:
+                if real_deriv_np is not None:
+                    deriv_scale = max(abs(real_deriv_np.min()), abs(real_deriv_np.max()), 1e-6)
+                    axes[row, col].imshow(real_deriv_np, cmap="RdBu",
+                                           vmin=-deriv_scale, vmax=deriv_scale)
+                    if row == 0:
+                        axes[row, col].set_title(f"real deriv\nscale=+-{_format_small(deriv_scale)}",
+                                                  fontsize=8)
+                else:
+                    # Only possible if this run has exactly one saved
+                    # step total (see _find_paired_step) -- shown as an
+                    # empty, clearly-labeled panel rather than silently
+                    # skipping the column (which would misalign every
+                    # OTHER row's columns if it happened on just one row).
+                    axes[row, col].axis("off")
+                    if row == 0:
+                        axes[row, col].set_title("real deriv\n(no paired step)", fontsize=8)
+                col += 1
 
         for ax in axes[row]:
             ax.set_xticks([])
@@ -259,7 +398,8 @@ def check_latent_channels(
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
     print(f"\nSaved latent channel visualization to {output_path} "
-          f"({len(frames)} frames, {latent_channels} channels)")
+          f"({len(frames)} frames, {total_channels} channels across {len(stream_order)} "
+          f"stream(s): {stream_order})")
     return output_path
 
 

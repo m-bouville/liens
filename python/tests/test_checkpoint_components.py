@@ -10,6 +10,7 @@ Run from python/ (imports rely on that root being on sys.path):
 """
 import torch
 import pytest
+import warnings
 
 from training.checkpoint_components import (
     ComponentCheckpoint, load_ae_components, load_lds_component,
@@ -98,6 +99,9 @@ def test_load_ae_components_config_and_provenance(tmp_path):
     assert components["encoder"].config == {
         "size": 64, "base_channels": 4, "latent_channels": 8,
         "latent_spatial_size": LATENT_SPATIAL_SIZE,
+        "stream_configs": {"state": {"channels": 8, "spatial_size": LATENT_SPATIAL_SIZE,
+                                      "mode": "autoencoder"}},
+        "recon_stream_name": "state",
     }
     assert components["encoder"].provenance["epoch"] == 12
     assert components["encoder"].provenance["val_loss"] == pytest.approx(0.0021)
@@ -116,6 +120,65 @@ def test_load_ae_components_propagates_explicit_latent_spatial_size(tmp_path):
 
     assert components["encoder"].config["latent_spatial_size"] == 4
     assert components["decoder"].config["latent_spatial_size"] == 4
+
+
+def test_load_ae_components_self_heals_stale_config_with_real_multi_stream_weights(tmp_path):
+    """THE actual bug hit during this project's own multi-stream
+    rollout: a checkpoint saved by an intermediate version of the code
+    that had the CONSTRUCTION fix (so training genuinely produced
+    2-stream weights) but not yet the separate checkpoint-SAVE fix (so
+    "config" never recorded that) -- config claims only "state", but
+    model_state's own keys prove "deriv" is really there too.
+
+    Uses the CURRENT (post-redesign) key naming directly
+    (encoder.bottlenecks.<name>.*), unlike _make_ae_checkpoint's own
+    fixture (which deliberately uses the OLD single-bottleneck naming
+    for its own, different purposes, and wouldn't exercise this cross-
+    check at all -- the regex it depends on requires the "bottlenecks"
+    -- plural -- form)."""
+    state = {
+        "encoder.down_blocks.0.conv1.weight": torch.randn(4, 1, 3, 3),
+        "encoder.bottlenecks.state.weight": torch.randn(8, 4, 1, 1),
+        "encoder.bottlenecks.state.bias": torch.randn(8),
+        "encoder.bottlenecks.deriv.weight": torch.randn(8, 4, 1, 1),
+        "encoder.bottlenecks.deriv.bias": torch.randn(8),
+        "decoder.unbottleneck.weight": torch.randn(4, 8, 1, 1),
+        "decoder.output_conv.weight": torch.randn(1, 4, 3, 3),
+    }
+    checkpoint = {
+        "model_state": state,
+        "epoch": 12,
+        "val_loss": 0.0021,
+        "val_loss_ema": 0.0025,
+        "test_dirs": ["/fake/run1"],
+        # Deliberately STALE: no "stream_configs"/"recon_stream_name"
+        # at all, and "latent_channels" only describes "state" -- the
+        # exact shape a pre-checkpoint-save-fix version of this
+        # codebase would have produced.
+        "config": {"size": 64, "base_channels": 4, "latent_channels": 8, "stats_weight": 0.01},
+    }
+    path = tmp_path / "fake-stage2-stale-metadata.pt"
+    torch.save(checkpoint, path)
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        components = load_ae_components(path)
+    assert any(issubclass(x.category, UserWarning) and "stale" in str(x.message) for x in w), \
+        f"expected a 'stale' UserWarning, got: {[str(x.message) for x in w]}"
+
+    # The self-healed config now correctly describes BOTH streams --
+    # this is what actually matters: a caller resolving stream_configs
+    # from components["encoder"].config afterward (e.g. model_assembly.py)
+    # must see "deriv" too, not just what the stale metadata claimed.
+    healed_streams = components["encoder"].config["stream_configs"]
+    assert set(healed_streams.keys()) == {"state", "deriv"}
+    assert healed_streams["deriv"]["channels"] == 8
+    assert healed_streams["deriv"]["mode"] == "decoder"
+    assert components["encoder"].config["recon_stream_name"] == "state"
+    # Decoder's componentized config is the SAME shared dict (see
+    # load_ae_components' own code) -- healed identically, not just
+    # the encoder's copy.
+    assert components["decoder"].config["stream_configs"] == healed_streams
 
 
 def test_load_ae_components_omits_stats_head_when_absent(tmp_path):

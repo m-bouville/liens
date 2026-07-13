@@ -7,9 +7,12 @@ directly, only on real Autoencoder/StatsHead/LatentDynamics instances.
 import torch
 import torch.nn as nn
 
-from models.autoencoder import Autoencoder
+from models.autoencoder import Autoencoder, EncoderDecoderPair
 from models.constants import LATENT_SPATIAL_SIZE
+from models.decoder import Decoder
+from models.encoder import Encoder
 from models.latent_dynamics import LatentDynamics
+from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 from training.checkpoint_components import ComponentCheckpoint
 from training.stats_head import StatsHead
 
@@ -17,7 +20,7 @@ from training.stats_head import StatsHead
 def build_models_from_components(
     components: dict[str, ComponentCheckpoint], device: str | None = None,
     freeze_decoder: bool = False, in_channels: int = 1,
-) -> tuple[Autoencoder, StatsHead | None, LatentDynamics, list[nn.Module]]:
+) -> tuple[Autoencoder | EncoderDecoderPair, StatsHead | None, LatentDynamics, list[nn.Module]]:
     """
     freeze_decoder: sets requires_grad_(False) on every decoder
     parameter and puts it in .eval() mode -- stage 4's mode (D stays
@@ -49,11 +52,21 @@ def build_models_from_components(
     frozen_modules: list[nn.Module] = []
 
     encoder_cfg = components["encoder"].config
-    ae = Autoencoder(size=encoder_cfg["size"], channels=in_channels,
-                      base_channels=encoder_cfg["base_channels"],
-                      latent_channels=encoder_cfg["latent_channels"],
-                      latent_spatial_size=encoder_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
-                      ).to(device)
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(encoder_cfg)
+    recon_stream = stream_configs[recon_stream_name]
+
+    if len(stream_configs) == 1:
+        ae = Autoencoder(size=encoder_cfg["size"], channels=in_channels,
+                          base_channels=encoder_cfg["base_channels"],
+                          latent_channels=recon_stream.channels,
+                          latent_spatial_size=recon_stream.spatial_size).to(device)
+    else:
+        encoder = Encoder(input_size=encoder_cfg["size"], in_channels=in_channels,
+                           base_channels=encoder_cfg["base_channels"], stream_configs=stream_configs)
+        decoder = Decoder(output_size=encoder_cfg["size"], out_channels=in_channels,
+                           base_channels=encoder_cfg["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder).to(device)
 
     # Reassemble the combined Autoencoder's state_dict by re-adding the
     # "encoder."/"decoder." prefixes ComponentCheckpoint's _strip_prefix

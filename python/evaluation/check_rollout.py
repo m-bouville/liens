@@ -52,9 +52,14 @@ from matplotlib.colors import TwoSlopeNorm
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder
+from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.decoder import Decoder
+from models.encoder import Encoder
+from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_dynamics import LatentDynamics
-from models.latent_streams import DEFAULT_STREAM_NAME
+from models.latent_streams import (
+    cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
+)
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
@@ -145,11 +150,13 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         x_next_true_t = torch.from_numpy(x_next_raw).unsqueeze(0).unsqueeze(0).to(device)
 
         # ae.encoder(x) returns dict[str, Tensor] (one entry per latent
-        # stream -- see models/latent_streams.py); this function
-        # predates the multi-stream (C0/C1) redesign and still only
-        # knows about the single default stream.
-        z_t = ae.encoder(x_t)[DEFAULT_STREAM_NAME]
-        z_next_true = ae.encoder(x_next_true_t)[DEFAULT_STREAM_NAME]
+        # stream -- see models/latent_streams.py); resolved from
+        # ae_config (already a parameter here) rather than assumed, so
+        # this works regardless of what the recon stream is actually
+        # named.
+        _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+        z_t = ae.encoder(x_t)[recon_stream_name]
+        z_next_true = ae.encoder(x_next_true_t)[recon_stream_name]
 
         # Per-TRANSITION dts, chained via rollout() -- NOT one big dt
         # covering the whole span. A single f_theta call with a large
@@ -281,15 +288,31 @@ def check_rollout(
     ae_checkpoint_path = Path(lds_checkpoint["ae_checkpoint"])
     ae_checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
     ae_config = ae_checkpoint["config"]
-    ae = Autoencoder(
-        size=ae_config["size"], channels=1,
-        base_channels=ae_config["base_channels"], latent_channels=ae_config["latent_channels"],
-    ).to(device)
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, ae_checkpoint["model_state"],
+    )
+    recon_stream = stream_configs[recon_stream_name]
+
+    if len(stream_configs) == 1:
+        ae = Autoencoder(
+            size=ae_config["size"], channels=1,
+            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+            latent_spatial_size=recon_stream.spatial_size,
+        ).to(device)
+    else:
+        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        decoder = Decoder(output_size=ae_config["size"], out_channels=1,
+                           base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     ae.eval()
 
     f_theta = LatentDynamics(
         latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
+        latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
     ).to(device)
     f_theta.load_state_dict(lds_checkpoint["model_state"])
