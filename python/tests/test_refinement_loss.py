@@ -11,6 +11,7 @@ import pytest
 
 from models.autoencoder import Autoencoder
 from models.latent_dynamics import LatentDynamics
+from models.latent_streams import DEFAULT_STREAM_NAME
 from training.stats_head import StatsHead
 from training.losses import StatsLoss
 from training.refinement_loss import compute_stage45_loss
@@ -143,7 +144,7 @@ def test_stats_term_matches_independent_computation():
     )
 
     with torch.no_grad():
-        z0_independent = ae.encoder(x_window[:, 0])
+        z0_independent = ae.encoder(x_window[:, 0])[DEFAULT_STREAM_NAME]
         pred_stats_independent = stats_head(z0_independent)
         expected_l_stats = stats_loss_fn(pred_stats_independent, true_stats)
 
@@ -184,7 +185,7 @@ def test_rollout_component_matches_independent_rollout_loss():
     )
 
     with torch.no_grad():
-        z0_independent = ae.encoder(x_window[:, 0])
+        z0_independent = ae.encoder(x_window[:, 0])[DEFAULT_STREAM_NAME]
         z_hat_full = f_theta.rollout(z0_independent, dt_window, theta)
         z_hat_independent = z_hat_full[:, 1:]
         expected_rollout = RolloutLoss()(z_hat_independent, components["z_true"])

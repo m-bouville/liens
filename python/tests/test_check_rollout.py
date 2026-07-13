@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from evaluation.check_rollout import _padded_bounds, parse_fixed_window, _correlation_pct, _format_small
+from models.latent_streams import DEFAULT_STREAM_NAME
 
 
 def test_padded_bounds_asymmetric_case():
@@ -261,7 +262,7 @@ def test_compute_sample_chains_through_full_window(tmp_run_dir):
     # old, buggy behavior) or stopping after one step.
     with torch.no_grad():
         x_t = torch.from_numpy(x_t_raw).unsqueeze(0).unsqueeze(0)
-        z_t = ae.encoder(x_t)
+        z_t = ae.encoder(x_t)[DEFAULT_STREAM_NAME]
         dts = torch.tensor([[1000 * 0.05, 1000 * 0.05, 1000 * 0.05]], dtype=torch.float32)
         theta = torch.tensor([[0.8 - 1.0]], dtype=torch.float32)  # temperature - T0, from the fixture
         z_hat_full = f_theta.rollout(z_t, dts, theta)

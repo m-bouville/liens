@@ -94,15 +94,20 @@ void Simulation::__runOneSimulation(double T,
     std::filesystem::path outdir = 
             writer::make_dir_name(__config.Nx, __config.Ny, T, noise, seed);
 
+    
+    std::ostringstream para_display;
+    para_display << "Run for {T:"  << std::setw(6) << T << 
+           ", noise:" << std::setw(6) << noise << 
+           ", seed:"  << std::setw(4) << seed << '}';
+
     {
         std::lock_guard<std::mutex> lock(cout_mutex);
         
         auto now = std::chrono::system_clock::now();
         std::time_t now_c = std::chrono::system_clock::to_time_t(now);
 
-        std::cout << "Starting run for " << "T:"  << std::setw(6) << T << 
-                ", noise:"  << std::setw(6) << noise << ", seed:"  << std::setw(4) << seed <<
-                " at " << std::put_time(std::localtime(&now_c), "%H:%M") << '\n';
+        std::cout << para_display.str() << " starting at " << 
+                std::put_time(std::localtime(&now_c), "%H:%M") << '\n';
     }
   
     std::filesystem::create_directories(outdir);
@@ -142,9 +147,7 @@ void Simulation::__runOneSimulation(double T,
 
     std::ostringstream log;
     // log << '\n';
-    log << "T:"  << std::setw(6) << T << 
-           ", noise:" << std::setw(6) << noise << 
-           ", seed:"  << std::setw(4) << seed;
+    log << para_display.str();
         //   << " (minimum at " << potential.minimum(T)*100 << "%)" << '\n';
 
     // // header (on two lines)
@@ -211,7 +214,7 @@ void Simulation::__runOneSimulation(double T,
         std::time_t now_c = std::chrono::system_clock::to_time_t(now);
 
         std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << log.str() << " DONE at " << 
+        std::cout << log.str() << " finished at " << 
                 std::put_time(std::localtime(&now_c), "%H:%M") << '\n';  // << '\n';  
     }
 }

@@ -14,6 +14,7 @@ caller-side weight choice, not a structural difference in this function.
 """
 import torch
 
+from models.latent_streams import DEFAULT_STREAM_NAME
 from training.losses import ReconLoss, RolloutLoss, StatsLoss
 
 
@@ -60,7 +61,14 @@ def compute_stage45_loss(
     # z0: WITH gradient -- feeds both the rollout PREDICTION chain
     # (z0 -> f_theta -> z_hat) and L_recon/L_stats, both anchored to
     # this real, observed starting frame.
-    z0 = ae.encoder(x0)
+    #
+    # ae.encoder(x) returns dict[str, Tensor] (one entry per latent
+    # stream -- see models/latent_streams.py); this function predates
+    # the multi-stream (C0/C1) redesign and still only knows about the
+    # single default stream, so it unwraps explicitly rather than
+    # silently assuming a bare-tensor return. Will need revisiting once
+    # this function itself is redesigned to use more than one stream.
+    z0 = ae.encoder(x0)[DEFAULT_STREAM_NAME]
 
     # z_true: the L_rollout TARGET, built entirely under no_grad. This
     # is the critical collapse-prevention mechanism (discussed at
@@ -76,7 +84,7 @@ def compute_stage45_loss(
     # resulting cost-model change from stage 3).
     with torch.no_grad():
         x_future_flat = x_future.reshape(batch_size * n_rollout_steps, *x_future.shape[2:])
-        z_true_flat = ae.encoder(x_future_flat)
+        z_true_flat = ae.encoder(x_future_flat)[DEFAULT_STREAM_NAME]
     z_true = z_true_flat.reshape(batch_size, n_rollout_steps, *z_true_flat.shape[1:])
 
     z_hat_full = f_theta.rollout(z0, dt_window, theta)

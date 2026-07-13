@@ -9,7 +9,7 @@ Run from python/ (imports rely on that root being on sys.path):
 import torch
 import pytest
 
-from training.datasets import MicrostructureEvolutionDataset
+from training.datasets import MicrostructureEvolutionDataset, MicrostructureSnapshotDataset
 
 
 def test_cached_mode_window_shape(tmp_run_dir, fake_encoder):
@@ -74,6 +74,43 @@ def test_window_info_matches_dataset_content(tmp_run_dir):
         for i, step in enumerate(info_steps):
             expected_value = step / 10000.0
             assert torch.allclose(window[i], torch.full_like(window[i], expected_value), atol=1e-3)
+
+
+def test_snapshot_dataset_frame_info_unaugmented(tmp_run_dir):
+    """frame_info's reported (run_dir, step) should always correspond
+    to what __getitem__ actually returned for that index -- the
+    trivial case (augment=False, base_idx == idx directly)."""
+    run_dir, steps = tmp_run_dir
+    ds = MicrostructureSnapshotDataset([run_dir], augment=False, min_step=0)
+    assert len(ds) == len(steps)
+    for idx in range(len(ds)):
+        x = ds[idx]
+        info_run_dir, info_step = ds.frame_info(idx)
+        assert info_run_dir == run_dir
+        assert info_step in steps
+        expected_value = info_step / 10000.0
+        assert torch.allclose(x, torch.full_like(x, expected_value), atol=1e-3)
+
+
+def test_snapshot_dataset_frame_info_augmented(tmp_run_dir):
+    """THE case that actually needs the divmod base_idx recovery
+    (unlike the unaugmented case, where idx already IS base_idx):
+    augment=True expands __len__ by _N_DIHEDRAL*4, and every one of
+    those augmented indices must still trace back to its correct
+    source frame, not a meaningless direct index into _index."""
+    run_dir, steps = tmp_run_dir
+    ds = MicrostructureSnapshotDataset([run_dir], augment=True, min_step=0)
+    n_aug = ds._N_DIHEDRAL * 4
+    assert len(ds) == len(steps) * n_aug
+    # Spot-check the first, middle, and last augmented variant of each
+    # base frame -- not every single index, to keep this fast, but
+    # enough to catch an off-by-one in the divmod boundary.
+    for base_idx, step in enumerate(steps):
+        for aug_offset in (0, n_aug // 2, n_aug - 1):
+            idx = base_idx * n_aug + aug_offset
+            info_run_dir, info_step = ds.frame_info(idx)
+            assert info_run_dir == run_dir
+            assert info_step == step
 
 
 def test_cross_mode_consistency(tmp_run_dir, fake_encoder):

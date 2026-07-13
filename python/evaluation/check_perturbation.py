@@ -25,8 +25,9 @@ diagnostics from one fit:
                      not curved/saturating
 
 check_perturbation() is importable -- see main.py, which calls it
-automatically after stage 2 with the checkpoint path it already has in
-hand. The CLI below is for standalone use.
+automatically after stage 2 AND after stage 4/5 (skipped gracefully
+there if the ancestor AE has no stats_head at all) with the checkpoint
+path it already has in hand. The CLI below is for standalone use.
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
@@ -41,6 +42,7 @@ import numpy as np
 import torch
 
 from models.autoencoder import Autoencoder
+from models.latent_streams import DEFAULT_STREAM_NAME
 from training.stats_head import StatsHead
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
@@ -135,7 +137,7 @@ def check_perturbation(
         for run_dir, step in chosen:
             x_np = load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny)
             x = torch.from_numpy(x_np).unsqueeze(0).unsqueeze(0).to(device)
-            z = ae.encoder(x)
+            z = ae.encoder(x)[DEFAULT_STREAM_NAME]
             stats_z = stats_head(z)  # baseline stats(z), NOT ground truth
 
             deltas = []

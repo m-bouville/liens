@@ -54,6 +54,7 @@ import torch
 
 from models.autoencoder import Autoencoder
 from models.latent_dynamics import LatentDynamics
+from models.latent_streams import DEFAULT_STREAM_NAME
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
@@ -143,8 +144,12 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         x_t = torch.from_numpy(x_t_raw).unsqueeze(0).unsqueeze(0).to(device)
         x_next_true_t = torch.from_numpy(x_next_raw).unsqueeze(0).unsqueeze(0).to(device)
 
-        z_t = ae.encoder(x_t)
-        z_next_true = ae.encoder(x_next_true_t)
+        # ae.encoder(x) returns dict[str, Tensor] (one entry per latent
+        # stream -- see models/latent_streams.py); this function
+        # predates the multi-stream (C0/C1) redesign and still only
+        # knows about the single default stream.
+        z_t = ae.encoder(x_t)[DEFAULT_STREAM_NAME]
+        z_next_true = ae.encoder(x_next_true_t)[DEFAULT_STREAM_NAME]
 
         # Per-TRANSITION dts, chained via rollout() -- NOT one big dt
         # covering the whole span. A single f_theta call with a large

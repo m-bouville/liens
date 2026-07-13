@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 
 from models.autoencoder import Autoencoder
 from models.constants import LATENT_SPATIAL_SIZE
+from models.latent_streams import DEFAULT_STREAM_NAME
 from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureSnapshotDataset, MicrostructureTripletDataset, \
                                complete_run_dirs, split_run_dirs
@@ -639,9 +640,9 @@ def train_stage2(
         alpha = alpha.to(device, non_blocking=True).view(-1, 1, 1, 1)
         true_stats = true_stats.to(device, non_blocking=True)
 
-        z1 = ae.encoder(x1)
-        z2 = ae.encoder(x2)
-        z3 = ae.encoder(x3)
+        z1 = ae.encoder(x1)[DEFAULT_STREAM_NAME]
+        z2 = ae.encoder(x2)[DEFAULT_STREAM_NAME]
+        z3 = ae.encoder(x3)[DEFAULT_STREAM_NAME]
         z_tilde = (1 - alpha) * z1 + alpha * z3
 
         x2_recon = ae.decoder(z2)

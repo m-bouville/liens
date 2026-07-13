@@ -49,6 +49,7 @@ import numpy as np
 import torch
 
 from models.autoencoder import Autoencoder
+from models.latent_streams import DEFAULT_STREAM_NAME
 from training.stats_head import StatsHead
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
@@ -180,9 +181,9 @@ def check_interpolation(
             x2 = torch.from_numpy(x2_np).unsqueeze(0).unsqueeze(0).to(device)
             x3 = torch.from_numpy(x3_np).unsqueeze(0).unsqueeze(0).to(device)
 
-            z1 = ae.encoder(x1)
-            z2 = ae.encoder(x2)
-            z3 = ae.encoder(x3)
+            z1 = ae.encoder(x1)[DEFAULT_STREAM_NAME]
+            z2 = ae.encoder(x2)[DEFAULT_STREAM_NAME]
+            z3 = ae.encoder(x3)[DEFAULT_STREAM_NAME]
             z_tilde = (1 - alpha) * z1 + alpha * z3
 
             stats_z_tilde = stats_head(z_tilde)

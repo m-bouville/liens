@@ -36,6 +36,7 @@ import torch
 
 from evaluation.check_rollout import _format_small, _padded_bounds
 from models.autoencoder import Autoencoder
+from models.latent_streams import DEFAULT_STREAM_NAME
 from training.datasets import MicrostructureSnapshotDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
@@ -105,7 +106,7 @@ def rank_channel_importance(
     with torch.no_grad():
         for idx in indices:
             x = dataset[idx].unsqueeze(0).to(device)
-            z = ae.encoder(x)
+            z = ae.encoder(x)[DEFAULT_STREAM_NAME]
             if latent_channels is None:
                 latent_channels = z.shape[1]
                 total_delta = np.zeros(latent_channels)
@@ -173,13 +174,7 @@ def check_latent_channels(
         generator = torch.Generator().manual_seed(seed)
         n_frames = min(n_frames, len(test_dataset))
         indices = torch.randperm(len(test_dataset), generator=generator)[:n_frames].tolist()
-        # MicrostructureSnapshotDataset has no public window_info()-style
-        # accessor (unlike MicrostructureEvolutionDataset) to trace an
-        # index back to (run_dir, step) -- reaching into its private
-        # _index here rather than not printing reproducible identifiers
-        # at all. Worth adding a public accessor there at some point,
-        # matching window_info's pattern, instead of this reaching in.
-        frames = [(test_dataset._index[i][0], test_dataset._index[i][1]) for i in indices]
+        frames = [test_dataset.frame_info(i) for i in indices]
         print(f"Selected {len(frames)} random frames (seed={seed}) -- reuse via "
               f"--fixed-frames for reproducible comparison:")
         for run_dir, step in frames:
@@ -196,7 +191,7 @@ def check_latent_channels(
         for run_dir, step in frames:
             x_raw = load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny)
             x = torch.from_numpy(x_raw).unsqueeze(0).unsqueeze(0).to(device)
-            z = ae.encoder(x)[0].cpu().numpy()  # (latent_channels, 8, 8)
+            z = ae.encoder(x)[DEFAULT_STREAM_NAME][0].cpu().numpy()  # (latent_channels, 8, 8)
             all_x.append(x_raw)
             all_z.append(z)
     all_z_arr = np.stack(all_z, axis=0)  # (n_frames, latent_channels, 8, 8)

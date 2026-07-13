@@ -426,6 +426,32 @@ class MicrostructureSnapshotDataset(Dataset):
 
         return stats
 
+    def frame_info(self, idx: int) -> tuple[Path, int]:
+        """
+        (run_dir, step) for a given __getitem__ index -- traces a
+        sample back to its exact source file, mirroring
+        MicrostructureEvolutionDataset.window_info's role for this
+        dataset's own (single snapshot, not a window) indexing. Added
+        specifically so callers like check_latent_channels.py's
+        random-frame-selection path don't need to reach into the
+        private _index themselves (which it previously did, since this
+        accessor didn't exist yet).
+
+        Correctly unwraps augmentation: idx is the AUGMENTED index (as
+        passed to __getitem__) when augment=True -- same
+        divmod(idx, n_aug) base_idx recovery __getitem__ itself uses --
+        so this returns the true source frame regardless of which
+        dihedral/translation variant idx happened to land on, not a
+        meaningless direct index into _index.
+        """
+        if self.augment:
+            n_aug = self._N_DIHEDRAL * 4
+            base_idx, _aug_idx = divmod(idx, n_aug)
+        else:
+            base_idx = idx
+        run_dir, step, _nx, _ny = self._index[base_idx]
+        return run_dir, step
+
     def __len__(self) -> int:
         n = len(self._index)
         if self.augment:

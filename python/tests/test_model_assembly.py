@@ -176,6 +176,6 @@ def test_version_mismatch_missing_key_raises_clear_error(tmp_path):
     specifically, distinct from the shape-mismatch test above.
     """
     components, _, _, _ = _build_components(tmp_path)
-    del components["encoder"].state_dict["bottleneck.weight"]
+    del components["encoder"].state_dict["bottlenecks.state.weight"]
     with pytest.raises(ValueError, match="missing keys"):
         build_models_from_components(components, device="cpu")

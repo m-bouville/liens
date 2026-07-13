@@ -1,6 +1,18 @@
 """
-Convolutional decoder: maps a latent representation back to a real-space
-microstructure. Mirrors encoder.py's depth/channel schedule exactly.
+Convolutional decoder: maps a latent representation back to real-space
+PIXELS -- what those pixels actually MEAN depends entirely on which
+latent stream produced the input, not on anything Decoder itself knows
+or checks (it's fully stream-agnostic by design, see the class
+docstring below). Fed a "state" stream, the output is a reconstructed
+microstructure. Fed a "deriv" stream (see the project's own C0/C1
+design doc), the output is NOT a microstructure at all -- it's
+whatever that stream represents (e.g. a time derivative), decoded
+through the exact same weights. Nothing about the return value, its
+shape, or this module's own code distinguishes the two cases -- that
+distinction has to come from the caller, via a LatentStreamConfig (see
+latent_streams.py's decode_stream, which is the safer way to call this
+for exactly this reason).
+Mirrors encoder.py's depth/channel schedule exactly.
 """
 
 import math
@@ -20,10 +32,17 @@ class Decoder(nn.Module):
     spatial resolution back up to output_size, mirroring Encoder's
     DownBlocks in reverse.
 
-    IMPORTANT: output_size, base_channels, latent_channels,
-    latent_spatial_size, and norm must match the paired Encoder's
-    construction arguments exactly, or shapes won't line up. This isn't
-    enforced here (Decoder is built standalone) -- autoencoder.py
+    IMPORTANT: output_size, base_channels, norm, and the specific
+    latent_channels/latent_spatial_size of WHICHEVER stream is being
+    decoded must match that stream's own values as declared in the
+    paired Encoder's stream_configs, or shapes won't line up. Since
+    Encoder can produce multiple streams (see latent_streams.py) while
+    Decoder only ever consumes one at a time, this is a per-stream
+    match, not "N values that must agree" the way it was before the
+    multi-stream redesign -- Decoder itself has no notion of "streams"
+    at all, and doesn't need one; whichever tensor it's handed just
+    needs to be shaped like something Encoder actually produces. This
+    isn't enforced here (Decoder is built standalone) -- autoencoder.py
     should be the single place that constructs both from one shared
     config.
 
