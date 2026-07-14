@@ -77,6 +77,77 @@ def _transform_angle(angle: torch.Tensor, k: int, flip: bool) -> torch.Tensor:
     return angle
 
 
+_N_AUGMENT_VARIANTS = 8 * 4  # N_DIHEDRAL(8) x 4 translations -- see _apply_augmentation
+
+
+def _apply_augmentation(x: torch.Tensor, aug_idx: int, nx: int, ny: int) -> tuple[torch.Tensor, int, bool]:
+    """
+    One of the N_DIHEDRAL(8) x 4 augmentation variants, applied to an
+    ALREADY-LOADED (C, H, W) frame (loading itself is the caller's
+    job -- this is pure transform selection, shared by
+    MicrostructureSnapshotDataset's per-frame augmentation and
+    MicrostructureEvolutionDataset's per-window augmentation, which
+    needs the SAME (k, flip, shift) applied to EVERY frame in a window
+    to keep the window physically consistent -- flipping x(t) but not
+    x(t+dt) would make the pair describe a physically meaningless
+    "evolution").
+
+    Sub-cell offset, used to spread the 4 translations across distinct
+    sub-cell phases instead of the single phase the old Nx/2-only
+    shifts all shared (see _LATENT_SPATIAL_SIZE's docstring for the
+    underlying artifact this addresses).
+
+    THIRDS, NOT HALVES: an earlier version of this used
+    _LATENT_SPATIAL_SIZE // 2 (a literal half-cell offset) for all 3
+    non-identity shifts, which seemed like the natural choice -- but
+    half of a cell added to itself returns to 0 mod cell_size (half +
+    half = cell_size == 0 mod cell_size), so the 4 shifts' residues --
+    (0,0), (0,half), (half,0), (half,half) -- form a closed 2-element
+    {0, half} subgroup under addition. That's a DEGENERATE,
+    lower-diversity phase set in disguise (effectively period
+    cell_size/2, not a genuine spread across the full cell), not the 4
+    independent phases it looks like at a glance. Thirds avoid this:
+    cell_size//3 and (cell_size*2)//3 aren't related by any such
+    small-order closure, so the 4 shifts' residues don't accidentally
+    collapse onto a smaller repeating subset the way the half-based
+    ones did.
+
+    NOTE -- this is only exactly a THIRD of a cell
+    (nx/_LATENT_SPATIAL_SIZE pixels wide) when nx ==
+    _LATENT_SPATIAL_SIZE**2 (64 for _LATENT_SPATIAL_SIZE=8), which is
+    the only size actually run through this dataset today. For any
+    other size (e.g. a future 128x128), the true cell size is nx //
+    _LATENT_SPATIAL_SIZE and this constant offset would land at a
+    different fraction of the cell instead -- still a distinct,
+    non-degenerate phase per the reasoning above, just not exactly "a
+    third" by name. Also worth noting: this uses the model's DEFAULT
+    bottleneck size (see models/constants.py) -- if a particular
+    checkpoint was built with a non-default latent_spatial_size (now
+    genuinely configurable), this augmentation phase-spread wouldn't
+    match ITS actual cell size. Augmentation happens before/independent
+    of any specific model though, so there's no natural single "right"
+    value to read here instead; the default is the reasonable
+    general-purpose choice.
+    """
+    n_translations = 4
+    dihedral_idx, translation_idx = divmod(aug_idx, n_translations)
+    k, flip = divmod(dihedral_idx, 2)
+
+    x = _dihedral_transform(x, k=k, flip=bool(flip))
+
+    third = _LATENT_SPATIAL_SIZE // 3
+    two_thirds = (_LATENT_SPATIAL_SIZE * 2) // 3
+    shifts = [
+        (0, 0),
+        (0, nx // 2 + third),
+        (ny // 2 + third, 0),
+        (ny // 2 + two_thirds, nx // 2 + two_thirds),
+    ]
+    shift_y, shift_x = shifts[translation_idx]
+    x = _translate(x, shift_y, shift_x)
+    return x, k, bool(flip)
+
+
 def complete_run_dirs(base: str | Path, nx: int, ny: int) -> list[Path]:
     """
     All directories for one grid size that exist on disk and are marked
@@ -460,62 +531,9 @@ class MicrostructureSnapshotDataset(Dataset):
         return n
 
     def _augment_item(self, base_idx: int, aug_idx: int) -> tuple[torch.Tensor, int, bool]:
-        n_translations = 4
-        dihedral_idx, translation_idx = divmod(aug_idx, n_translations)
-        k, flip = divmod(dihedral_idx, 2)
-
         x = self._load(base_idx)
-        x = _dihedral_transform(x, k=k, flip=bool(flip))
-
         _, _, nx, ny = self._index[base_idx]
-        # Sub-cell offset, used to spread the 4 translations across
-        # distinct sub-cell phases instead of the single phase the old
-        # Nx/2-only shifts all shared (see _LATENT_SPATIAL_SIZE's
-        # docstring for the underlying artifact this addresses).
-        #
-        # THIRDS, NOT HALVES: an earlier version of this used
-        # _LATENT_SPATIAL_SIZE // 2 (a literal half-cell offset) for all
-        # 3 non-identity shifts, which seemed like the natural choice --
-        # but half of a cell added to itself returns to 0 mod cell_size
-        # (half + half = cell_size == 0 mod cell_size), so the 4 shifts'
-        # residues -- (0,0), (0,half), (half,0), (half,half) -- form a
-        # closed 2-element {0, half} subgroup under addition. That's a
-        # DEGENERATE, lower-diversity phase set in disguise (effectively
-        # period cell_size/2, not a genuine spread across the full
-        # cell), not the 4 independent phases it looks like at a glance.
-        # Thirds avoid this: cell_size//3 and (cell_size*2)//3 aren't
-        # related by any such small-order closure, so the 4 shifts'
-        # residues don't accidentally collapse onto a smaller repeating
-        # subset the way the half-based ones did.
-        #
-        # NOTE -- this is only exactly a THIRD of a cell
-        # (nx/_LATENT_SPATIAL_SIZE pixels wide) when
-        # nx == _LATENT_SPATIAL_SIZE**2 (64 for _LATENT_SPATIAL_SIZE=8),
-        # which is the only size actually run through this dataset
-        # today. For any other size (e.g. a future 128x128), the true
-        # cell size is nx // _LATENT_SPATIAL_SIZE and this constant
-        # offset would land at a different fraction of the cell instead
-        # -- still a distinct, non-degenerate phase per the reasoning
-        # above, just not exactly "a third" by name. Also worth noting:
-        # this uses the model's DEFAULT bottleneck size (see
-        # models/constants.py) -- if a particular checkpoint was built
-        # with a non-default latent_spatial_size (now genuinely
-        # configurable), this augmentation phase-spread wouldn't match
-        # ITS actual cell size. Augmentation happens before/independent
-        # of any specific model though, so there's no natural single
-        # "right" value to read here instead; the default is the
-        # reasonable general-purpose choice.
-        third = _LATENT_SPATIAL_SIZE // 3
-        two_thirds = (_LATENT_SPATIAL_SIZE * 2) // 3
-        shifts = [
-            (0, 0),
-            (0, nx // 2 + third),
-            (ny // 2 + third, 0),
-            (ny // 2 + two_thirds, nx // 2 + two_thirds),
-        ]
-        shift_y, shift_x = shifts[translation_idx]
-        x = _translate(x, shift_y, shift_x)
-        return x, k, bool(flip)
+        return _apply_augmentation(x, aug_idx, nx, ny)
 
     def __getitem__(self, idx: int):
         if not self.augment:
@@ -649,7 +667,8 @@ class MicrostructureEvolutionDataset(Dataset):
                  skip_bad: bool = True, min_step: int = 0,
                  min_stdev_phi: float | None = None, encode_batch_size: int = 256,
                  good_steps: dict[Path, list[int]] | None = None,
-                 stat_names: list[str] | None = None):
+                 stat_names: list[str] | None = None, augment: bool = False,
+                 min_std_deriv: float | None = None):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
@@ -680,6 +699,49 @@ class MicrostructureEvolutionDataset(Dataset):
         auto-detected, since silently resolving a different schema than
         the already-trained stats_head expects would be a much worse
         failure mode than requiring it explicitly.
+
+        augment: False (default) -- EXACT prior behavior, unchanged for
+        every existing caller (stage 3, stage 4/5). If True, applies
+        MicrostructureSnapshotDataset's own D4-dihedral-x-4-translation
+        scheme (see _apply_augmentation, shared between both classes),
+        multiplying __len__ by N_DIHEDRAL(8) x 4 = 32 -- but critically,
+        the SAME (k, flip, shift) is applied to EVERY frame in a
+        window, not independently per frame: flipping x(t) while
+        leaving x(t+dt) unflipped would make the pair describe a
+        physically meaningless "evolution", not a genuine augmented
+        view of a real one. Restricted to raw-pixel mode (encoder=None)
+        -- augmenting a cached LATENT has no well-defined meaning here
+        (unlike a raw pixel grid, there's no established correspondence
+        between D4/translating the 8x8 latent grid and any real
+        symmetry of the underlying physics) -- and to stat_names=None,
+        since MicrostructureSnapshotDataset's matching angle-statistic
+        transform (_transform_angle) isn't implemented here; combining
+        augment=True with either raises at construction, not a silent
+        wrong answer.
+
+        min_std_deriv: None (default) -- no filtering beyond
+        min_step/min_stdev_phi. If given, ALSO excludes any candidate
+        window whose first transition's (x(t+dt)-x(t))/dt has spatial
+        std BELOW this threshold -- a DIFFERENT axis from
+        min_stdev_phi, which only ever looks at a single frame's own
+        spatial variance and says nothing about how much two
+        consecutive frames actually differ. A microstructure can be
+        genuinely spatially complex (comfortably passing min_stdev_phi
+        at BOTH endpoints -- e.g. sharp, well-defined straight-strip
+        interfaces) while being essentially stationary between those
+        two specific saved steps (a straight interface has zero
+        curvature, and curvature-driven interface motion is
+        proportional to curvature -- zero curvature means zero
+        velocity, regardless of how sharp or well-resolved the
+        interface itself is). That's a real, physically legitimate
+        state this class's other filters were never designed to catch,
+        since they only ever examine one frame at a time, not a pair.
+        Only meaningful in raw-pixel mode (encoder=None) -- raises
+        otherwise, matching augment's own restriction and for the
+        analogous reason (no well-defined meaning against a cached
+        latent). Computed directly from each candidate window's own
+        already-loaded frames (no extra disk I/O), so this is cheap
+        even though it's a per-window check rather than a per-step one.
         """
         if stat_names is not None and encoder is not None:
             raise ValueError(
@@ -690,16 +752,41 @@ class MicrostructureEvolutionDataset(Dataset):
         if window_length < 2:
             raise ValueError(f"window_length must be >= 2 (got {window_length}), "
                               f"since a window needs at least one transition to predict")
+        if augment and encoder is not None:
+            raise ValueError(
+                "augment=True was given together with a real encoder (cached-latent, stage-3 "
+                "mode) -- augmenting a cached LATENT has no well-defined meaning (see this "
+                "constructor's own docstring). Pass encoder=None if you want augmented raw-pixel "
+                "windows."
+            )
+        if augment and stat_names is not None:
+            raise ValueError(
+                "augment=True was given together with stat_names -- the matching angle-statistic "
+                "transform isn't implemented for this class (see this constructor's own "
+                "docstring), so this combination would silently produce statistics that don't "
+                "match the augmented (flipped/rotated) frames. Not supported."
+            )
+        if min_std_deriv is not None and encoder is not None:
+            raise ValueError(
+                "min_std_deriv was given together with a real encoder (cached-latent, stage-3 "
+                "mode) -- this filters on the RAW PIXEL derivative's spatial std, which has no "
+                "well-defined meaning against a cached latent (see this constructor's own "
+                "docstring). Pass encoder=None if you want this filter."
+            )
 
         self.window_length = window_length
         self.encoder_given = encoder is not None  # which mode __getitem__ operates in
         self.stat_names = stat_names
+        self.augment = augment
+        self.min_std_deriv = min_std_deriv
         self._run_dirs: list[Path] = []         # run_dir per run_idx, for tracing samples back
         self._run_steps: list[list[int]] = []   # kept step numbers per run, in order
         self._run_data: list[torch.Tensor] = []  # per run, on CPU: latents (n_kept,C,8,8) if
                                                    # encoder given, else raw frames (n_kept,1,ny,nx)
         self._run_dt_scale: list[float] = []    # metadata.dt per run
         self._run_theta: list[torch.Tensor] = []  # (n_theta,) physical params per run -- see class docstring
+        self._run_nx: list[int] = []            # metadata.nx per run, only used if augment=True
+        self._run_ny: list[int] = []            # metadata.ny per run, only used if augment=True
         self._stats_by_run = {}                 # run_dir -> statistics.csv DataFrame, only if stat_names given
         self._index: list[tuple[int, int]] = []  # (run_idx, window_start_position)
 
@@ -710,6 +797,7 @@ class MicrostructureEvolutionDataset(Dataset):
         if self.encoder_given:
             encoder = encoder.to(device).eval()
         n_windowless_runs = 0
+        n_degenerate_deriv_windows = 0
 
         for run_dir in run_dirs:
             metadata = load.read_metadata(run_dir / "metadata.txt")
@@ -751,6 +839,8 @@ class MicrostructureEvolutionDataset(Dataset):
             self._run_steps.append(kept_steps)
             self._run_data.append(run_data)
             self._run_dt_scale.append(metadata.dt)
+            self._run_nx.append(metadata.nx)
+            self._run_ny.append(metadata.ny)
             # T0 (metadata: "threshold temperature in Landau potential") is
             # the physically meaningful reference point, not 0 -- the whole
             # sweep is subcritical (T < T0), and how close a run sits to
@@ -768,7 +858,20 @@ class MicrostructureEvolutionDataset(Dataset):
                     stats_df = self._stats_by_run[run_dir]
                     if start_step not in stats_df.index or stats_df.loc[start_step, self.stat_names].isna().any():
                         continue  # same NaN-guard rationale as MicrostructureTripletDataset
+                if self.min_std_deriv is not None:
+                    first_dt = (kept_steps[start + 1] - kept_steps[start]) * metadata.dt
+                    first_deriv = (run_data[start + 1] - run_data[start]) / first_dt
+                    if first_deriv.std().item() < self.min_std_deriv:
+                        n_degenerate_deriv_windows += 1
+                        continue
                 self._index.append((run_idx, start))
+
+        if n_degenerate_deriv_windows:
+            print(f"MicrostructureEvolutionDataset: {n_degenerate_deriv_windows} candidate window(s) "
+                  f"skipped for having a near-degenerate first-transition derivative "
+                  f"(std < min_std_deriv={self.min_std_deriv}) -- spatially complex but "
+                  f"essentially stationary between those two specific steps (e.g. a straight, "
+                  f"zero-curvature interface), not excluded by min_stdev_phi alone.")
 
         if n_windowless_runs:
             print(f"MicrostructureEvolutionDataset: {n_windowless_runs}/{len(run_dirs)} runs "
@@ -777,13 +880,36 @@ class MicrostructureEvolutionDataset(Dataset):
                   f"is a large fraction)")
 
     def __len__(self) -> int:
-        return len(self._index)
+        n = len(self._index)
+        if self.augment:
+            n *= _N_AUGMENT_VARIANTS
+        return n
 
     def __getitem__(self, idx: int):
-        run_idx, start = self._index[idx]
+        if self.augment:
+            base_idx, aug_idx = divmod(idx, _N_AUGMENT_VARIANTS)
+        else:
+            base_idx, aug_idx = idx, None
+
+        run_idx, start = self._index[base_idx]
         end = start + self.window_length
 
         window = self._run_data[run_idx][start:end]  # (window_length, C, 8, 8) or (window_length, 1, ny, nx)
+
+        if aug_idx is not None:
+            # The SAME (k, flip, shift) applied to EVERY frame in the
+            # window -- not independently per frame, which would make
+            # the window describe a physically meaningless "evolution"
+            # (see _apply_augmentation's own docstring). window is
+            # (window_length, C, H, W); apply per-frame and re-stack,
+            # discarding the per-frame k/flip (identical across frames
+            # by construction, and unused here -- stat_names=None is
+            # guaranteed whenever augment=True, so there's no angle
+            # statistic that would need it).
+            nx, ny = self._run_nx[run_idx], self._run_ny[run_idx]
+            window = torch.stack([
+                _apply_augmentation(frame, aug_idx, nx, ny)[0] for frame in window
+            ])
 
         steps = self._run_steps[run_idx][start:end]
         dt_scale = self._run_dt_scale[run_idx]
@@ -812,8 +938,15 @@ class MicrostructureEvolutionDataset(Dataset):
         sample back to its exact source files/steps (e.g. check_rollout.py
         decoding a prediction and comparing against the real x(t+dt)),
         independent of which mode built this dataset.
+
+        Correctly unwraps augmentation the same way __getitem__ does
+        (divmod by _N_AUGMENT_VARIANTS) when augment=True, so this
+        returns the true source window regardless of which augmented
+        variant idx happened to land on -- matching
+        MicrostructureSnapshotDataset.frame_info's identical pattern.
         """
-        run_idx, start = self._index[idx]
+        base_idx = idx // _N_AUGMENT_VARIANTS if self.augment else idx
+        run_idx, start = self._index[base_idx]
         end = start + self.window_length
         return self._run_dirs[run_idx], self._run_steps[run_idx][start:end]
 

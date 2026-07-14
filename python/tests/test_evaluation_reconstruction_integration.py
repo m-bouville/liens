@@ -49,6 +49,12 @@ from evaluation.check_perturbation import check_perturbation
 from evaluation.check_rollout import check_rollout
 from evaluation.check_parameter_dependence import check_parameter_dependence
 
+pytestmark = [
+    pytest.mark.filterwarnings("ignore:Polyfit may be poorly conditioned"),
+    pytest.mark.filterwarnings("ignore:invalid value encountered in divide"),
+    pytest.mark.filterwarnings("ignore:Data has no positive values, and therefore cannot be log-scaled"),
+]
+
 
 _NON_DEFAULT_SPATIAL = 4  # anything != models.constants.LATENT_SPATIAL_SIZE (8)
 
