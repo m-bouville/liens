@@ -271,8 +271,15 @@ def cross_check_stream_configs_against_state_dict(
     weights themselves can.
 
     encoder_state_dict: keys as saved directly under "model_state"/
-    "ae_state" (still "encoder."-prefixed, e.g.
-    "encoder.bottlenecks.state.weight") -- NOT yet prefix-stripped.
+    "ae_state", NOT yet prefix-stripped -- either "encoder."-prefixed
+    (Autoencoder, and pre-MultiStreamAutoencoder checkpoints, e.g.
+    "encoder.bottlenecks.state.weight") or "encoders.shared."-prefixed
+    (MultiStreamAutoencoder, e.g.
+    "encoders.shared.bottlenecks.deriv.weight" -- see autoencoder.py's
+    own docstring on why the container holds a NAMED DICT of encoders,
+    not a bare .encoder attribute). Both recognized, since this
+    function's whole purpose is reading whatever a checkpoint's ACTUAL
+    weights say regardless of which version of the code produced them.
 
     Returns stream_configs/recon_stream_name UNCHANGED if the
     state_dict's own bottleneck stream names already match (the
@@ -281,11 +288,14 @@ def cross_check_stream_configs_against_state_dict(
     claims but the state_dict doesn't have (a stranger, different kind
     of corruption this function doesn't try to fix).
     """
+    _BOTTLENECK_KEY_RE = re.compile(r"(encoders?\.(?:shared\.)?bottlenecks\.)([^.]+)\.")
     found_names = set()
+    prefix = None
     for key in encoder_state_dict:
-        m = re.match(r"encoder\.bottlenecks\.([^.]+)\.", key)
+        m = _BOTTLENECK_KEY_RE.match(key)
         if m:
-            found_names.add(m.group(1))
+            prefix = m.group(1)  # "encoder.bottlenecks." or "encoders.shared.bottlenecks."
+            found_names.add(m.group(2))
 
     if not found_names or found_names == set(stream_configs):
         return stream_configs, recon_stream_name
@@ -308,7 +318,7 @@ def cross_check_stream_configs_against_state_dict(
     recon_stream = stream_configs[recon_stream_name]
     corrected = dict(stream_configs)
     for name in sorted(missing):
-        weight_key = f"encoder.bottlenecks.{name}.weight"
+        weight_key = f"{prefix}{name}.weight"
         channels = encoder_state_dict[weight_key].shape[0]
         corrected[name] = LatentStreamConfig(
             name=name, channels=channels, spatial_size=recon_stream.spatial_size,

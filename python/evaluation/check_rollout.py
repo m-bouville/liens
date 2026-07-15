@@ -52,7 +52,7 @@ from matplotlib.colors import TwoSlopeNorm
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.constants import LATENT_SPATIAL_SIZE
@@ -153,10 +153,17 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         # stream -- see models/latent_streams.py); resolved from
         # ae_config (already a parameter here) rather than assumed, so
         # this works regardless of what the recon stream is actually
-        # named.
+        # named. ae here is the FULL container (Autoencoder exposes
+        # .encoder/.decoder directly, MultiStreamAutoencoder only has
+        # .encoders["shared"]/.decoders["shared"] -- see those classes'
+        # own docstrings on why), resolved locally since this function
+        # has its own scope, separate from check_rollout()'s own
+        # ae_encoder/ae_decoder helpers.
+        ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+        ae_decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
         _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
-        z_t = ae.encoder(x_t)[recon_stream_name]
-        z_next_true = ae.encoder(x_next_true_t)[recon_stream_name]
+        z_t = ae_encoder(x_t)[recon_stream_name]
+        z_next_true = ae_encoder(x_next_true_t)[recon_stream_name]
 
         # Per-TRANSITION dts, chained via rollout() -- NOT one big dt
         # covering the whole span. A single f_theta call with a large
@@ -171,8 +178,8 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         z_hat_full = f_theta.rollout(z_t, dts, theta)
         z_next_pred = z_hat_full[:, -1]
 
-        x_next_pred = ae.decoder(z_next_pred)[0, 0].cpu().numpy()
-        x_next_ae_baseline = ae.decoder(z_next_true)[0, 0].cpu().numpy()
+        x_next_pred = ae_decoder(z_next_pred)[0, 0].cpu().numpy()
+        x_next_ae_baseline = ae_decoder(z_next_true)[0, 0].cpu().numpy()
 
     return x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_val
 
@@ -306,9 +313,12 @@ def check_rollout(
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     ae.eval()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+    ae_decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
 
     f_theta = LatentDynamics(
         latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
@@ -372,7 +382,7 @@ def check_rollout(
         # actual filtered test distribution -- compute_sample() then does
         # the real work fresh, independent of this dataset object.
         dataset = MicrostructureEvolutionDataset(
-            test_dirs, encoder=ae.encoder, device=device, window_length=window_length,
+            test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi,
         )
         if len(dataset) == 0:

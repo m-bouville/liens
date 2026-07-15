@@ -60,13 +60,13 @@ def test_stage2_trains_deriv_via_l_deriv(tmp_path):
         epochs=1, batch_size=4, base_channels=4,
         latent_names=["state", "deriv"], latent_modes=["autoencoder", "decoder"],
         latent_channels_decoder=4, latent_spatial_decoder=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
         checkpoint_path=tmp_path / "stage1.pt", device="cpu", seed=0,
         log_every_epoch=True, loss_curve_path=tmp_path / "curve1.png",
     )
     stage1_checkpoint = torch.load(stage1_path, map_location="cpu", weights_only=True)
-    deriv_weight_after_stage1 = stage1_checkpoint["model_state"]["encoder.bottlenecks.deriv.weight"].clone()
+    deriv_weight_after_stage1 = stage1_checkpoint["model_state"]["encoders.shared.bottlenecks.deriv.weight"].clone()
 
     stage2_path = train_stage2(
         base_path=base_path, resume_from=stage1_path,
@@ -78,7 +78,7 @@ def test_stage2_trains_deriv_via_l_deriv(tmp_path):
         log_every_epoch=True, loss_curve_path=tmp_path / "curve2.png",
     )
     stage2_checkpoint = torch.load(stage2_path, map_location="cpu", weights_only=True)
-    deriv_weight_after_stage2 = stage2_checkpoint["model_state"]["encoder.bottlenecks.deriv.weight"]
+    deriv_weight_after_stage2 = stage2_checkpoint["model_state"]["encoders.shared.bottlenecks.deriv.weight"]
 
     assert not torch.allclose(deriv_weight_after_stage1, deriv_weight_after_stage2), (
         "deriv bottleneck weights UNCHANGED between stage 1 and stage 2 -- "
@@ -100,7 +100,7 @@ def test_stage2_rejects_single_stream_ancestor(tmp_path):
     stage1_path = train_autoencoder(
         size=32, base_path=base_path,
         epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
         checkpoint_path=tmp_path / "stage1_single.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1.png",
@@ -127,13 +127,13 @@ def test_stage2_freeze_outer_layers_works_with_multi_stream(tmp_path):
         epochs=1, batch_size=4, base_channels=4,
         latent_names=["state", "deriv"], latent_modes=["autoencoder", "decoder"],
         latent_channels_decoder=4, latent_spatial_decoder=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
         checkpoint_path=tmp_path / "stage1.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1.png",
     )
     stage1_checkpoint = torch.load(stage1_path, map_location="cpu", weights_only=True)
-    frozen_key = "encoder.down_blocks.0.conv.block.0.weight"
+    frozen_key = "encoders.shared.down_blocks.0.conv.block.0.weight"
     frozen_before = stage1_checkpoint["model_state"][frozen_key].clone()
 
     stage2_path = train_stage2(
@@ -148,8 +148,8 @@ def test_stage2_freeze_outer_layers_works_with_multi_stream(tmp_path):
     )
     stage2_checkpoint = torch.load(stage2_path, map_location="cpu", weights_only=True)
     frozen_after = stage2_checkpoint["model_state"][frozen_key]
-    deriv_after = stage2_checkpoint["model_state"]["encoder.bottlenecks.deriv.weight"]
-    deriv_before = stage1_checkpoint["model_state"]["encoder.bottlenecks.deriv.weight"]
+    deriv_after = stage2_checkpoint["model_state"]["encoders.shared.bottlenecks.deriv.weight"]
+    deriv_before = stage1_checkpoint["model_state"]["encoders.shared.bottlenecks.deriv.weight"]
 
     assert torch.equal(frozen_before, frozen_after), (
         "frozen outer layer's weights CHANGED despite n_frozen_stages=1 -- "

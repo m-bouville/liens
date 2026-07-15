@@ -18,7 +18,7 @@ import gc
 import torch
 from torch.utils.data import DataLoader
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -49,6 +49,56 @@ from evaluation.check_perturbation import check_perturbation
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_ae.py -> python/
 
 
+class _RunningStats:
+    """
+    Incremental mean/std tracker -- accumulates sum, sum-of-squares,
+    and count across many tensors without ever storing one, so this
+    can track a quantity's actual scale across an entire epoch's worth
+    of batches cheaply. Exists specifically to debug z0/z1 scale
+    mismatches with real, measured numbers instead of theoretical
+    reasoning about what their scale "should" be.
+    """
+    def __init__(self):
+        self.sum = 0.0
+        self.sumsq = 0.0
+        self.count = 0
+
+    def update(self, x: torch.Tensor) -> None:
+        x = x.detach()
+        self.sum += x.sum().item()
+        self.sumsq += (x * x).sum().item()
+        self.count += x.numel()
+
+    def mean_std(self) -> tuple[float, float]:
+        if self.count == 0:
+            return float("nan"), float("nan")
+        mean = self.sum / self.count
+        var = max(self.sumsq / self.count - mean * mean, 0.0)  # clamp: float roundoff can make this tiny-negative
+        return mean, var ** 0.5
+
+
+class _PerStatAccumulator:
+    """
+    Running, per-BATCH average of a per-stat tensor (StatsLoss.per_stat_mse's
+    own output) across an epoch -- NOT weighted by batch size (batches are
+    mostly uniform, and this keeps the accumulation as simple as
+    z0_train_stats/z1_train_stats's own _RunningStats usage). Exists
+    specifically to answer "which stats does z1 actually predict well",
+    not just an aggregate scalar that hides the answer.
+    """
+    def __init__(self):
+        self.sum: torch.Tensor | None = None
+        self.n_batches = 0
+
+    def update(self, per_stat: torch.Tensor) -> None:
+        per_stat = per_stat.detach().cpu()
+        self.sum = per_stat if self.sum is None else self.sum + per_stat
+        self.n_batches += 1
+
+    def average(self) -> torch.Tensor | None:
+        return self.sum / self.n_batches if self.sum is not None else None
+
+
 def train_autoencoder(
     size: int, base_path: Path,
     epochs: int = 100, batch_size: int = 64, lr: float = 1e-3,
@@ -57,6 +107,7 @@ def train_autoencoder(
     latent_names: list[str] | None = None, latent_modes: list[str] | None = None,
     latent_channels_decoder: int | None = None, latent_spatial_decoder: int | None = None,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
+    augment: bool = True,
     min_step: int | None = None, min_stdev_phi: float | None = None,
     min_std_deriv: float | None = None,
     stat_names: list[str] | None = None, stats_weight: float | None = None,
@@ -182,7 +233,7 @@ def train_autoencoder(
           f"{len(train_dirs)} train / {len(val_dirs)} val / {len(test_dirs)} test dirs")
 
     train_set = MicrostructureSnapshotDataset(
-        train_dirs, cache_in_memory=True, augment=True,
+        train_dirs, cache_in_memory=True, augment=augment,
         min_step=min_step, min_stdev_phi=min_stdev_phi,
         include_stats=include_stats, stat_names=stat_names,
     )
@@ -195,8 +246,12 @@ def train_autoencoder(
         min_step=min_step, min_stdev_phi=min_stdev_phi,
         include_stats=include_stats, stat_names=val_stat_names,
     )
-    print(f"{train_set.n_base_samples} base snapshots (train) -> {len(train_set)} after "
-          f"augmentation, {val_set.n_base_samples} (val, unaugmented)")
+    if augment:
+        print(f"{train_set.n_base_samples} base snapshots (train) -> {len(train_set)} after "
+              f"augmentation, {val_set.n_base_samples} (val, unaugmented)")
+    else:
+        print(f"{len(train_set)} snapshots (train, augmentation OFF -- faster, less diverse), "
+              f"{val_set.n_base_samples} (val, unaugmented)")
 
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
@@ -272,14 +327,17 @@ def train_autoencoder(
         # in the saved checkpoint would only be honestly held-out for
         # one of the two objectives.
         c1_train_set = MicrostructureEvolutionDataset(
-            train_dirs, encoder=None, window_length=2, augment=True,
+            train_dirs, encoder=None, window_length=2, augment=augment,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
+            stat_names=train_set.stat_names if include_stats else None,
         )
         c1_val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=None, window_length=2,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
+            stat_names=train_set.stat_names if include_stats else None,
         )
-        print(f"{len(c1_train_set)} (train, augmented) / {len(c1_val_set)} (val, unaugmented) "
+        print(f"{len(c1_train_set)} (train, {'augmented' if augment else 'NOT augmented'}) / "
+              f"{len(c1_val_set)} (val, unaugmented) "
               f"consecutive-pair windows for C1 ('{deriv_stream_name}') training")
         c1_train_loader = DataLoader(
             c1_train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
@@ -300,7 +358,8 @@ def train_autoencoder(
         decoder = Decoder(output_size=size, out_channels=1, base_channels=base_channels,
                            latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
 
     recon_loss = ReconLoss()
     params = list(ae.parameters())
@@ -314,11 +373,29 @@ def train_autoencoder(
         stats_loss_fn = StatsLoss(mean.to(device), std.to(device), stat_names=train_set.stat_names)
         params += list(stats_head.parameters())
 
+    # stats_head1: L_stats1, the deriv stream's own analogous anchor --
+    # see step_c1's own docstring for why this predicts the SAME
+    # original stats (not their derivative) from z1. Separate weights
+    # from stats_head (z1 means something fundamentally different from
+    # z0, so this is genuinely a different mapping to learn, not a
+    # reusable one), but the SAME stats_loss_fn instance -- both
+    # predict the identical physical quantities against the identical
+    # normalization, so there's nothing stream-specific to duplicate
+    # there.
+    stats_head1 = None
+    if include_stats and train_c1:
+        deriv_stream = stream_configs[deriv_stream_name]
+        stats_head1 = StatsHead(latent_channels=deriv_stream.channels, stat_names=train_set.stat_names,
+                                 latent_spatial=deriv_stream.spatial_size).to(device)
+        params += list(stats_head1.parameters())
+
     if resume_from is not None:
         prev = torch.load(resume_from, map_location=device, weights_only=True)
         ae.load_state_dict(prev["model_state"])
         if stats_head is not None and prev.get("stats_head_state") is not None:
             stats_head.load_state_dict(prev["stats_head_state"])
+        if stats_head1 is not None and prev.get("stats_head1_state") is not None:
+            stats_head1.load_state_dict(prev["stats_head1_state"])
         print(f"Resumed model weights from {resume_from}")
 
     optimizer = torch.optim.Adam(params, lr=lr)
@@ -335,8 +412,8 @@ def train_autoencoder(
         if len(stream_configs) == 1:
             x_recon, z = ae(x)
         else:
-            z = ae.encoder(x)[recon_stream_name]
-            x_recon = ae.decoder(z)
+            x_recon, z = ae.pathways[recon_stream_name](x)
+        (z0_train_stats if train else z0_val_stats).update(z)
         recon = recon_loss(x_recon, x)
 
         if include_stats:
@@ -357,17 +434,16 @@ def train_autoencoder(
     def step_c1(batch, train: bool):
         """
         C1: decode the deriv stream, compare against the REAL
-        finite-difference derivative (x(t+dt)-x(t))/dt -- L_recon1
-        alone (no L_stats1 yet, see this function's own docstring/the
-        project's C0/C1 design doc: deferred, not an oversight).
+        finite-difference derivative (x(t+dt)-x(t))/dt -- L_recon1.
 
         Uses the SAME optimizer as step() (both draw from
         ae.parameters(), the full shared trunk+both bottlenecks+
         decoder) -- this is what makes alternation actually train the
         shared trunk and decoder from BOTH objectives, not just the
         deriv bottleneck in isolation, since backward() through
-        ae.encoder(x_t)[deriv_stream_name] and ae.decoder(...) touches
-        all of those, not just the one projection.
+        ae.pathways[deriv_stream_name](x_t) touches the shared trunk,
+        the deriv bottleneck, AND the shared decoder, not just the one
+        projection.
 
         NORMALIZED like the old L_interp was (diff_norm/target_norm,
         per SAMPLE) -- NOT because small dt makes target_deriv diverge
@@ -383,16 +459,55 @@ def train_autoencoder(
         epoch dominate the gradient disproportionately -- exactly what
         this normalization exists to prevent, independent of any
         specific story for why the magnitude varies.
+
+        The deriv stream's decode pathway (ae.pathways[deriv_stream_name])
+        applies its own learnable output-scale correction internally
+        (see autoencoder.py's EncoderDecoderPair) -- D's raw output is
+        always state-scale (~O(0.1-1)) regardless of which stream
+        produced its input, since D itself has no way to know; a real
+        physical derivative is inherently far smaller (~O(1e-4..1e-3)),
+        so this stream's own pathway carries a genuine nn.Parameter
+        (log-parameterized, trained by the SAME optimizer as everything
+        else here) that closes that gap, applied AFTER decode.
+
+        This REPLACES an earlier, static deriv_output_scale
+        hyperparameter that lived on this function's own signature --
+        confirmed via the per-epoch z0/z1 diagnostics (still tracked
+        below) that a single well-chosen constant genuinely fixed the
+        scale mismatch, which is what justified promoting it to a real,
+        checkpoint-persisted, LEARNABLE parameter instead of leaving it
+        as a hand-tuned constant every caller would need to guess.
+
+        L_stats1 (stats_head1, only when include_stats): predicts the
+        SAME original stats stats_head predicts from z0 -- NOT their
+        time-derivative. A grain boundary's own motion doesn't imply
+        the bulk statistics (volume, anisotropy, length scale, ...)
+        are changing at any comparable rate -- interface velocity and
+        "how fast is avg_phi changing" are related but genuinely
+        different questions, and the former is what z1 actually
+        encodes. Predicting the SAME target stats_head already uses
+        (available directly, no dataset changes needed) tests whether
+        z1 happens to ALSO carry usable information about the current
+        state's bulk statistics, which is an entirely fair question to
+        ask even though z1's primary job (L_recon1) is about motion,
+        not state. Per-stat error is tracked separately (see the
+        epoch-end print) specifically because this is expected to
+        vary a lot by stat -- interface-adjacent quantities plausibly
+        answerable from boundary motion, bulk quantities plausibly not.
         """
-        window, dt_window, _theta = batch
+        if include_stats:
+            window, dt_window, _theta, stats_target = batch
+            stats_target = stats_target.to(device, non_blocking=True)
+        else:
+            window, dt_window, _theta = batch
         window = window.to(device, non_blocking=True)
         dt_window = dt_window.to(device, non_blocking=True)
         x_t = window[:, 0]
         x_next = window[:, 1]
         dt = dt_window[:, 0].view(-1, 1, 1, 1)
 
-        z_deriv = ae.encoder(x_t)[deriv_stream_name]
-        pred_deriv = ae.decoder(z_deriv)
+        pred_deriv, z_deriv = ae.pathways[deriv_stream_name](x_t)
+        (z1_train_stats if train else z1_val_stats).update(z_deriv)
         target_deriv = (x_next - x_t) / dt
         # dim=(1,2,3): per-SAMPLE norm over channel+spatial dims (pixel-
         # space here, unlike L_interp's own latent-space per-channel-
@@ -407,12 +522,22 @@ def train_autoencoder(
         target_norm = torch.linalg.vector_norm(target_deriv, dim=(1, 2, 3)).clamp_min(1e-6)
         recon1 = (diff_norm / target_norm).mean()
 
+        if include_stats:
+            stats_pred1 = stats_head1(z_deriv)
+            stats1 = stats_loss_fn(stats_pred1, stats_target)
+            per_stat1 = stats_loss_fn.per_stat_mse(stats_pred1, stats_target).detach()
+            (stats1_per_stat_train if train else stats1_per_stat_val).update(per_stat1)
+            total1 = recon1 + stats_weight * stats1
+        else:
+            stats1 = torch.tensor(0.0)
+            total1 = recon1
+
         if train:
             optimizer.zero_grad()
-            recon1.backward()
+            total1.backward()
             optimizer.step()
 
-        return recon1.item()
+        return total1.item(), recon1.item(), stats1.item()
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
@@ -423,13 +548,28 @@ def train_autoencoder(
     heading += (f"train = recon +{stats_weight:6.3f} stats | valid = recon +{stats_weight:6.3f} "
                 f"stats  (e-3)  ema") if include_stats else "train | valid  (e-3)  ema"
     if train_c1:
-        heading += f"  || C1 ('{deriv_stream_name}') train | valid  (e-3)"
+        if include_stats:
+            heading += f"  || C1 ('{deriv_stream_name}') recon +stats | recon +stats  (e-3)"
+        else:
+            heading += f"  || C1 ('{deriv_stream_name}') train | valid  (e-3)"
     print(heading)
 
     for epoch in range(1, epochs + 1):
+        # Fresh each epoch -- see step()/step_c1() for where these get
+        # updated, and the epoch-end print below for where they're
+        # reported. z1 IS what's fed to D now (no input-side rescaling
+        # -- see step_c1's own docstring for why that turned out to be
+        # unnecessary), so tracking it directly is enough; there's no
+        # separate "z1/a" quantity in the computation anymore.
+        z0_train_stats, z0_val_stats = _RunningStats(), _RunningStats()
+        z1_train_stats, z1_val_stats = _RunningStats(), _RunningStats()
+        stats1_per_stat_train, stats1_per_stat_val = _PerStatAccumulator(), _PerStatAccumulator()
+
         ae.train()
         if stats_head is not None:
             stats_head.train()
+        if stats_head1 is not None:
+            stats_head1.train()
         # C1 trained INTERLEAVED with C0, batch by batch -- genuine
         # alternation (see this function's own docstring): one C0
         # batch, one C1 batch, repeat, NOT running all of C0's batches
@@ -452,7 +592,7 @@ def train_autoencoder(
         # the other is cycled (restarted) to keep pace, not the other
         # way around -- but cycling is symmetric in the code below, so
         # it's correct regardless of which one happens to be shorter.
-        train_total = train_recon = train_stats = train_recon1 = 0.0
+        train_total = train_recon = train_stats = train_recon1 = train_stats1 = 0.0
         n_train = n_train_c1 = 0
         c0_iter = iter(train_loader)
         c1_iter = iter(c1_train_loader) if train_c1 else None
@@ -478,8 +618,9 @@ def train_autoencoder(
                     c1_iter = iter(c1_train_loader)
                     batch1 = next(c1_iter)
                 bs1 = batch1[0].size(0)
-                recon1 = step_c1(batch1, train=True)
+                _, recon1, stats1 = step_c1(batch1, train=True)
                 train_recon1 += recon1 * bs1
+                train_stats1 += stats1 * bs1
                 n_train_c1 += bs1
 
         train_total /= n_train
@@ -487,10 +628,13 @@ def train_autoencoder(
         train_stats /= n_train
         if train_c1:
             train_recon1 /= n_train_c1
+            train_stats1 /= n_train_c1
 
         ae.eval()
         if stats_head is not None:
             stats_head.eval()
+        if stats_head1 is not None:
+            stats_head1.eval()
         val_total = val_recon = val_stats = 0.0
         n_val = len(val_set)
         with torch.no_grad():
@@ -507,15 +651,17 @@ def train_autoencoder(
         # C1 validation: sequential (not interleaved) is fine here --
         # no gradient/parameter-update sequencing concern exists during
         # eval, unlike training above.
-        val_recon1 = 0.0
+        val_recon1 = val_stats1 = 0.0
         if train_c1:
             n_val_c1 = len(c1_val_set)
             with torch.no_grad():
                 for batch1 in c1_val_loader:
                     bs1 = batch1[0].size(0)
-                    recon1 = step_c1(batch1, train=False)
+                    _, recon1, stats1 = step_c1(batch1, train=False)
                     val_recon1 += recon1 * bs1
+                    val_stats1 += stats1 * bs1
             val_recon1 /= n_val_c1
+            val_stats1 /= n_val_c1
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
@@ -543,13 +689,18 @@ def train_autoencoder(
             # criterion that drives checkpoint selection (deferred --
             # see the project's own todo list on whether/how it should
             # factor in).
-            msg += f"  ||{train_recon1*1_000:7.3f} |{val_recon1*1_000:7.3f}"
+            if include_stats:
+                msg += (f"  ||{train_recon1*1_000:7.3f} +{stats_weight*train_stats1*1_000:6.3f} "
+                        f"|{val_recon1*1_000:7.3f} +{stats_weight*val_stats1*1_000:6.3f}")
+            else:
+                msg += f"  ||{train_recon1*1_000:7.3f} |{val_recon1*1_000:7.3f}"
 
         if saved_this_epoch:
             epochs_since_improvement = 0
             checkpoint = {
                 "model_state": ae.state_dict(),
                 "stats_head_state": stats_head.state_dict() if stats_head is not None else None,
+                "stats_head1_state": stats_head1.state_dict() if stats_head1 is not None else None,
                 "epoch": epoch,
                 "val_loss": val_total,
                 "val_loss_ema": val_ema,
@@ -598,6 +749,26 @@ def train_autoencoder(
 
         if log_every_epoch or saved_this_epoch:
             print(msg)
+            z0_train_mean, z0_train_std = z0_train_stats.mean_std()
+            z0_val_mean, z0_val_std = z0_val_stats.mean_std()
+            print(f"      z0: train mean={z0_train_mean:+.4e} std={z0_train_std:.4e} | "
+                  f"val mean={z0_val_mean:+.4e} std={z0_val_std:.4e}")
+            if train_c1:
+                z1_train_mean, z1_train_std = z1_train_stats.mean_std()
+                z1_val_mean, z1_val_std = z1_val_stats.mean_std()
+                print(f"      z1: train mean={z1_train_mean:+.4e} std={z1_train_std:.4e} | "
+                      f"val mean={z1_val_mean:+.4e} std={z1_val_std:.4e} "
+                      f"(this is what actually gets fed to D -- compare its std against z0's own std above)")
+                if include_stats:
+                    train_per_stat = stats1_per_stat_train.average()
+                    val_per_stat = stats1_per_stat_val.average()
+                    if train_per_stat is not None:
+                        per_stat_parts = [
+                            f"{name}: train={train_per_stat[i].item():6.3f} val={val_per_stat[i].item():6.3f}"
+                            for i, name in enumerate(train_set.stat_names)
+                        ]
+                        print(f"      L_stats1 per-stat (normalized MSE, z1 -> stats_head1): "
+                              + " | ".join(per_stat_parts))
 
         if early_stopping_patience is not None and epochs_since_improvement >= early_stopping_patience:
             print(f"Early stopping at epoch {epoch}: no improvement for "
@@ -607,7 +778,8 @@ def train_autoencoder(
     return checkpoint_path
 
 
-def freeze_outer_layers(ae: Autoencoder | EncoderDecoderPair, n_frozen_stages: int) -> list[torch.nn.Module]:
+def freeze_outer_layers(ae: Autoencoder | EncoderDecoderPair | MultiStreamAutoencoder,
+                         n_frozen_stages: int) -> list[torch.nn.Module]:
     """
     Freezes the OUTERMOST n_frozen_stages layers on each side (closest to
     real space, farthest from the latent bottleneck): the encoder's
@@ -662,29 +834,38 @@ def freeze_outer_layers(ae: Autoencoder | EncoderDecoderPair, n_frozen_stages: i
     frozen_modules: list[torch.nn.Module] = []
     if n_frozen_stages <= 0:
         return frozen_modules
-    for block in ae.encoder.down_blocks[:n_frozen_stages]:
+    # MultiStreamAutoencoder doesn't expose .encoder/.decoder directly
+    # (only .encoders["shared"]/.decoders["shared"], see its own
+    # docstring on why) -- Autoencoder/EncoderDecoderPair still do.
+    encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+    decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
+    for block in encoder.down_blocks[:n_frozen_stages]:
         for p in block.parameters():
             p.requires_grad_(False)
         frozen_modules.append(block)
-    for block in ae.decoder.up_blocks[-n_frozen_stages:]:
+    for block in decoder.up_blocks[-n_frozen_stages:]:
         for p in block.parameters():
             p.requires_grad_(False)
         frozen_modules.append(block)
-    for p in ae.decoder.output_conv.parameters():
+    for p in decoder.output_conv.parameters():
         p.requires_grad_(False)
-    frozen_modules.append(ae.decoder.output_conv)
+    frozen_modules.append(decoder.output_conv)
     return frozen_modules
 
 
 def _param_group(key: str) -> str:
     """Groups a state_dict/named_parameters/named_buffers key by its
-    containing block, e.g. 'encoder.down_blocks.0.conv1.weight' ->
-    'encoder.down_blocks.0', 'encoder.bottleneck.weight' ->
-    'encoder.bottleneck'."""
+    containing block. Keys come from MultiStreamAutoencoder specifically
+    (the only kind of model train_stage2 ever builds), e.g.
+    'encoders.shared.down_blocks.0.conv1.weight' ->
+    'encoders.shared.down_blocks.0', 'decoders.shared.output_conv.weight'
+    -> 'decoders.shared.output_conv', 'pathways.deriv.log_output_scale'
+    -> 'pathways.deriv.log_output_scale' (its own group -- a single
+    scalar, not part of a larger block to group further)."""
     parts = key.split(".")
-    if len(parts) >= 3 and parts[1] in ("down_blocks", "up_blocks"):
-        return ".".join(parts[:3])
-    return ".".join(parts[:2])
+    if len(parts) >= 4 and parts[2] in ("down_blocks", "up_blocks"):
+        return ".".join(parts[:4])
+    return ".".join(parts[:3])
 
 
 def _drift_by_block(initial: dict, final: dict) -> dict[str, float]:
@@ -898,7 +1079,7 @@ def train_stage2(
         )
     deriv_stream_name = other_decodable[0]
 
-    # Always EncoderDecoderPair: the multi-stream requirement above
+    # Always MultiStreamAutoencoder: the multi-stream requirement above
     # guarantees len(stream_configs) >= 2 by this point, unlike
     # train_autoencoder's own construction (which still needs to
     # support the single-stream case).
@@ -907,7 +1088,8 @@ def train_stage2(
     decoder = Decoder(output_size=size, out_channels=1, base_channels=model_cfg["base_channels"],
                        latent_channels=recon_stream.channels,
                        latent_spatial_size=recon_stream.spatial_size)
-    ae = EncoderDecoderPair(encoder, decoder).to(device)
+    ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                 stream_configs=stream_configs).to(device)
     ae.load_state_dict(prev["model_state"])
     frozen_modules = freeze_outer_layers(ae, n_frozen_stages)
     if n_frozen_stages > 0:
@@ -1027,11 +1209,11 @@ def train_stage2(
         x_next = window[:, 1]
         dt = dt_window[:, 0].view(-1, 1, 1, 1)
 
-        z_t = ae.encoder(x_t)
+        z_t = ae.encoders["shared"](x_t)
         z0_t = z_t[recon_stream_name]
         z1_t = z_t[deriv_stream_name]
 
-        x_recon = ae.decoder(z0_t)
+        x_recon = ae.decoders["shared"](z0_t) * torch.exp(ae.pathways[recon_stream_name].log_output_scale)
         recon = recon_loss(x_recon, x_t)
 
         stats_pred = stats_head(z0_t)
@@ -1062,7 +1244,7 @@ def train_stage2(
         # rather than z1 genuinely learning to predict a trajectory
         # that's independently anchored by L_recon.
         with torch.no_grad():
-            z0_next = ae.encoder(x_next)[recon_stream_name]
+            z0_next = ae.encoders["shared"](x_next)[recon_stream_name]
         target_deriv = (z0_next - z0_t.detach()) / dt
         deriv_loss = recon_loss(z1_t, target_deriv)
 

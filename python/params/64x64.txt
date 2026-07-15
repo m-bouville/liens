@@ -4,17 +4,30 @@ base 		  = ../datasets	# optional -- falls back to --base if omitted
 Nx			  =  64
 Ny			  =  64
 
+min_step 	  = 3000       	# skip snapshots earlier than this step
+min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
+min_std_deriv = 0.0002		# skip time derivatives whose stdev is below this
+
+# deriv_output_scale=1.  		# default: 1.e-3
+
+# force 	      = True
+
+augment       = True		# False: speed things up for quick tests
+
+
 
 # Stage 1
 #   autoencoder
-latent_channels= 16
 
-min_step 	  = 3000       	# skip snapshots earlier than this step
-min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
+latent_names    = state, deriv
+latent_modes    = autoencoder, decoder
+latent_channels_decoder= 6
+latent_spatial_decoder=  8   # optional, defaults to 8 (models.constants.LATENT_SPATIAL_SIZE)
+
 stats_weight  = 0.01     	# weight of L_stats relative to L_recon
 
-epochs 		  =  50			# note: stage 1 is augmented
-patience 	  =  10        	# renamed to early_stopping_patience internally
+epochs 		  =  60			# note: stage 1 is augmented
+patience 	  =   5        	# renamed to early_stopping_patience internally
 batches		  = 128
 
 # force 	    = True     	# uncomment to always retrain this stage,
@@ -22,15 +35,13 @@ batches		  = 128
 
 # Stage 2
 #   latent-space validation (interpolation-consistency fine-tuning)
-min_step 	  = same
-min_stdev_phi = same      	# inherit stage 1's value instead of repeating it
 
 stats_weight  = same     	# weight of L_stats relative to L_recon
 interp_weight = 0.001
-n_frozen_stages= 0
+n_frozen_stages= 2
 
 epochs 		  =  100		# note: stage 2 is not augmented
-patience 	  =   20
+patience 	  =   10
 batches 	  = same
 # epochs 		= 0    		# uncomment to SKIP this stage entirely --
 							# stage 3 would then use stage 1's output directly
@@ -41,12 +52,12 @@ batches 	  = same
 n_rollout_steps= 1
 stats_weight  = 0.01
 
-min_step 	  = same
-min_stdev_phi = same
-
 batches		  = 512
 epochs 		  = 500
 patience 	  =  50
+
+# force 	    = True
+
 
 # Stage 3b
 #   latent dynamics surrogate (rollout)
@@ -54,12 +65,11 @@ n_rollout_steps= 2
 stats_weight  = 0.01
 one_step_weight= 0.
 
-min_step 	  = 3000
-min_stdev_phi = 0.01
-
 batches		  = 512
 epochs 		  = 500
 patience 	  =  50
+
+# force 	    = True
 
 
 # Stage 4
@@ -69,9 +79,6 @@ recon_weight   = 0.5       # small but NONZERO anchor -- pick a value, this is a
 stats_weight   = 0.01
 
 n_rollout_steps= same
-
-min_step 	  = 3000
-min_stdev_phi = 0.01
 
 batches		  = 256
 epochs 		  =  50
@@ -85,9 +92,6 @@ recon_weight   = 1.0        # now primary, per the original design intent
 stats_weight   = 0.01
 
 n_rollout_steps= same      # match stage 4's -- same reasoning as before
-
-min_step       = same
-min_stdev_phi  = same
 
 batches        = 256
 epochs         =  30

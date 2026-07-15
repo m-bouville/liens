@@ -66,7 +66,8 @@ def build_models_from_components(
         decoder = Decoder(output_size=encoder_cfg["size"], out_channels=in_channels,
                            base_channels=encoder_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder).to(device)
+        ae = EncoderDecoderPair(encoder, decoder, stream_name=recon_stream_name,
+                                 mode=recon_stream.mode).to(device)
 
     # Reassemble the combined Autoencoder's state_dict by re-adding the
     # "encoder."/"decoder." prefixes ComponentCheckpoint's _strip_prefix
@@ -88,10 +89,22 @@ def build_models_from_components(
             f"definition (shape mismatch): {e}. Likely a version mismatch between "
             f"this codebase and whatever produced the checkpoint."
         ) from e
-    if result.missing_keys or result.unexpected_keys:
+    # log_output_scale is a genuinely NEW, model-level attribute (see
+    # autoencoder.py's own EncoderDecoderPair) -- never part of either
+    # component's own state_dict, so it's always "missing" when
+    # reassembling from componentized encoder/decoder checkpoints,
+    # regardless of when they were saved. Its absence here means
+    # "this checkpoint predates the scale-correction feature," not a
+    # real version mismatch -- defaults to log_output_scale=0 (scale=1,
+    # no correction), the same as if the feature never existed, exactly
+    # matching what these older checkpoints actually did. Filtered out
+    # before the strict check below so a REAL missing/unexpected key
+    # (an actual version mismatch) still raises.
+    missing_keys = [k for k in result.missing_keys if not k.endswith("log_output_scale")]
+    if missing_keys or result.unexpected_keys:
         raise ValueError(
             f"Reassembled Autoencoder state_dict doesn't match the current model "
-            f"definition -- missing keys: {result.missing_keys}, unexpected keys: "
+            f"definition -- missing keys: {missing_keys}, unexpected keys: "
             f"{result.unexpected_keys}. Likely a version mismatch between this codebase "
             f"and whatever produced the checkpoint."
         )

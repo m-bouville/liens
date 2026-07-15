@@ -61,7 +61,7 @@ def test_train_autoencoder_c1_alternation_actually_trains_deriv_stream(tmp_path)
         epochs=2, batch_size=4, base_channels=4,
         latent_names=["state", "deriv"], latent_modes=["autoencoder", "decoder"],
         latent_channels_decoder=4, latent_spatial_decoder=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats_weight=0.0,
         checkpoint_path=checkpoint_path, device="cpu", seed=0,
         log_every_epoch=True, loss_curve_path=tmp_path / "curve.png",
@@ -70,8 +70,8 @@ def test_train_autoencoder_c1_alternation_actually_trains_deriv_stream(tmp_path)
 
     checkpoint = torch.load(result_path, map_location="cpu", weights_only=True)
     state = checkpoint["model_state"]
-    assert "encoder.bottlenecks.deriv.weight" in state
-    deriv_weight_after = state["encoder.bottlenecks.deriv.weight"]
+    assert "encoders.shared.bottlenecks.deriv.weight" in state
+    deriv_weight_after = state["encoders.shared.bottlenecks.deriv.weight"]
 
     # Rebuild the SAME architecture fresh (same seed=0 used above) to
     # get the ACTUAL pre-training initial weight, rather than assuming

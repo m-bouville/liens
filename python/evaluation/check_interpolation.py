@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import (
@@ -155,9 +155,11 @@ def check_interpolation(
         decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
                            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
 
     stats_head = StatsHead(
         latent_channels=recon_stream.channels, stat_names=stats_config["stat_names"],
@@ -201,9 +203,9 @@ def check_interpolation(
             x2 = torch.from_numpy(x2_np).unsqueeze(0).unsqueeze(0).to(device)
             x3 = torch.from_numpy(x3_np).unsqueeze(0).unsqueeze(0).to(device)
 
-            z1 = ae.encoder(x1)[recon_stream_name]
-            z2 = ae.encoder(x2)[recon_stream_name]
-            z3 = ae.encoder(x3)[recon_stream_name]
+            z1 = ae_encoder(x1)[recon_stream_name]
+            z2 = ae_encoder(x2)[recon_stream_name]
+            z3 = ae_encoder(x3)[recon_stream_name]
             z_tilde = (1 - alpha) * z1 + alpha * z3
 
             stats_z_tilde = stats_head(z_tilde)
@@ -232,6 +234,8 @@ def check_interpolation(
               f"(positive -> worse over longer spans)")
 
     lo, hi = 0.0, np.percentile(rel_err, 99.5)
+    if hi <= lo:
+        hi = lo + 1e-6  # degenerate (near-)zero-width range -- give the histogram a minimal, non-zero span
     n_outside = int((rel_err > hi).sum())
 
     fig, ax = plt.subplots(figsize=(8, 6))

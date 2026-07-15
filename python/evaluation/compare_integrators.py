@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -100,9 +100,11 @@ def main():
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     ae.eval()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
 
     f_theta = LatentDynamics(
         latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
@@ -115,7 +117,7 @@ def main():
     # window_length=3: need (t-dt_prev, t, t+dt_curr) triplets, one more
     # step than one-step training/checking used.
     dataset = MicrostructureEvolutionDataset(
-        test_dirs, encoder=ae.encoder, device=device, window_length=3,
+        test_dirs, encoder=ae_encoder, device=device, window_length=3,
         min_step=min_step, min_stdev_phi=min_stdev_phi,
     )
     print(f"Evaluating {len(dataset)} test triplets...")

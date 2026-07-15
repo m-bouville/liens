@@ -713,11 +713,15 @@ class MicrostructureEvolutionDataset(Dataset):
         -- augmenting a cached LATENT has no well-defined meaning here
         (unlike a raw pixel grid, there's no established correspondence
         between D4/translating the 8x8 latent grid and any real
-        symmetry of the underlying physics) -- and to stat_names=None,
-        since MicrostructureSnapshotDataset's matching angle-statistic
-        transform (_transform_angle) isn't implemented here; combining
-        augment=True with either raises at construction, not a silent
-        wrong answer.
+        symmetry of the underlying physics). If stat_names includes
+        "angle", it's corrected the same way
+        MicrostructureSnapshotDataset's own augmentation corrects it
+        (_transform_angle, applied using the SAME (k, flip) the window
+        itself was transformed by) -- so "angle" correctly describes
+        the augmented frame's actual orientation, not the unaugmented
+        one. Every other stat (avg_phi, stdev_phi, etc.) is a
+        rotation/flip-invariant scalar, unaffected by which augmented
+        variant produced the frame, and needs no correction at all.
 
         min_std_deriv: None (default) -- no filtering beyond
         min_step/min_stdev_phi. If given, ALSO excludes any candidate
@@ -758,13 +762,6 @@ class MicrostructureEvolutionDataset(Dataset):
                 "mode) -- augmenting a cached LATENT has no well-defined meaning (see this "
                 "constructor's own docstring). Pass encoder=None if you want augmented raw-pixel "
                 "windows."
-            )
-        if augment and stat_names is not None:
-            raise ValueError(
-                "augment=True was given together with stat_names -- the matching angle-statistic "
-                "transform isn't implemented for this class (see this constructor's own "
-                "docstring), so this combination would silently produce statistics that don't "
-                "match the augmented (flipped/rotated) frames. Not supported."
             )
         if min_std_deriv is not None and encoder is not None:
             raise ValueError(
@@ -896,20 +893,20 @@ class MicrostructureEvolutionDataset(Dataset):
 
         window = self._run_data[run_idx][start:end]  # (window_length, C, 8, 8) or (window_length, 1, ny, nx)
 
+        aug_k = aug_flip = None
         if aug_idx is not None:
             # The SAME (k, flip, shift) applied to EVERY frame in the
             # window -- not independently per frame, which would make
             # the window describe a physically meaningless "evolution"
             # (see _apply_augmentation's own docstring). window is
-            # (window_length, C, H, W); apply per-frame and re-stack,
-            # discarding the per-frame k/flip (identical across frames
-            # by construction, and unused here -- stat_names=None is
-            # guaranteed whenever augment=True, so there's no angle
-            # statistic that would need it).
+            # (window_length, C, H, W); apply per-frame and re-stack.
+            # k/flip captured here (not discarded) -- needed below to
+            # correct the "angle" stat, if stat_names includes it, to
+            # match the augmented frame's actual orientation.
             nx, ny = self._run_nx[run_idx], self._run_ny[run_idx]
-            window = torch.stack([
-                _apply_augmentation(frame, aug_idx, nx, ny)[0] for frame in window
-            ])
+            transformed = [_apply_augmentation(frame, aug_idx, nx, ny) for frame in window]
+            window = torch.stack([t[0] for t in transformed])
+            aug_k, aug_flip = transformed[0][1], transformed[0][2]  # identical across frames by construction
 
         steps = self._run_steps[run_idx][start:end]
         dt_scale = self._run_dt_scale[run_idx]
@@ -929,6 +926,9 @@ class MicrostructureEvolutionDataset(Dataset):
             self._stats_by_run[run_dir].loc[start_step, self.stat_names].to_numpy(dtype=float),
             dtype=torch.float32,
         )
+        if aug_idx is not None and "angle" in self.stat_names:
+            angle_idx = self.stat_names.index("angle")
+            true_stats[angle_idx] = _transform_angle(true_stats[angle_idx], aug_k, aug_flip)
         return window, dt_window, theta, true_stats
 
     def window_info(self, idx: int) -> tuple[Path, list[int]]:

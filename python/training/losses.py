@@ -71,7 +71,7 @@ class StatsLoss(nn.Module):
         # stat is untouched.
         self.angle_idx = stat_names.index("angle") if stat_names and "angle" in stat_names else None
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _wrapped_diff(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target_norm = (target - self.mean) / self.std
         diff = pred - target_norm
         if self.angle_idx is not None:
@@ -83,7 +83,26 @@ class StatsLoss(nn.Module):
             wrapped = ((angle_diff + period / 2) % period) - period / 2
             diff = diff.clone()
             diff[..., self.angle_idx] = wrapped
+        return diff
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        diff = self._wrapped_diff(pred, target)
         return (diff ** 2).mean()
+
+    def per_stat_mse(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Same computation as forward(), but mean over the BATCH dim only,
+        returning (n_stats,) instead of collapsing everything into one
+        scalar -- lets a caller see which specific stats a given latent
+        actually predicts well versus poorly, rather than only their
+        blended average. Exists specifically because bulk-derived stats
+        (e.g. avg_phi) and interface-derived ones can have very
+        different answerability from a given stream (e.g. the deriv
+        stream, which only ever sees interface motion) -- collapsing
+        them into one number would hide exactly that distinction.
+        """
+        diff = self._wrapped_diff(pred, target)
+        return (diff ** 2).mean(dim=tuple(range(diff.ndim - 1)))
 
 
 class OneStepLoss(nn.Module):

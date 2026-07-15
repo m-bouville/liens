@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 from evaluation.check_rollout import _format_small, _padded_bounds
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import (
@@ -130,22 +130,24 @@ def rank_channel_importance(
     n_samples = min(n_samples, len(dataset))
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(len(dataset), generator=generator)[:n_samples].tolist()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+    ae_decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
 
     latent_channels = None
     total_delta = None
     with torch.no_grad():
         for idx in indices:
             x = dataset[idx].unsqueeze(0).to(device)
-            z = ae.encoder(x)[recon_stream_name]
+            z = ae_encoder(x)[recon_stream_name]
             if latent_channels is None:
                 latent_channels = z.shape[1]
                 total_delta = np.zeros(latent_channels)
-            x_recon_full = ae.decoder(z)
+            x_recon_full = ae_decoder(z)
             base_loss = recon_loss(x_recon_full, x).item()
             for c in range(latent_channels):
                 z_ablated = z.clone()
                 z_ablated[:, c] = 0.0
-                x_recon_ablated = ae.decoder(z_ablated)
+                x_recon_ablated = ae_decoder(z_ablated)
                 ablated_loss = recon_loss(x_recon_ablated, x).item()
                 total_delta[c] += ablated_loss - base_loss
     return total_delta / n_samples
@@ -187,9 +189,12 @@ def check_latent_channels(
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+    ae_decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
 
     nx, ny = ae_config["size"], ae_config["size"]
 
@@ -248,7 +253,7 @@ def check_latent_channels(
         for run_dir, step in frames:
             x_raw = load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny)
             x = torch.from_numpy(x_raw).unsqueeze(0).unsqueeze(0).to(device)
-            z_dict = ae.encoder(x)
+            z_dict = ae_encoder(x)
             all_x.append(x_raw)
             all_z.append({name: z_dict[name][0].cpu().numpy() for name in stream_order})
 

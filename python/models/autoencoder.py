@@ -14,7 +14,72 @@ from .latent_streams import DEFAULT_STREAM_NAME, LatentStreamConfig, LatentStrea
 _STREAM_NAME = DEFAULT_STREAM_NAME
 
 
-class Autoencoder(nn.Module):
+class EncoderDecoderPair(nn.Module):
+    """
+    ONE decode PATHWAY: reads a single named stream's z out of
+    encoder(x) (encoder may know about other streams too -- this
+    pathway only ever touches its own), decodes it through decoder,
+    and applies that stream's own output-scale correction.
+
+    The scale exists because a decodable stream that ISN'T the
+    reconstruction target (e.g. a time-derivative stream, C1) needs D
+    to produce a very different-scale output than state -- state
+    (~O(0.1-1)) vs a real physical derivative (~O(1e-4..1e-3),
+    inherently far smaller than the state it's a rate of change OF) --
+    while its INPUT to D is comparable in scale to any other stream's
+    (both come from bottleneck convs built the same way). D itself has
+    no way to know which stream produced whichever z it's holding, so
+    its raw output is always state-scale regardless -- this pathway's
+    own output-scale is what actually closes that gap, applied AFTER
+    decode, not by distorting D's input.
+
+    learnable_scale is decided ONCE, at construction, from the
+    stream's own LatentStreamMode -- not a flag every call site has to
+    remember to set correctly:
+      - AUTOENCODER-mode (decoding a stream against ITS OWN input,
+        i.e. a genuine reconstruction): scale is stored as a BUFFER,
+        not a Parameter -- constant 1.0 (log_output_scale=0),
+        structurally UNABLE to be trained, not merely defaulted there.
+        A stream decoding as itself is, by definition, already at
+        whatever scale D was built to produce; there is no other scale
+        for it to calibrate to, so nothing should ever be able to move
+        this away from 1.0, not even by accident.
+      - DECODER-mode (decoded, but compared against something OTHER
+        than its own input -- e.g. C1 vs a finite-difference
+        derivative): scale is a real nn.Parameter, log-parameterized
+        (guarantees positivity for free, and avoids the optimizer
+        needing to approach zero asymptotically from the positive
+        side -- there's no reason this scale would ever need to change
+        sign, it's a pure magnitude correction).
+      - PURE_LATENT streams are never decoded at all (see
+        latent_streams.LatentStreamMode) -- constructing a pathway for
+        one is a caller mistake, refused outright.
+
+    Whether the scale is a buffer or a Parameter, callers can always
+    read pathway.log_output_scale uniformly -- no branching on "is
+    this one learnable" needed anywhere downstream.
+    """
+    def __init__(self, encoder: Encoder, decoder: Decoder, stream_name: str, mode: LatentStreamMode):
+        super().__init__()
+        if mode == LatentStreamMode.PURE_LATENT:
+            raise ValueError(f"stream '{stream_name}' is pure_latent -- cannot build a decode "
+                              f"pathway for a stream declared never-decodable")
+        self.encoder = encoder
+        self.decoder = decoder
+        self.stream_name = stream_name
+        self.mode = mode
+        if mode == LatentStreamMode.AUTOENCODER:
+            self.register_buffer("log_output_scale", torch.zeros(()))
+        else:
+            self.log_output_scale = nn.Parameter(torch.zeros(()))
+
+    def forward(self, x: torch.Tensor):
+        z = self.encoder(x)[self.stream_name]
+        x_recon = self.decoder(z) * torch.exp(self.log_output_scale)
+        return x_recon, z
+
+
+class Autoencoder(EncoderDecoderPair):
     """
     Constructs Encoder and Decoder together from a single set of
     hyperparameters -- unlike building them separately, where nothing
@@ -29,8 +94,16 @@ class Autoencoder(nn.Module):
     multi-stream model uses -- Autoencoder is the C0-only path (see the
     project's own design doc: C0 genuinely IS an autoencoder in the
     full sense; other streams, e.g. a time-derivative stream, are NOT,
-    so they're never routed through this wrapper -- see
-    latent_streams.decode_stream, used directly instead).
+    so they're never routed through this wrapper).
+
+    IS an EncoderDecoderPair (a single AUTOENCODER-mode pathway, its
+    own encoder/decoder) rather than a hand-maintained parallel
+    implementation -- inheriting mode=AUTOENCODER from the parent is
+    exactly what makes its log_output_scale a constant, non-trainable
+    buffer (see EncoderDecoderPair's own docstring): a stream decoding
+    as itself has no other scale to calibrate to, and that invariant
+    is enforced by the type itself, not by every caller remembering to
+    leave something unset.
 
     forward() returns (x_recon, z): both are needed downstream (z feeds
     LDS training -- stage 3 onward, refined jointly with the encoder in
@@ -51,8 +124,6 @@ class Autoencoder(nn.Module):
         norm: str = "batch",
         use_skips: bool = False,
     ):
-        super().__init__()
-
         self.size = size
         self.channels = channels
         self.latent_channels = latent_channels
@@ -66,7 +137,7 @@ class Autoencoder(nn.Module):
             )
         }
 
-        self.encoder = Encoder(
+        encoder = Encoder(
             input_size=size,
             in_channels=channels,
             base_channels=base_channels,
@@ -74,7 +145,7 @@ class Autoencoder(nn.Module):
             norm=norm,
             use_skips=use_skips,
         )
-        self.decoder = Decoder(
+        decoder = Decoder(
             output_size=size,
             out_channels=channels,
             base_channels=base_channels,
@@ -83,6 +154,7 @@ class Autoencoder(nn.Module):
             norm=norm,
             use_skips=use_skips,
         )
+        super().__init__(encoder, decoder, stream_name=_STREAM_NAME, mode=LatentStreamMode.AUTOENCODER)
 
     def encode(self, x: torch.Tensor):
         z = self.encoder(x)
@@ -95,41 +167,64 @@ class Autoencoder(nn.Module):
         return self.decoder(z, skips=skips)
 
     def forward(self, x: torch.Tensor):
+        # Overrides EncoderDecoderPair's own forward() -- ONLY because
+        # use_skips needs the separate encode()/decode() calls above
+        # (skip tensors have to be threaded through explicitly);
+        # log_output_scale is still applied, for consistency with
+        # every other pathway, even though it's structurally always
+        # exp(0)=1.0 here (see EncoderDecoderPair's own docstring) --
+        # a harmless, always-identity multiply, not a special case.
         if self.use_skips:
             z, skips = self.encode(x)
             x_recon = self.decode(z, skips=skips)
         else:
             z = self.encode(x)
             x_recon = self.decode(z)
-        return x_recon, z
+        return x_recon * torch.exp(self.log_output_scale), z
 
 
-class EncoderDecoderPair(nn.Module):
+class MultiStreamAutoencoder(nn.Module):
     """
-    Minimal container bundling an Encoder+Decoder pair as ONE nn.Module
-    -- giving .parameters()/.state_dict()/.to(device)/.train()/.eval()
-    uniformly, matching Autoencoder's own convenience, via .encoder/
-    .decoder ATTRIBUTE access (not a plain nn.ModuleDict, which only
-    supports bracket access -- so callers can use ae.encoder/ae.decoder
-    identically regardless of whether ae is a real Autoencoder or this
-    container).
+    Top-level container for the >1-stream case, where Autoencoder
+    itself structurally cannot apply (it only ever knows about ONE
+    AUTOENCODER-mode stream -- see Autoencoder's own docstring).
 
-    Used for the >1-stream case: Autoencoder itself structurally cannot
-    apply there (it only ever knows about ONE AUTOENCODER-mode stream
-    -- see this file's own Autoencoder docstring). Deliberately does
-    NOT implement Autoencoder's forward()/encode()/decode() -- those
-    are single-stream-specific; callers go through .encoder(x)/
-    .decoder(z) directly instead, unwrapping whichever stream they need
-    from Encoder's dict return themselves (see latent_streams.py's
-    decode_stream for the guarded way to do that unwrap).
+    Holds encoders/decoders as NAMED DICTS (nn.ModuleDict), not bare
+    .encoder/.decoder attributes -- today there is exactly one shared
+    trunk feeding every stream ({"shared": encoder}, {"shared":
+    decoder}), but a dict-of-one is a trivial special case of a dict,
+    not a different structure that would need revisiting if a future
+    design ever wanted a separate trunk per stream (or per group of
+    streams) -- the shape of this container doesn't have to change for
+    that, only what's put in the dicts.
 
-    A real, shared class (not duplicated per call site) specifically so
-    every multi-stream consumer -- train_ae.py's training loop,
-    check_reconstruction.py's diagnostic, and whatever else needs to
-    reconstruct a saved multi-stream checkpoint -- builds the exact
-    same state_dict key shape (encoder.*/decoder.*) the same way.
+    pathways (nn.ModuleDict, one EncoderDecoderPair per stream) is
+    where callers actually go for anything -- e.g.
+    model.pathways["deriv"](x) -- rather than manually doing
+    encoder(x)[name] then decoder(z) themselves at every call site the
+    way pre-this-class code had to. That's the actual point of this
+    class: the output-scale correction becomes automatic at the call
+    site, not something every consumer has to remember to apply.
+
+    Each pathway holds a direct reference to the SAME encoder/decoder
+    objects also sitting in self.encoders/self.decoders -- reachable
+    two ways through the module tree (model.encoders["shared"] and
+    model.pathways["deriv"].encoder are the identical object). This is
+    correct, not a bug: PyTorch's own named_parameters()/state_dict()
+    deduplicate by tensor/module identity, not by path, so a shared
+    trunk reachable multiple ways still only contributes its
+    parameters once -- optimizer construction (model.parameters()),
+    .train()/.eval(), and .to(device) all keep working as single calls
+    on this container despite the redundant paths.
     """
-    def __init__(self, encoder: Encoder, decoder: Decoder):
+    def __init__(self, encoders: dict[str, Encoder], decoders: dict[str, Decoder],
+                 stream_configs: dict[str, LatentStreamConfig]):
         super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
+        self.encoders = nn.ModuleDict(encoders)
+        self.decoders = nn.ModuleDict(decoders)
+        self.pathways = nn.ModuleDict({
+            name: EncoderDecoderPair(encoders["shared"], decoders["shared"],
+                                      stream_name=name, mode=cfg.mode)
+            for name, cfg in stream_configs.items()
+            if cfg.mode != LatentStreamMode.PURE_LATENT
+        })

@@ -45,7 +45,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
               f"training (stage 1 requires at least --latent-channels, for instance). "
               f"'# Stage N' must be on its own line, exactly '# Stage' followed by a "
               f"number, nothing else on that line.")
-    base_path = Path(global_params.get("base", default_base))
+    base_path = Path(global_params.pop("base", default_base))
 
     # Nx/Ny: the ONLY source of grid size now (config.txt is no longer
     # read at all -- see module docstring). Checked in both the global
@@ -103,7 +103,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
         return None
 
     # ---- Stage 1: autoencoder ----
-    stage1_kwargs = _prepare_stage_kwargs(stages.get(1, {}))
+    stage1_kwargs = _prepare_stage_kwargs(stages.get(1, {}), global_params)
     force1 = stage1_kwargs.pop("force", False)
     stage1_kwargs = _strip_unrecognized_params(train_autoencoder, stage1_kwargs, "Stage 1")
     signature1 = {"base_path": str(base_path),
@@ -136,7 +136,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print()
 
     # ---- Stage 2: latent-space validation ----
-    stage2_kwargs = _prepare_stage_kwargs(stages.get(2, {}))
+    stage2_kwargs = _prepare_stage_kwargs(stages.get(2, {}), global_params)
     force2 = stage2_kwargs.pop("force", False)
     stage2_kwargs = _strip_unrecognized_params(train_stage2, stage2_kwargs, "Stage 2")
     if stage2_kwargs.get("epochs") == 0:
@@ -155,7 +155,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
         if stage2_checkpoint is None:
             with _log_to_file(stage_output_path(2).with_suffix(".log")):
                 print("=" * 70)
-                print("STAGE 2: latent-space validation (interpolation-consistency fine-tuning)")
+                print("STAGE 2: latent-space validation (L_deriv fine-tuning)")
                 print("=" * 70)
                 registry2_path = _STAGE_DIRS[2] / "registry-stage2.csv"
                 stage2_checkpoint = train_stage2(
@@ -243,7 +243,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
         needs regenerating, matching every other stage's convention of
         not re-running sanity checks against a checkpoint that was
         already reused from the registry, not retrained this run."""
-        kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}))
+        kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}), global_params)
         force = kwargs.pop("force", False)
         kwargs = _strip_unrecognized_params(train_lds, kwargs, f"Stage {stage_key}")
         # Default to quiet (only print on save/early-stop), not train_lds()'s
@@ -395,7 +395,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
         this is comes from the section name itself, not a value inside
         it."""
         freeze_decoder = (stage_key == 4)
-        kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}))
+        kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}), global_params)
         force = kwargs.pop("force", False)
         kwargs = _strip_unrecognized_params(train_refinement, kwargs, f"Stage {stage_key}")
         if resume_from is not None:

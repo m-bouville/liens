@@ -41,7 +41,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import (
@@ -116,9 +116,11 @@ def check_perturbation(
         decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
                            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
 
     stats_head = StatsHead(
         latent_channels=recon_stream.channels, stat_names=stats_config["stat_names"],
@@ -157,7 +159,7 @@ def check_perturbation(
         for run_dir, step in chosen:
             x_np = load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny)
             x = torch.from_numpy(x_np).unsqueeze(0).unsqueeze(0).to(device)
-            z = ae.encoder(x)[recon_stream_name]
+            z = ae_encoder(x)[recon_stream_name]
             stats_z = stats_head(z)  # baseline stats(z), NOT ground truth
 
             deltas = []

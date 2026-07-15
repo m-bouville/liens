@@ -106,12 +106,28 @@ def _convert_value(value: str):
 _LIST_VALUED_KEYS = {"latent_names", "latent_modes"}
 
 
-def _prepare_stage_kwargs(raw_params: dict[str, str]) -> dict:
-    """Converts a parsed stage's raw string params into typed kwargs,
+def _prepare_stage_kwargs(raw_params: dict[str, str], global_params: dict[str, str] | None = None) -> dict:
+    """
+    Converts a parsed stage's raw string params into typed kwargs,
     renaming a few keys (e.g. patience -> early_stopping_patience) to
-    match the underlying function's actual parameter names."""
+    match the underlying function's actual parameter names.
+
+    global_params, if given, supplies a DEFAULT for any key this stage
+    doesn't specify at all -- NOT the same as '= same' (which requires
+    the key to be present in the stage's own section, just pointing at
+    an earlier value): omitting the key here means "use the global
+    default if there is one", while '= same' means "use the specific
+    value from the nearest preceding stage or the global section". The
+    stage's own value always wins over the global default when both
+    are given -- this is a fallback, not an override. Deliberately a
+    plain dict merge, not scoped to any particular set of keys: any
+    global key applies to any stage that happens to accept a parameter
+    by that name (see _strip_unrecognized_params for what happens to
+    ones that don't).
+    """
+    merged = {**(global_params or {}), **raw_params}
     kwargs = {}
-    for key, value in raw_params.items():
+    for key, value in merged.items():
         renamed_key = _KEY_RENAMES.get(key, key)
         if renamed_key in _LIST_VALUED_KEYS:
             kwargs[renamed_key] = [part.strip() for part in value.split(",")]

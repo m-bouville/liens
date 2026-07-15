@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -336,9 +336,12 @@ def check_parameter_dependence(
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     ae.eval()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+    ae_decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
 
     f_theta = LatentDynamics(
         latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
@@ -349,7 +352,7 @@ def check_parameter_dependence(
     f_theta.eval()
 
     dataset = MicrostructureEvolutionDataset(
-        test_dirs, encoder=ae.encoder, device=device, window_length=window_length,
+        test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
         min_step=min_step, min_stdev_phi=min_stdev_phi,
     )
     print(f"Evaluating {len(dataset)} test windows...")
@@ -393,8 +396,8 @@ def check_parameter_dependence(
 
             latent_loss = one_step_loss(z_next_pred, z_next_true).item()
 
-            x_next_pred = ae.decoder(z_next_pred)
-            x_next_true = ae.decoder(z_next_true)
+            x_next_pred = ae_decoder(z_next_pred)
+            x_next_true = ae_decoder(z_next_true)
             pixel_loss = recon_loss(x_next_pred, x_next_true).item()
 
             dts.append(dt.item())

@@ -22,7 +22,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -181,9 +181,10 @@ def train_lds(
         _decoder_module = Decoder(output_size=ae_config["size"], out_channels=1,
                                    base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                                    latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(_encoder_module, _decoder_module).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": _encoder_module}, decoders={"shared": _decoder_module},
+                                     stream_configs=stream_configs).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
-    encoder = ae.encoder
+    encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad_(False)

@@ -184,9 +184,24 @@ def _load_state_dict_into_current_model(ae: Autoencoder, saved_state_dict: dict)
     CURRENT-code model, rather than relying on fresh random
     initialization to happen to match (see module docstring). Renaming
     itself lives in _remap_key, not here -- see that function's own
-    docstring for why."""
+    docstring for why.
+
+    strict=False + explicit missing-key check (not just strict=True):
+    log_output_scale (see autoencoder.py's EncoderDecoderPair) is a
+    genuinely NEW buffer this golden-master fixture predates -- always
+    "missing" here regardless of when the fixture was captured, not a
+    sign of real architecture drift. Filtered out before re-raising so
+    any OTHER missing/unexpected key (genuine drift, what this test
+    exists to catch) still fails loudly.
+    """
     remapped = {_remap_key(key): value for key, value in saved_state_dict.items()}
-    ae.load_state_dict(remapped)
+    result = ae.load_state_dict(remapped, strict=False)
+    missing = [k for k in result.missing_keys if not k.endswith("log_output_scale")]
+    if missing or result.unexpected_keys:
+        raise RuntimeError(
+            f"Error(s) in loading state_dict for {ae.__class__.__name__}: "
+            f"missing keys: {missing}, unexpected keys: {result.unexpected_keys}"
+        )
 
 
 def _compare_against_fixture(fixture_path: Path = _FIXTURE_PATH) -> dict:

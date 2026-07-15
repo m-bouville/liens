@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -157,9 +157,11 @@ def main():
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     ae.eval()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
 
     windows = [parse_fixed_window(s) for s in args.fixed_windows]
     n_steps = len(windows[0][1]) - 1
@@ -170,9 +172,9 @@ def main():
 
     all_errors_a, all_errors_b = [], []
     for run_dir, steps in windows:
-        errors_a = rollout_errors(run_dir, steps, ae.encoder, f_theta_a, ae_config, device,
+        errors_a = rollout_errors(run_dir, steps, ae_encoder, f_theta_a, ae_config, device,
                                    recon_stream_name=recon_stream_name)
-        errors_b = rollout_errors(run_dir, steps, ae.encoder, f_theta_b, ae_config, device,
+        errors_b = rollout_errors(run_dir, steps, ae_encoder, f_theta_b, ae_config, device,
                                    recon_stream_name=recon_stream_name)
         all_errors_a.append(errors_a)
         all_errors_b.append(errors_b)

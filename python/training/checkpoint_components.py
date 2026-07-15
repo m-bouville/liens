@@ -50,10 +50,25 @@ def _strip_prefix(state_dict: dict, prefix: str) -> dict:
     'encoder.down_blocks.0.conv1.weight' -> 'down_blocks.0.conv1.weight'
     for prefix='encoder' -- so the result loads directly into a
     standalone Encoder()/Decoder() instance, not just back into the
-    combined Autoencoder it was saved from.
+    combined model it was saved from.
+
+    Tries BOTH the older, flat "encoder."/"decoder." prefix
+    (Autoencoder, and pre-MultiStreamAutoencoder checkpoints) and the
+    newer "encoders.shared."/"decoders.shared." prefix
+    (MultiStreamAutoencoder -- see autoencoder.py's own docstring on
+    why the container holds a named dict of encoders/decoders, not a
+    bare .encoder/.decoder attribute), using whichever one actually
+    matches keys in this state_dict. A checkpoint has exactly one of
+    these two shapes, never both -- silently returning an empty dict
+    for an unrecognized prefix (the OLD bug here) makes every key the
+    fresh Encoder/Decoder needs look "missing" downstream, not a clean
+    failure at the point where the real mismatch actually is.
     """
-    full_prefix = prefix + "."
-    return {k[len(full_prefix):]: v for k, v in state_dict.items() if k.startswith(full_prefix)}
+    for full_prefix in (f"{prefix}.", f"{prefix}s.shared."):
+        stripped = {k[len(full_prefix):]: v for k, v in state_dict.items() if k.startswith(full_prefix)}
+        if stripped:
+            return stripped
+    return {}
 
 
 def load_ae_components(checkpoint_path: str | Path,

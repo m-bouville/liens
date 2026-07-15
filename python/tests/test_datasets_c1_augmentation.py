@@ -83,17 +83,40 @@ def test_augment_rejects_cached_latent_mode(tmp_path):
         MicrostructureEvolutionDataset([run_dir], encoder=fake_encoder, window_length=2, augment=True)
 
 
-def test_augment_rejects_stat_names(tmp_path):
+def test_augment_correctly_transforms_angle_stat(tmp_path):
+    """"angle" is no longer rejected under augment=True -- it's
+    corrected using the SAME (k, flip) the window itself was
+    transformed by, matching _transform_angle exactly (the same
+    function MicrostructureSnapshotDataset's own augmentation uses)."""
+    from training.datasets import _transform_angle
     run_dir = _build_run_dir(tmp_path, "T800_n010_s1")
-    # Need a statistics.csv for this to get far enough to hit the
-    # augment+stat_names check specifically, not an earlier unrelated error
+    import pandas as pd
+    true_angle = 0.73
+    df = pd.DataFrame({"angle": [true_angle] * 5}, index=[0, 1000, 2000, 3000, 4000])
+    df.index.name = "step"
+    df.to_csv(run_dir / "statistics.csv")
+
+    ds_aug = MicrostructureEvolutionDataset([run_dir], encoder=None, window_length=2,
+                                              augment=True, stat_names=["angle"])
+    for aug_idx in [0, 5, 13, 31]:
+        _, _, _, true_stats = ds_aug[0 * 32 + aug_idx]
+        dihedral_idx, translation_idx = divmod(aug_idx, 4)
+        k, flip = divmod(dihedral_idx, 2)
+        expected = _transform_angle(torch.tensor(true_angle), k, bool(flip))
+        assert abs(true_stats[0].item() - expected.item()) < 1e-4, f"mismatch at aug_idx={aug_idx}"
+
+
+def test_augment_allows_non_angle_stats(tmp_path):
+    """avg_phi/stdev_phi/etc. are rotation/flip-invariant scalars --
+    unlike "angle", combining them with augment=True should NOT raise."""
+    run_dir = _build_run_dir(tmp_path, "T800_n010_s1")
     import pandas as pd
     df = pd.DataFrame({"avg_phi": [0.1] * 5}, index=[0, 1000, 2000, 3000, 4000])
     df.index.name = "step"
     df.to_csv(run_dir / "statistics.csv")
-    with pytest.raises(ValueError, match="angle-statistic"):
-        MicrostructureEvolutionDataset([run_dir], encoder=None, window_length=2,
-                                         augment=True, stat_names=["avg_phi"])
+    ds = MicrostructureEvolutionDataset([run_dir], encoder=None, window_length=2,
+                                          augment=True, stat_names=["avg_phi"])
+    assert len(ds) > 0
 
 
 def test_snapshot_dataset_augmentation_unchanged_by_refactor(tmp_path):

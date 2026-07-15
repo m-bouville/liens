@@ -35,7 +35,7 @@ from pathlib import Path
 import torch
 import pytest
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_dynamics import LatentDynamics
@@ -63,7 +63,7 @@ def _save_ae_checkpoint(path, run_dirs, size=64, base_channels=4, latent_channel
                          latent_spatial_size=_NON_DEFAULT_SPATIAL, multi_stream=False,
                          stale_metadata=False, include_stats_head=True, stat_names=None):
     """
-    Builds and saves a REAL Autoencoder (or EncoderDecoderPair, for
+    Builds and saves a REAL Autoencoder (or MultiStreamAutoencoder, for
     multi_stream) checkpoint -- real weights, real state_dict, exactly
     what train_ae.py itself produces. multi_stream + stale_metadata
     together reproduces the exact "self_heals" scenario: config claims
@@ -82,7 +82,8 @@ def _save_ae_checkpoint(path, run_dirs, size=64, base_channels=4, latent_channel
                            stream_configs=stream_configs)
         decoder = Decoder(output_size=size, out_channels=1, base_channels=base_channels,
                            latent_channels=latent_channels, latent_spatial_size=latent_spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs)
     else:
         ae = Autoencoder(size=size, channels=1, base_channels=base_channels,
                           latent_channels=latent_channels, latent_spatial_size=latent_spatial_size)
@@ -163,6 +164,7 @@ def test_check_latent_channels_non_default_spatial_size(tmp_path, tmp_run_dir):
     assert output_path.exists()
 
 
+@pytest.mark.filterwarnings("ignore:checkpoint's saved config only described streams")
 def test_check_latent_channels_stale_multi_stream_metadata(tmp_path, tmp_run_dir):
     run_dir, steps = tmp_run_dir
     ae_path = tmp_path / "fake-stage2-stale.pt"
@@ -191,6 +193,7 @@ def test_check_reconstruction_non_default_spatial_size(tmp_path, tmp_run_dir):
     assert output_path.exists()
 
 
+@pytest.mark.filterwarnings("ignore:checkpoint's saved config only described streams")
 def test_check_reconstruction_stale_multi_stream_metadata(tmp_path, tmp_run_dir):
     run_dir, steps = tmp_run_dir
     ae_path = tmp_path / "fake-stage2-stale.pt"
@@ -278,6 +281,7 @@ def test_check_parameter_dependence_non_default_spatial_size(tmp_path, tmp_run_d
     assert output_path.exists()
 
 
+@pytest.mark.filterwarnings("ignore:checkpoint's saved config only described streams")
 def test_check_rollout_stale_multi_stream_metadata(tmp_path, tmp_run_dir):
     """THE combination that broke model_assembly.py originally, exercised
     here for check_rollout.py's own (separate) reconstruction path."""

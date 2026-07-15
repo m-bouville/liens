@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from evaluation.check_rollout import _format_small
-from models.autoencoder import EncoderDecoderPair
+from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import (
@@ -100,14 +100,26 @@ def check_reconstruction(
               f"only has a derivative panel for one.")
 
     recon_stream = stream_configs[recon_stream_name]
-    encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                       base_channels=model_cfg["base_channels"], stream_configs=stream_configs).to(device)
-    decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
-                       base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
-                       latent_spatial_size=recon_stream.spatial_size).to(device)
-    ae = EncoderDecoderPair(encoder, decoder).to(device)
+    if len(stream_configs) == 1:
+        ae = Autoencoder(
+            size=model_cfg["size"], channels=1,
+            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
+            latent_spatial_size=recon_stream.spatial_size,
+        ).to(device)
+        encoder, decoder = ae.encoder, ae.decoder
+    else:
+        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs).to(device)
+        decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
+                           base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
+
+    def _pathway_scale(stream_name):
+        return ae.pathways[stream_name].log_output_scale if hasattr(ae, "pathways") else ae.log_output_scale
 
     # window_length=2 (a real consecutive PAIR, not a lone snapshot):
     # needed regardless of whether a derivative panel ends up shown,
@@ -152,7 +164,7 @@ def check_reconstruction(
             dt = dt_window[0].item()
 
             z = encoder(x_t)
-            x_recon = decoder(z[recon_stream_name])
+            x_recon = decoder(z[recon_stream_name]) * torch.exp(_pathway_scale(recon_stream_name))
             loss = recon_loss(x_recon, x_t).item()
 
             x_np = x_t[0, 0].cpu().numpy()
@@ -175,7 +187,7 @@ def check_reconstruction(
 
             if deriv_stream_name is not None:
                 real_deriv_np = ((x_next - x_t) / dt)[0, 0].cpu().numpy()
-                pred_deriv = decoder(z[deriv_stream_name])
+                pred_deriv = decoder(z[deriv_stream_name]) * torch.exp(_pathway_scale(deriv_stream_name))
                 pred_deriv_np = pred_deriv[0, 0].cpu().numpy()
                 deriv_diff_np = pred_deriv_np - real_deriv_np
                 deriv_loss = recon_loss(pred_deriv, (x_next - x_t) / dt).item()
