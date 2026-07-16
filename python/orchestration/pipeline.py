@@ -1,6 +1,6 @@
 """
 The actual pipeline orchestrator: run_from_params_file() runs stages
-1->2->3(a/b)->4->5 as specified by one stage-parameters file. See
+1->1b->2->3(a/b)->4->5 as specified by one stage-parameters file. See
 main.py's own module docstring for the file format, naming convention,
 and caching behavior -- this module is deliberately just the
 orchestration logic itself; main.py stays a thin CLI entry point
@@ -23,7 +23,7 @@ from orchestration.logging_utils import _log_to_file
 from orchestration.paths import _PYTHON_ROOT, _STAGE_DIRS
 from orchestration.stage_params import _prepare_stage_kwargs, _strip_unrecognized_params, parse_stage_params
 from training.checkpoint_components import split_joint_checkpoint_for_evaluation
-from training.train_ae import train_autoencoder, train_stage2
+from training.train_ae import train_autoencoder, train_stage1b, train_stage2
 from training.train_lds import train_lds
 from training.train_refinement import train_refinement
 
@@ -31,12 +31,16 @@ from training.train_refinement import train_refinement
 def run_from_params_file(params_path: Path, default_base: Path,
                           device: str | None = None) -> Path:
     """
-    Runs stages 1->2->3(a/b)->4->5 as specified by a stage-parameters
+    Runs stages 1->1b->2->3(a/b)->4->5 as specified by a stage-parameters
     file, stopping early and returning whichever checkpoint is the LAST
-    one actually produced (stage 3's if no '# Stage 4' section is given,
-    stage 4's if no '# Stage 5', stage 5's if both are present). See the
-    module docstring for the file format, naming convention, and caching
-    behavior (own expected filename, then the parameter registry).
+    one actually produced (stage 1's own if no '# Stage 1b' section is
+    given -- stage 2 REQUIRES a multi-stream (deriv-stream) ancestor,
+    which only stage 1b produces, so stage 2 onward is skipped entirely
+    without it, same "stop early if not configured" convention already
+    used for stage 4/5 below; stage 3's if no '# Stage 4' section is
+    given, stage 4's if no '# Stage 5', stage 5's if both are present).
+    See the module docstring for the file format, naming convention, and
+    caching behavior (own expected filename, then the parameter registry).
     """
     global_params, stages = parse_stage_params(params_path)
     if not stages:
@@ -135,21 +139,72 @@ def run_from_params_file(params_path: Path, default_base: Path,
             )
             print()
 
+    # ---- Stage 1b: deriv stream decoder ----
+    # NOT optional in the same sense stage 4/5 are (those are genuine
+    # refinement add-ons on top of an already-complete stage 3); stage
+    # 1's OWN output is still a complete, usable single-stream
+    # autoencoder on its own. But stage 2 onward all require a
+    # multi-stream (deriv-stream) ancestor, which ONLY stage 1b
+    # produces -- so if it's absent from this params file, the
+    # pipeline stops here, at stage 1's own output, rather than
+    # attempting stage 2 and failing partway through it.
+    if "1b" not in stages:
+        print("No '# Stage 1b' section given -- stopping after stage 1 "
+              "(stage 2 onward all require stage 1b's deriv-stream output).\n")
+        return stage1_checkpoint
+
+    stage1b_kwargs = _prepare_stage_kwargs(stages.get("1b", {}), global_params)
+    force1b = stage1b_kwargs.pop("force", False)
+    stage1b_kwargs = _strip_unrecognized_params(train_stage1b, stage1b_kwargs, "Stage 1b")
+    signature1b = {"base_path": str(base_path),
+                   "stage1_checkpoint": str(stage1_checkpoint),
+                   **extra_signature, **_signature_kwargs(stage1b_kwargs)}
+    stage1b_checkpoint = resolve_checkpoint("1b", force1b, signature1b, stage1b_kwargs.get("epochs"))
+    if stage1b_checkpoint is None:
+        with _log_to_file(stage_output_path("1b").with_suffix(".log")):
+            print("=" * 70)
+            print("STAGE 1b: deriv stream decoder")
+            print("=" * 70)
+            registry1b_path = _STAGE_DIRS["1b"] / "registry-stage1b.csv"
+            stage1b_checkpoint = train_stage1b(
+                base_path=base_path, resume_from=stage1_checkpoint,
+                checkpoint_path=stage_output_path("1b"), device=device,
+                loss_curve_path=_PYTHON_ROOT.parent / "output" / f"stage1b/{stage_output_path('1b').stem}-loss_curve.png",
+                on_checkpoint_saved=_make_checkpoint_callback(registry1b_path, signature1b),
+                **stage1b_kwargs,
+            )
+            print(f"\nStage 1b complete: {stage1b_checkpoint}\n")
+            _upsert_registry(registry1b_path, stage1b_checkpoint, signature1b)
+
+            print("=" * 70)
+            print("Sanity check: reconstruction quality (stage 1b checkpoint)")
+            print("=" * 70)
+            check_reconstruction(
+                checkpoint_path=stage1b_checkpoint, device=device,
+                min_step=stage1b_kwargs.get("min_step", 0),
+                output_path=_PYTHON_ROOT.parent / "output" / f"stage1b/{stage1b_checkpoint.stem}-reconstruction.png",
+            )
+            print()
+
     # ---- Stage 2: latent-space validation ----
     stage2_kwargs = _prepare_stage_kwargs(stages.get(2, {}), global_params)
     force2 = stage2_kwargs.pop("force", False)
     stage2_kwargs = _strip_unrecognized_params(train_stage2, stage2_kwargs, "Stage 2")
     if stage2_kwargs.get("epochs") == 0:
-        print("Stage 2: epochs=0 -> skipping, using stage 1's output directly\n")
-        stage2_checkpoint = stage1_checkpoint
+        print("Stage 2: epochs=0 -> skipping, using stage 1b's output directly\n")
+        stage2_checkpoint = stage1b_checkpoint
     else:
         # Naming note: registries use a consistent "stageN_checkpoint" ancestry
         # convention across ALL stages, independent of whatever the underlying
         # function calls its own parameter (train_stage2 calls it resume_from,
-        # train_lds calls it ae_checkpoint_path) -- so "stage1_checkpoint" means
-        # the same thing everywhere you look, in any registry.
+        # train_lds calls it ae_checkpoint_path) -- so "stage1b_checkpoint" means
+        # the same thing everywhere you look, in any registry. Stage 2's direct
+        # ancestor is stage 1b now (not stage 1 -- stage 1b's own model_state
+        # already carries everything stage 1 trained forward unchanged, see
+        # train_stage1b's own docstring), so the signature reflects THAT
+        # ancestry, not stage 1's.
         signature2 = {"base_path": str(base_path),
-                       "stage1_checkpoint": str(stage1_checkpoint),
+                       "stage1b_checkpoint": str(stage1b_checkpoint),
                        **extra_signature, **_signature_kwargs(stage2_kwargs)}
         stage2_checkpoint = resolve_checkpoint(2, force2, signature2, stage2_kwargs.get("epochs"))
         if stage2_checkpoint is None:
@@ -159,7 +214,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 registry2_path = _STAGE_DIRS[2] / "registry-stage2.csv"
                 stage2_checkpoint = train_stage2(
-                    base_path=base_path, resume_from=stage1_checkpoint,
+                    base_path=base_path, resume_from=stage1b_checkpoint,
                     checkpoint_path=stage_output_path(2), device=device,
                     loss_curve_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage_output_path(2).stem}-loss_curve.png",
                     on_checkpoint_saved=_make_checkpoint_callback(registry2_path, signature2),

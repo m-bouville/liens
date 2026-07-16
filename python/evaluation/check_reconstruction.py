@@ -100,6 +100,7 @@ def check_reconstruction(
               f"only has a derivative panel for one.")
 
     recon_stream = stream_configs[recon_stream_name]
+    decoder_for_stream = model_cfg.get("decoder_for_stream")
     if len(stream_configs) == 1:
         ae = Autoencoder(
             size=model_cfg["size"], channels=1,
@@ -107,7 +108,8 @@ def check_reconstruction(
             latent_spatial_size=recon_stream.spatial_size,
         ).to(device)
         encoder, decoder = ae.encoder, ae.decoder
-    else:
+    elif decoder_for_stream is None:
+        # Stage 2's own format: every stream shares ONE decoder.
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
                            base_channels=model_cfg["base_channels"], stream_configs=stream_configs).to(device)
         decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
@@ -115,11 +117,37 @@ def check_reconstruction(
                            latent_spatial_size=recon_stream.spatial_size).to(device)
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
                                      stream_configs=stream_configs).to(device)
+    else:
+        # Stage 1b's own format: a SEPARATE decoder per stream (see
+        # autoencoder.py's MultiStreamAutoencoder -- decoder_for_stream
+        # maps each stream name to which decoder key its own pathway
+        # reads from). One Decoder built per UNIQUE decoder key
+        # referenced, sized from whichever stream actually uses it
+        # (today, always exactly one stream per decoder key, but this
+        # doesn't assume that -- the last stream seen for a given key
+        # wins if more than one ever mapped to the same decoder, same
+        # as any dict-building loop).
+        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs).to(device)
+        decoders = {}
+        for stream_name, decoder_key in decoder_for_stream.items():
+            stream_cfg = stream_configs[stream_name]
+            decoders[decoder_key] = Decoder(
+                output_size=model_cfg["size"], out_channels=1,
+                base_channels=model_cfg["base_channels"], latent_channels=stream_cfg.channels,
+                latent_spatial_size=stream_cfg.spatial_size,
+            ).to(device)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
+                                     stream_configs=stream_configs,
+                                     decoder_for_stream=decoder_for_stream).to(device)
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
 
     def _pathway_scale(stream_name):
         return ae.pathways[stream_name].log_output_scale if hasattr(ae, "pathways") else ae.log_output_scale
+
+    def _pathway_decoder(stream_name):
+        return ae.pathways[stream_name].decoder if hasattr(ae, "pathways") else ae.decoder
 
     # window_length=2 (a real consecutive PAIR, not a lone snapshot):
     # needed regardless of whether a derivative panel ends up shown,
@@ -164,7 +192,7 @@ def check_reconstruction(
             dt = dt_window[0].item()
 
             z = encoder(x_t)
-            x_recon = decoder(z[recon_stream_name]) * torch.exp(_pathway_scale(recon_stream_name))
+            x_recon = _pathway_decoder(recon_stream_name)(z[recon_stream_name]) * torch.exp(_pathway_scale(recon_stream_name))
             loss = recon_loss(x_recon, x_t).item()
 
             x_np = x_t[0, 0].cpu().numpy()
@@ -187,7 +215,7 @@ def check_reconstruction(
 
             if deriv_stream_name is not None:
                 real_deriv_np = ((x_next - x_t) / dt)[0, 0].cpu().numpy()
-                pred_deriv = decoder(z[deriv_stream_name]) * torch.exp(_pathway_scale(deriv_stream_name))
+                pred_deriv = _pathway_decoder(deriv_stream_name)(z[deriv_stream_name]) * torch.exp(_pathway_scale(deriv_stream_name))
                 pred_deriv_np = pred_deriv[0, 0].cpu().numpy()
                 deriv_diff_np = pred_deriv_np - real_deriv_np
                 deriv_loss = recon_loss(pred_deriv, (x_next - x_t) / dt).item()

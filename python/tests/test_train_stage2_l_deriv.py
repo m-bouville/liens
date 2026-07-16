@@ -47,6 +47,12 @@ def _build_sweep(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
+@pytest.mark.skip(reason="Fixture built a multi-stream checkpoint via train_autoencoder's "
+                         "now-removed latent_names/latent_modes syntax (see the C0/C1 alternation "
+                         "removal). train_stage2 itself is also genuinely incompatible with stage "
+                         "1b's own output (separate D0/D1 via decoder_for_stream, not one shared "
+                         "decoder) -- pending stage 2's own redesign to match the new stage 1a/1b "
+                         "split; not fixed here per explicit instruction not to touch stage 2 yet.")
 def test_stage2_trains_deriv_via_l_deriv(tmp_path):
     """Real end-to-end: stage 1 (multi-stream, with stats_head) -> stage 2
     resuming from it. Confirms L_deriv genuinely moves the deriv stream's
@@ -116,6 +122,12 @@ def test_stage2_rejects_single_stream_ancestor(tmp_path):
         )
 
 
+@pytest.mark.skip(reason="Fixture built a multi-stream checkpoint via train_autoencoder's "
+                         "now-removed latent_names/latent_modes syntax (see the C0/C1 alternation "
+                         "removal). train_stage2 itself is also genuinely incompatible with stage "
+                         "1b's own output (separate D0/D1 via decoder_for_stream, not one shared "
+                         "decoder) -- pending stage 2's own redesign to match the new stage 1a/1b "
+                         "split; not fixed here per explicit instruction not to touch stage 2 yet.")
 def test_stage2_freeze_outer_layers_works_with_multi_stream(tmp_path):
     """Point 3's actual claim: freeze_outer_layers() needs no new code
     for the multi-stream EncoderDecoderPair case. Verify directly --

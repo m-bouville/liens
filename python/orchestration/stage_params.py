@@ -19,8 +19,16 @@ def parse_stage_params(path: Path) -> tuple[dict[str, str], dict[int | str, dict
     Returns (global_params, {stage_key: {key: value}}), all values
     still raw strings -- see _prepare_stage_kwargs for type conversion.
     stage_key is an int (1, 2, 3) for ordinary stages, or a string
-    ('3a', '3b') for stage 3's optional two-phase curriculum -- see
-    module docstring.
+    ('1b', '3a', '3b') for stage 1's deriv-stream decoder or stage 3's
+    optional two-phase curriculum -- see module docstring. '1a' is
+    accepted as an ALIAS for plain stage 1 (normalized to the int key
+    1, not kept as a separate '1a' string) -- unlike '3a'/'3b' (two
+    genuinely distinct curriculum phases of stage 3), '1a' isn't a
+    different phase of anything, it's just another, more consistent-
+    looking name for stage 1 itself (matching the project's own
+    '1a'/'1b' pairing convention: stage 1a = single-stream autoencoder,
+    stage 1b = deriv stream decoder). '1b' is NOT touched by this --
+    it's a genuinely distinct stage (train_stage1b), not an alias.
     """
     global_params: dict[str, str] = {}
     stages: dict[int | str, dict[str, str]] = {}
@@ -34,7 +42,9 @@ def parse_stage_params(path: Path) -> tuple[dict[str, str], dict[int | str, dict
             try:
                 current_stage = int(raw_stage)
             except ValueError:
-                current_stage = raw_stage.lower()  # e.g. "3a"
+                current_stage = raw_stage.lower()  # e.g. "3a", "1b"
+                if current_stage == "1a":
+                    current_stage = 1
             current_dict = stages.setdefault(current_stage, {})
             continue
 
@@ -97,13 +107,12 @@ def _convert_value(value: str):
 
 
 # Keys that need a LIST of strings (comma-separated in the params
-# file), not the normal scalar bool/int/float conversion above --
-# currently just the two stream-config keys (see
-# models/latent_streams.build_stream_configs). A fixed set of key
-# NAMES, not a generic "does the value contain a comma" heuristic,
-# specifically so this doesn't misfire on some future unrelated param
-# that happens to also use commas for a different reason.
-_LIST_VALUED_KEYS = {"latent_names", "latent_modes"}
+# file), not the normal scalar bool/int/float conversion above. A
+# fixed set of key NAMES, not a generic "does the value contain a
+# comma" heuristic, specifically so this doesn't misfire on some
+# future unrelated param that happens to also use commas for a
+# different reason.
+_LIST_VALUED_KEYS = {"stat_names"}
 
 
 def _prepare_stage_kwargs(raw_params: dict[str, str], global_params: dict[str, str] | None = None) -> dict:

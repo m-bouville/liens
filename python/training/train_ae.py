@@ -23,10 +23,11 @@ from models.constants import LATENT_SPATIAL_SIZE
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import (
-    DEFAULT_STREAM_NAME, LatentStreamConfig, LatentStreamMode, build_stream_configs,
+    DEFAULT_STREAM_NAME, LatentStreamConfig, LatentStreamMode,
     cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
 )
 from training.checkpoint_criterion import CheckpointCriterionTracker
+from training.checkpoint_components import _strip_prefix
 from training.datasets import MicrostructureEvolutionDataset, MicrostructureSnapshotDataset, \
                                complete_run_dirs, split_run_dirs
 from training.losses import ReconLoss, StatsLoss
@@ -77,39 +78,14 @@ class _RunningStats:
         return mean, var ** 0.5
 
 
-class _PerStatAccumulator:
-    """
-    Running, per-BATCH average of a per-stat tensor (StatsLoss.per_stat_mse's
-    own output) across an epoch -- NOT weighted by batch size (batches are
-    mostly uniform, and this keeps the accumulation as simple as
-    z0_train_stats/z1_train_stats's own _RunningStats usage). Exists
-    specifically to answer "which stats does z1 actually predict well",
-    not just an aggregate scalar that hides the answer.
-    """
-    def __init__(self):
-        self.sum: torch.Tensor | None = None
-        self.n_batches = 0
-
-    def update(self, per_stat: torch.Tensor) -> None:
-        per_stat = per_stat.detach().cpu()
-        self.sum = per_stat if self.sum is None else self.sum + per_stat
-        self.n_batches += 1
-
-    def average(self) -> torch.Tensor | None:
-        return self.sum / self.n_batches if self.sum is not None else None
-
-
 def train_autoencoder(
     size: int, base_path: Path,
     epochs: int = 100, batch_size: int = 64, lr: float = 1e-3,
     base_channels: int = 32, latent_channels: int = 8,
     latent_spatial_size: int = LATENT_SPATIAL_SIZE,
-    latent_names: list[str] | None = None, latent_modes: list[str] | None = None,
-    latent_channels_decoder: int | None = None, latent_spatial_decoder: int | None = None,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     augment: bool = True,
     min_step: int | None = None, min_stdev_phi: float | None = None,
-    min_std_deriv: float | None = None,
     stat_names: list[str] | None = None, stats_weight: float | None = None,
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
     seed: int = 0, checkpoint_path: Path | None = None,
@@ -119,10 +95,24 @@ def train_autoencoder(
     loss_curve_path: Path | None = None,
 ) -> Path:
     """
-    Stage 1: train the AE on individual snapshots with L_recon, and (if
-    stats_weight > 0) L_stats via stats_head.py. Returns the path of the
-    best checkpoint saved (selected on an EMA of val_total, see
-    val_ema_decay).
+    Stage 1a: train a SINGLE-stream AE (state only) on individual
+    snapshots with L_recon, and (if stats_weight > 0) L_stats via
+    stats_head.py. Returns the path of the best checkpoint saved
+    (selected on an EMA of val_total, see val_ema_decay).
+
+    Single-stream, deliberately -- this used to also support an
+    alternating C0/C1 multi-stream mode (train a 'deriv' stream here
+    too, batch-by-batch alternation with C0); see
+    train_ae_pre_stage1b_archive.py for that version. It was replaced
+    by a dedicated stage 1b (train_stage1b, see that function's own
+    docstring for the full reasoning) once an isolation test showed
+    C0-alone here already predicts state correctly, while the
+    alternating version's z0/z1 latent scale never stabilized across
+    a real run -- training C0 with ZERO interference from C1 is
+    exactly what this function now does, by construction, not by
+    argument. Every current caller resumes into stage 1b for the
+    deriv stream; this function no longer knows that stream exists at
+    all.
 
     log_every_epoch: if False, only prints a line when a checkpoint is
     actually saved (plus the early-stopping/final message) -- useful for
@@ -143,45 +133,13 @@ def train_autoencoder(
 
     resume_from: optional checkpoint to initialize model_state/
     stats_head_state from before training starts (e.g. to continue stage
-    1 training itself with more epochs -- NOT how stage 2 works, which
-    is a separate function with a different loss/data structure).
+    1a training itself with more epochs -- NOT how stage 1b/2 work,
+    which are separate functions with different loss/data structures).
 
     early_stopping_patience: stop once val_ema hasn't improved for this
     many consecutive epochs, instead of always running the full `epochs`
     budget -- a data-driven stopping signal rather than a guessed epoch
-    count for "stage 1 is done".
-
-    latent_names/latent_modes/latent_channels_decoder/latent_spatial_decoder:
-    optional multi-stream (C0/C1 redesign) syntax -- see
-    models.latent_streams.build_stream_configs for the exact format.
-    If latent_names is None (default), behaves EXACTLY as before this
-    syntax existed: a single stream, sized by latent_channels/
-    latent_spatial_size, built via Autoencoder directly. If given,
-    latent_channels_decoder/latent_spatial_decoder (falling back to
-    latent_channels/latent_spatial_size if not given) size every
-    decodable stream, and the AUTOENCODER-mode stream trains against
-    L_recon (+ L_stats) exactly as the single-stream case always has.
-
-    If there's exactly one OTHER decodable stream too (the C1/
-    "derivative" role -- exactly one required, not zero-or-more, see
-    the ValueError raised otherwise), it's trained ALTERNATED with C0,
-    batch by batch within the same epoch (not summed into one loss --
-    a C1 batch updates via L_recon1 alone, decoding that stream and
-    comparing against the real finite-difference derivative
-    (x(t+dt)-x(t))/dt from a genuine consecutive-pair window). Both
-    draw from the SAME optimizer (ae.parameters()), so a C1 batch's
-    backward pass also reaches the shared trunk and decoder, not just
-    the deriv stream's own bottleneck projection -- which is the whole
-    point of alternating rather than training the two completely
-    independently. L_stats1 is NOT implemented (deferred, per the
-    project's own design doc -- "not a priority" there) -- C1 is
-    L_recon1 only, no stats_head involvement at all for that stream.
-    checkpoint SELECTION (val_loss/val_loss_ema, what actually decides
-    when to save) still comes from C0 alone -- C1's own val loss is
-    recorded in the checkpoint (val_loss_c1) but doesn't currently
-    factor into that decision; whether/how it should is an open,
-    deferred question (see the project's own todo list), not decided
-    here.
+    count for "stage 1a is done".
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(seed)
@@ -262,104 +220,10 @@ def train_autoencoder(
         persistent_workers=num_workers > 0, pin_memory=device.type == "cuda",
     )
 
-    # See this function's own docstring for the full behavior. Backward
-    # compat is exact: latent_names=None (the default -- no params file
-    # written before this syntax existed will ever set it) takes this
-    # whole block down to a single line, byte-identical to before.
-    if latent_names is not None:
-        if latent_modes is None:
-            raise ValueError("latent_names was given without latent_modes -- both are "
-                              "required together (see build_stream_configs)")
-        stream_configs = build_stream_configs(
-            names=latent_names, modes=latent_modes,
-            channels_decoder=(latent_channels_decoder if latent_channels_decoder is not None
-                               else latent_channels),
-            spatial_decoder=(latent_spatial_decoder if latent_spatial_decoder is not None
-                              else latent_spatial_size),
-        )
-    else:
-        stream_configs = {DEFAULT_STREAM_NAME: LatentStreamConfig(
-            name=DEFAULT_STREAM_NAME, channels=latent_channels, spatial_size=latent_spatial_size,
-            mode=LatentStreamMode.AUTOENCODER,
-        )}
-
-    autoencoder_stream_names = [n for n, c in stream_configs.items()
-                                 if c.mode == LatentStreamMode.AUTOENCODER]
-    if len(autoencoder_stream_names) != 1:
-        raise ValueError(
-            f"train_autoencoder() needs exactly one autoencoder-mode stream to train "
-            f"L_recon/L_stats against (this function trains the reconstruction "
-            f"objective only -- see this function's own docstring), got "
-            f"{len(autoencoder_stream_names)}: {autoencoder_stream_names}"
-        )
-    recon_stream_name = autoencoder_stream_names[0]
-    recon_stream = stream_configs[recon_stream_name]
-
-    # C1 (derivative) training kicks in automatically whenever there's
-    # a second stream to train -- same condition that already switches
-    # model construction to EncoderDecoderPair, no separate flag needed.
-    # Requires EXACTLY one other decodable stream, matching
-    # recon_stream_name's own strictness above: the current design doc
-    # scope is genuinely just state+deriv, and silently guessing at
-    # different behavior for 3+ streams would be worse than a clear
-    # error until that's an actual, considered case.
-    other_decodable = [n for n, c in stream_configs.items()
-                        if n != recon_stream_name and c.mode != LatentStreamMode.PURE_LATENT]
-    if len(other_decodable) > 1:
-        raise ValueError(
-            f"train_autoencoder() only knows how to train ONE other (derivative-role) "
-            f"stream alongside the recon stream, got {len(other_decodable)}: "
-            f"{other_decodable} -- this is a real scope limit, not an oversight."
-        )
-    deriv_stream_name = other_decodable[0] if other_decodable else None
-    train_c1 = deriv_stream_name is not None
-
-    c1_train_loader = c1_val_loader = None
-    if train_c1:
-        # encoder=None (raw pixel pairs, not cached latents): the
-        # encoder is being TRAINED here, so nothing could be cached
-        # against it anyway (unlike stage 3's frozen-encoder use of
-        # this same dataset class). window_length=2 -- exactly one
-        # transition per sample, matching what L_recon1 needs (x(t),
-        # x(t+dt), dt), nothing more. Built from the SAME train_dirs/
-        # val_dirs C0 already split, not a fresh independent split --
-        # C0 and C1 must agree on what's train/val/test, or "test_dirs"
-        # in the saved checkpoint would only be honestly held-out for
-        # one of the two objectives.
-        c1_train_set = MicrostructureEvolutionDataset(
-            train_dirs, encoder=None, window_length=2, augment=augment,
-            min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
-            stat_names=train_set.stat_names if include_stats else None,
-        )
-        c1_val_set = MicrostructureEvolutionDataset(
-            val_dirs, encoder=None, window_length=2,
-            min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
-            stat_names=train_set.stat_names if include_stats else None,
-        )
-        print(f"{len(c1_train_set)} (train, {'augmented' if augment else 'NOT augmented'}) / "
-              f"{len(c1_val_set)} (val, unaugmented) "
-              f"consecutive-pair windows for C1 ('{deriv_stream_name}') training")
-        c1_train_loader = DataLoader(
-            c1_train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-            persistent_workers=num_workers > 0, pin_memory=device.type == "cuda",
-        )
-        c1_val_loader = DataLoader(
-            c1_val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-            persistent_workers=num_workers > 0, pin_memory=device.type == "cuda",
-        )
-
-    if len(stream_configs) == 1:
-        ae = Autoencoder(size=size, channels=1, base_channels=base_channels,
-                          latent_channels=recon_stream.channels,
-                          latent_spatial_size=recon_stream.spatial_size).to(device)
-    else:
-        encoder = Encoder(input_size=size, in_channels=1, base_channels=base_channels,
-                           stream_configs=stream_configs)
-        decoder = Decoder(output_size=size, out_channels=1, base_channels=base_channels,
-                           latent_channels=recon_stream.channels,
-                           latent_spatial_size=recon_stream.spatial_size)
-        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
-                                     stream_configs=stream_configs).to(device)
+    recon_stream_name = DEFAULT_STREAM_NAME
+    ae = Autoencoder(size=size, channels=1, base_channels=base_channels,
+                      latent_channels=latent_channels,
+                      latent_spatial_size=latent_spatial_size).to(device)
 
     recon_loss = ReconLoss()
     params = list(ae.parameters())
@@ -367,35 +231,17 @@ def train_autoencoder(
     stats_head = None
     stats_loss_fn = None
     if include_stats:
-        stats_head = StatsHead(latent_channels=recon_stream.channels, stat_names=train_set.stat_names,
-                                latent_spatial=recon_stream.spatial_size).to(device)
+        stats_head = StatsHead(latent_channels=latent_channels, stat_names=train_set.stat_names,
+                                latent_spatial=latent_spatial_size).to(device)
         mean, std = train_set.stats_normalization()
         stats_loss_fn = StatsLoss(mean.to(device), std.to(device), stat_names=train_set.stat_names)
         params += list(stats_head.parameters())
-
-    # stats_head1: L_stats1, the deriv stream's own analogous anchor --
-    # see step_c1's own docstring for why this predicts the SAME
-    # original stats (not their derivative) from z1. Separate weights
-    # from stats_head (z1 means something fundamentally different from
-    # z0, so this is genuinely a different mapping to learn, not a
-    # reusable one), but the SAME stats_loss_fn instance -- both
-    # predict the identical physical quantities against the identical
-    # normalization, so there's nothing stream-specific to duplicate
-    # there.
-    stats_head1 = None
-    if include_stats and train_c1:
-        deriv_stream = stream_configs[deriv_stream_name]
-        stats_head1 = StatsHead(latent_channels=deriv_stream.channels, stat_names=train_set.stat_names,
-                                 latent_spatial=deriv_stream.spatial_size).to(device)
-        params += list(stats_head1.parameters())
 
     if resume_from is not None:
         prev = torch.load(resume_from, map_location=device, weights_only=True)
         ae.load_state_dict(prev["model_state"])
         if stats_head is not None and prev.get("stats_head_state") is not None:
             stats_head.load_state_dict(prev["stats_head_state"])
-        if stats_head1 is not None and prev.get("stats_head1_state") is not None:
-            stats_head1.load_state_dict(prev["stats_head1_state"])
         print(f"Resumed model weights from {resume_from}")
 
     optimizer = torch.optim.Adam(params, lr=lr)
@@ -409,10 +255,7 @@ def train_autoencoder(
             x = batch.to(device, non_blocking=True)
             stats_target = None
 
-        if len(stream_configs) == 1:
-            x_recon, z = ae(x)
-        else:
-            x_recon, z = ae.pathways[recon_stream_name](x)
+        x_recon, z = ae(x)
         (z0_train_stats if train else z0_val_stats).update(z)
         recon = recon_loss(x_recon, x)
 
@@ -431,114 +274,6 @@ def train_autoencoder(
 
         return total.item(), recon.item(), stats.item()
 
-    def step_c1(batch, train: bool):
-        """
-        C1: decode the deriv stream, compare against the REAL
-        finite-difference derivative (x(t+dt)-x(t))/dt -- L_recon1.
-
-        Uses the SAME optimizer as step() (both draw from
-        ae.parameters(), the full shared trunk+both bottlenecks+
-        decoder) -- this is what makes alternation actually train the
-        shared trunk and decoder from BOTH objectives, not just the
-        deriv bottleneck in isolation, since backward() through
-        ae.pathways[deriv_stream_name](x_t) touches the shared trunk,
-        the deriv bottleneck, AND the shared decoder, not just the one
-        projection.
-
-        NORMALIZED like the old L_interp was (diff_norm/target_norm,
-        per SAMPLE) -- NOT because small dt makes target_deriv diverge
-        (it doesn't: for a genuinely continuous trajectory,
-        (x_next-x_t) shrinks right along with dt, so the ratio
-        converges to the true derivative, not infinity -- and
-        min_step filtering keeps dt >= ~500 here regardless, so this
-        was never the actual mechanism). The real reason is simpler:
-        REGARDLESS of why, target_deriv's magnitude isn't controlled to
-        any particular scale across different samples, and an
-        unnormalized MSE against a variable-magnitude target lets
-        whichever samples happen to have the largest magnitude that
-        epoch dominate the gradient disproportionately -- exactly what
-        this normalization exists to prevent, independent of any
-        specific story for why the magnitude varies.
-
-        The deriv stream's decode pathway (ae.pathways[deriv_stream_name])
-        applies its own learnable output-scale correction internally
-        (see autoencoder.py's EncoderDecoderPair) -- D's raw output is
-        always state-scale (~O(0.1-1)) regardless of which stream
-        produced its input, since D itself has no way to know; a real
-        physical derivative is inherently far smaller (~O(1e-4..1e-3)),
-        so this stream's own pathway carries a genuine nn.Parameter
-        (log-parameterized, trained by the SAME optimizer as everything
-        else here) that closes that gap, applied AFTER decode.
-
-        This REPLACES an earlier, static deriv_output_scale
-        hyperparameter that lived on this function's own signature --
-        confirmed via the per-epoch z0/z1 diagnostics (still tracked
-        below) that a single well-chosen constant genuinely fixed the
-        scale mismatch, which is what justified promoting it to a real,
-        checkpoint-persisted, LEARNABLE parameter instead of leaving it
-        as a hand-tuned constant every caller would need to guess.
-
-        L_stats1 (stats_head1, only when include_stats): predicts the
-        SAME original stats stats_head predicts from z0 -- NOT their
-        time-derivative. A grain boundary's own motion doesn't imply
-        the bulk statistics (volume, anisotropy, length scale, ...)
-        are changing at any comparable rate -- interface velocity and
-        "how fast is avg_phi changing" are related but genuinely
-        different questions, and the former is what z1 actually
-        encodes. Predicting the SAME target stats_head already uses
-        (available directly, no dataset changes needed) tests whether
-        z1 happens to ALSO carry usable information about the current
-        state's bulk statistics, which is an entirely fair question to
-        ask even though z1's primary job (L_recon1) is about motion,
-        not state. Per-stat error is tracked separately (see the
-        epoch-end print) specifically because this is expected to
-        vary a lot by stat -- interface-adjacent quantities plausibly
-        answerable from boundary motion, bulk quantities plausibly not.
-        """
-        if include_stats:
-            window, dt_window, _theta, stats_target = batch
-            stats_target = stats_target.to(device, non_blocking=True)
-        else:
-            window, dt_window, _theta = batch
-        window = window.to(device, non_blocking=True)
-        dt_window = dt_window.to(device, non_blocking=True)
-        x_t = window[:, 0]
-        x_next = window[:, 1]
-        dt = dt_window[:, 0].view(-1, 1, 1, 1)
-
-        pred_deriv, z_deriv = ae.pathways[deriv_stream_name](x_t)
-        (z1_train_stats if train else z1_val_stats).update(z_deriv)
-        target_deriv = (x_next - x_t) / dt
-        # dim=(1,2,3): per-SAMPLE norm over channel+spatial dims (pixel-
-        # space here, unlike L_interp's own latent-space per-channel-
-        # vector norm over dim=1 alone -- same INTENT, adapted to this
-        # tensor's shape). Floor is 1e-6, not L_interp's 1e-3: derivative
-        # magnitudes are inherently tiny (~1e-4..1e-3, see
-        # check_reconstruction.py's own identical floor choice for the
-        # derivative-panel color scale, established for the same
-        # reason) -- 1e-3 would clamp most real samples to a shared
-        # constant, defeating the point of a PER-SAMPLE normalization.
-        diff_norm = torch.linalg.vector_norm(pred_deriv - target_deriv, dim=(1, 2, 3))
-        target_norm = torch.linalg.vector_norm(target_deriv, dim=(1, 2, 3)).clamp_min(1e-6)
-        recon1 = (diff_norm / target_norm).mean()
-
-        if include_stats:
-            stats_pred1 = stats_head1(z_deriv)
-            stats1 = stats_loss_fn(stats_pred1, stats_target)
-            per_stat1 = stats_loss_fn.per_stat_mse(stats_pred1, stats_target).detach()
-            (stats1_per_stat_train if train else stats1_per_stat_val).update(per_stat1)
-            total1 = recon1 + stats_weight * stats1
-        else:
-            stats1 = torch.tensor(0.0)
-            total1 = recon1
-
-        if train:
-            optimizer.zero_grad()
-            total1.backward()
-            optimizer.step()
-
-        return total1.item(), recon1.item(), stats1.item()
-
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
@@ -547,94 +282,38 @@ def train_autoencoder(
     heading = f"/{epochs:3d} "
     heading += (f"train = recon +{stats_weight:6.3f} stats | valid = recon +{stats_weight:6.3f} "
                 f"stats  (e-3)  ema") if include_stats else "train | valid  (e-3)  ema"
-    if train_c1:
-        if include_stats:
-            heading += f"  || C1 ('{deriv_stream_name}') recon +stats | recon +stats  (e-3)"
-        else:
-            heading += f"  || C1 ('{deriv_stream_name}') train | valid  (e-3)"
     print(heading)
 
     for epoch in range(1, epochs + 1):
-        # Fresh each epoch -- see step()/step_c1() for where these get
-        # updated, and the epoch-end print below for where they're
-        # reported. z1 IS what's fed to D now (no input-side rescaling
-        # -- see step_c1's own docstring for why that turned out to be
-        # unnecessary), so tracking it directly is enough; there's no
-        # separate "z1/a" quantity in the computation anymore.
+        # Fresh each epoch -- see step() for where these get updated,
+        # and the epoch-end print below for where they're reported.
+        # Kept even without a second (deriv) stream to compare against
+        # -- monitoring z's own scale over training is a cheap, useful,
+        # general-purpose diagnostic on its own, not something that
+        # only mattered for the alternation this function no longer
+        # does.
         z0_train_stats, z0_val_stats = _RunningStats(), _RunningStats()
-        z1_train_stats, z1_val_stats = _RunningStats(), _RunningStats()
-        stats1_per_stat_train, stats1_per_stat_val = _PerStatAccumulator(), _PerStatAccumulator()
 
         ae.train()
         if stats_head is not None:
             stats_head.train()
-        if stats_head1 is not None:
-            stats_head1.train()
-        # C1 trained INTERLEAVED with C0, batch by batch -- genuine
-        # alternation (see this function's own docstring): one C0
-        # batch, one C1 batch, repeat, NOT running all of C0's batches
-        # then all of C1's in two separate sequential blocks. This
-        # matters for more than just the multi-task-learning framing
-        # (both objectives' gradients staying "fresh" against each
-        # other) -- it also matters for BatchNorm specifically: running
-        # statistics accumulate via momentum-based EMA throughout the
-        # epoch, so whichever objective's batches ran MOST RECENTLY
-        # right before ae.eval() disproportionately shapes what eval
-        # mode actually uses. Two sequential blocks (C0 first, C1
-        # last) would mean validation's BatchNorm stats are skewed
-        # toward C1's specific batch statistics regardless of C0 being
-        # the vastly larger, more representative dataset -- exactly
-        # the kind of bug that shows up as "training looks fine,
-        # validation is inexplicably terrible."
-        #
-        # n_batches = max(C0, C1): whichever is naturally longer (C0,
-        # almost always, given augmentation) runs its own true length;
-        # the other is cycled (restarted) to keep pace, not the other
-        # way around -- but cycling is symmetric in the code below, so
-        # it's correct regardless of which one happens to be shorter.
-        train_total = train_recon = train_stats = train_recon1 = train_stats1 = 0.0
-        n_train = n_train_c1 = 0
-        c0_iter = iter(train_loader)
-        c1_iter = iter(c1_train_loader) if train_c1 else None
-        n_batches = max(len(train_loader), len(c1_train_loader)) if train_c1 else len(train_loader)
 
-        for _ in range(n_batches):
-            try:
-                batch0 = next(c0_iter)
-            except StopIteration:
-                c0_iter = iter(train_loader)
-                batch0 = next(c0_iter)
-            bs0 = batch0[0].size(0) if include_stats else batch0.size(0)
-            total, recon, stats = step(batch0, train=True)
-            train_total += total * bs0
-            train_recon += recon * bs0
-            train_stats += stats * bs0
-            n_train += bs0
-
-            if train_c1:
-                try:
-                    batch1 = next(c1_iter)
-                except StopIteration:
-                    c1_iter = iter(c1_train_loader)
-                    batch1 = next(c1_iter)
-                bs1 = batch1[0].size(0)
-                _, recon1, stats1 = step_c1(batch1, train=True)
-                train_recon1 += recon1 * bs1
-                train_stats1 += stats1 * bs1
-                n_train_c1 += bs1
-
+        train_total = train_recon = train_stats = 0.0
+        n_train = 0
+        for batch in train_loader:
+            bs = batch[0].size(0) if include_stats else batch.size(0)
+            total, recon, stats = step(batch, train=True)
+            train_total += total * bs
+            train_recon += recon * bs
+            train_stats += stats * bs
+            n_train += bs
         train_total /= n_train
         train_recon /= n_train
         train_stats /= n_train
-        if train_c1:
-            train_recon1 /= n_train_c1
-            train_stats1 /= n_train_c1
 
         ae.eval()
         if stats_head is not None:
             stats_head.eval()
-        if stats_head1 is not None:
-            stats_head1.eval()
         val_total = val_recon = val_stats = 0.0
         n_val = len(val_set)
         with torch.no_grad():
@@ -647,21 +326,6 @@ def train_autoencoder(
         val_total /= n_val
         val_recon /= n_val
         val_stats /= n_val
-
-        # C1 validation: sequential (not interleaved) is fine here --
-        # no gradient/parameter-update sequencing concern exists during
-        # eval, unlike training above.
-        val_recon1 = val_stats1 = 0.0
-        if train_c1:
-            n_val_c1 = len(c1_val_set)
-            with torch.no_grad():
-                for batch1 in c1_val_loader:
-                    bs1 = batch1[0].size(0)
-                    _, recon1, stats1 = step_c1(batch1, train=False)
-                    val_recon1 += recon1 * bs1
-                    val_stats1 += stats1 * bs1
-            val_recon1 /= n_val_c1
-            val_stats1 /= n_val_c1
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
@@ -682,41 +346,21 @@ def train_autoencoder(
                     f"{val_ema*1_000:6.3f}")
         else:
             msg += f"{train_total*1_000:7.3f} |{val_total*1_000:7.3f}  {val_ema*1_000:7.3f}"
-        if train_c1:
-            # NOT summed into val_total/val_ema -- see this function's
-            # own docstring: genuine alternation means C1's loss stays
-            # its own, separately-tracked quantity, not folded into the
-            # criterion that drives checkpoint selection (deferred --
-            # see the project's own todo list on whether/how it should
-            # factor in).
-            if include_stats:
-                msg += (f"  ||{train_recon1*1_000:7.3f} +{stats_weight*train_stats1*1_000:6.3f} "
-                        f"|{val_recon1*1_000:7.3f} +{stats_weight*val_stats1*1_000:6.3f}")
-            else:
-                msg += f"  ||{train_recon1*1_000:7.3f} |{val_recon1*1_000:7.3f}"
 
         if saved_this_epoch:
             epochs_since_improvement = 0
             checkpoint = {
                 "model_state": ae.state_dict(),
                 "stats_head_state": stats_head.state_dict() if stats_head is not None else None,
-                "stats_head1_state": stats_head1.state_dict() if stats_head1 is not None else None,
                 "epoch": epoch,
                 "val_loss": val_total,
                 "val_loss_ema": val_ema,
-                # Informational only -- does NOT factor into val_loss/
-                # val_loss_ema above, which still drive checkpoint
-                # SELECTION via C0 alone (see this function's own
-                # docstring; whether/how C1 should factor into that
-                # criterion is an open, deferred question, not decided
-                # here).
-                "val_loss_c1": val_recon1 if train_c1 else None,
                 "normalized": False,
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
                     "size": size, "base_channels": base_channels,
-                    "latent_channels": recon_stream.channels,
-                    "latent_spatial_size": recon_stream.spatial_size,
+                    "latent_channels": latent_channels,
+                    "latent_spatial_size": latent_spatial_size,
                     "stats_weight": stats_weight,
                     # Plain dicts/strings, not the LatentStreamConfig/
                     # LatentStreamMode objects themselves -- this
@@ -724,13 +368,18 @@ def train_autoencoder(
                     # weights_only=True (see the project's own
                     # torch.load convention), which only allow-lists a
                     # fixed set of safe types; custom dataclasses/Enums
-                    # aren't in it. recon_stream_name identifies which
-                    # entry the flat latent_channels/latent_spatial_size
-                    # above describes.
+                    # aren't in it. Still written as a single-entry
+                    # stream_configs (not a bare latent_channels/
+                    # latent_spatial_size pair) so every downstream
+                    # reader (checkpoint_components.py,
+                    # resolve_stream_configs_from_checkpoint_config,
+                    # train_stage1b, every evaluation script) keeps
+                    # working from ONE convention regardless of which
+                    # stage produced a checkpoint.
                     "stream_configs": {
-                        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                               "mode": cfg.mode.value}
-                        for name, cfg in stream_configs.items()
+                        recon_stream_name: {"channels": latent_channels,
+                                             "spatial_size": latent_spatial_size,
+                                             "mode": LatentStreamMode.AUTOENCODER.value}
                     },
                     "recon_stream_name": recon_stream_name,
                 },
@@ -753,22 +402,6 @@ def train_autoencoder(
             z0_val_mean, z0_val_std = z0_val_stats.mean_std()
             print(f"      z0: train mean={z0_train_mean:+.4e} std={z0_train_std:.4e} | "
                   f"val mean={z0_val_mean:+.4e} std={z0_val_std:.4e}")
-            if train_c1:
-                z1_train_mean, z1_train_std = z1_train_stats.mean_std()
-                z1_val_mean, z1_val_std = z1_val_stats.mean_std()
-                print(f"      z1: train mean={z1_train_mean:+.4e} std={z1_train_std:.4e} | "
-                      f"val mean={z1_val_mean:+.4e} std={z1_val_std:.4e} "
-                      f"(this is what actually gets fed to D -- compare its std against z0's own std above)")
-                if include_stats:
-                    train_per_stat = stats1_per_stat_train.average()
-                    val_per_stat = stats1_per_stat_val.average()
-                    if train_per_stat is not None:
-                        per_stat_parts = [
-                            f"{name}: train={train_per_stat[i].item():6.3f} val={val_per_stat[i].item():6.3f}"
-                            for i, name in enumerate(train_set.stat_names)
-                        ]
-                        print(f"      L_stats1 per-stat (normalized MSE, z1 -> stats_head1): "
-                              + " | ".join(per_stat_parts))
 
         if early_stopping_patience is not None and epochs_since_improvement >= early_stopping_patience:
             print(f"Early stopping at epoch {epoch}: no improvement for "
@@ -896,6 +529,583 @@ def compute_weight_drift(
     """
     return (_drift_by_block(initial_params, final_params),
             _drift_by_block(initial_buffers, final_buffers))
+
+
+def train_stage1b(
+    base_path: Path, resume_from: Path,
+    stats_weight: float = 0.0,
+    latent_channels: int | None = None,
+    freeze_encoder: bool = True,
+    cos_weight: float = 0.0,
+    epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
+    val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
+    augment: bool = True,
+    min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_std_deriv: float | None = None,
+    val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
+    seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
+    on_checkpoint_saved: Callable[[Path, int], None] | None = None,
+    log_every_epoch: bool = True,
+    loss_curve_path: Path | None = None,
+) -> Path:
+    """
+    Stage 1b: extends a Stage 1a (single-stream, state-only) checkpoint
+    with a new 'deriv' stream -- its own bottleneck (in the SAME,
+    otherwise-frozen encoder), its own decoder D1, and its own stats
+    anchor stats_head1. Trains ONLY these new pieces; everything from
+    1a (the encoder's trunk + its 'state' bottleneck, D0, stats_head0)
+    is frozen and/or simply not used in this stage's forward pass at
+    all.
+
+    Why a separate stage, not the C0/C1 alternation this project tried
+    before (see train_ae_pre_stage1b_archive.py for that version):
+    training C0 completely alone in stage 1a means z0 stabilizes with
+    ZERO interference from C1 -- confirmed directly, not assumed,
+    since a single-stream-only run was already shown to predict state
+    correctly while the alternating version's z0/z1 scale never
+    stabilized. Freezing the ENTIRE trunk here means stage 1b's own
+    training is structurally UNABLE to destabilize z0 or the trunk --
+    not "less likely to", zero gradient reaches frozen parameters,
+    full stop. A separate D1 (not sharing D0) removes the other
+    standing hypothesis -- conflicting gradients from two different-
+    scale objectives fighting over one decoder's weights -- entirely,
+    not just partially.
+
+    latent_channels: the deriv stream's OWN channel count, independent
+    of state's (each stream has its own, separate bottleneck conv, so
+    a different channel count is genuinely valid -- unconstrained by
+    the shared trunk). None (default) matches state's own channel
+    count. There is deliberately NO equivalent latent_spatial_size
+    parameter here -- unlike channels, spatial_size is NOT
+    independently choosable: Encoder itself hard-requires every stream
+    to share exactly one spatial_size (the shared trunk only ever
+    produces ONE bottleneck resolution, read by every stream's
+    bottleneck conv), enforced at Encoder construction -- before this
+    function's own warm-start logic even runs. deriv's spatial_size is
+    therefore always state's own, inherited automatically, not a
+    choice this function exposes at all.
+
+    freeze_encoder: True (default) is the real, intended training mode
+    -- everything from stage 1a (trunk + state bottleneck) stays
+    frozen, which is the entire point of splitting stage 1a/1b apart
+    (see this function's own opening paragraphs). False is a DIAGNOSTIC
+    override only: it unfreezes the trunk + state bottleneck too,
+    directly testing whether the frozen, reconstruction-only trunk's
+    own activations carry any usable derivative information AT ALL,
+    independent of whatever the deriv bottleneck's own (limited, 1x1
+    conv) readout capacity might otherwise be blamed for. A checkpoint
+    trained this way is not a valid stage-2 ancestor -- z0 will very
+    likely destabilize, the exact problem stage 1a/1b was built to
+    avoid.
+
+    cos_weight: 0.0 (default, off) is the real loss -- L_recon1
+    unmodified. > 0 adds cos_weight * (1 - cos_sim(pred_deriv,
+    target_deriv)) to the total loss -- ANOTHER diagnostic override,
+    not a real training mode. L_recon1's own ratio form
+    (diff_norm/target_norm) has a real structural property worth
+    isolating: when ||pred|| starts far larger than ||target||, the
+    gradient is dominated by shrinking pred's own magnitude (target is
+    nearly negligible in pred-target until the scales get close),
+    which could structurally starve directional learning of gradient
+    signal regardless of whether the information is actually
+    extractable. A large cos_weight removes that ambiguity by
+    optimizing direction directly, with nothing else competing for the
+    gradient -- if cos_sim still can't move off chance level under
+    this, that's substantially stronger evidence of no extractable
+    signal at all than the ratio loss alone could show.
+
+    D1 is warm-STARTED as a copy of D0's own weights (not random init)
+    -- both decode to the same kind of pixel-space microstructure
+    output, so D0's learned spatial-upsampling features are a
+    reasonable prior for D1, free to diverge from there during this
+    stage's own training. Only works when the deriv stream's own
+    latent_channels matches state's (D0/D1 need identical input shapes
+    for a weight copy to even be valid) -- falls back to D1's own
+    random init, with a clear printed message, when it doesn't.
+
+    L_stats1 predicts the SAME original stats stats_head0 predicts
+    (avg_phi, stdev_phi, ...) -- NOT their time-derivative. A grain
+    boundary's own motion doesn't imply the bulk statistics are
+    changing at any comparable rate (interface velocity and "how fast
+    is avg_phi changing" are related but genuinely different
+    questions), and predicting the SAME target stats_head0 already
+    uses tests whether z1 happens to ALSO carry usable information
+    about the CURRENT state's bulk statistics -- a fair question even
+    though z1's primary job (L_recon1) is about motion, not state.
+    Reuses stats_head0's own stat_names/normalization directly (same
+    physical quantities, same normalization, only the source latent
+    differs) -- there's no separate stat_names parameter here.
+
+    log_output_scale (the pathway's own decode-time scale correction,
+    see autoencoder.py's EncoderDecoderPair) is a genuine nn.Parameter
+    here (deriv is a DECODER-mode stream), included in this function's
+    own optimizer below. D1 has no shared-decoder ambiguity to correct
+    for (unlike the earlier alternation approach, where D was SHARED
+    across two different-scale tasks) -- but D1's own weights start
+    from a RANDOM init that has no reason to already match the
+    target's own natural scale (derivatives are typically tiny,
+    ~1e-4..1e-3 -- see check_reconstruction.py's own identical
+    magnitude for the derivative-panel color scale), and output_conv
+    has no final activation bounding its range at all. This parameter
+    gives training a single, fast, GLOBAL way to correct that initial
+    mismatch, rather than requiring every one of D1's own weights to
+    individually shrink toward the right scale through gradient
+    descent alone -- genuinely useful, not dead weight left over from
+    the earlier design.
+    """
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    torch.manual_seed(seed)
+
+    if min_step is None:
+        raise ValueError("train_stage1b() requires min_step to be given explicitly -- "
+                          "config.txt no longer provides ML training defaults.")
+
+    prev = torch.load(resume_from, map_location=device, weights_only=True)
+    model_cfg = prev["config"]
+    prev_stream_configs, prev_recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    prev_stream_configs, prev_recon_stream_name = cross_check_stream_configs_against_state_dict(
+        prev_stream_configs, prev_recon_stream_name, prev["model_state"],
+    )
+    if len(prev_stream_configs) != 1:
+        raise ValueError(
+            f"train_stage1b() requires resume_from to be a SINGLE-stream (stage 1a) checkpoint -- "
+            f"got {len(prev_stream_configs)} streams: {list(prev_stream_configs)}. Stage 1b's whole "
+            f"point is extending a state-only checkpoint with a NEW deriv stream; a checkpoint that "
+            f"already has more than one stream isn't what this stage resumes from."
+        )
+    state_name = prev_recon_stream_name
+    state_cfg = prev_stream_configs[state_name]
+    size = model_cfg["size"]
+    base_channels = model_cfg["base_channels"]
+
+    prev_stats_config = prev.get("stats_config")
+    if prev_stats_config is None:
+        raise ValueError(f"{resume_from} has no stats_head (it was trained with stats_weight <= 0 "
+                          f"in stage 1a) -- L_stats1 needs the SAME stat_names/normalization "
+                          f"stats_head0 uses, which isn't available without it.")
+    stat_names = prev_stats_config["stat_names"]
+    print(f"Resuming from {resume_from} (state stream: channels={state_cfg.channels}, "
+          f"spatial_size={state_cfg.spatial_size}, stat_names={stat_names})")
+
+    deriv_channels = latent_channels if latent_channels is not None else state_cfg.channels
+    deriv_spatial = state_cfg.spatial_size
+
+    stream_configs = {
+        state_name: state_cfg,
+        "deriv": LatentStreamConfig(name="deriv", channels=deriv_channels,
+                                     spatial_size=deriv_spatial, mode=LatentStreamMode.DECODER),
+    }
+
+    # Encoder EXTENDED with the new deriv bottleneck -- built fresh
+    # (random init for EVERY parameter, including the trunk+state
+    # bottleneck), then the trunk+state parts are overwritten with
+    # stage 1a's own trained weights; the deriv bottleneck is left at
+    # its own fresh random init, since stage 1a never had one.
+    encoder = Encoder(input_size=size, in_channels=1, base_channels=base_channels,
+                       stream_configs=stream_configs)
+    old_encoder_state = _strip_prefix(prev["model_state"], "encoder")
+    load_result = encoder.load_state_dict(old_encoder_state, strict=False)
+    unexpected_missing = [k for k in load_result.missing_keys if not k.startswith("bottlenecks.deriv.")]
+    if unexpected_missing or load_result.unexpected_keys:
+        raise ValueError(
+            f"Loading stage 1a's encoder weights into the extended (state+deriv) encoder didn't "
+            f"go as expected -- missing (besides the new deriv bottleneck, which SHOULD be "
+            f"missing): {unexpected_missing}, unexpected: {load_result.unexpected_keys}. Likely a "
+            f"version mismatch between this codebase and whatever produced the checkpoint."
+        )
+
+    D0 = Decoder(output_size=size, out_channels=1, base_channels=base_channels,
+                 latent_channels=state_cfg.channels, latent_spatial_size=state_cfg.spatial_size)
+    D0.load_state_dict(_strip_prefix(prev["model_state"], "decoder"))
+
+    D1 = Decoder(output_size=size, out_channels=1, base_channels=base_channels,
+                 latent_channels=deriv_channels, latent_spatial_size=deriv_spatial)
+    if deriv_channels == state_cfg.channels:
+        D1.load_state_dict(D0.state_dict())
+        print("D1 warm-started as a copy of D0's own weights (matching latent shape).")
+    else:
+        print(f"D1 NOT warm-started from D0 -- channel counts differ "
+              f"(deriv: {deriv_channels} {deriv_spatial}x{deriv_spatial} channels vs "
+              f"state: {state_cfg.channels} {state_cfg.spatial_size}x{state_cfg.spatial_size} "
+              f"channels). D1 starts from its own random init instead.")
+
+    ae = MultiStreamAutoencoder(
+        encoders={"shared": encoder}, decoders={"D0": D0, "D1": D1},
+        stream_configs=stream_configs, decoder_for_stream={state_name: "D0", "deriv": "D1"},
+    ).to(device)
+
+    # FREEZE: the entire trunk + state bottleneck (everything stage 1a
+    # actually trained) -- structurally unable to be moved by this
+    # stage's own gradient, not just "not included in the optimizer"
+    # (both enforced below, belt and suspenders: requires_grad_ stops
+    # backprop from updating it even if it WERE in the optimizer, and
+    # the optimizer's own param list is the second, independent
+    # guard). D0/stats_head0 are FROZEN too, but more precisely UNUSED
+    # -- neither is even called in this stage's forward pass at all
+    # (see step() below), so freezing them is moot for correctness,
+    # just explicit; they're carried into the final checkpoint
+    # UNCHANGED, needed by stage 2.
+    #
+    # freeze_encoder=False is a DIAGNOSTIC override, not a real training
+    # mode -- it unfreezes the trunk + state bottleneck too, directly
+    # testing whether the FROZEN, reconstruction-only trunk genuinely
+    # lacks derivative-relevant information at all (as opposed to that
+    # information being present but not linearly readable by a single
+    # 1x1 bottleneck conv). This WILL destabilize z0 (the entire reason
+    # stage 1a/1b are separate stages in the first place) -- a
+    # checkpoint trained this way is not meant to feed stage 2, only to
+    # answer the diagnostic question of whether deriv prediction is
+    # possible AT ALL from this trunk's own activations when given the
+    # freedom to adapt.
+    if freeze_encoder:
+        for name, p in encoder.named_parameters():
+            if not name.startswith("bottlenecks.deriv."):
+                p.requires_grad_(False)
+    else:
+        print("freeze_encoder=False -- DIAGNOSTIC MODE. The trunk + state bottleneck are "
+              "UNFROZEN this run. This checkpoint is not meant to feed stage 2 -- z0 will "
+              "very likely destabilize, same as the earlier C0/C1 alternation approach. "
+              "Only use this to check whether deriv prediction becomes possible at all "
+              "when the encoder can adapt.")
+    for p in D0.parameters():
+        p.requires_grad_(False)
+
+    initial_params = {k: v.clone().cpu() for k, v in ae.named_parameters()}
+    initial_buffers = {k: v.clone().cpu() for k, v in ae.named_buffers()}
+
+    stats_head0 = StatsHead(latent_channels=state_cfg.channels, stat_names=stat_names,
+                             latent_spatial=state_cfg.spatial_size).to(device)
+    stats_head0.load_state_dict(prev["stats_head_state"])
+    stats_head0.eval()
+    for p in stats_head0.parameters():
+        p.requires_grad_(False)
+
+    include_stats = stats_weight > 1e-6
+    stats_head1 = None
+    stats_loss_fn = None
+    mean = prev_stats_config["stats_mean"].to(device)
+    std = prev_stats_config["stats_std"].to(device)
+    if include_stats:
+        stats_head1 = StatsHead(latent_channels=deriv_channels, stat_names=stat_names,
+                                 latent_spatial=deriv_spatial).to(device)
+        stats_loss_fn = StatsLoss(mean, std, stat_names=stat_names)
+
+    recon_loss = ReconLoss()
+
+    trainable_params = ([p for p in encoder.parameters() if p.requires_grad] + list(D1.parameters())
+                         + [ae.pathways["deriv"].log_output_scale])
+    if stats_head1 is not None:
+        trainable_params += list(stats_head1.parameters())
+    optimizer = torch.optim.Adam(trainable_params, lr=lr)
+
+    if checkpoint_path is None:
+        name = ae_checkpoint_name(size, state_cfg.channels, stats_weight)
+        checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage1b" / f"{name}-stage1b.pt"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"checkpoint: {checkpoint_path}")
+
+    if loss_curve_path is None:
+        name = ae_checkpoint_name(size, state_cfg.channels, stats_weight)
+        loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage1b" / f"{name}-stage1b-loss_curve.png"
+
+    epoch_history: list[int] = []
+    train_loss_history: list[float] = []
+    val_loss_history: list[float] = []
+    best_so_far_history: list[float] = []
+
+    run_dirs = complete_run_dirs(base_path, size, size)
+    if not run_dirs:
+        raise ValueError(f"No complete runs found under {base_path}/{size}x{size} -- "
+                          f"check base_path, or that metadata.txt exists there")
+    train_dirs, val_dirs, test_dirs = split_run_dirs(run_dirs, val_fraction, test_fraction, seed=seed)
+    print(f"{len(run_dirs)} complete runs -> "
+          f"{len(train_dirs)} train / {len(val_dirs)} val / {len(test_dirs)} test dirs")
+
+    train_set = MicrostructureEvolutionDataset(
+        train_dirs, encoder=None, window_length=2, augment=augment,
+        min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
+        stat_names=stat_names if include_stats else None,
+    )
+    val_set = MicrostructureEvolutionDataset(
+        val_dirs, encoder=None, window_length=2,
+        min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
+        stat_names=stat_names if include_stats else None,
+    )
+    print(f"{len(train_set)} (train, {'augmented' if augment else 'NOT augmented'}) / "
+          f"{len(val_set)} (val, unaugmented) consecutive-pair windows for stage 1b")
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                               persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                             persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
+
+    def step(batch, train: bool):
+        if include_stats:
+            window, dt_window, _theta, stats_target = batch
+            stats_target = stats_target.to(device, non_blocking=True)
+        else:
+            window, dt_window, _theta = batch
+        window = window.to(device, non_blocking=True)
+        dt_window = dt_window.to(device, non_blocking=True)
+        x_t = window[:, 0]
+        x_next = window[:, 1]
+        dt = dt_window[:, 0].view(-1, 1, 1, 1)
+
+        pred_deriv, z1 = ae.pathways["deriv"](x_t)
+        (z1_train_stats if train else z1_val_stats).update(z1)
+        # std across ONLY the spatial (H, W) dims, per (sample, channel)
+        # -- distinct from z1_train_stats' own overall std, which mixes
+        # spatial variation together with batch/channel variation and
+        # can't tell them apart. The decode path from here (unbottleneck
+        # is a 1x1 conv, every UpBlock is a non-overlapping stride-2
+        # transposed conv) never mixes DIFFERENT spatial positions with
+        # each other at any point -- so if z1 doesn't genuinely vary
+        # across its own 4x4 grid, no amount of decoder capacity or
+        # training could produce anything but a repeated, per-position
+        # pattern, regardless of what z1's overall (non-spatial) content is.
+        z1_spatial_std = z1.std(dim=(2, 3))  # (batch, channels)
+        (z1_spatial_std_train if train else z1_spatial_std_val).update(z1_spatial_std)
+        target_deriv = (x_next - x_t) / dt
+        # Per-SAMPLE normalized ratio, not plain MSE -- same rationale
+        # as the earlier C0/C1-alternation version (see the archived
+        # file): target_deriv's magnitude isn't controlled to any
+        # particular scale across samples, and an unnormalized MSE
+        # lets whichever samples happen to have the largest magnitude
+        # dominate the gradient disproportionately.
+        diff_norm = torch.linalg.vector_norm(pred_deriv - target_deriv, dim=(1, 2, 3))
+        target_norm = torch.linalg.vector_norm(target_deriv, dim=(1, 2, 3)).clamp_min(1e-6)
+        recon1 = (diff_norm / target_norm).mean()
+
+        # Diagnostic only (no gradient effect) -- separates two very
+        # different failure modes that recon1 alone can't distinguish:
+        # a pure SCALE mismatch (pred right direction, wrong magnitude
+        # -- fixable by more training / log_output_scale) shows up as
+        # pred_norm far from target_norm with cos_sim near +1; pred
+        # carrying no real signal about target_deriv at all (this
+        # project's own standing "z1 has no information" hypothesis)
+        # shows up as cos_sim near 0 regardless of how close the norms
+        # happen to be.
+        pred_norm = torch.linalg.vector_norm(pred_deriv.detach(), dim=(1, 2, 3))
+        flat_pred = pred_deriv.detach().flatten(1)
+        flat_target = target_deriv.flatten(1)
+        cos_sim = torch.nn.functional.cosine_similarity(flat_pred, flat_target, dim=1)
+        (pred_norm_train if train else pred_norm_val).update(pred_norm)
+        (target_norm_train if train else target_norm_val).update(target_norm.detach())
+        (cos_sim_train if train else cos_sim_val).update(cos_sim)
+
+        if include_stats:
+            stats_pred1 = stats_head1(z1)
+            stats1 = stats_loss_fn(stats_pred1, stats_target)
+            total = recon1 + stats_weight * stats1
+        else:
+            stats1 = torch.tensor(0.0)
+            total = recon1
+
+        if cos_weight > 0:
+            # NON-detached version -- gradient must flow through this
+            # for it to do anything. 1 - cos_sim (not -cos_sim) so the
+            # minimum is 0, not unbounded-negative, keeping this on a
+            # comparable scale to recon1 rather than able to dominate
+            # by growing without bound.
+            cos_loss = (1 - torch.nn.functional.cosine_similarity(
+                pred_deriv.flatten(1), target_deriv.flatten(1), dim=1)).mean()
+            total = total + cos_weight * cos_loss
+        else:
+            cos_loss = torch.tensor(0.0)
+
+        if train:
+            optimizer.zero_grad()
+            total.backward()
+            optimizer.step()
+
+        return total.item(), recon1.item(), stats1.item(), cos_loss.item()
+
+    tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
+    epochs_since_improvement = 0
+
+    stats_label = "stats1" if include_stats else "stats1_diag"
+    print(f"Stage 1b: starting {epochs} epochs (early_stopping_patience: "
+          f"{early_stopping_patience}, batches of {batch_size}), stats_weight={stats_weight}"
+          f"{' (anchor active)' if include_stats else ' (diagnostic only, not optimized)'}")
+    print(f"/{epochs:3d} train = recon1 + {stats_weight}*{stats_label} | valid = ...  | ema  (all e-3)")
+
+    for epoch in range(1, epochs + 1):
+        # Fresh each epoch -- see step() for where these get updated,
+        # and the epoch-end print below for where they're reported.
+        z1_train_stats, z1_val_stats = _RunningStats(), _RunningStats()
+        z1_spatial_std_train, z1_spatial_std_val = _RunningStats(), _RunningStats()
+        pred_norm_train, pred_norm_val = _RunningStats(), _RunningStats()
+        target_norm_train, target_norm_val = _RunningStats(), _RunningStats()
+        cos_sim_train, cos_sim_val = _RunningStats(), _RunningStats()
+
+        ae.train()
+        # D0/stats_head0 always stay in eval mode -- unused in this
+        # stage's forward pass regardless of freeze_encoder. The
+        # encoder itself only needs the SAME eval-mode treatment when
+        # it's actually frozen (see this function's own freeze_encoder
+        # docstring/comment above): ae.train() is recursive and would
+        # otherwise flip the trunk's BatchNorm2d layers back to train
+        # mode even though their WEIGHTS are frozen, letting them
+        # normalize using the CURRENT BATCH's own statistics instead of
+        # stage 1a's own stable ones -- a real, previously-confirmed
+        # bug. encoder.eval() is safe even though the deriv bottleneck
+        # stays trainable: the bottleneck is a plain nn.Conv2d (no
+        # BatchNorm/Dropout/any train-vs-eval-sensitive layer at all),
+        # so eval mode has zero effect on it -- only the frozen
+        # down_blocks actually care. When freeze_encoder=False
+        # (diagnostic mode), the trunk is genuinely being trained, so
+        # it correctly stays in train mode instead, same as D1.
+        if freeze_encoder:
+            encoder.eval()
+        D0.eval()
+        stats_head0.eval()
+
+        train_total = train_recon = train_stats = train_cos = 0.0
+        n_train = len(train_set)
+        for batch in train_loader:
+            bs = batch[0].size(0)
+            total, recon, stats, cos = step(batch, train=True)
+            train_total += total * bs
+            train_recon += recon * bs
+            train_stats += stats * bs
+            train_cos += cos * bs
+        train_total /= n_train
+        train_recon /= n_train
+        train_stats /= n_train
+        train_cos /= n_train
+
+        ae.eval()
+        val_total = val_recon = val_stats = val_cos = 0.0
+        n_val = len(val_set)
+        with torch.no_grad():
+            for batch in val_loader:
+                bs = batch[0].size(0)
+                total, recon, stats, cos = step(batch, train=False)
+                val_total += total * bs
+                val_recon += recon * bs
+                val_stats += stats * bs
+                val_cos += cos * bs
+        val_total /= n_val
+        val_recon /= n_val
+        val_stats /= n_val
+        val_cos /= n_val
+
+        _, saved_this_epoch = tracker.update(epoch, val_total)
+        val_ema = tracker.val_ema
+
+        epoch_history.append(epoch)
+        train_loss_history.append(train_total)
+        val_loss_history.append(val_total)
+        best_so_far_history.append(tracker.best_val_loss)
+        loss_curve(epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+                   loss_curve_path, title="Stage 1b loss")
+
+        if include_stats:
+            msg = (f"{epoch:4d}|{train_total*1_000:7.3f} ={train_recon*1_000:6.3f} "
+                   f"+{stats_weight*train_stats*1_000:6.3f} |{val_total*1_000:7.3f} "
+                   f"={val_recon*1_000:6.3f} +{stats_weight*val_stats*1_000:6.3f} |"
+                   f"{val_ema*1_000:7.3f}")
+        else:
+            msg = (f"{epoch:4d}|{train_total*1_000:7.3f} |{val_total*1_000:7.3f} |"
+                   f"{val_ema*1_000:7.3f}")
+        if cos_weight > 0:
+            msg += (f"  ||cos: train={cos_weight*train_cos*1_000:7.3f} "
+                    f"(raw cos_sim={1 - train_cos:+.4f}) |val={cos_weight*val_cos*1_000:7.3f} "
+                    f"(raw cos_sim={1 - val_cos:+.4f})")
+
+        if saved_this_epoch:
+            epochs_since_improvement = 0
+            torch.save({
+                "model_state": ae.state_dict(),
+                "stats_head_state": stats_head0.state_dict(),
+                "stats_head1_state": stats_head1.state_dict() if stats_head1 is not None else None,
+                "epoch": epoch,
+                "val_loss": val_total,
+                "val_loss_ema": val_ema,
+                "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
+                "config": {
+                    "size": size, "base_channels": base_channels,
+                    "latent_channels": state_cfg.channels,
+                    "latent_spatial_size": state_cfg.spatial_size,
+                    "stats_weight": model_cfg["stats_weight"],
+                    "stream_configs": {
+                        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
+                               "mode": cfg.mode.value}
+                        for name, cfg in stream_configs.items()
+                    },
+                    "recon_stream_name": state_name,
+                    "decoder_for_stream": {state_name: "D0", "deriv": "D1"},
+                },
+                "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
+                "stage1b_config": {"stats_weight": stats_weight, "resumed_from": str(resume_from)},
+            }, checkpoint_path)
+            msg += "  -> saved"
+            if on_checkpoint_saved is not None:
+                on_checkpoint_saved(checkpoint_path, epoch)
+        else:
+            epochs_since_improvement += 1
+
+        if log_every_epoch or saved_this_epoch:
+            print(msg)
+            z1_train_mean, z1_train_std = z1_train_stats.mean_std()
+            z1_val_mean, z1_val_std = z1_val_stats.mean_std()
+            print(f"      z1: train mean={z1_train_mean:+.4e} std={z1_train_std:.4e} | "
+                  f"val mean={z1_val_mean:+.4e} std={z1_val_std:.4e}")
+            z1_spatial_std_train_mean, _ = z1_spatial_std_train.mean_std()
+            z1_spatial_std_val_mean, _ = z1_spatial_std_val.mean_std()
+            print(f"      z1 WITHIN-SAMPLE spatial std (mean over batch/channel, std across "
+                  f"the 4x4 grid ONLY): train={z1_spatial_std_train_mean:.4e} "
+                  f"val={z1_spatial_std_val_mean:.4e}  (compare against z1's own OVERALL std "
+                  f"above -- if this is much smaller, z1 varies mainly across batch/channel, "
+                  f"not across its own spatial positions, and the decode path structurally "
+                  f"cannot produce a spatially-varying prediction regardless of training)")
+            pred_norm_train_mean, _ = pred_norm_train.mean_std()
+            pred_norm_val_mean, _ = pred_norm_val.mean_std()
+            target_norm_train_mean, _ = target_norm_train.mean_std()
+            target_norm_val_mean, _ = target_norm_val.mean_std()
+            cos_sim_train_mean, _ = cos_sim_train.mean_std()
+            cos_sim_val_mean, _ = cos_sim_val.mean_std()
+            print(f"      pred_deriv vs target_deriv -- ||pred||: train={pred_norm_train_mean:.4e} "
+                  f"val={pred_norm_val_mean:.4e} | ||target||: train={target_norm_train_mean:.4e} "
+                  f"val={target_norm_val_mean:.4e} | cos_sim: train={cos_sim_train_mean:+.4f} "
+                  f"val={cos_sim_val_mean:+.4f}  (cos_sim near 0 = pred carries no real signal "
+                  f"about target's direction; near +-1 with a norm mismatch = pure scale issue)")
+
+        if early_stopping_patience is not None and epochs_since_improvement >= early_stopping_patience:
+            print(f"Early stopping at epoch {epoch}: no improvement for "
+                  f"{early_stopping_patience} epochs")
+            break
+
+    final_checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    final_state = final_checkpoint["model_state"]
+    final_params = {k: final_state[k] for k in initial_params}
+    final_buffers = {k: final_state[k] for k in initial_buffers}
+    param_drift, buffer_drift = compute_weight_drift(
+        initial_params, initial_buffers, final_params, final_buffers)
+
+    print("\nPer-block PARAMETER drift (L2 norm of change from stage-1a starting point):")
+    frozen_groups = {group for group, value in param_drift.items() if value == 0.0}
+    for group, value in sorted(param_drift.items()):
+        flag = "  <- frozen/unused, should be 0" if group in frozen_groups else ""
+        print(f"  {group:<28} {value:10.4f}{flag}")
+    if buffer_drift:
+        # BatchNorm running_mean/running_var are BUFFERS, not
+        # parameters -- a frozen block can have EXACTLY zero parameter
+        # drift (confirmed above) while its BatchNorm buffers still
+        # drift, if that block was accidentally left in .train() mode
+        # (BatchNorm normalizes using the CURRENT BATCH's own
+        # statistics whenever the module itself is in train mode,
+        # independent of requires_grad -- a real bug this project hit
+        # directly: ae.train()'s own recursion re-enables train mode on
+        # every submodule each epoch, including ones frozen via
+        # requires_grad_(False) alone). Nonzero buffer drift on a block
+        # flagged "frozen" above is exactly that signal.
+        print("\nPer-block BUFFER drift (e.g. BatchNorm running_mean/running_var):")
+        for group, value in sorted(buffer_drift.items()):
+            flag = "  <- frozen/unused, should be ~0" if group in frozen_groups else ""
+            print(f"  {group:<28} {value:10.4f}{flag}")
+
+    return checkpoint_path
 
 
 def train_stage2(

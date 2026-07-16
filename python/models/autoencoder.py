@@ -206,24 +206,65 @@ class MultiStreamAutoencoder(nn.Module):
     class: the output-scale correction becomes automatic at the call
     site, not something every consumer has to remember to apply.
 
+    decoder_for_stream: dict[str, str] | None, maps each stream NAME to
+    which DECODER key its own pathway should read from. None (default)
+    means every stream shares the single decoder in `decoders` --
+    correct whenever there's genuinely only one decoder to share (the
+    original design, still correct e.g. for Stage 2's C0/C1 sharing D).
+    Explicit routing (e.g. {"state": "D0", "deriv": "D1"}, TWO separate
+    decoder entries) is what a design with genuinely independent
+    decoders per stream needs -- D1 trained without D0's own gradient
+    ever touching it, and vice versa, rather than the two objectives
+    fighting over the same decoder weights. The ENCODER side has no
+    equivalent per-stream routing: the trunk is always genuinely
+    shared, by design, across every stream this class has ever needed
+    to support (a stream-specific decoder is a real, separate network;
+    a stream-specific "trunk" would defeat the entire point of a
+    shared-trunk architecture) -- so exactly one encoder key is
+    required, not a dict of choices.
+
     Each pathway holds a direct reference to the SAME encoder/decoder
     objects also sitting in self.encoders/self.decoders -- reachable
     two ways through the module tree (model.encoders["shared"] and
-    model.pathways["deriv"].encoder are the identical object). This is
-    correct, not a bug: PyTorch's own named_parameters()/state_dict()
-    deduplicate by tensor/module identity, not by path, so a shared
-    trunk reachable multiple ways still only contributes its
+    model.pathways["deriv"].encoder are the identical object when they
+    share one decoder; with separate decoders, model.decoders["D1"]
+    and model.pathways["deriv"].decoder are the identical object
+    instead). This is correct, not a bug: PyTorch's own
+    named_parameters()/state_dict() deduplicate by tensor/module
+    identity, not by path, so a shared trunk (or a decoder reachable
+    via decoders AND exactly one pathway) still only contributes its
     parameters once -- optimizer construction (model.parameters()),
     .train()/.eval(), and .to(device) all keep working as single calls
     on this container despite the redundant paths.
     """
     def __init__(self, encoders: dict[str, Encoder], decoders: dict[str, Decoder],
-                 stream_configs: dict[str, LatentStreamConfig]):
+                 stream_configs: dict[str, LatentStreamConfig],
+                 decoder_for_stream: dict[str, str] | None = None):
         super().__init__()
         self.encoders = nn.ModuleDict(encoders)
         self.decoders = nn.ModuleDict(decoders)
+
+        if len(encoders) != 1:
+            raise ValueError(
+                f"MultiStreamAutoencoder requires exactly one shared encoder trunk -- got "
+                f"{len(encoders)} encoder keys: {list(encoders)}. Per-stream encoder routing "
+                f"isn't supported: the trunk is always genuinely shared by design, across every "
+                f"stream this class has ever needed (see this class's own docstring)."
+            )
+        ((_encoder_key, shared_encoder),) = encoders.items()
+
+        if decoder_for_stream is None:
+            if len(decoders) != 1:
+                raise ValueError(
+                    f"decoder_for_stream was not given, but {len(decoders)} decoder keys exist "
+                    f"({list(decoders)}) -- ambiguous which one each stream's pathway should use. "
+                    f"Pass decoder_for_stream explicitly when there's more than one decoder."
+                )
+            ((only_decoder_key, _),) = decoders.items()
+            decoder_for_stream = {name: only_decoder_key for name in stream_configs}
+
         self.pathways = nn.ModuleDict({
-            name: EncoderDecoderPair(encoders["shared"], decoders["shared"],
+            name: EncoderDecoderPair(shared_encoder, decoders[decoder_for_stream[name]],
                                       stream_name=name, mode=cfg.mode)
             for name, cfg in stream_configs.items()
             if cfg.mode != LatentStreamMode.PURE_LATENT

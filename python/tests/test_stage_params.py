@@ -71,10 +71,17 @@ def test_key_renaming_still_applies_to_globally_inherited_keys():
     assert kwargs == {"early_stopping_patience": 4}
 
 
-def test_list_valued_keys_still_convert_correctly_when_inherited():
-    global_params = {"latent_names": "state, deriv"}
+def test_list_valued_keys_still_convert_correctly_when_inherited(monkeypatch):
+    """latent_names/latent_modes (the ORIGINAL reason this mechanism
+    existed) are gone now -- _LIST_VALUED_KEYS is empty by default (see
+    its own comment) -- but the comma-split MECHANISM itself is still
+    real, general infrastructure, tested here via a synthetic key
+    rather than a dead one."""
+    import orchestration.stage_params as stage_params_module
+    monkeypatch.setattr(stage_params_module, "_LIST_VALUED_KEYS", {"some_list_param"})
+    global_params = {"some_list_param": "a, b, c"}
     kwargs = _prepare_stage_kwargs({}, global_params)
-    assert kwargs["latent_names"] == ["state", "deriv"]
+    assert kwargs["some_list_param"] == ["a", "b", "c"]
 
 
 # ---- End-to-end: parse_stage_params + _prepare_stage_kwargs together --
@@ -142,3 +149,49 @@ min_stdev_phi = same
     # preceding stage), NOT the global section's -- _resolve_same
     # checks preceding stages before falling back to global.
     assert stages[2]["min_stdev_phi"] == "0.03"
+
+
+def test_stage_1a_header_is_an_alias_for_plain_stage_1(tmp_path):
+    """Regression test for a real reported bug: '# Stage 1a' (a more
+    natural, consistent name pairing with '# Stage 1b') was silently
+    never read at all -- the pipeline only ever looked for the bare
+    '# Stage 1' key, so every param in a '# Stage 1a' section was
+    dropped without any error, surfacing as a confusing "missing
+    stats_weight" failure far from the actual cause. '1a' must
+    normalize to the SAME int key (1) plain '# Stage 1' uses -- unlike
+    '3a'/'3b', which stay their own distinct string keys (two genuinely
+    different curriculum phases of stage 3, not aliases for anything)."""
+    path = _write(tmp_path, """
+# Stage 1a
+stats_weight = 0.01
+epochs = 20
+
+# Stage 1b
+stats_weight = 0.02
+epochs = 5
+""")
+    global_params, stages = parse_stage_params(path)
+    assert 1 in stages, "'# Stage 1a' should have been normalized to the int key 1"
+    assert "1a" not in stages, "'1a' should NOT remain as its own separate string key"
+    assert stages[1]["stats_weight"] == "0.01"
+    assert stages[1]["epochs"] == "20"
+
+    # '1b' must NOT be touched by this normalization -- it's a
+    # genuinely distinct stage (train_stage1b), not an alias.
+    assert "1b" in stages
+    assert stages["1b"]["stats_weight"] == "0.02"
+    assert stages["1b"]["epochs"] == "5"
+
+
+def test_stage_1_and_1a_headers_are_interchangeable(tmp_path):
+    """Whichever spelling is used, the SAME stage-1 section is
+    populated -- confirms this isn't just 1a happening to work, but
+    that both forms genuinely mean the same thing."""
+    path_bare = tmp_path / "bare.txt"
+    path_bare.write_text("# Stage 1\nstats_weight = 0.05\n")
+    path_1a = tmp_path / "alt.txt"
+    path_1a.write_text("# Stage 1a\nstats_weight = 0.05\n")
+
+    _, stages_bare = parse_stage_params(path_bare)
+    _, stages_1a = parse_stage_params(path_1a)
+    assert stages_bare[1]["stats_weight"] == stages_1a[1]["stats_weight"] == "0.05"

@@ -23,6 +23,7 @@ from pathlib import Path
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/orchestration/paths.py -> python/
 _STAGE_DIRS = {1: _PYTHON_ROOT / "checkpoints" / "stage1",
+               "1b": _PYTHON_ROOT / "checkpoints" / "stage1b",
                2: _PYTHON_ROOT / "checkpoints" / "stage2",
                3: _PYTHON_ROOT / "checkpoints" / "stage3",
                "3a": _PYTHON_ROOT / "checkpoints" / "stage3a",

@@ -10,6 +10,7 @@ import torch
 
 _STAGE_LABELS = {
     1: "stage 1 (autoencoder)",
+    "1b": "stage 1b (deriv stream decoder)",
     2: "stage 2 (latent-space validation)",
     3: "stage 3 (latent dynamics surrogate)",
     4: "stage 4 (encoder refinement)",
@@ -43,13 +44,20 @@ def identify_checkpoint_stage(checkpoint: dict) -> str:
         # checkpoint trained before that rename doesn't need retraining
         # just to be correctly identified.
         return _STAGE_LABELS[2]
+    if "stage1b_config" in checkpoint:
+        # MUST be checked before the plain stage-1 test just below --
+        # a stage 1b checkpoint ALSO has model_state + a
+        # config["latent_channels"] entry (same shape stage 1's own
+        # save uses), so without this check first, every stage 1b
+        # checkpoint would be silently misidentified as plain stage 1.
+        return _STAGE_LABELS["1b"]
     if ("model_state" in checkpoint and isinstance(checkpoint.get("config"), dict)
             and "latent_channels" in checkpoint["config"]):
         return _STAGE_LABELS[1]
     return "unrecognized (doesn't match any known stage's checkpoint structure)"
 
 
-def _validate_checkpoint_stage(path: Path, stage_num: int, device: str | None) -> None:
+def _validate_checkpoint_stage(path: Path, stage_num: int | str, device: str | None) -> None:
     """Raises a clear, specific error if `path` isn't actually a
     checkpoint from the expected stage. identify_checkpoint_stage()
     already tries every known stage's structure in turn regardless of
