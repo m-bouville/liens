@@ -8,10 +8,10 @@ from orchestration.checkpoint_identification import identify_checkpoint_stage
 def _build_run_dir_with_stats(base_dir, name, size=32):
     run_dir = base_dir / name
     run_dir.mkdir()
-    steps = [0, 1000, 2000, 3000, 4000]
+    steps = [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000]
     metadata_text = "\n".join([
         f"directory = {name}", "code version = test", "status = complete",
-        f"Nx = {size}", f"Ny = {size}", "dt = 0.05", "steps = 4000",
+        f"Nx = {size}", f"Ny = {size}", "dt = 0.05", "steps = 7000",
         f"save_steps = {' '.join(str(s) for s in steps)}",
         "a0 = 1.0", "b = 1.0", "T0 = 1.0", "temperature = 0.8",
         "kappa = 0.2", "mobility = 0.05", "phi0 = 0.0", "noise = 0.01",
@@ -45,7 +45,7 @@ def _build_sweep(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
-def test_pipeline_runs_1_then_1b(tmp_path):
+def test_pipeline_runs_1_then_1b(tmp_path, isolated_project_root):
     """THE actual end-to-end claim currently in scope: a params file
     with Stage 1 and 1b sections runs that chain correctly. Stage 2 is
     DELIBERATELY not included here -- it still assumes a single shared
@@ -106,15 +106,16 @@ epochs = 0
     print("ALL CHECKS PASSED")
 
 
-def test_pipeline_stage2_still_incompatible_with_stage1b_output(tmp_path):
-    """Documents the CURRENT, known, not-yet-fixed boundary directly --
-    if a '# Stage 2' section IS given after '# Stage 1b', the pipeline
-    correctly reaches stage 2 (unlike before stage 1b existed, where it
-    failed with '0 deriv streams'), but stage 2 itself still cannot
-    load a separate-D0/D1 checkpoint. This SHOULD start failing once
-    stage 2 is redesigned to match -- at which point this test should
-    be replaced with a real end-to-end 1->1b->2 test, not deleted
-    silently."""
+def test_pipeline_runs_1_then_1b_then_2(tmp_path, isolated_project_root):
+    """Stage 2's own redesign (separate D0/D1 via decoder_for_stream,
+    both stats heads, all five C0/C1 loss terms) is what this test
+    used to be blocked on -- it previously asserted stage 2 correctly
+    REACHED but then failed to load a stage 1b checkpoint (see git
+    history / the old RuntimeError this test used to expect). Now that
+    stage 2 is fixed, this confirms the FULL pipeline runs through
+    run_from_params_file() end to end, not just that train_stage2()
+    works when called directly (test_train_stage2_c0c1.py already
+    covers that in more detail)."""
     base_path = _build_sweep(tmp_path, n_runs=6, size=32)
     params_text = f"""
 Nx = 32
@@ -125,6 +126,7 @@ num_workers = 0
 val_fraction = 0.34
 test_fraction = 0.17
 augment = false
+force = true
 
 # Stage 1
 epochs = 1
@@ -143,18 +145,39 @@ stats_weight = 0.01
 epochs = 1
 batch_size = 4
 deriv_weight = 1.0
+recon1_weight = 0.5
+stats1_weight = 0.02
 """
     params_path = tmp_path / "test_pipeline_stage2.txt"
     params_path.write_text(params_text)
 
-    import pytest
-    with pytest.raises(RuntimeError, match="decoders.shared"):
+    # run_from_params_file itself always attempts stage 3 onward too
+    # (same pre-existing pipeline behavior noted in
+    # test_pipeline_runs_1_then_1b above -- stage 2/3 aren't gated on
+    # section presence the way stage 4/5 are), so a params file with no
+    # "# Stage 3" section will hit a stage-3 config error afterward.
+    # Irrelevant to what THIS test verifies: that stage 1 -> 1b -> 2
+    # themselves ran and produced a correct checkpoint, checked
+    # directly from disk below regardless of what happens after that.
+    try:
         run_from_params_file(params_path, default_base=base_path, device="cpu")
-    print("Confirmed: stage 2 reaches the KNOWN decoder-structure mismatch, "
-          "not the old (now-fixed) '0 deriv streams' error")
+    except ValueError as e:
+        if "train_lds()" not in str(e):
+            raise
+
+    from orchestration.paths import _STAGE_DIRS
+    stage2_files = list(_STAGE_DIRS[2].glob("test_pipeline_stage2-stage2.pt"))
+    assert len(stage2_files) == 1, "stage 2's own checkpoint file was not created"
+    checkpoint = torch.load(stage2_files[0], map_location="cpu", weights_only=True)
+    identity = identify_checkpoint_stage(checkpoint)
+    print(f"Stage 2 checkpoint identified as: {identity}")
+    assert identity == "stage 2 (latent-space validation)"
+    assert checkpoint["stats_head1_state"] is not None
+    assert checkpoint["config"]["decoder_for_stream"] == {"state": "D0", "deriv": "D1"}
+    print("Full pipeline (1 -> 1b -> 2) ran end to end via run_from_params_file")
 
 
-def test_pipeline_stops_after_stage1_without_stage1b_section(tmp_path):
+def test_pipeline_stops_after_stage1_without_stage1b_section(tmp_path, isolated_project_root):
     """If '# Stage 1b' isn't in the params file at all, the pipeline
     should stop at stage 1's own output -- not attempt stage 2 (which
     would fail anyway, requiring a multi-stream ancestor it doesn't have)."""

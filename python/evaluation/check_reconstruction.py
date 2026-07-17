@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from evaluation.check_rollout import _format_small
-from models.autoencoder import Autoencoder, MultiStreamAutoencoder
+from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import (
@@ -101,7 +101,39 @@ def check_reconstruction(
 
     recon_stream = stream_configs[recon_stream_name]
     decoder_for_stream = model_cfg.get("decoder_for_stream")
-    if len(stream_configs) == 1:
+    # Whether this checkpoint is actually flat ("encoder."/"decoder.",
+    # stage 4/5's own EncoderDecoderPair -- see model_assembly.py's
+    # build_models_from_components) or nested ("encoders.shared."/
+    # "decoders.*", stage 1/1b/2's own MultiStreamAutoencoder) is a
+    # property of the ACTUAL saved keys, not of how many streams
+    # stream_configs happens to list -- a stage 4/5 checkpoint keeps
+    # the full, inherited multi-stream stream_configs in its own
+    # config even though model_assembly.py only ever saves a flat,
+    # single-pathway EncoderDecoderPair (it only needs the recon
+    # stream), regardless of how many streams that config lists.
+    is_flat_checkpoint = any(k.startswith("encoder.") for k in checkpoint["model_state"])
+    if is_flat_checkpoint and deriv_stream_name is not None:
+        print(f"NOTE: this checkpoint's own ancestor had a '{deriv_stream_name}' stream, but "
+              f"this checkpoint itself only kept '{recon_stream_name}''s own decoder (stage 4/5 "
+              f"only ever needs the reconstruction stream's own pathway, see "
+              f"model_assembly.py's build_models_from_components) -- no derivative panel is "
+              f"possible from this checkpoint alone.")
+        deriv_stream_name = None
+
+    if is_flat_checkpoint:
+        # Mirrors model_assembly.py's own construction exactly (the
+        # SAME code that produced this checkpoint) -- encoder built
+        # with the FULL stream_configs (every bottleneck, even ones
+        # with no decoder here), wrapped in a single-pathway
+        # EncoderDecoderPair for just the reconstruction stream.
+        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs).to(device)
+        decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
+                           base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size).to(device)
+        ae = EncoderDecoderPair(encoder, decoder, stream_name=recon_stream_name,
+                                 mode=recon_stream.mode).to(device)
+    elif len(stream_configs) == 1:
         ae = Autoencoder(
             size=model_cfg["size"], channels=1,
             base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,

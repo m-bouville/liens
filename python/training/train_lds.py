@@ -170,12 +170,13 @@ def train_lds(
         stream_configs, recon_stream_name, ae_checkpoint["model_state"],
     )
     recon_stream = stream_configs[recon_stream_name]
-
+    decoder_for_stream = ae_config.get("decoder_for_stream")
     if len(stream_configs) == 1:
         ae = Autoencoder(size=ae_config["size"], channels=1, base_channels=ae_config["base_channels"],
                           latent_channels=recon_stream.channels,
                           latent_spatial_size=recon_stream.spatial_size).to(device)
-    else:
+    elif decoder_for_stream is None:
+        # Stage 2's own (pre-stage-1b) format: every stream shares ONE decoder.
         _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
                                    base_channels=ae_config["base_channels"], stream_configs=stream_configs)
         _decoder_module = Decoder(output_size=ae_config["size"], out_channels=1,
@@ -183,6 +184,26 @@ def train_lds(
                                    latent_spatial_size=recon_stream.spatial_size)
         ae = MultiStreamAutoencoder(encoders={"shared": _encoder_module}, decoders={"shared": _decoder_module},
                                      stream_configs=stream_configs).to(device)
+    else:
+        # Stage 1b's own format: a SEPARATE decoder per stream (see
+        # autoencoder.py's MultiStreamAutoencoder). Only the encoder
+        # ever gets used below, but load_state_dict still needs a
+        # decoder object per unique decoder key for the checkpoint's
+        # own keys to match at all -- their actual weights are inert
+        # here, never read again after this load.
+        _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
+                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        _decoders = {}
+        for stream_name, decoder_key in decoder_for_stream.items():
+            stream_cfg = stream_configs[stream_name]
+            _decoders[decoder_key] = Decoder(
+                output_size=ae_config["size"], out_channels=1,
+                base_channels=ae_config["base_channels"], latent_channels=stream_cfg.channels,
+                latent_spatial_size=stream_cfg.spatial_size,
+            )
+        ae = MultiStreamAutoencoder(encoders={"shared": _encoder_module}, decoders=_decoders,
+                                     stream_configs=stream_configs,
+                                     decoder_for_stream=decoder_for_stream).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
     encoder.eval()

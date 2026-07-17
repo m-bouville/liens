@@ -59,7 +59,11 @@ def test_y_axis_capped_at_2x_first_train_loss(tmp_path, monkeypatch):
     ymin, ymax = ax.get_ylim()
     expected_cap = 2 * train_loss[0]  # 20.0 -- NOT anywhere near the 5000/6000 spike
     assert ymax == expected_cap, f"expected y-axis top exactly {expected_cap}, got {ymax}"
-    assert ymin == 0
+    # NOT ymin == 0: all values here are positive, so loss_curve() now
+    # uses a log-scale y-axis by default (see its own docstring) --
+    # log(0) is undefined, so matplotlib floors to the smallest
+    # positive value actually present instead of exactly 0.
+    assert ymin > 0
     assert ymax < max(val_loss), "the cap should be far below the actual spike -- confirms it's a real cap"
 
 
@@ -93,7 +97,8 @@ def test_y_axis_not_capped_when_nothing_exceeds_it(tmp_path, monkeypatch):
     assert ymax < unused_cap, (
         f"axis should auto-scale below the unused cap ({unused_cap}), got ymax={ymax}"
     )
-    assert ymin == 0
+    # NOT ymin == 0 -- see the identical comment in the capped test above.
+    assert ymin > 0
 
 
 def test_secondary_lines_do_not_crash_and_produce_a_file(tmp_path):
@@ -123,3 +128,50 @@ def test_creates_parent_directories(tmp_path):
     plots.loss_curve([1], [1.0], [1.1], [1.1], out)
 
     assert out.exists()
+
+
+
+def test_log_scale_used_when_all_values_positive(tmp_path, monkeypatch):
+    """The requested change: log-scale y-axis by default."""
+    out = tmp_path / "loss_curve.png"
+    captured_axes = {}
+    real_subplots = plt.subplots
+
+    def spy_subplots(*args, **kwargs):
+        fig, ax = real_subplots(*args, **kwargs)
+        captured_axes["ax"] = ax
+        return fig, ax
+
+    monkeypatch.setattr(plt, "subplots", spy_subplots)
+    epochs = list(range(1, 6))
+    train_loss = [124.097, 7.071, 5.202, 4.147, 3.856]
+    val_loss = [7.202, 4.830, 4.321, 3.827, 3.465]
+    best_so_far = [7.202, 6.490, 5.840, 5.236, 4.705]
+    plots.loss_curve(epochs, train_loss, val_loss, best_so_far, out)
+
+    ax = captured_axes["ax"]
+    assert ax.get_yscale() == "log"
+
+
+def test_falls_back_to_linear_when_a_zero_value_present(tmp_path, monkeypatch):
+    """log(0) is undefined -- a zero (or negative) value anywhere in
+    the data must fall back to linear scale, not crash."""
+    out = tmp_path / "loss_curve.png"
+    captured_axes = {}
+    real_subplots = plt.subplots
+
+    def spy_subplots(*args, **kwargs):
+        fig, ax = real_subplots(*args, **kwargs)
+        captured_axes["ax"] = ax
+        return fig, ax
+
+    monkeypatch.setattr(plt, "subplots", spy_subplots)
+    epochs = [1, 2, 3]
+    train_loss = [1.0, 0.0, 0.5]
+    val_loss = [1.0, 0.5, 0.3]
+    best_so_far = [1.0, 0.5, 0.3]
+    plots.loss_curve(epochs, train_loss, val_loss, best_so_far, out)  # must not raise
+
+    ax = captured_axes["ax"]
+    assert ax.get_yscale() == "linear"
+    assert ax.get_ylim()[0] == 0

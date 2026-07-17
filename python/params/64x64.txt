@@ -18,12 +18,12 @@ augment       = True		# False: speed things up for quick tests
 #   autoencoder
 
 latent_channels = 6
-latent_spatial_size = 8   # optional, defaults to 8 
+latent_spatial_size= 8   	# optional, defaults to 8 
 
 stats_weight  = 0.01     	# weight of L_stats relative to L_recon
 
-epochs 		  =  60			# note: stage 1 is augmented
-patience 	  =  10        	# renamed to early_stopping_patience internally
+epochs 		  =  20			# note: stage 1 is augmented
+patience 	  =   4       	# renamed to early_stopping_patience internally
 batches		  = 128
 
 
@@ -32,26 +32,36 @@ batches		  = 128
 
 latent_channels = 6
 
-stats_weight  = 0.01     	# weight of L_stats1 relative to L_recon1
+stats_weight  = 0.5     	# weight of L_stats1 relative to L_recon1
 
-epochs 		  =  60			# note: stage 1b is augmented
-patience 	  =  10        	# renamed to early_stopping_patience internally
+epochs 		  =  50			# note: stage 1b is augmented
+patience 	  =   5        	# renamed to early_stopping_patience internally
 batches		  = 128
 
 freeze_encoder= True
-cos_weight	  = 50
+cos_weight	  = 2
+
+# force 	      = True
+
+# Training -- recon1: 371, stats1: 72 (0.01*stats1: 0.720)
 
 
 # Stage 2
 #   latent-space validation (interpolation-consistency fine-tuning)
 
-stats_weight  = 0.01     	# weight of L_stats relative to L_recon
-deriv_weight  = 0.5
+recon1_weight = 0.0005		# multiplies a number 3 orders of magnitude larger
+stats_weight  = 0.01     	# weight of L_stats0 relative to L_recon0
+stats1_weight = 0.0002    	# weight of L_stats1 relative to L_recon0
+deriv_weight  = 0.02
 n_frozen_stages= 2
 
-epochs 		  =    0   # 100		# note: stage 2 is not augmented
+epochs 		  =  100		# note: stage 2 is not augmented
 patience 	  =   10
 batches 	  = same
+
+force 	      = True
+
+# Training -- recon1: 615 (0.001*recon1: 0.615), stats1: 1230 (0.001*stats1: 1.23)
 
 
 # Stage 3a
@@ -60,8 +70,10 @@ n_rollout_steps= 1
 stats_weight  = 0.01
 
 batches		  = 512
-epochs 		  = 0   # 500
+epochs 		  = 500
 patience 	  =  50
+
+force 	      = True
 
 
 # Stage 3b
@@ -71,21 +83,25 @@ stats_weight  = 0.01
 one_step_weight= 0.
 
 batches		  = 512
-epochs 		  = 0   # 500
+epochs 		  = 500
 patience 	  =  50
+
+force 	      = True
 
 
 # Stage 4
 #   encoder refinement
 rollout_weight = 1.0        # primary term for stage 4 (matches the default, but explicit is safer)
-recon_weight   = 0.5       # small but NONZERO anchor -- pick a value, this is a real design choice
+recon_weight   = 0.5       # small but NONZERO anchor -- this is a real design choice
 stats_weight   = 0.01
 
 n_rollout_steps= same
 
 batches		  = 256
-epochs 		  =  0   # 50
+epochs 		  =  50
 patience 	  =  10
+
+force 	      = True
 
 
 # Stage 5
@@ -97,5 +113,5 @@ stats_weight   = 0.01
 n_rollout_steps= same      # match stage 4's -- same reasoning as before
 
 batches        = 256
-epochs         =  0   # 30
+epochs         =  30
 patience       =   5

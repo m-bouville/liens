@@ -47,60 +47,17 @@ def _build_sweep(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
-@pytest.mark.skip(reason="Fixture built a multi-stream checkpoint via train_autoencoder's "
-                         "now-removed latent_names/latent_modes syntax (see the C0/C1 alternation "
-                         "removal). train_stage2 itself is also genuinely incompatible with stage "
-                         "1b's own output (separate D0/D1 via decoder_for_stream, not one shared "
-                         "decoder) -- pending stage 2's own redesign to match the new stage 1a/1b "
-                         "split; not fixed here per explicit instruction not to touch stage 2 yet.")
-def test_stage2_trains_deriv_via_l_deriv(tmp_path):
-    """Real end-to-end: stage 1 (multi-stream, with stats_head) -> stage 2
-    resuming from it. Confirms L_deriv genuinely moves the deriv stream's
-    weights FURTHER (not just that stage 1 alone did), and that the
-    checkpoint's own saved config correctly reflects deriv_weight, not
-    the old interp_weight."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4,
-        latent_names=["state", "deriv"], latent_modes=["autoencoder", "decoder"],
-        latent_channels_decoder=4, latent_spatial_decoder=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1.pt", device="cpu", seed=0,
-        log_every_epoch=True, loss_curve_path=tmp_path / "curve1.png",
-    )
-    stage1_checkpoint = torch.load(stage1_path, map_location="cpu", weights_only=True)
-    deriv_weight_after_stage1 = stage1_checkpoint["model_state"]["encoders.shared.bottlenecks.deriv.weight"].clone()
-
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1_path,
-        deriv_weight=1.0, stats_weight=0.0,
-        epochs=2, batch_size=4, num_workers=0,
-        val_fraction=0.34, test_fraction=0.17,
-        min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
-        log_every_epoch=True, loss_curve_path=tmp_path / "curve2.png",
-    )
-    stage2_checkpoint = torch.load(stage2_path, map_location="cpu", weights_only=True)
-    deriv_weight_after_stage2 = stage2_checkpoint["model_state"]["encoders.shared.bottlenecks.deriv.weight"]
-
-    assert not torch.allclose(deriv_weight_after_stage1, deriv_weight_after_stage2), (
-        "deriv bottleneck weights UNCHANGED between stage 1 and stage 2 -- "
-        "L_deriv is not actually reaching this stream's parameters in stage 2"
-    )
-    print(f"deriv bottleneck weight moved further in stage 2: max abs diff = "
-          f"{(deriv_weight_after_stage2 - deriv_weight_after_stage1).abs().max().item():.6f}")
-
-    assert "deriv_weight" in stage2_checkpoint["stage2_config"]
-    assert "interp_weight" not in stage2_checkpoint["stage2_config"]
-    print("stage2_config:", stage2_checkpoint["stage2_config"])
-
-
 def test_stage2_rejects_single_stream_ancestor(tmp_path):
     """L_deriv has no meaning without a deriv stream -- must raise
-    clearly, not silently do something else."""
+    clearly, not silently do something else. The two tests that used
+    to sit here (deriv-training-in-stage-2, freeze_outer_layers-with-
+    multi-stream) were superseded by test_train_stage2_c0c1.py's own,
+    more complete end-to-end test once stage 2 was redesigned for the
+    real stage 1a/1b split (separate D0/D1, both stats heads, all
+    five loss terms) -- removed here rather than kept skipped, since
+    resurrecting their old latent_names/latent_modes-based fixtures
+    would just duplicate what that file already covers more
+    thoroughly."""
     base_path = _build_sweep(tmp_path, n_runs=6, size=32)
 
     stage1_path = train_autoencoder(
@@ -120,57 +77,3 @@ def test_stage2_rejects_single_stream_ancestor(tmp_path):
             min_step=0, min_stdev_phi=None,
             checkpoint_path=tmp_path / "stage2_should_fail.pt", device="cpu",
         )
-
-
-@pytest.mark.skip(reason="Fixture built a multi-stream checkpoint via train_autoencoder's "
-                         "now-removed latent_names/latent_modes syntax (see the C0/C1 alternation "
-                         "removal). train_stage2 itself is also genuinely incompatible with stage "
-                         "1b's own output (separate D0/D1 via decoder_for_stream, not one shared "
-                         "decoder) -- pending stage 2's own redesign to match the new stage 1a/1b "
-                         "split; not fixed here per explicit instruction not to touch stage 2 yet.")
-def test_stage2_freeze_outer_layers_works_with_multi_stream(tmp_path):
-    """Point 3's actual claim: freeze_outer_layers() needs no new code
-    for the multi-stream EncoderDecoderPair case. Verify directly --
-    frozen blocks show exactly 0 parameter drift, trainable ones don't."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4,
-        latent_names=["state", "deriv"], latent_modes=["autoencoder", "decoder"],
-        latent_channels_decoder=4, latent_spatial_decoder=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1.png",
-    )
-    stage1_checkpoint = torch.load(stage1_path, map_location="cpu", weights_only=True)
-    frozen_key = "encoders.shared.down_blocks.0.conv.block.0.weight"
-    frozen_before = stage1_checkpoint["model_state"][frozen_key].clone()
-
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1_path,
-        deriv_weight=1.0, stats_weight=0.0,
-        epochs=2, batch_size=4, num_workers=0,
-        val_fraction=0.34, test_fraction=0.17,
-        min_step=0, min_stdev_phi=None,
-        n_frozen_stages=1,
-        checkpoint_path=tmp_path / "stage2_frozen.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
-    )
-    stage2_checkpoint = torch.load(stage2_path, map_location="cpu", weights_only=True)
-    frozen_after = stage2_checkpoint["model_state"][frozen_key]
-    deriv_after = stage2_checkpoint["model_state"]["encoders.shared.bottlenecks.deriv.weight"]
-    deriv_before = stage1_checkpoint["model_state"]["encoders.shared.bottlenecks.deriv.weight"]
-
-    assert torch.equal(frozen_before, frozen_after), (
-        "frozen outer layer's weights CHANGED despite n_frozen_stages=1 -- "
-        "freeze_outer_layers() is not correctly freezing this multi-stream model"
-    )
-    assert not torch.allclose(deriv_before, deriv_after), (
-        "deriv bottleneck (should stay TRAINABLE -- it's bottleneck-adjacent, "
-        "not an outer layer) didn't move at all"
-    )
-    print("frozen outer layer: exactly unchanged (correct)")
-    print(f"trainable deriv bottleneck: moved (correct), max abs diff = "
-          f"{(deriv_after - deriv_before).abs().max().item():.6f}")

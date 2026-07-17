@@ -52,7 +52,7 @@ from matplotlib.colors import TwoSlopeNorm
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder, MultiStreamAutoencoder
+from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.constants import LATENT_SPATIAL_SIZE
@@ -155,13 +155,18 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         # this works regardless of what the recon stream is actually
         # named. ae here is the FULL container (Autoencoder exposes
         # .encoder/.decoder directly, MultiStreamAutoencoder only has
-        # .encoders["shared"]/.decoders["shared"] -- see those classes'
+        # .encoders["shared"]/.decoders[...] -- see those classes'
         # own docstrings on why), resolved locally since this function
         # has its own scope, separate from check_rollout()'s own
-        # ae_encoder/ae_decoder helpers.
-        ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
-        ae_decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
+        # ae_encoder/ae_decoder helpers. ae_decoder specifically must
+        # be recon_stream_name's own pathway decoder (not a generic
+        # "shared" fallback) -- z_t below is THAT stream's own latent,
+        # and decoders may now be genuinely separate per stream (stage
+        # 1b's own format).
         _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+        ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+        ae_decoder = (ae.pathways[recon_stream_name].decoder if hasattr(ae, "pathways")
+                      else ae.decoder)
         z_t = ae_encoder(x_t)[recon_stream_name]
         z_next_true = ae_encoder(x_next_true_t)[recon_stream_name]
 
@@ -300,14 +305,23 @@ def check_rollout(
         stream_configs, recon_stream_name, ae_checkpoint["model_state"],
     )
     recon_stream = stream_configs[recon_stream_name]
-
-    if len(stream_configs) == 1:
+    decoder_for_stream = ae_config.get("decoder_for_stream")
+    is_flat_checkpoint = any(k.startswith("encoder.") for k in ae_checkpoint["model_state"])
+    if is_flat_checkpoint:
+        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        decoder = Decoder(output_size=ae_config["size"], out_channels=1,
+                           base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder, stream_name=recon_stream_name,
+                                 mode=recon_stream.mode).to(device)
+    elif len(stream_configs) == 1:
         ae = Autoencoder(
             size=ae_config["size"], channels=1,
             base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
             latent_spatial_size=recon_stream.spatial_size,
         ).to(device)
-    else:
+    elif decoder_for_stream is None:
         encoder = Encoder(input_size=ae_config["size"], in_channels=1,
                            base_channels=ae_config["base_channels"], stream_configs=stream_configs)
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
@@ -315,10 +329,23 @@ def check_rollout(
                            latent_spatial_size=recon_stream.spatial_size)
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
                                      stream_configs=stream_configs).to(device)
+    else:
+        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        decoders = {}
+        for stream_name, decoder_key in decoder_for_stream.items():
+            stream_cfg = stream_configs[stream_name]
+            decoders[decoder_key] = Decoder(
+                output_size=ae_config["size"], out_channels=1,
+                base_channels=ae_config["base_channels"], latent_channels=stream_cfg.channels,
+                latent_spatial_size=stream_cfg.spatial_size,
+            )
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
+                                     stream_configs=stream_configs,
+                                     decoder_for_stream=decoder_for_stream).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     ae.eval()
     ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
-    ae_decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
 
     f_theta = LatentDynamics(
         latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],

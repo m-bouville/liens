@@ -66,27 +66,39 @@ def loss_curve(
         ax.plot(epochs, secondary_val, label=f"valid ({secondary_label})",
                 color="tab:orange", linestyle="--", linewidth=1, alpha=0.5)
 
+    all_series = [train_loss, val_loss, best_so_far]
+    if secondary_train is not None:
+        all_series.append(secondary_train)
+    if secondary_val is not None:
+        all_series.append(secondary_val)
+    all_values = [v for series in all_series for v in series]
+    # Log scale needs every value strictly > 0 -- log(0) and log(negative)
+    # are undefined. Losses are positive in practice, but this is a real
+    # (if rare) edge case worth falling back gracefully for, not
+    # crashing on (e.g. a genuinely perfect, exactly-zero-loss epoch).
+    use_log = bool(all_values) and min(all_values) > 0
+    if use_log:
+        ax.set_yscale("log")
+
     if train_loss and train_loss[0] > 0:
         cap = 2 * train_loss[0]
-        all_series = [train_loss, val_loss, best_so_far]
-        if secondary_train is not None:
-            all_series.append(secondary_train)
-        if secondary_val is not None:
-            all_series.append(secondary_val)
-        observed_max = max(max(series) for series in all_series if series)
+        observed_max = max(all_values) if all_values else 0
         if observed_max > cap:
             ax.set_ylim(top=cap)
         # else: leave the top unset -- auto-scale to the real range,
         # which is already <= cap and gives a tighter, more accurate
         # bound than always stretching to a value nothing reaches.
-    ax.set_ylim(bottom=0)
+    if not use_log:
+        ax.set_ylim(bottom=0)
+    # else: no bottom=0 on a log axis (undefined) -- matplotlib auto-
+    # floors to the smallest positive value actually present instead.
 
     ax.set_xlabel("epoch")
-    ax.set_ylabel("loss")
+    ax.set_ylabel("loss" + (" (log scale)" if use_log else ""))
     if title:
         ax.set_title(title)
     ax.legend(loc="upper right", fontsize=9)
-    ax.grid(alpha=0.3)
+    ax.grid(alpha=0.3, which="both" if use_log else "major")
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -150,3 +150,67 @@ def tmp_run_dir_with_stats(tmp_run_dir):
 
     return run_dir, steps, STAT_NAMES
 
+
+@pytest.fixture
+def isolated_project_root(tmp_path, monkeypatch):
+    """
+    For any test that calls run_from_params_file() or another
+    pipeline-level entry point WITHOUT explicitly overriding every
+    checkpoint_path/loss_curve_path/output_path itself: every module
+    in this project independently anchors its own default output
+    locations to _PYTHON_ROOT = Path(__file__).resolve().parent.parent
+    (see test_path_policy.py's own docstring on why this anchoring
+    exists at all -- it replaced an earlier, CWD-relative-path bug).
+    That's the CORRECT behavior for real use, but it means any test
+    that doesn't override these defaults writes directly into this
+    project's own real checkpoints/ and output/ directories -- not a
+    tmp_path, an actually-active working directory the person using
+    this project sees and has to clean up by hand.
+
+    Redirects every such module's own _PYTHON_ROOT (and any OTHER
+    module-level constant derived from it at import time, which won't
+    automatically follow a patched _PYTHON_ROOT on its own) to a fresh
+    tmp_path instead, for the duration of one test. Covers every
+    module actually involved in a full stage 1->1b->2->3a->3b run
+    (train_ae.py/train_lds.py/train_refinement.py/orchestration.paths/
+    orchestration.pipeline) -- NOT the individual evaluation/*.py
+    scripts, which each have their own, separate _PYTHON_ROOT too, but
+    only ever use it for CLI argument defaults (argparse), never when
+    called programmatically with an explicit checkpoint_path/
+    output_path the way the pipeline itself always does internally.
+
+    orchestration.pipeline specifically imports _PYTHON_ROOT/
+    _STAGE_DIRS via `from orchestration.paths import ...` -- a
+    same-name BINDING in its own namespace, not a live reference back
+    to orchestration.paths's own copy, so patching paths.py's copy
+    alone would NOT affect what pipeline.py itself actually reads.
+    Both need patching separately, or this fixture would silently miss
+    exactly the module that matters most (the one run_from_params_file
+    itself lives in).
+    """
+    root = tmp_path / "isolated_project_root"
+    (root / "checkpoints").mkdir(parents=True)
+    (root.parent / "output").mkdir(parents=True, exist_ok=True)
+
+    stage_dirs = {1: root / "checkpoints" / "stage1",
+                  "1b": root / "checkpoints" / "stage1b",
+                  2: root / "checkpoints" / "stage2",
+                  3: root / "checkpoints" / "stage3",
+                  "3a": root / "checkpoints" / "stage3a",
+                  "3b": root / "checkpoints" / "stage3b",
+                  4: root / "checkpoints" / "stage4",
+                  5: root / "checkpoints" / "stage5"}
+
+    import training.train_ae as train_ae
+    import training.train_lds as train_lds
+    import training.train_refinement as train_refinement
+    import orchestration.paths as orch_paths
+    import orchestration.pipeline as orch_pipeline
+
+    for module in (train_ae, train_lds, train_refinement, orch_paths, orch_pipeline):
+        monkeypatch.setattr(module, "_PYTHON_ROOT", root, raising=True)
+    for module in (orch_paths, orch_pipeline):
+        monkeypatch.setattr(module, "_STAGE_DIRS", stage_dirs, raising=True)
+    monkeypatch.setattr(orch_paths, "_CHECKPOINTS_ROOT", root / "checkpoints", raising=True)
+
+    return root

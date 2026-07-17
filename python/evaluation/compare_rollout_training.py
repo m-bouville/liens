@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder, MultiStreamAutoencoder
+from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -145,13 +145,23 @@ def main():
         stream_configs, recon_stream_name, ae_checkpoint["model_state"],
     )
     recon_stream = stream_configs[recon_stream_name]
-    if len(stream_configs) == 1:
+    decoder_for_stream = ae_config.get("decoder_for_stream")
+    is_flat_checkpoint = any(k.startswith("encoder.") for k in ae_checkpoint["model_state"])
+    if is_flat_checkpoint:
+        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        decoder = Decoder(output_size=ae_config["size"], out_channels=1,
+                           base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder, stream_name=recon_stream_name,
+                                 mode=recon_stream.mode).to(device)
+    elif len(stream_configs) == 1:
         ae = Autoencoder(
             size=ae_config["size"], channels=1,
             base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
             latent_spatial_size=recon_stream.spatial_size,
         ).to(device)
-    else:
+    elif decoder_for_stream is None:
         encoder = Encoder(input_size=ae_config["size"], in_channels=1,
                            base_channels=ae_config["base_channels"], stream_configs=stream_configs)
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
@@ -159,6 +169,20 @@ def main():
                            latent_spatial_size=recon_stream.spatial_size)
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
                                      stream_configs=stream_configs).to(device)
+    else:
+        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        decoders = {}
+        for stream_name, decoder_key in decoder_for_stream.items():
+            stream_cfg = stream_configs[stream_name]
+            decoders[decoder_key] = Decoder(
+                output_size=ae_config["size"], out_channels=1,
+                base_channels=ae_config["base_channels"], latent_channels=stream_cfg.channels,
+                latent_spatial_size=stream_cfg.spatial_size,
+            )
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
+                                     stream_configs=stream_configs,
+                                     decoder_for_stream=decoder_for_stream).to(device)
     ae.load_state_dict(ae_checkpoint["model_state"])
     ae.eval()
     ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]

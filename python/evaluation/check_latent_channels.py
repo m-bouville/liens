@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 from evaluation.check_rollout import _format_small, _padded_bounds
-from models.autoencoder import Autoencoder, MultiStreamAutoencoder
+from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import (
@@ -131,7 +131,8 @@ def rank_channel_importance(
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(len(dataset), generator=generator)[:n_samples].tolist()
     ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
-    ae_decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
+    ae_decoder = (ae.pathways[recon_stream_name].decoder if hasattr(ae, "pathways")
+                  else ae.decoder)
 
     latent_channels = None
     total_delta = None
@@ -176,14 +177,28 @@ def check_latent_channels(
         stream_configs, recon_stream_name, checkpoint["model_state"],
     )
     recon_stream = stream_configs[recon_stream_name]
-
-    if len(stream_configs) == 1:
+    decoder_for_stream = ae_config.get("decoder_for_stream")
+    is_flat_checkpoint = any(k.startswith("encoder.") for k in checkpoint["model_state"])
+    if is_flat_checkpoint:
+        # Mirrors model_assembly.py's own construction exactly (the
+        # SAME code that produced this checkpoint) -- encoder built
+        # with the FULL stream_configs (every bottleneck, even ones
+        # with no decoder here), wrapped in a single-pathway
+        # EncoderDecoderPair for just the reconstruction stream.
+        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        decoder = Decoder(output_size=ae_config["size"], out_channels=1,
+                           base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder, stream_name=recon_stream_name,
+                                 mode=recon_stream.mode).to(device)
+    elif len(stream_configs) == 1:
         ae = Autoencoder(
             size=ae_config["size"], channels=1,
             base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
             latent_spatial_size=recon_stream.spatial_size,
         ).to(device)
-    else:
+    elif decoder_for_stream is None:
         encoder = Encoder(input_size=ae_config["size"], in_channels=1,
                            base_channels=ae_config["base_channels"], stream_configs=stream_configs)
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
@@ -191,10 +206,23 @@ def check_latent_channels(
                            latent_spatial_size=recon_stream.spatial_size)
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
                                      stream_configs=stream_configs).to(device)
+    else:
+        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+        decoders = {}
+        for stream_name, decoder_key in decoder_for_stream.items():
+            stream_cfg = stream_configs[stream_name]
+            decoders[decoder_key] = Decoder(
+                output_size=ae_config["size"], out_channels=1,
+                base_channels=ae_config["base_channels"], latent_channels=stream_cfg.channels,
+                latent_spatial_size=stream_cfg.spatial_size,
+            )
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
+                                     stream_configs=stream_configs,
+                                     decoder_for_stream=decoder_for_stream).to(device)
     ae.load_state_dict(checkpoint["model_state"])
     ae.eval()
     ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
-    ae_decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
 
     nx, ny = ae_config["size"], ae_config["size"]
 

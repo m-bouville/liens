@@ -463,26 +463,32 @@ def freeze_outer_layers(ae: Autoencoder | EncoderDecoderPair | MultiStreamAutoen
     ae.train() call, or "frozen" blocks with BatchNorm will keep
     drifting via their running stats even though their learnable weights
     are correctly held fixed.
+
+    Freezes EVERY decoder found (ae.decoders, if the container has more
+    than one -- e.g. a stage-1b-derived checkpoint's own D0/D1), not
+    just one -- symmetric treatment for every decode pathway, not just
+    whichever happens to be named "shared".
     """
     frozen_modules: list[torch.nn.Module] = []
     if n_frozen_stages <= 0:
         return frozen_modules
     # MultiStreamAutoencoder doesn't expose .encoder/.decoder directly
-    # (only .encoders["shared"]/.decoders["shared"], see its own
-    # docstring on why) -- Autoencoder/EncoderDecoderPair still do.
+    # (only .encoders["shared"]/.decoders[...], see its own docstring
+    # on why) -- Autoencoder/EncoderDecoderPair still do.
     encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
-    decoder = ae.decoder if hasattr(ae, "decoder") else ae.decoders["shared"]
+    decoders = [ae.decoder] if hasattr(ae, "decoder") else list(ae.decoders.values())
     for block in encoder.down_blocks[:n_frozen_stages]:
         for p in block.parameters():
             p.requires_grad_(False)
         frozen_modules.append(block)
-    for block in decoder.up_blocks[-n_frozen_stages:]:
-        for p in block.parameters():
+    for decoder in decoders:
+        for block in decoder.up_blocks[-n_frozen_stages:]:
+            for p in block.parameters():
+                p.requires_grad_(False)
+            frozen_modules.append(block)
+        for p in decoder.output_conv.parameters():
             p.requires_grad_(False)
-        frozen_modules.append(block)
-    for p in decoder.output_conv.parameters():
-        p.requires_grad_(False)
-    frozen_modules.append(decoder.output_conv)
+        frozen_modules.append(decoder.output_conv)
     return frozen_modules
 
 
@@ -1111,6 +1117,7 @@ def train_stage1b(
 def train_stage2(
     base_path: Path, resume_from: Path,
     deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats_weight: float = 0.0,
+    recon1_weight: float = 1.0, stats1_weight: float | None = None,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     min_step: int | None = None, min_stdev_phi: float | None = None,
@@ -1175,10 +1182,37 @@ def train_stage2(
     still run as a before/after diagnostic (see below) -- only removed
     as a TRAINING loss, not as a sanity-check tool.
 
-    L_stats1 (the deriv stream's own analogous stats anchor) is
-    deliberately NOT implemented here either, matching Stage 1's own
-    "not a priority" deferral for the identical reason -- real, separate
-    scope, not folded in silently alongside L_deriv.
+    Full loss: L_recon0 + recon1_weight*L_recon1 + stats_weight*L_stats0
+    + stats1_weight*L_stats1 + effective_deriv_weight*L_deriv --
+    matching the project's own C0/C1 design table (both streams'
+    reconstruction and stats terms, plus the latent-space consistency
+    term). L_recon0/L_stats0 are the SAME terms this function already
+    had (state stream, unweighted/stats_weight-weighted respectively --
+    L_recon0's own weight is implicitly 1.0, the reference every other
+    term is expressed relative to, matching every other stage in this
+    project's own convention of never giving the primary recon term an
+    explicit weight parameter). L_recon1/L_stats1 are NEW here,
+    mirroring stage 1b's own identical terms exactly: L_recon1 is
+    D1(z1) compared against the REAL pixel-space derivative via the
+    same per-sample normalized-ratio form stage 1b uses (plain MSE
+    would be wrong here -- see stage 1b's own docstring on why a raw
+    derivative's tiny natural scale needs this), and L_stats1 predicts
+    the SAME original stats stats_head0 predicts (not their
+    derivative), via stats_head1, reusing the identical true_stats
+    target L_stats0 already has.
+
+    recon1_weight/stats1_weight are SEPARATE from L_recon0/L_stats0's
+    own weighting (recon1_weight default 1.0, stats1_weight default
+    None -- meaning "inherit stats_weight's own value unless given
+    explicitly", matching stage 1b's own "reuse the same stats_weight"
+    precedent while still allowing independent tuning if the two
+    streams' stats terms turn out to need it). L_recon0 and L_recon1
+    are genuinely different loss FORMS at different natural scales
+    (plain reconstruction MSE vs. a normalized ratio) -- summing them
+    with an assumed-equal weight risked exactly the kind of scale
+    domination this project already hit and fixed once in stage 1b,
+    so this stays an explicit, independently-tunable choice rather
+    than a silent assumption.
 
     Requires a genuinely multi-stream ancestor with a deriv-role stream
     (raises clearly otherwise) -- L_deriv has no meaning without one,
@@ -1288,18 +1322,42 @@ def train_stage2(
             f"A single-stream (pre-C0/C1) checkpoint can no longer resume into stage 2."
         )
     deriv_stream_name = other_decodable[0]
+    deriv_stream = stream_configs[deriv_stream_name]
 
     # Always MultiStreamAutoencoder: the multi-stream requirement above
     # guarantees len(stream_configs) >= 2 by this point, unlike
     # train_autoencoder's own construction (which still needs to
     # support the single-stream case).
+    #
+    # decoder_for_stream: read from the ANCESTOR's own config, not
+    # assumed -- a stage-1b-derived checkpoint has separate D0/D1 (see
+    # autoencoder.py's MultiStreamAutoencoder), which is what actually
+    # crashed here before this fix (this function used to always build
+    # one shared decoder, unconditionally). An older, pre-stage-1b
+    # multi-stream checkpoint (if one still exists) has no
+    # decoder_for_stream key at all, in which case every stream falls
+    # back to sharing one decoder, matching what such a checkpoint's
+    # own state_dict actually has.
     encoder = Encoder(input_size=size, in_channels=1, base_channels=model_cfg["base_channels"],
                        stream_configs=stream_configs)
-    decoder = Decoder(output_size=size, out_channels=1, base_channels=model_cfg["base_channels"],
-                       latent_channels=recon_stream.channels,
-                       latent_spatial_size=recon_stream.spatial_size)
-    ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
-                                 stream_configs=stream_configs).to(device)
+    decoder_for_stream = model_cfg.get("decoder_for_stream")
+    if decoder_for_stream is None:
+        decoder = Decoder(output_size=size, out_channels=1, base_channels=model_cfg["base_channels"],
+                           latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
+    else:
+        decoders = {}
+        for stream_name, decoder_key in decoder_for_stream.items():
+            stream_cfg = stream_configs[stream_name]
+            decoders[decoder_key] = Decoder(
+                output_size=size, out_channels=1, base_channels=model_cfg["base_channels"],
+                latent_channels=stream_cfg.channels, latent_spatial_size=stream_cfg.spatial_size,
+            )
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
+                                     stream_configs=stream_configs,
+                                     decoder_for_stream=decoder_for_stream).to(device)
     ae.load_state_dict(prev["model_state"])
     frozen_modules = freeze_outer_layers(ae, n_frozen_stages)
     if n_frozen_stages > 0:
@@ -1332,6 +1390,27 @@ def train_stage2(
     stats_head.eval()
     for p in stats_head.parameters():
         p.requires_grad_(False)
+
+    # stats_head1: the deriv stream's own analogous anchor (see stage
+    # 1b's own identical L_stats1). Same freezing rationale as
+    # stats_head above -- gracefully absent (None) if the ancestor
+    # itself never had one (stage 1b trained with stats_weight<=0),
+    # in which case L_stats1 is simply not computed regardless of
+    # what stats1_weight is set to here.
+    stats_head1_state = prev.get("stats_head1_state")
+    if stats_head1_state is None:
+        stats_head1 = None
+        print("NOTE: ancestor checkpoint has no stats_head1 (stage 1b was trained with "
+              "stats_weight<=0) -- L_stats1 will not be computed this stage, regardless of "
+              "stats1_weight.")
+    else:
+        stats_head1 = StatsHead(latent_channels=deriv_stream.channels, stat_names=stat_names,
+                                 latent_spatial=deriv_stream.spatial_size).to(device)
+        stats_head1.load_state_dict(stats_head1_state)
+        stats_head1.eval()
+        for p in stats_head1.parameters():
+            p.requires_grad_(False)
+    effective_stats1_weight = stats_weight if stats1_weight is None else stats1_weight
 
     mean = stats_config["stats_mean"].to(device)
     std = stats_config["stats_std"].to(device)
@@ -1423,7 +1502,13 @@ def train_stage2(
         z0_t = z_t[recon_stream_name]
         z1_t = z_t[deriv_stream_name]
 
-        x_recon = ae.decoders["shared"](z0_t) * torch.exp(ae.pathways[recon_stream_name].log_output_scale)
+        # Decoder access is decoder_for_stream-AWARE now (via
+        # ae.pathways[...].decoder), not the old hardcoded
+        # ae.decoders["shared"] -- D0/D1 may be genuinely separate
+        # decoders now (a stage-1b-derived ancestor), not necessarily
+        # one shared decoder.
+        x_recon = (ae.pathways[recon_stream_name].decoder(z0_t)
+                   * torch.exp(ae.pathways[recon_stream_name].log_output_scale))
         recon = recon_loss(x_recon, x_t)
 
         stats_pred = stats_head(z0_t)
@@ -1440,11 +1525,41 @@ def train_stage2(
         # satisfying L_recon.
         stats_loss_val = stats_loss_fn(stats_pred, true_stats)
 
+        # L_recon1: D1(z1) compared against the REAL pixel-space
+        # derivative -- mirrors stage 1b's own L_recon1 EXACTLY (same
+        # per-sample normalized-ratio form, same rationale: a raw
+        # derivative's tiny natural scale makes plain MSE let whichever
+        # samples happen to have the largest magnitude dominate the
+        # gradient disproportionately). Genuinely different from
+        # L_deriv below -- this is PIXEL-space (decode z1, compare to
+        # the real pixel derivative), L_deriv is LATENT-space (compare
+        # z1 directly to what z0's own trajectory implies, never
+        # decoding at all). Both exist here; they are not redundant --
+        # see this function's own docstring.
+        pred_pixel_deriv1 = (ae.pathways[deriv_stream_name].decoder(z1_t)
+                              * torch.exp(ae.pathways[deriv_stream_name].log_output_scale))
+        target_pixel_deriv1 = (x_next - x_t) / dt
+        diff_norm1 = torch.linalg.vector_norm(pred_pixel_deriv1 - target_pixel_deriv1, dim=(1, 2, 3))
+        target_norm1 = torch.linalg.vector_norm(target_pixel_deriv1, dim=(1, 2, 3)).clamp_min(1e-6)
+        recon1 = (diff_norm1 / target_norm1).mean()
+
+        # L_stats1: predicts the SAME original stats stats_head0
+        # predicts (not their derivative) -- mirrors stage 1b's own
+        # L_stats1 exactly, same target, same rationale (see stage 1b's
+        # own docstring on why the same-stats target, not a
+        # derivative-of-stats one). None (ancestor never had one) means
+        # this term is simply skipped, regardless of stats1_weight.
+        if stats_head1 is not None:
+            stats_pred1 = stats_head1(z1_t)
+            stats1_loss_val = stats_loss_fn(stats_pred1, true_stats)
+        else:
+            stats1_loss_val = torch.tensor(0.0)
+
         # L_deriv: z1(t) (the deriv stream's OWN encode of x(t)) pulled
         # toward what z0's own latent trajectory implies its rate of
         # change should be -- NOT derivable from pixel-space alone (per
         # the project's own design doc), which is the whole reason this
-        # is a separate objective from Stage 1's C1 (pixel-space:
+        # is a separate objective from L_recon1 above (pixel-space:
         # decode z1, compare against the real pixel derivative). Both
         # z0(t) and z0(t+dt) are DETACHED here: this term must not feed
         # gradient back into z0 through this path (z0 already gets its
@@ -1458,27 +1573,33 @@ def train_stage2(
         target_deriv = (z0_next - z0_t.detach()) / dt
         deriv_loss = recon_loss(z1_t, target_deriv)
 
-        total = recon + stats_weight * stats_loss_val + effective_deriv_weight * deriv_loss
+        total = (recon + recon1_weight * recon1
+                 + stats_weight * stats_loss_val + effective_stats1_weight * stats1_loss_val
+                 + effective_deriv_weight * deriv_loss)
 
         if train:
             optimizer.zero_grad()
             total.backward()
             optimizer.step()
 
-        return total.item(), recon.item(), stats_loss_val.item(), deriv_loss.item()
+        return (total.item(), recon.item(), recon1.item(),
+                stats_loss_val.item(), stats1_loss_val.item(), deriv_loss.item())
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
-    stats_label = "stats" if stats_weight > 0 else "stats_diag"
+    stats_label = "stats0" if stats_weight > 0 else "stats0_diag"
+    stats1_label = "stats1" if effective_stats1_weight > 0 else "stats1_diag"
     print(f"Stage 2: starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size}), "
           f"deriv_weight={deriv_weight}"
           f"{f' (ramped over {deriv_weight_warmup_epochs} epochs)' if deriv_weight_warmup_epochs > 0 else ''}"
-          f", stats_weight={stats_weight}"
-          f"{' (anchor active)' if stats_weight > 0 else ' (diagnostic only, not optimized)'}")
-    print(f"/{epochs:3d} train = recon + {stats_weight}*{stats_label} + {deriv_weight}*deriv | "
-          f"valid = ...  | ema    (all e-3)")
+          f", recon1_weight={recon1_weight}, stats_weight={stats_weight}"
+          f"{' (anchor active)' if stats_weight > 0 else ' (diagnostic only, not optimized)'}"
+          f", stats1_weight={effective_stats1_weight}"
+          f"{' (anchor active)' if stats_head1 is not None and effective_stats1_weight > 0 else ' (inactive)'}")
+    print(f"/{epochs:3d} train = recon0 +{recon1_weight}*recon1 +{stats_weight}*{stats_label} "
+          f"+{effective_stats1_weight}*{stats1_label} +{deriv_weight}*deriv | valid = ...  | ema    (all e-3)")
 
     for epoch in range(1, epochs + 1):
         # Linear ramp: 0 at epoch 0 (never reached, epochs are 1-indexed)
@@ -1502,36 +1623,44 @@ def train_stage2(
             # requires_grad_(False) correctly stops gradient updates --
             # see freeze_outer_layers()'s docstring.
             m.eval()
-        train_total = train_recon = train_stats = train_deriv = 0.0
+        train_total = train_recon = train_recon1 = train_stats = train_stats1 = train_deriv = 0.0
         n_train = len(train_set)
         for batch in train_loader:
             bs = batch[0].size(0)
-            total, recon, stats, deriv = step(batch, train=True,
-                                               effective_deriv_weight=effective_deriv_weight)
+            total, recon, recon1, stats, stats1, deriv = step(
+                batch, train=True, effective_deriv_weight=effective_deriv_weight)
             train_total += total * bs
             train_recon += recon * bs
+            train_recon1 += recon1 * bs
             train_stats += stats * bs
+            train_stats1 += stats1 * bs
             train_deriv += deriv * bs
         train_total /= n_train
         train_recon /= n_train
+        train_recon1 /= n_train
         train_stats /= n_train
+        train_stats1 /= n_train
         train_deriv /= n_train
 
         ae.eval()
-        val_total = val_recon = val_stats = val_deriv = 0.0
+        val_total = val_recon = val_recon1 = val_stats = val_stats1 = val_deriv = 0.0
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0)
-                total, recon, stats, deriv = step(batch, train=False,
-                                                   effective_deriv_weight=effective_deriv_weight)
+                total, recon, recon1, stats, stats1, deriv = step(
+                    batch, train=False, effective_deriv_weight=effective_deriv_weight)
                 val_total += total * bs
                 val_recon += recon * bs
+                val_recon1 += recon1 * bs
                 val_stats += stats * bs
+                val_stats1 += stats1 * bs
                 val_deriv += deriv * bs
         val_total /= n_val
         val_recon /= n_val
+        val_recon1 /= n_val
         val_stats /= n_val
+        val_stats1 /= n_val
         val_deriv /= n_val
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
@@ -1547,10 +1676,12 @@ def train_stage2(
         )
 
         msg = (f"{epoch:4d}|"
-               f"{train_total*1_000:6.3f} ={train_recon*1_000:6.3f} "
-               f"+{stats_weight*train_stats*1_000:6.3f} +{effective_deriv_weight*train_deriv*1_000:6.3f} |"
-               f"{val_total*1_000:6.3f} ={val_recon*1_000:6.3f}"
-               f"+{stats_weight*val_stats*1_000:6.3f} +{effective_deriv_weight*val_deriv*1_000:6.3f} |"
+               f"{train_total*1_000:6.3f} ={train_recon*1_000:6.3f} +{recon1_weight*train_recon1*1_000:6.3f} "
+               f"+{stats_weight*train_stats*1_000:6.3f} +{effective_stats1_weight*train_stats1*1_000:6.3f} "
+               f"+{effective_deriv_weight*train_deriv*1_000:6.3f} |"
+               f"{val_total*1_000:6.3f} ={val_recon*1_000:6.3f} +{recon1_weight*val_recon1*1_000:6.3f}"
+               f"+{stats_weight*val_stats*1_000:6.3f} +{effective_stats1_weight*val_stats1*1_000:6.3f} "
+               f"+{effective_deriv_weight*val_deriv*1_000:6.3f} |"
                f"{val_ema*1_000:6.3f}")
 
         if saved_this_epoch:
@@ -1558,6 +1689,7 @@ def train_stage2(
             torch.save({
                 "model_state": ae.state_dict(),
                 "stats_head_state": stats_head.state_dict(),
+                "stats_head1_state": stats_head1.state_dict() if stats_head1 is not None else None,
                 "epoch": epoch,
                 "val_loss": val_total,
                 "val_loss_ema": val_ema,
@@ -1573,11 +1705,13 @@ def train_stage2(
                         for name, cfg in stream_configs.items()
                     },
                     "recon_stream_name": recon_stream_name,
+                    "decoder_for_stream": decoder_for_stream,
                 },
                 "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
                 "stage2_config": {"deriv_weight": deriv_weight,
                                    "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
-                                   "stats_weight": stats_weight,
+                                   "recon1_weight": recon1_weight,
+                                   "stats_weight": stats_weight, "stats1_weight": effective_stats1_weight,
                                    "n_frozen_stages": n_frozen_stages, "resumed_from": str(resume_from)},
             }, checkpoint_path)
             msg += "  -> saved"
