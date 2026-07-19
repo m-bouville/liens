@@ -9,7 +9,7 @@ Stage numbering (see docs/neural_nets.md):
     2. Latent-space validation: interpolation-consistency fine-tuning
        (E, D trainable; stats_head FROZEN, used only as a fixed
        measuring instrument for L_interp) -- L_recon + lambda1*L_interp,
-       optionally + stats_weight*L_stats as an anchor (gradient flows
+       optionally + stats0_weight*L_stats0 as an anchor (gradient flows
        into E only, since stats_head is frozen) against the encoder
        drifting away from anything stats_head can still interpret --
        see train_stage2()'s docstring for why this is needed at all.
@@ -56,14 +56,14 @@ STAGE-PARAMETERS FILE FORMAT, e.g. 64x64_no_stage2.txt:
     # Stage 1
     min_step      = 4000            # inline '#' comments are stripped
     min_stdev_phi = 0.01
-    stats_weight  = 0.01
+    stats0_weight  = 0.01
     latent_channels = 8
     force = True                    # always retrain, even if a match already exists
     # Stage 2
     epochs = 0                      # 0 = SKIP this stage entirely
     min_stdev_phi = same            # inherit from the nearest preceding stage/global
     n_frozen_stages = 2             # optional: freeze E/D's outer layers (see train_stage2)
-    stats_weight = 0.01             # optional: L_stats anchor weight (0 = no anchor)
+    stats0_weight = 0.01             # optional: L_stats0 anchor weight (0 = no anchor)
     # Stage 3
     epochs = 50
     patience = 10                   # renamed to early_stopping_patience internally

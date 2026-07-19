@@ -156,7 +156,7 @@ def rank_channel_importance(
 
 def check_latent_channels(
     ae_checkpoint_path: Path, fixed_frames: list[str] | None = None,
-    n_frames: int = 12, seed: int = 0, min_step: int = 0,
+    n_frames: int = 12, seed: int = 0, min_step: int = 0, min_stdev_phi: float | None = None,
     n_importance_samples: int = 200, skip_importance: bool = False,
     output_path: Path | None = None, device: str | None = None,
 ) -> Path:
@@ -242,11 +242,12 @@ def check_latent_channels(
     test_dataset = None
     if test_dirs:
         test_dirs = [Path(d) for d in test_dirs]
-        test_dataset = MicrostructureSnapshotDataset(test_dirs, augment=False, min_step=min_step)
+        test_dataset = MicrostructureSnapshotDataset(test_dirs, augment=False, min_step=min_step,
+                                                       min_stdev_phi=min_stdev_phi)
         if len(test_dataset) == 0:
             print(f"WARNING: no snapshots found in the checkpoint's {len(test_dirs)} "
-                  f"test_dirs (after min_step={min_step} filtering) -- skipping "
-                  f"importance ranking.")
+                  f"test_dirs (after min_step={min_step}, min_stdev_phi={min_stdev_phi} "
+                  f"filtering) -- skipping importance ranking.")
             test_dataset = None
     elif not fixed_frames:
         raise ValueError(f"{ae_checkpoint_path} has no saved test_dirs -- pass "
@@ -430,6 +431,7 @@ def check_latent_channels(
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
+    plt.close(fig)
     print(f"\nSaved latent channel visualization to {output_path} "
           f"({len(frames)} frames, {total_channels} channels across {len(stream_order)} "
           f"stream(s): {stream_order})")
@@ -445,6 +447,7 @@ def main():
     parser.add_argument("--n-frames", type=int, default=12)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min-step", type=int, default=0)
+    parser.add_argument("--min-stdev-phi", type=float, default=None)
     parser.add_argument("--n-importance-samples", type=int, default=200,
             help="test frames used for ablation-based channel importance ranking "
                  "(separate from --n-frames, which only controls the figure)")
@@ -459,6 +462,7 @@ def main():
     check_latent_channels(
         ae_checkpoint_path=args.ae_checkpoint, fixed_frames=args.fixed_frames,
         n_frames=args.n_frames, seed=args.seed, min_step=args.min_step,
+        min_stdev_phi=args.min_stdev_phi,
         n_importance_samples=args.n_importance_samples, skip_importance=args.skip_importance,
         output_path=args.output, device=args.device,
     )

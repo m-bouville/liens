@@ -86,7 +86,8 @@ def train_autoencoder(
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     augment: bool = True,
     min_step: int | None = None, min_stdev_phi: float | None = None,
-    stat_names: list[str] | None = None, stats_weight: float | None = None,
+    stat_names: list[str] | None = None, stats0_weight: float | None = None,
+    recon0_scale: float = 1.0, stats0_scale: float = 1.0,
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
     seed: int = 0, checkpoint_path: Path | None = None,
     resume_from: Path | None = None, device: str | None = None,
@@ -96,9 +97,19 @@ def train_autoencoder(
 ) -> Path:
     """
     Stage 1a: train a SINGLE-stream AE (state only) on individual
-    snapshots with L_recon, and (if stats_weight > 0) L_stats via
-    stats_head.py. Returns the path of the best checkpoint saved
-    (selected on an EMA of val_total, see val_ema_decay).
+    snapshots with L_recon0/recon0_scale, and (if stats0_weight > 0)
+    stats0_weight*L_stats0/stats0_scale via stats_head.py. Returns the
+    path of the best checkpoint saved (selected on an EMA of val_total,
+    see val_ema_decay).
+
+    recon0_scale/stats0_scale are magnitude-normalization terms, NOT
+    importance weights -- L_recon0 and L_stats0 sit at genuinely
+    different natural orders of magnitude, and dividing each by its own
+    scale (default 1.0, a no-op) lets stats0_weight express relative
+    IMPORTANCE cleanly, without also having to silently absorb a
+    magnitude correction it was never meant to carry. Live in the
+    params file's shared preamble (same value across every stage that
+    recognizes them), not re-specified per stage the way *_weight is.
 
     Single-stream, deliberately -- this used to also support an
     alternating C0/C1 multi-stream mode (train a 'deriv' stream here
@@ -145,31 +156,38 @@ def train_autoencoder(
     torch.manual_seed(seed)
 
     # config.txt is simulation-sweep-only now (Nx/Ny/dt/temperatures/...) --
-    # min_step/stats_weight are ML training parameters and must be passed
+    # min_step/stats0_weight are ML training parameters and must be passed
     # explicitly by the caller (e.g. from a stage-parameters file via
     # main.py), not silently inferred from config.txt. min_stdev_phi is
     # NOT required to be non-None -- it's genuinely allowed to be None
-    # (no stdev-based filtering at all), unlike min_step/stats_weight,
-    # which have no meaningful None value (stats_weight is compared
+    # (no stdev-based filtering at all), unlike min_step/stats0_weight,
+    # which have no meaningful None value (stats0_weight is compared
     # against a threshold just below; min_step feeds a plain int
     # comparison at the dataset level).
     missing = [name for name, v in [("min_step", min_step),
-                                     ("stats_weight", stats_weight)] if v is None]
+                                     ("stats0_weight", stats0_weight)] if v is None]
     if missing:
         raise ValueError(f"train_autoencoder() requires {', '.join(missing)} to be given "
                           f"explicitly -- config.txt no longer provides ML training defaults.")
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  stats_weight={stats_weight}")
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  stats0_weight={stats0_weight}")
 
-    include_stats = stats_weight > 1e-6
+    include_stats = stats0_weight > 1e-6
 
     if checkpoint_path is None:
-        name = ae_checkpoint_name(size, latent_channels, stats_weight)
+        # ae_checkpoint_name's own "stats_weight" argument name/the
+        # checkpoint config's own saved "stats_weight" key are UNCHANGED
+        # -- an internal, cross-cutting persistence format read by many
+        # downstream consumers (every evaluation script, later stages'
+        # own ancestor lookups), separate from this function's own,
+        # renamed parameter name. Same precedent as ae_latent_channels
+        # already not matching the checkpoint's own "latent_channels" key.
+        name = ae_checkpoint_name(size, latent_channels, stats0_weight)
         checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage1" / f"{name}.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
 
     if loss_curve_path is None:
-        name = ae_checkpoint_name(size, latent_channels, stats_weight)
+        name = ae_checkpoint_name(size, latent_channels, stats0_weight)
         loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage1" / f"{name}-loss_curve.png"
 
     epoch_history: list[int] = []
@@ -190,31 +208,53 @@ def train_autoencoder(
     print(f"{len(run_dirs)} complete runs ({size} x {size}) -> "
           f"{len(train_dirs)} train / {len(val_dirs)} val / {len(test_dirs)} test dirs")
 
-    train_set = MicrostructureSnapshotDataset(
-        train_dirs, cache_in_memory=True, augment=augment,
-        min_step=min_step, min_stdev_phi=min_stdev_phi,
-        include_stats=include_stats, stat_names=stat_names,
-    )
-    # Lock val's stat_names to whatever train resolved (auto-detection is
-    # order-dependent; without this, val could silently end up checked
-    # against a different run's schema than train was).
-    val_stat_names = train_set.stat_names if include_stats else None
-    val_set = MicrostructureSnapshotDataset(
-        val_dirs, cache_in_memory=True, augment=False,
-        min_step=min_step, min_stdev_phi=min_stdev_phi,
-        include_stats=include_stats, stat_names=val_stat_names,
-    )
-    if augment:
-        print(f"{train_set.n_base_samples} base snapshots (train) -> {len(train_set)} after "
-              f"augmentation, {val_set.n_base_samples} (val, unaugmented)")
-    else:
-        print(f"{len(train_set)} snapshots (train, augmentation OFF -- faster, less diverse), "
+    if epochs == 0:
+        # Ablation mode: no training happens (see the epoch loop
+        # below), so train_set/train_loader would never be touched.
+        # MicrostructureSnapshotDataset's own construction is cheaper
+        # than MicrostructureEvolutionDataset's (no min_std_deriv --
+        # nothing here needs to read snapshot PAIRS to compute a
+        # derivative), but cache_in_memory=True still means reading
+        # every train snapshot into memory upfront, for a dataset
+        # that's then never iterated -- skipped entirely instead.
+        # stat_names normally locks to whatever train_set itself
+        # auto-detected -- with train_set skipped, val_set's own
+        # auto-detection is used directly instead, since it's the
+        # only dataset being built at all in this case.
+        train_set = train_loader = None
+        val_set = MicrostructureSnapshotDataset(
+            val_dirs, cache_in_memory=True, augment=False,
+            min_step=min_step, min_stdev_phi=min_stdev_phi,
+            include_stats=include_stats, stat_names=stat_names,
+        )
+        print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
               f"{val_set.n_base_samples} (val, unaugmented)")
+    else:
+        train_set = MicrostructureSnapshotDataset(
+            train_dirs, cache_in_memory=True, augment=augment,
+            min_step=min_step, min_stdev_phi=min_stdev_phi,
+            include_stats=include_stats, stat_names=stat_names,
+        )
+        # Lock val's stat_names to whatever train resolved (auto-detection is
+        # order-dependent; without this, val could silently end up checked
+        # against a different run's schema than train was).
+        val_stat_names = train_set.stat_names if include_stats else None
+        val_set = MicrostructureSnapshotDataset(
+            val_dirs, cache_in_memory=True, augment=False,
+            min_step=min_step, min_stdev_phi=min_stdev_phi,
+            include_stats=include_stats, stat_names=val_stat_names,
+        )
+        if augment:
+            print(f"{train_set.n_base_samples} base snapshots (train) -> {len(train_set)} after "
+                  f"augmentation, {val_set.n_base_samples} (val, unaugmented)")
+        else:
+            print(f"{len(train_set)} snapshots (train, augmentation OFF -- faster, less diverse), "
+                  f"{val_set.n_base_samples} (val, unaugmented)")
 
-    train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        persistent_workers=num_workers > 0, pin_memory=device.type == "cuda",
-    )
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+            persistent_workers=num_workers > 0, pin_memory=device.type == "cuda",
+        )
     val_loader = DataLoader(
         val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         persistent_workers=num_workers > 0, pin_memory=device.type == "cuda",
@@ -231,10 +271,14 @@ def train_autoencoder(
     stats_head = None
     stats_loss_fn = None
     if include_stats:
-        stats_head = StatsHead(latent_channels=latent_channels, stat_names=train_set.stat_names,
+        # train_set is None in epochs=0 ablation mode (skipped entirely,
+        # see above) -- val_set is the only dataset built in that case,
+        # so it's the source for stat_names/normalization instead.
+        stats_source = train_set if train_set is not None else val_set
+        stats_head = StatsHead(latent_channels=latent_channels, stat_names=stats_source.stat_names,
                                 latent_spatial=latent_spatial_size).to(device)
-        mean, std = train_set.stats_normalization()
-        stats_loss_fn = StatsLoss(mean.to(device), std.to(device), stat_names=train_set.stat_names)
+        mean, std = stats_source.stats_normalization()
+        stats_loss_fn = StatsLoss(mean.to(device), std.to(device), stat_names=stats_source.stat_names)
         params += list(stats_head.parameters())
 
     if resume_from is not None:
@@ -257,22 +301,22 @@ def train_autoencoder(
 
         x_recon, z = ae(x)
         (z0_train_stats if train else z0_val_stats).update(z)
-        recon = recon_loss(x_recon, x)
+        recon0 = recon_loss(x_recon, x)
 
         if include_stats:
             stats_pred = stats_head(z)
-            stats = stats_loss_fn(stats_pred, stats_target)
-            total = recon + stats_weight * stats
+            stats0 = stats_loss_fn(stats_pred, stats_target)
+            total = recon0 / recon0_scale + stats0_weight * stats0 / stats0_scale
         else:
-            stats = torch.tensor(0.0)
-            total = recon
+            stats0 = torch.tensor(0.0)
+            total = recon0 / recon0_scale
 
         if train:
             optimizer.zero_grad()
             total.backward()
             optimizer.step()
 
-        return total.item(), recon.item(), stats.item()
+        return total.item(), recon0.item(), stats0.item()
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
@@ -280,11 +324,11 @@ def train_autoencoder(
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
     heading = f"/{epochs:3d} "
-    heading += (f"train = recon +{stats_weight:6.3f} stats | valid = recon +{stats_weight:6.3f} "
-                f"stats  (e-3)  ema") if include_stats else "train | valid  (e-3)  ema"
+    heading += (f"train = recon0/{recon0_scale} +{stats0_weight:.3g}*stats0/{stats0_scale} | "
+                f"valid = ...  | ema") if include_stats else f"train = recon0/{recon0_scale} | valid | ema"
     print(heading)
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         # Fresh each epoch -- see step() for where these get updated,
         # and the epoch-end print below for where they're reported.
         # Kept even without a second (deriv) stream to compare against
@@ -298,37 +342,45 @@ def train_autoencoder(
         if stats_head is not None:
             stats_head.train()
 
-        train_total = train_recon = train_stats = 0.0
+        train_total = train_recon0 = train_stats0 = 0.0
         n_train = 0
-        for batch in train_loader:
-            bs = batch[0].size(0) if include_stats else batch.size(0)
-            total, recon, stats = step(batch, train=True)
-            train_total += total * bs
-            train_recon += recon * bs
-            train_stats += stats * bs
-            n_train += bs
-        train_total /= n_train
-        train_recon /= n_train
-        train_stats /= n_train
+        if epoch > 0:
+            for batch in train_loader:
+                bs = batch[0].size(0) if include_stats else batch.size(0)
+                total, recon0, stats0 = step(batch, train=True)
+                train_total += total * bs
+                train_recon0 += recon0 * bs
+                train_stats0 += stats0 * bs
+                n_train += bs
+            train_total /= n_train
+            train_recon0 /= n_train
+            train_stats0 /= n_train
+        else:
+            # epoch 0 (epochs=0 ablation only): no training at all --
+            # NaN honestly reflects that these metrics don't apply this
+            # "epoch" (n_train stays 0, so dividing would also fail),
+            # rather than a misleading 0.0.
+            train_total = train_recon0 = train_stats0 = float("nan")
 
         ae.eval()
         if stats_head is not None:
             stats_head.eval()
-        val_total = val_recon = val_stats = 0.0
+        val_total = val_recon0 = val_stats0 = 0.0
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0) if include_stats else batch.size(0)
-                total, recon, stats = step(batch, train=False)
+                total, recon0, stats0 = step(batch, train=False)
                 val_total += total * bs
-                val_recon += recon * bs
-                val_stats += stats * bs
+                val_recon0 += recon0 * bs
+                val_stats0 += stats0 * bs
         val_total /= n_val
-        val_recon /= n_val
-        val_stats /= n_val
+        val_recon0 /= n_val
+        val_stats0 /= n_val
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
+        val_ema_str = f"{val_ema:7.4f}" if val_ema is not None else "(warmup)"
 
         epoch_history.append(epoch)
         train_loss_history.append(train_total)
@@ -339,13 +391,15 @@ def train_autoencoder(
             loss_curve_path, title="Stage 1 loss",
         )
 
-        msg = f"{epoch:4d}"
+        msg = f"{epoch:4d}|"
         if include_stats:
-            msg += (f"{train_total*1_000:7.3f} ={train_recon*1_000:6.3f} +{stats_weight*train_stats*1_000:6.3f} |"
-                    f"{val_total*1_000:6.3f} ={val_recon*1_000:6.3f} +{stats_weight*val_stats*1_000:6.3f} |"
-                    f"{val_ema*1_000:6.3f}")
+            msg += (f"{train_total:7.4f} ={train_recon0/recon0_scale:7.4f} "
+                    f"+{stats0_weight*train_stats0/stats0_scale:7.4f} |"
+                    f"{val_total:7.4f} ={val_recon0/recon0_scale:7.4f} "
+                    f"+{stats0_weight*val_stats0/stats0_scale:7.4f} |"
+                    f"{val_ema_str}")
         else:
-            msg += f"{train_total*1_000:7.3f} |{val_total*1_000:7.3f}  {val_ema*1_000:7.3f}"
+            msg += f"{train_total:7.4f} |{val_total:7.4f}  {val_ema_str}"
 
         if saved_this_epoch:
             epochs_since_improvement = 0
@@ -361,7 +415,7 @@ def train_autoencoder(
                     "size": size, "base_channels": base_channels,
                     "latent_channels": latent_channels,
                     "latent_spatial_size": latent_spatial_size,
-                    "stats_weight": stats_weight,
+                    "stats_weight": stats0_weight,
                     # Plain dicts/strings, not the LatentStreamConfig/
                     # LatentStreamMode objects themselves -- this
                     # project loads every checkpoint with
@@ -384,7 +438,7 @@ def train_autoencoder(
                     "recon_stream_name": recon_stream_name,
                 },
                 "stats_config": {
-                    "stat_names": train_set.stat_names,
+                    "stat_names": stats_source.stat_names,
                     "stats_mean": stats_loss_fn.mean.cpu() if stats_loss_fn is not None else None,
                     "stats_std": stats_loss_fn.std.cpu() if stats_loss_fn is not None else None,
                 } if include_stats else None,
@@ -539,7 +593,8 @@ def compute_weight_drift(
 
 def train_stage1b(
     base_path: Path, resume_from: Path,
-    stats_weight: float = 0.0,
+    stats1_weight: float = 0.0,
+    recon1_scale: float = 1.0, stats1_scale: float = 1.0, cos_scale: float = 1.0,
     latent_channels: int | None = None,
     freeze_encoder: bool = True,
     cos_weight: float = 0.0,
@@ -786,7 +841,7 @@ def train_stage1b(
     for p in stats_head0.parameters():
         p.requires_grad_(False)
 
-    include_stats = stats_weight > 1e-6
+    include_stats = stats1_weight > 1e-6
     stats_head1 = None
     stats_loss_fn = None
     mean = prev_stats_config["stats_mean"].to(device)
@@ -805,13 +860,13 @@ def train_stage1b(
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
 
     if checkpoint_path is None:
-        name = ae_checkpoint_name(size, state_cfg.channels, stats_weight)
+        name = ae_checkpoint_name(size, state_cfg.channels, stats1_weight)
         checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage1b" / f"{name}-stage1b.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
 
     if loss_curve_path is None:
-        name = ae_checkpoint_name(size, state_cfg.channels, stats_weight)
+        name = ae_checkpoint_name(size, state_cfg.channels, stats1_weight)
         loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage1b" / f"{name}-stage1b-loss_curve.png"
 
     epoch_history: list[int] = []
@@ -827,21 +882,36 @@ def train_stage1b(
     print(f"{len(run_dirs)} complete runs -> "
           f"{len(train_dirs)} train / {len(val_dirs)} val / {len(test_dirs)} test dirs")
 
-    train_set = MicrostructureEvolutionDataset(
-        train_dirs, encoder=None, window_length=2, augment=augment,
-        min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
-        stat_names=stat_names if include_stats else None,
-    )
+    if epochs == 0:
+        # Ablation mode: no training happens at all (see the epoch loop
+        # below), so train_set/train_loader would never be touched --
+        # building them anyway would scan every train_dir (typically
+        # the majority of all runs) for min_std_deriv filtering, which
+        # requires reading actual snapshot pairs to compute a
+        # derivative per candidate window. That scan, not any actual
+        # training, is the real cost behind "preparation is slow even
+        # for epochs=0" -- skipped entirely here instead.
+        train_set = train_loader = None
+        print("train_set: skipped (epochs=0 ablation -- never iterated over)")
+    else:
+        train_set = MicrostructureEvolutionDataset(
+            train_dirs, encoder=None, window_length=2, augment=augment,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
+            stat_names=stat_names if include_stats else None,
+        )
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                                   persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
     val_set = MicrostructureEvolutionDataset(
         val_dirs, encoder=None, window_length=2,
         min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
         stat_names=stat_names if include_stats else None,
     )
-    print(f"{len(train_set)} (train, {'augmented' if augment else 'NOT augmented'}) / "
-          f"{len(val_set)} (val, unaugmented) consecutive-pair windows for stage 1b")
+    if epochs > 0:
+        print(f"{len(train_set)} (train, {'augmented' if augment else 'NOT augmented'}) / "
+              f"{len(val_set)} (val, unaugmented) consecutive-pair windows for stage 1b")
+    else:
+        print(f"{len(val_set)} (val, unaugmented) consecutive-pair windows for stage 1b")
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                               persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
                              persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
 
@@ -859,18 +929,6 @@ def train_stage1b(
 
         pred_deriv, z1 = ae.pathways["deriv"](x_t)
         (z1_train_stats if train else z1_val_stats).update(z1)
-        # std across ONLY the spatial (H, W) dims, per (sample, channel)
-        # -- distinct from z1_train_stats' own overall std, which mixes
-        # spatial variation together with batch/channel variation and
-        # can't tell them apart. The decode path from here (unbottleneck
-        # is a 1x1 conv, every UpBlock is a non-overlapping stride-2
-        # transposed conv) never mixes DIFFERENT spatial positions with
-        # each other at any point -- so if z1 doesn't genuinely vary
-        # across its own 4x4 grid, no amount of decoder capacity or
-        # training could produce anything but a repeated, per-position
-        # pattern, regardless of what z1's overall (non-spatial) content is.
-        z1_spatial_std = z1.std(dim=(2, 3))  # (batch, channels)
-        (z1_spatial_std_train if train else z1_spatial_std_val).update(z1_spatial_std)
         target_deriv = (x_next - x_t) / dt
         # Per-SAMPLE normalized ratio, not plain MSE -- same rationale
         # as the earlier C0/C1-alternation version (see the archived
@@ -902,10 +960,10 @@ def train_stage1b(
         if include_stats:
             stats_pred1 = stats_head1(z1)
             stats1 = stats_loss_fn(stats_pred1, stats_target)
-            total = recon1 + stats_weight * stats1
+            total = recon1 / recon1_scale + stats1_weight * stats1 / stats1_scale
         else:
             stats1 = torch.tensor(0.0)
-            total = recon1
+            total = recon1 / recon1_scale
 
         if cos_weight > 0:
             # NON-detached version -- gradient must flow through this
@@ -915,7 +973,7 @@ def train_stage1b(
             # by growing without bound.
             cos_loss = (1 - torch.nn.functional.cosine_similarity(
                 pred_deriv.flatten(1), target_deriv.flatten(1), dim=1)).mean()
-            total = total + cos_weight * cos_loss
+            total = total + cos_weight * cos_loss / cos_scale
         else:
             cos_loss = torch.tensor(0.0)
 
@@ -931,15 +989,17 @@ def train_stage1b(
 
     stats_label = "stats1" if include_stats else "stats1_diag"
     print(f"Stage 1b: starting {epochs} epochs (early_stopping_patience: "
-          f"{early_stopping_patience}, batches of {batch_size}), stats_weight={stats_weight}"
+          f"{early_stopping_patience}, batches of {batch_size}), stats1_weight={stats1_weight}"
           f"{' (anchor active)' if include_stats else ' (diagnostic only, not optimized)'}")
-    print(f"/{epochs:3d} train = recon1 + {stats_weight}*{stats_label} | valid = ...  | ema  (all e-3)")
+    formula = f"recon1/{recon1_scale} + {stats1_weight}*{stats_label}/{stats1_scale}"
+    if cos_weight > 0:
+        formula += f" + {cos_weight}*cos/{cos_scale}"
+    print(f"/{epochs:3d} train = {formula} | valid = ...  | ema")
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         # Fresh each epoch -- see step() for where these get updated,
         # and the epoch-end print below for where they're reported.
         z1_train_stats, z1_val_stats = _RunningStats(), _RunningStats()
-        z1_spatial_std_train, z1_spatial_std_val = _RunningStats(), _RunningStats()
         pred_norm_train, pred_norm_val = _RunningStats(), _RunningStats()
         target_norm_train, target_norm_val = _RunningStats(), _RunningStats()
         cos_sim_train, cos_sim_val = _RunningStats(), _RunningStats()
@@ -966,38 +1026,45 @@ def train_stage1b(
         D0.eval()
         stats_head0.eval()
 
-        train_total = train_recon = train_stats = train_cos = 0.0
-        n_train = len(train_set)
-        for batch in train_loader:
-            bs = batch[0].size(0)
-            total, recon, stats, cos = step(batch, train=True)
-            train_total += total * bs
-            train_recon += recon * bs
-            train_stats += stats * bs
-            train_cos += cos * bs
-        train_total /= n_train
-        train_recon /= n_train
-        train_stats /= n_train
-        train_cos /= n_train
+        train_total = train_recon1 = train_stats1 = train_cos = 0.0
+        if epoch > 0:
+            n_train = len(train_set)
+            for batch in train_loader:
+                bs = batch[0].size(0)
+                total, recon1, stats1, cos = step(batch, train=True)
+                train_total += total * bs
+                train_recon1 += recon1 * bs
+                train_stats1 += stats1 * bs
+                train_cos += cos * bs
+            train_total /= n_train
+            train_recon1 /= n_train
+            train_stats1 /= n_train
+            train_cos /= n_train
+        else:
+            # epoch 0 (epochs=0 ablation only): no training at all --
+            # NaN honestly reflects that these metrics don't apply this
+            # "epoch", rather than a misleading 0.0.
+            train_total = train_recon1 = train_stats1 = train_cos = float("nan")
 
         ae.eval()
-        val_total = val_recon = val_stats = val_cos = 0.0
+        val_total = val_recon1 = val_stats1 = val_cos = 0.0
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0)
-                total, recon, stats, cos = step(batch, train=False)
+                total, recon1, stats1, cos = step(batch, train=False)
                 val_total += total * bs
-                val_recon += recon * bs
-                val_stats += stats * bs
+                val_recon1 += recon1 * bs
+                val_stats1 += stats1 * bs
                 val_cos += cos * bs
         val_total /= n_val
-        val_recon /= n_val
-        val_stats /= n_val
+        val_recon1 /= n_val
+        val_stats1 /= n_val
         val_cos /= n_val
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
+        val_ema_str = f"{val_ema:7.4f}" if val_ema is not None else "(warmup)"
 
         epoch_history.append(epoch)
         train_loss_history.append(train_total)
@@ -1007,16 +1074,16 @@ def train_stage1b(
                    loss_curve_path, title="Stage 1b loss")
 
         if include_stats:
-            msg = (f"{epoch:4d}|{train_total*1_000:7.3f} ={train_recon*1_000:6.3f} "
-                   f"+{stats_weight*train_stats*1_000:6.3f} |{val_total*1_000:7.3f} "
-                   f"={val_recon*1_000:6.3f} +{stats_weight*val_stats*1_000:6.3f} |"
-                   f"{val_ema*1_000:7.3f}")
+            msg = (f"{epoch:4d}|{train_total:7.4f} ={train_recon1/recon1_scale:7.4f} "
+                   f"+{stats1_weight*train_stats1/stats1_scale:7.4f} |{val_total:7.4f} "
+                   f"={val_recon1/recon1_scale:7.4f} +{stats1_weight*val_stats1/stats1_scale:7.4f} |"
+                   f"{val_ema_str}")
         else:
-            msg = (f"{epoch:4d}|{train_total*1_000:7.3f} |{val_total*1_000:7.3f} |"
-                   f"{val_ema*1_000:7.3f}")
+            msg = (f"{epoch:4d}|{train_total:7.4f} |{val_total:7.4f} |"
+                   f"{val_ema_str}")
         if cos_weight > 0:
-            msg += (f"  ||cos: train={cos_weight*train_cos*1_000:7.3f} "
-                    f"(raw cos_sim={1 - train_cos:+.4f}) |val={cos_weight*val_cos*1_000:7.3f} "
+            msg += (f"  ||cos: train={cos_weight*train_cos/cos_scale:7.4f} "
+                    f"(raw cos_sim={1 - train_cos:+.4f}) |val={cos_weight*val_cos/cos_scale:7.4f} "
                     f"(raw cos_sim={1 - val_cos:+.4f})")
 
         if saved_this_epoch:
@@ -1043,7 +1110,7 @@ def train_stage1b(
                     "decoder_for_stream": {state_name: "D0", "deriv": "D1"},
                 },
                 "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
-                "stage1b_config": {"stats_weight": stats_weight, "resumed_from": str(resume_from)},
+                "stage1b_config": {"stats1_weight": stats1_weight, "resumed_from": str(resume_from)},
             }, checkpoint_path)
             msg += "  -> saved"
             if on_checkpoint_saved is not None:
@@ -1057,25 +1124,26 @@ def train_stage1b(
             z1_val_mean, z1_val_std = z1_val_stats.mean_std()
             print(f"      z1: train mean={z1_train_mean:+.4e} std={z1_train_std:.4e} | "
                   f"val mean={z1_val_mean:+.4e} std={z1_val_std:.4e}")
-            z1_spatial_std_train_mean, _ = z1_spatial_std_train.mean_std()
-            z1_spatial_std_val_mean, _ = z1_spatial_std_val.mean_std()
-            print(f"      z1 WITHIN-SAMPLE spatial std (mean over batch/channel, std across "
-                  f"the 4x4 grid ONLY): train={z1_spatial_std_train_mean:.4e} "
-                  f"val={z1_spatial_std_val_mean:.4e}  (compare against z1's own OVERALL std "
-                  f"above -- if this is much smaller, z1 varies mainly across batch/channel, "
-                  f"not across its own spatial positions, and the decode path structurally "
-                  f"cannot produce a spatially-varying prediction regardless of training)")
             pred_norm_train_mean, _ = pred_norm_train.mean_std()
             pred_norm_val_mean, _ = pred_norm_val.mean_std()
             target_norm_train_mean, _ = target_norm_train.mean_std()
             target_norm_val_mean, _ = target_norm_val.mean_std()
-            cos_sim_train_mean, _ = cos_sim_train.mean_std()
-            cos_sim_val_mean, _ = cos_sim_val.mean_std()
-            print(f"      pred_deriv vs target_deriv -- ||pred||: train={pred_norm_train_mean:.4e} "
-                  f"val={pred_norm_val_mean:.4e} | ||target||: train={target_norm_train_mean:.4e} "
-                  f"val={target_norm_val_mean:.4e} | cos_sim: train={cos_sim_train_mean:+.4f} "
-                  f"val={cos_sim_val_mean:+.4f}  (cos_sim near 0 = pred carries no real signal "
-                  f"about target's direction; near +-1 with a norm mismatch = pure scale issue)")
+            norm_line = (f"      pred_deriv vs target_deriv -- ||pred||: train={pred_norm_train_mean:.4e} "
+                         f"val={pred_norm_val_mean:.4e} | ||target||: train={target_norm_train_mean:.4e} "
+                         f"val={target_norm_val_mean:.4e}")
+            if cos_weight == 0:
+                # Only place cos_sim is shown at all when cos_weight==0 --
+                # the "||cos:" suffix below is gated on cos_weight>0, so
+                # this is NOT redundant in that case (unlike when
+                # cos_weight>0, where it would just repeat the same
+                # numbers already shown there).
+                cos_sim_train_mean, _ = cos_sim_train.mean_std()
+                cos_sim_val_mean, _ = cos_sim_val.mean_std()
+                norm_line += (f" | cos_sim: train={cos_sim_train_mean:+.4f} "
+                              f"val={cos_sim_val_mean:+.4f}  (cos_sim near 0 = pred carries no "
+                              f"real signal about target's direction; near +-1 with a norm "
+                              f"mismatch = pure scale issue)")
+            print(norm_line)
 
         if early_stopping_patience is not None and epochs_since_improvement >= early_stopping_patience:
             print(f"Early stopping at epoch {epoch}: no improvement for "
@@ -1116,8 +1184,10 @@ def train_stage1b(
 
 def train_stage2(
     base_path: Path, resume_from: Path,
-    deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats_weight: float = 0.0,
-    recon1_weight: float = 1.0, stats1_weight: float | None = None,
+    deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats0_weight: float = 0.0,
+    recon1_weight: float = 0.0, stats1_weight: float = 0.0,
+    recon0_scale: float = 1.0, recon1_scale: float = 1.0,
+    stats0_scale: float = 1.0, stats1_scale: float = 1.0, deriv_scale: float = 1.0,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     min_step: int | None = None, min_stdev_phi: float | None = None,
@@ -1132,7 +1202,7 @@ def train_stage2(
     """
     Stage 2 (latent-space validation, C0/C1 redesign): trains (E, D) on
     real consecutive-pair (x(t), x(t+dt)) windows with L_recon +
-    lambda_deriv*L_deriv (+ stats_weight*L_stats anchor, see below) --
+    lambda_deriv*L_deriv (+ stats0_weight*L_stats anchor, see below) --
     matching the project's own design doc's Stage 2 spec ("similar to
     Stage 1 + extra L_deriv").
 
@@ -1182,32 +1252,50 @@ def train_stage2(
     still run as a before/after diagnostic (see below) -- only removed
     as a TRAINING loss, not as a sanity-check tool.
 
-    Full loss: L_recon0 + recon1_weight*L_recon1 + stats_weight*L_stats0
-    + stats1_weight*L_stats1 + effective_deriv_weight*L_deriv --
-    matching the project's own C0/C1 design table (both streams'
-    reconstruction and stats terms, plus the latent-space consistency
-    term). L_recon0/L_stats0 are the SAME terms this function already
-    had (state stream, unweighted/stats_weight-weighted respectively --
+    Full loss: L_recon0 + recon0_weight*L_stats0 + recon1_weight*L_recon1
+    + stats1_weight*L_stats1 + effective_deriv_weight*L_deriv (last three
+    all default to 0 except deriv_weight -- see below). L_recon0 is the
+    SAME term this function already had (state stream, unweighted --
     L_recon0's own weight is implicitly 1.0, the reference every other
     term is expressed relative to, matching every other stage in this
     project's own convention of never giving the primary recon term an
-    explicit weight parameter). L_recon1/L_stats1 are NEW here,
-    mirroring stage 1b's own identical terms exactly: L_recon1 is
-    D1(z1) compared against the REAL pixel-space derivative via the
-    same per-sample normalized-ratio form stage 1b uses (plain MSE
-    would be wrong here -- see stage 1b's own docstring on why a raw
-    derivative's tiny natural scale needs this), and L_stats1 predicts
-    the SAME original stats stats_head0 predicts (not their
-    derivative), via stats_head1, reusing the identical true_stats
-    target L_stats0 already has.
+    explicit weight parameter).
 
-    recon1_weight/stats1_weight are SEPARATE from L_recon0/L_stats0's
-    own weighting (recon1_weight default 1.0, stats1_weight default
-    None -- meaning "inherit stats_weight's own value unless given
-    explicitly", matching stage 1b's own "reuse the same stats_weight"
-    precedent while still allowing independent tuning if the two
-    streams' stats terms turn out to need it). L_recon0 and L_recon1
-    are genuinely different loss FORMS at different natural scales
+    DEFAULT BEHAVIOR (recon1_weight=stats1_weight=0.0): z1 is trained
+    PURELY by L_deriv -- a pure latent-space quantity from stage 2
+    onward, never re-anchored to pixel space or to stage 1b's own
+    stats_head1 here. This reflects a real design decision, not a
+    placeholder: stage 1b's own job is getting the deriv bottleneck (and
+    the shared trunk, to a lesser extent) into a region that already
+    carries real, extractable directional signal -- a curriculum/warm-
+    start step using a well-behaved, directly-supervised pixel-space
+    objective, EXACTLY parallel to how stage 3a (n_rollout_steps=1)
+    warm-starts stage 3b (n_rollout_steps=2). Once that's done, z1 has
+    no further need for D1/SH1's own pixel-space grounding -- L_deriv
+    alone should be sufficient to refine it, and stage 1b already did
+    the hard part of making that tractable (see the zero-signal/
+    checkerboard failure this project hit and fixed BEFORE stage 1b
+    existed, back when L_deriv was attempted with no pixel-space
+    grounding at all).
+
+    D1/stats_head1 are NOT removed from this function (see
+    recon1_weight/stats1_weight below) -- kept available, defaulted
+    off, for flexibility while this design choice is still being
+    validated empirically. TODO: revisit whether D1/stats_head1 should
+    be dropped from stage 2 (or from the pipeline entirely, past stage
+    1b) once there's enough evidence the pure-L_deriv default is
+    sufficient on its own.
+
+    recon1_weight/stats1_weight, if explicitly set nonzero, mirror
+    stage 1b's own identical terms exactly: L_recon1 is D1(z1) compared
+    against the REAL pixel-space derivative via the same per-sample
+    normalized-ratio form stage 1b uses (plain MSE would be wrong here
+    -- see stage 1b's own docstring on why a raw derivative's tiny
+    natural scale needs this), and L_stats1 predicts the SAME original
+    stats stats_head0 predicts (not their derivative), via stats_head1,
+    reusing the identical true_stats target L_stats0 already has.
+    L_recon0 and L_recon1 are genuinely different loss FORMS at
+    different natural scales
     (plain reconstruction MSE vs. a normalized ratio) -- summing them
     with an assumed-equal weight risked exactly the kind of scale
     domination this project already hit and fixed once in stage 1b,
@@ -1229,7 +1317,7 @@ def train_stage2(
     being asked to learn from this stage's own (smaller, fine-tuning)
     data.
 
-    stats_weight: an ANCHOR, not a second objective -- pulls E back
+    stats0_weight: an ANCHOR, not a second objective -- pulls E back
     toward producing z's the frozen stats_head can still correctly
     interpret against true statistics, directly countering the
     scale-collapse failure mode observed empirically once L_stats was
@@ -1251,7 +1339,7 @@ def train_stage2(
     structural guarantee against drift (see that function's docstring
     for the bottleneck/unbottleneck loophole). Per-block weight-drift is
     always printed at the end regardless, as the actual safety net --
-    complementary to stats_weight, not a substitute for it. Matches the
+    complementary to stats0_weight, not a substitute for it. Matches the
     design doc's own Stage 2 freeze pattern (shared trunk + D synthesis
     layers frozen, E's projection heads + D's first layer trainable)
     without needing new code -- this function already freezes outer
@@ -1274,7 +1362,7 @@ def train_stage2(
     there's no "stage 2 from scratch". Grid size is read from that
     checkpoint's own config; ITS stats_weight is used only for
     checkpoint naming (see ancestor_stats_weight below), independent of
-    THIS function's own stats_weight parameter (the anchor's weight).
+    THIS function's own stats0_weight parameter (the anchor's weight).
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(seed)
@@ -1298,12 +1386,12 @@ def train_stage2(
     stat_names = stats_config["stat_names"]
     # NOTE: this is the ANCESTOR checkpoint's own stats_weight (stage 1's),
     # used only to name this stage's checkpoint file consistently -- NOT
-    # the same as this function's own stats_weight parameter (the anchor
+    # the same as this function's own stats0_weight parameter (the anchor
     # weight, which may be zero even though the ancestor's wasn't).
     ancestor_stats_weight = model_cfg["stats_weight"]
     size = model_cfg["size"]
     print(f"Resuming from {resume_from} (stat_names={stat_names}, "
-          f"ancestor_stats_weight={ancestor_stats_weight}, this stage's stats_weight={stats_weight})")
+          f"ancestor_stats_weight={ancestor_stats_weight}, this stage's stats0_weight={stats0_weight})")
 
     stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
     stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
@@ -1379,7 +1467,7 @@ def train_stage2(
     # FROZEN during stage 2: L_deriv is a purely latent-space z0/z1
     # comparison (see step()'s own docstring/comments) with no
     # ground-truth supervision for stats_head at all -- the anchor term
-    # (stats_weight*L_stats below) is the ONLY source of real-statistics
+    # (stats0_weight*L_stats below) is the ONLY source of real-statistics
     # signal this stage has, and it's explicitly gradient-into-E-only by
     # design (see that term's own comment). Without freezing, stats_head
     # could drift away from actually predicting real statistics while
@@ -1394,14 +1482,14 @@ def train_stage2(
     # stats_head1: the deriv stream's own analogous anchor (see stage
     # 1b's own identical L_stats1). Same freezing rationale as
     # stats_head above -- gracefully absent (None) if the ancestor
-    # itself never had one (stage 1b trained with stats_weight<=0),
+    # itself never had one (stage 1b trained with stats1_weight<=0),
     # in which case L_stats1 is simply not computed regardless of
     # what stats1_weight is set to here.
     stats_head1_state = prev.get("stats_head1_state")
     if stats_head1_state is None:
         stats_head1 = None
         print("NOTE: ancestor checkpoint has no stats_head1 (stage 1b was trained with "
-              "stats_weight<=0) -- L_stats1 will not be computed this stage, regardless of "
+              "stats1_weight<=0) -- L_stats1 will not be computed this stage, regardless of "
               "stats1_weight.")
     else:
         stats_head1 = StatsHead(latent_channels=deriv_stream.channels, stat_names=stat_names,
@@ -1410,7 +1498,10 @@ def train_stage2(
         stats_head1.eval()
         for p in stats_head1.parameters():
             p.requires_grad_(False)
-    effective_stats1_weight = stats_weight if stats1_weight is None else stats1_weight
+    # No more inheritance logic needed here (stats1_weight used to
+    # default to None, meaning "inherit stats0_weight's own value") --
+    # it's now always a direct, explicit float, defaulting to 0.0
+    # (pure L_deriv, see this function's own docstring).
 
     mean = stats_config["stats_mean"].to(device)
     std = stats_config["stats_std"].to(device)
@@ -1440,16 +1531,26 @@ def train_stage2(
     print(f"{len(run_dirs)} complete runs -> "
           f"{len(train_dirs)} train / {len(val_dirs)} val / {len(test_dirs)} test dirs")
 
-    train_set = MicrostructureEvolutionDataset(train_dirs, encoder=None, window_length=2,
-                                                stat_names=stat_names, min_std_deriv=min_std_deriv,
-                                                min_step=min_step, min_stdev_phi=min_stdev_phi)
-    val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None, window_length=2,
-                                              stat_names=stat_names, min_std_deriv=min_std_deriv,
-                                              min_step=min_step, min_stdev_phi=min_stdev_phi)
-    print(f"{len(train_set)} train / {len(val_set)} val consecutive-pair windows")
-
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                               persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
+    if epochs == 0:
+        # Ablation mode: no training happens (see the epoch loop
+        # below), so train_set/train_loader would never be touched --
+        # skipped entirely, same rationale as Stage 1a/1b's own fix.
+        train_set = train_loader = None
+        val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None, window_length=2,
+                                                  stat_names=stat_names, min_std_deriv=min_std_deriv,
+                                                  min_step=min_step, min_stdev_phi=min_stdev_phi)
+        print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
+              f"{len(val_set)} val consecutive-pair windows")
+    else:
+        train_set = MicrostructureEvolutionDataset(train_dirs, encoder=None, window_length=2,
+                                                    stat_names=stat_names, min_std_deriv=min_std_deriv,
+                                                    min_step=min_step, min_stdev_phi=min_stdev_phi)
+        val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None, window_length=2,
+                                                  stat_names=stat_names, min_std_deriv=min_std_deriv,
+                                                  min_step=min_step, min_stdev_phi=min_stdev_phi)
+        print(f"{len(train_set)} train / {len(val_set)} val consecutive-pair windows")
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                                   persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
                              persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
 
@@ -1512,7 +1613,7 @@ def train_stage2(
         recon = recon_loss(x_recon, x_t)
 
         stats_pred = stats_head(z0_t)
-        # ANCHOR (weight = stats_weight, default 0.0 = no anchor, matching
+        # ANCHOR (weight = stats0_weight, default 0.0 = no anchor, matching
         # the table exactly unless explicitly opted into): pulls E back
         # toward producing z's the FROZEN stats_head can still correctly
         # interpret against true statistics. Gradient flows through z0_t
@@ -1573,9 +1674,10 @@ def train_stage2(
         target_deriv = (z0_next - z0_t.detach()) / dt
         deriv_loss = recon_loss(z1_t, target_deriv)
 
-        total = (recon + recon1_weight * recon1
-                 + stats_weight * stats_loss_val + effective_stats1_weight * stats1_loss_val
-                 + effective_deriv_weight * deriv_loss)
+        total = (recon / recon0_scale + recon1_weight * recon1 / recon1_scale
+                 + stats0_weight * stats_loss_val / stats0_scale
+                 + stats1_weight * stats1_loss_val / stats1_scale
+                 + effective_deriv_weight * deriv_loss / deriv_scale)
 
         if train:
             optimizer.zero_grad()
@@ -1588,20 +1690,30 @@ def train_stage2(
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
-    stats_label = "stats0" if stats_weight > 0 else "stats0_diag"
-    stats1_label = "stats1" if effective_stats1_weight > 0 else "stats1_diag"
+    stats_label = "stats0" if stats0_weight > 0 else "stats0_diag"
+    stats1_label = "stats1" if stats1_weight > 0 else "stats1_diag"
+    # (weight, label, scale) for every OPTIONAL term -- recon0 is always
+    # shown separately (the unweighted primary term). Only include a
+    # term in the header/per-epoch breakdown at all if its own weight is
+    # nonzero -- a term that structurally cannot contribute anything
+    # ("+0.0*something", every single epoch) is noise, not information.
+    active_terms = [(w, lbl, s) for w, lbl, s in [
+        (recon1_weight, "recon1", recon1_scale), (stats0_weight, stats_label, stats0_scale),
+        (stats1_weight, stats1_label, stats1_scale), (deriv_weight, "deriv", deriv_scale),
+    ] if w > 0]
+
     print(f"Stage 2: starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size}), "
           f"deriv_weight={deriv_weight}"
           f"{f' (ramped over {deriv_weight_warmup_epochs} epochs)' if deriv_weight_warmup_epochs > 0 else ''}"
-          f", recon1_weight={recon1_weight}, stats_weight={stats_weight}"
-          f"{' (anchor active)' if stats_weight > 0 else ' (diagnostic only, not optimized)'}"
-          f", stats1_weight={effective_stats1_weight}"
-          f"{' (anchor active)' if stats_head1 is not None and effective_stats1_weight > 0 else ' (inactive)'}")
-    print(f"/{epochs:3d} train = recon0 +{recon1_weight}*recon1 +{stats_weight}*{stats_label} "
-          f"+{effective_stats1_weight}*{stats1_label} +{deriv_weight}*deriv | valid = ...  | ema    (all e-3)")
+          f", recon1_weight={recon1_weight}, stats0_weight={stats0_weight}"
+          f"{' (anchor active)' if stats0_weight > 0 else ' (diagnostic only, not optimized)'}"
+          f", stats1_weight={stats1_weight}"
+          f"{' (anchor active)' if stats_head1 is not None and stats1_weight > 0 else ' (inactive)'}")
+    formula = " ".join(f"+{w}*{lbl}/{s}" for w, lbl, s in active_terms)
+    print(f"/{epochs:3d} train = recon0/{recon0_scale} {formula} | valid = ...  | ema")
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         # Linear ramp: 0 at epoch 0 (never reached, epochs are 1-indexed)
         # up to deriv_weight at epoch=deriv_weight_warmup_epochs and
         # beyond. deriv_weight_warmup_epochs=0 (opt-out) skips this
@@ -1624,23 +1736,29 @@ def train_stage2(
             # see freeze_outer_layers()'s docstring.
             m.eval()
         train_total = train_recon = train_recon1 = train_stats = train_stats1 = train_deriv = 0.0
-        n_train = len(train_set)
-        for batch in train_loader:
-            bs = batch[0].size(0)
-            total, recon, recon1, stats, stats1, deriv = step(
-                batch, train=True, effective_deriv_weight=effective_deriv_weight)
-            train_total += total * bs
-            train_recon += recon * bs
-            train_recon1 += recon1 * bs
-            train_stats += stats * bs
-            train_stats1 += stats1 * bs
-            train_deriv += deriv * bs
-        train_total /= n_train
-        train_recon /= n_train
-        train_recon1 /= n_train
-        train_stats /= n_train
-        train_stats1 /= n_train
-        train_deriv /= n_train
+        if epoch > 0:
+            n_train = len(train_set)
+            for batch in train_loader:
+                bs = batch[0].size(0)
+                total, recon, recon1, stats, stats1, deriv = step(
+                    batch, train=True, effective_deriv_weight=effective_deriv_weight)
+                train_total += total * bs
+                train_recon += recon * bs
+                train_recon1 += recon1 * bs
+                train_stats += stats * bs
+                train_stats1 += stats1 * bs
+                train_deriv += deriv * bs
+            train_total /= n_train
+            train_recon /= n_train
+            train_recon1 /= n_train
+            train_stats /= n_train
+            train_stats1 /= n_train
+            train_deriv /= n_train
+        else:
+            # epoch 0 (epochs=0 ablation only): no training at all --
+            # NaN honestly reflects that these metrics don't apply this
+            # "epoch", rather than a misleading 0.0.
+            train_total = train_recon = train_recon1 = train_stats = train_stats1 = train_deriv = float("nan")
 
         ae.eval()
         val_total = val_recon = val_recon1 = val_stats = val_stats1 = val_deriv = 0.0
@@ -1665,6 +1783,7 @@ def train_stage2(
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
+        val_ema_str = f"{val_ema:7.4f}" if val_ema is not None else "(warmup)"
 
         epoch_history.append(epoch)
         train_loss_history.append(train_total)
@@ -1675,14 +1794,20 @@ def train_stage2(
             loss_curve_path, title="Stage 2 loss",
         )
 
+        term_values = {
+            "recon1": (recon1_weight, recon1_scale, train_recon1, val_recon1),
+            stats_label: (stats0_weight, stats0_scale, train_stats, val_stats),
+            stats1_label: (stats1_weight, stats1_scale, train_stats1, val_stats1),
+            "deriv": (effective_deriv_weight, deriv_scale, train_deriv, val_deriv),
+        }
+        train_terms = " ".join(f"+{w*tv/s:7.4f}" for lbl, (w, s, tv, _) in term_values.items()
+                                if any(lbl == l for _, l, _ in active_terms))
+        val_terms = " ".join(f"+{w*vv/s:7.4f}" for lbl, (w, s, _, vv) in term_values.items()
+                              if any(lbl == l for _, l, _ in active_terms))
         msg = (f"{epoch:4d}|"
-               f"{train_total*1_000:6.3f} ={train_recon*1_000:6.3f} +{recon1_weight*train_recon1*1_000:6.3f} "
-               f"+{stats_weight*train_stats*1_000:6.3f} +{effective_stats1_weight*train_stats1*1_000:6.3f} "
-               f"+{effective_deriv_weight*train_deriv*1_000:6.3f} |"
-               f"{val_total*1_000:6.3f} ={val_recon*1_000:6.3f} +{recon1_weight*val_recon1*1_000:6.3f}"
-               f"+{stats_weight*val_stats*1_000:6.3f} +{effective_stats1_weight*val_stats1*1_000:6.3f} "
-               f"+{effective_deriv_weight*val_deriv*1_000:6.3f} |"
-               f"{val_ema*1_000:6.3f}")
+               f"{train_total:7.4f} ={train_recon/recon0_scale:7.4f} {train_terms} |"
+               f"{val_total:7.4f} ={val_recon/recon0_scale:7.4f} {val_terms} |"
+               f"{val_ema_str}")
 
         if saved_this_epoch:
             epochs_since_improvement = 0
@@ -1711,7 +1836,7 @@ def train_stage2(
                 "stage2_config": {"deriv_weight": deriv_weight,
                                    "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
                                    "recon1_weight": recon1_weight,
-                                   "stats_weight": stats_weight, "stats1_weight": effective_stats1_weight,
+                                   "stats0_weight": stats0_weight, "stats1_weight": stats1_weight,
                                    "n_frozen_stages": n_frozen_stages, "resumed_from": str(resume_from)},
             }, checkpoint_path)
             msg += "  -> saved"
@@ -1806,7 +1931,7 @@ def main():
         base_channels=args.base_channels, latent_channels=args.latent_channels,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
         num_workers=args.num_workers, min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
-        stat_names=args.stat_names, stats_weight=args.stats_weight,
+        stat_names=args.stat_names, stats0_weight=args.stats_weight,
         val_ema_decay=args.val_ema_decay, early_stopping_patience=args.early_stopping_patience,
         seed=args.seed, checkpoint_path=args.checkpoint, resume_from=args.resume_from,
         device=args.device, log_every_epoch=not args.quiet,

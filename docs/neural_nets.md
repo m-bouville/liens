@@ -35,20 +35,26 @@ From each snapshot, more are created through
 There are five losses, which can be mixed and matched at the different stages:
 - reconstruction loss: $L_\mathrm{recon}$,
 - statistics loss: $L_\mathrm{stats}$,
-- interpolation loss: $L_\mathrm{interp}$,
+- derivative loss: $L_\mathrm{deriv}$,
 - one-step latent prediction loss: $L_\mathrm{1step}$,
 - multi-step rollout loss: $L_\mathrm{rollout}$.
 
-| \#| Stage             | Trained |Frozen|Unused| Space | Loss                            |
-|---|-------------------|---------|------|------|-------|---------------------------------|
-| 1 | autoencoder       | E, D, SH|      | f    | real  | `L_recon + λ L_stats`           |
-| 2 | latent validation |E${}^*$, D${}^*$| SH   | f    | both  | `L_recon + λ L_stats + λ₁ L_interp` |
-| 3a| LDS               | f       | E, SH| D    | latent| `L_1step`                       |
-| 3b| LDS               | f       | E, SH| D    | latent| `L_rollout + ε L_1step`         |
-| 4 | encoder refinement| E, f    | D, SH|      | lat + ε real| `L_rollout + λ L_stats + ε L_recon` |
-| 5 | end-to-end        | E, f, D | SH   |      | real  | `L_recon + λ L_stats + λ₂ L_rollout` |
+| \#| Stage                  | Trained |Frozen|Unused| C$_0$/C$_1$|Space | Loss                            |
+|---|-------------------|--------------|------|------|-------|-------|---------------------------------|
+| 1 a| autoencoder       | E, D0, SH0|         | SH1, D1, f    | C$_0$ | real  | `L_recon0 + λ L_stats0`           |
+| 1 b| C1 decoder      | D1, SH1      | E    | SH0, D0, f    | C$_1$ | real  | `L_recon1 + λ L_stats1`           |
+| 2 | latent validation |E${}^*$, D$_0^*$, D$_1^*$| SH$_0$, SH$_1$ | f | C$_1^\dagger$ | both |`L_recon0+1 + λ L_stats0+1 + λ₁ L_deriv` |
+| 3a| LDS               | f       | E, SH$_{0+1}$ | D$_{0+1}$ | both | latent| `L_1step + λ₁ L_deriv`           |
+| 3b| LDS               | f       | E, SH$_{0+1}$ | D$_{0+1}$ | both | latent| `L_rollout + ε L_1step + λ₁ L_deriv` |
+| 4 | encoder refinement| E, f    | D$_{0+1}$, SH$_{0+1}$|   | both | lat + ε real|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
+| 5 | end-to-end        | E, f, D$_{0+1}$ | SH$_{0+1}$  |      | both | real  |`L_recon + λ L_stats + λ₂ L_rollout + λ₁ L_deriv` |
 
-SH: `stats_head`; ${}^*$: outter layers frozen.
+Notes:
+- `L_recon` means reconstruction for both C$_0$ (on µstructure itself) and C$_1$ (on time derivative),
+- likewise for `L_stats` (we do not heavily split them, so no need to at this high level),
+- SH: `stats_head`,
+- ${}^*$: outter layers frozen,
+- ${}^\dagger$: mostly.
 
 
 
@@ -67,7 +73,8 @@ $$L_\mathrm{stats} = \sum_{i=1}^{N_s} w_i \left[g_i(z) - s_i(x)\right]^2.$$
 (See below for more details.)
 
 
-### Interpolation loss
+### Derivative loss
+One compares $z_1(t)$ and $[z_0(t+\Delta t) - z_0(t)] / \Delta t$.
 See latent-space validation (step 2) below. Note: in stage 1 the small dense NN for the statistics is trained along the encoder and decoder, in 2 it is frozen.
 
 
@@ -132,39 +139,72 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 
 
 
-## Latent-space validation (stage 2)
-Training the AE (stage 1) ensures that the initial state can be recovered. This proves that the latent representation $z$ somehow describes $x$, not that is a smooth and structured coordinate system. Doing arithmetic to predict the time evolution would be impossible in a jagged space. For that, latent representation must make sense.
+## Predicting in latent space
 
-Coding analogy: stage 1 creates code that works (recovers the original), and stage 2 refactors it to make it suitable for stage 3.
+### Split latent space
+One wants to get a latent representation which could reconstruct, while preserving internal logic. We introduce a split latent channel:
+- C$_0$ encodes the microstructure (the "state", 0th order): $z_0(t)$ is such that $D(z_0(t));
+- C$_1$ encodes the time derivative (1st order): $\mathrm{d}z_0 / \mathrm{d}t = \dot{z}_0$ (unlike C$_0$, C$_1$ is not decoded: it works purely in latent space). 
+
+A Taylor expansion of $z_0$ gives
+$$z_0(t + \Delta t) = z_0(t) + \dot{z}_0(t)\,\Delta t + \ddot{z}_0(t)\,(\Delta t^2/2) + o(\Delta t^2).$$
+Since $z_1(t) \approx \dot{z}_0(t)$ by training target, our prediction is
+$$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
 
 
-### How stage 2 works
-In stage 1, there are two constraints: recovering the original (decoder) and getting statistics right (`stats_head`). In stage 2, we add a loss function on qualitative representation (interpolation, perturbation). 
+### Initial training
+- stage 1: C$_0$ trained through AE (`L_recon0 + λ L_stats0`)
+- stage 2?: improved latent representation of the link between C$_0$ and C$_1$: $z_1(t)$ learns $\frac{z_0(t+\Delta t) - z_0(t)}{\Delta t}$.
+- stage 3 starts from
+  - $C_0(t+\Delta t) = C_0(t) + \Delta t C_1(t)$,
+  - $C_1(t+\Delta t)$ from was it learned,
+  - 3a: `L_1step`, 3b: `L_rollout`
 
-In stage 2, we are changing the latent representation, so we need to change the encoder. And if the decoder did not change, it would no longer reconstruct properly, so we cannot freeze it either. Since neither E nor D is frozen, there could be a synchronized drift. We keep `stats_head` (with frozen coefficients) to prevent this.
+The asymmetry between C$_0$ and C$_1$ in on the number of channels, not size, in the latent space (still true?).
 
+
+### stage 2
+Training the AE (stage 1) ensures that the initial state can be recovered. This proves that the latent representation $z$ somehow describes $x$, not that is a smooth and structured coordinate system. 
+Working directly in latent space is faster (it is smaller than real space), but _a priori_ we cannot do arithmetic. 
+
+The goal of stage 2 is to have a meaningful latent representation of the relationship between C$_0$ and C$_1$. Enforce $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can do $$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
+
+This can be as simple as adding `L_deriv` to the loss function of stage 1.
+
+In stage 2, we are changing the latent representation, so we need to change the encoder. And if the decoder did not change, it would no longer reconstruct properly, so we cannot freeze it either. Since neither E nor D is frozen, there could be a synchronized drift. We keep `stats0_head` (with frozen coefficients) to prevent this.
 We can also freeze the outter layers of both encoder and decoder (not those close to the latent space) for regularization.
 
 
-### Working in latent space
-We work directly in latent space to avoid relying on the decoder. But there, we cannot calculate physical statistics or measure a direct distance between microstructures pixel by pixel (the calculation $z_2 - z_1$ has no meaning). 
+### stage 3 (LDS)
+Provided with $z_0(t)$ and $z_1(t)$, one must learn $z_0(t+\Delta t)$ and $z_1(t+\Delta t)$.
 
+#### fθ and dz1 / dt
+$f_\theta$ does not need to be trained to the first-order term, it only needs to learn $\ddot{z}_0$ (curvature, a.k.a. $\dot{z}_1$), plus the gap between $z_1$ and $\dot{z}_0$. Then $f_\theta(z_0(t), z_1(t))$ should be trained against
+$$[z_0(t + \Delta t) - z_0(t) - z_1(t)\,\Delta t] / (\Delta t^2/2),$$
+with $\theta$ (currently just the temperature) as further input.
+
+#### gθ and d²z1 / dt²
+A similar Taylor expansion for $z_1$ gives
+$$z_1(t + \Delta t) = z_1(t) + \dot{z}_1(t)\,\Delta t + \ddot{z}_1(t)\,(\Delta t^2/2) + o(\Delta t^2).$$
+Since $f_\theta(z_0(t), z_1(t))$ is trained to approximate $\dot{z}_1(t)$, we can add a $g_\theta$ approximating $\ddot{z}_1$ (i.e. $\dot{f}_\theta$), by training $g_\theta(z_0(t), z_1(t))$ against
+$$[z_1(t + \Delta t) - z_1(t) - f_\theta(z_0(t), z_1(t))\,\Delta t] / (\Delta t^2/2),$$
+again accounting for $\theta$.
+
+In stage 3a, we use only one step, `L_1step`. Stage 3b will involve several consecutive steps (`L_rollout`)​.
+
+
+### Interpolation and perturbation
 In what follows $\mathrm{stats}(z)$ is the vector of statistics, of norm $\|\mathrm{stats}(z)\|$, calculated by the small dense NN described above. It cannot be the statistics of $x$ in the real world, since this would say nothing about latent representation.
 
-
-### Interpolation
 Interpolation in latent space should preserve physical plausibility, not just visual smoothness.
 One takes $t_1 < t_2 < t_3$ three successive time steps in the same simulation, with real states $x_i$ and latent representations $z_i = E(x_i)$. We compare $z_2$ to the interpolated $\tilde{z} = (1-\alpha) z_1 + \alpha z_3$, with $\alpha = (t_2-t_1) / (t_3-t_1)$: we measure and minimize $\|\mathrm{stats}(\tilde{z}) - \mathrm{stats}(z_2)\| \, / \, {\|\mathrm{stats}(z_2)\|}$.
 
-
-### Perturbation
 Let $z_{\varepsilon} = z + \varepsilon \, \eta$, with $\eta \sim \mathcal{N}(0, 1)$. One expects that $\mathrm{stats}(z_{\varepsilon}) \approx \mathrm{stats}(z) + \varepsilon \Delta S$. So a linear regression of $\|\mathrm{stats}(z_{\varepsilon}) - \mathrm{stats}(z)\|$ with several values of $\varepsilon$ can nudge towards:
 - intercept $\approx 0$ (no discontinuity),
 - $R^2 \approx 1$ (e.g. not curvature). 
-
-Perturbation is currently used as _post-hoc_ diagnostic, not as loss function.
-
 Variant: structured perturbations (directional latent shifts) instead of isotropic noise.
+
+Interpolation and perturbation are currently used as _post-hoc_ diagnostic, not as loss functions.
 
 
 

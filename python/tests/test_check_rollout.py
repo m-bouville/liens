@@ -16,7 +16,9 @@ Run from python/ (imports rely on that root being on sys.path):
 import numpy as np
 import pytest
 
-from evaluation.check_rollout import _padded_bounds, parse_fixed_window, _correlation_pct, _format_small
+from utils import load_datasets as load
+
+from evaluation.check_rollout import _padded_bounds, _error_bounds, parse_fixed_window, _correlation_pct, _format_small
 from models.latent_streams import DEFAULT_STREAM_NAME
 
 
@@ -219,7 +221,7 @@ def test_compute_sample_chains_through_full_window(tmp_run_dir):
     many steps are given -- that was the exact bug (always testing
     1-step quality even for a 3-step window).
 
-    Verified two ways: (1) the returned x_t_raw/x_next_raw/dt_val match
+    Verified two ways: (1) the returned x_t_raw/x_next_raw/dt_total match
     the fixture's own known, deterministic values exactly; (2) the
     predicted result is cross-checked against an INDEPENDENT manual
     call to f_theta.rollout() with the same per-transition dts, using
@@ -236,29 +238,46 @@ def test_compute_sample_chains_through_full_window(tmp_run_dir):
     nothing caught the mismatch until this test actually executed.
     """
     import torch
-    from models.autoencoder import Autoencoder
+    from models.autoencoder import MultiStreamAutoencoder
+    from models.encoder import Encoder
+    from models.decoder import Decoder
+    from models.latent_streams import LatentStreamConfig, LatentStreamMode
     from models.latent_dynamics import LatentDynamics
     from evaluation.check_rollout import compute_sample
 
     run_dir, steps = tmp_run_dir  # steps = [0, 1000, 2000, 3000, 4000], dt=0.05, size=64
 
-    ae = Autoencoder(size=64, channels=1, base_channels=4, latent_channels=4)
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=4, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+        "deriv": LatentStreamConfig(name="deriv", channels=4, spatial_size=8,
+                                     mode=LatentStreamMode.DECODER),
+    }
+    encoder = Encoder(input_size=64, in_channels=1, base_channels=4, stream_configs=stream_configs)
+    decoder = Decoder(output_size=64, out_channels=1, base_channels=4,
+                       latent_channels=4, latent_spatial_size=8)
+    ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                 stream_configs=stream_configs)
     ae.eval()
     f_theta = LatentDynamics(latent_channels=4, n_theta=1, hidden_dim=16, n_hidden_layers=1)
     f_theta.eval()
-    ae_config = {"size": 64, "latent_channels": 4, "latent_spatial_size": 8}
+    ae_config = {"size": 64, "latent_channels": 4, "latent_spatial_size": 8,
+                 "stream_configs": {"state": {"channels": 4, "spatial_size": 8, "mode": "autoencoder"},
+                                     "deriv": {"channels": 4, "spatial_size": 8, "mode": "decoder"}},
+                 "recon_stream_name": "state"}
     device = torch.device("cpu")
 
     window = steps[:4]  # [0, 1000, 2000, 3000] -- a 3-step window, matching n_rollout_steps=3
 
-    x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_val = compute_sample(
+    x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_total, dt_per_step = compute_sample(
         run_dir, window, ae, f_theta, ae_config, device,
     )
 
     # (1) known, deterministic fixture values: constant field = step/10000
     assert np.allclose(x_t_raw, 0 / 10000.0, atol=1e-3)       # step 0
     assert np.allclose(x_next_raw, 3000 / 10000.0, atol=1e-3)  # step 3000 (the FINAL step, not step 1000)
-    assert dt_val == pytest.approx((3000 - 0) * 0.05)  # metadata.dt=0.05 in the fixture
+    assert dt_total == pytest.approx((3000 - 0) * 0.05)  # metadata.dt=0.05 in the fixture
+    assert dt_per_step == pytest.approx([1000 * 0.05, 1000 * 0.05, 1000 * 0.05])
 
     # (2) independent cross-check: manually chain the SAME real models
     # with the same per-transition dts, and confirm compute_sample's
@@ -266,15 +285,63 @@ def test_compute_sample_chains_through_full_window(tmp_run_dir):
     # through rollout(), not silently doing a single big-dt call (the
     # old, buggy behavior) or stopping after one step.
     with torch.no_grad():
-        x_t = torch.from_numpy(x_t_raw).unsqueeze(0).unsqueeze(0)
-        z_t = ae.encoder(x_t)[DEFAULT_STREAM_NAME]
+        x_all = torch.stack([
+            torch.from_numpy(load.read_phi_half(run_dir / load.snapshot_filename(step), 64, 64))
+            for step in window
+        ]).unsqueeze(1)  # (len(window), 1, 64, 64) -- EVERY step, real z1 needed at each one
+        x_all_encoded = ae.encoders["shared"](x_all)
+        z0_t = x_all_encoded[DEFAULT_STREAM_NAME][0:1]
+        z1_sequence = x_all_encoded["deriv"].unsqueeze(0)  # (1, len(window), C, 8, 8)
         dts = torch.tensor([[1000 * 0.05, 1000 * 0.05, 1000 * 0.05]], dtype=torch.float32)
         theta = torch.tensor([[0.8 - 1.0]], dtype=torch.float32)  # temperature - T0, from the fixture
-        z_hat_full = f_theta.rollout(z_t, dts, theta)
-        expected_pred = ae.decoder(z_hat_full[:, -1])[0, 0].numpy()
+        z0_hat_full = f_theta.rollout(z0_t, z1_sequence, dts, theta)
+        expected_pred = ae.pathways["state"].decoder(z0_hat_full[:, -1])[0, 0].numpy()
 
     assert np.allclose(x_next_pred, expected_pred, atol=1e-5), (
         "compute_sample's prediction doesn't match an independently chained "
         "rollout() call with the same models and dts -- the chaining fix may "
         "have regressed."
     )
+
+
+def test_error_bounds_expands_beyond_floor_for_a_genuinely_bad_prediction():
+    """Regression test for a real, reported bug: the error panel's own
+    scale used to be derived ONLY from real_delta (a fixed floor,
+    factor=0.25), never checking whether the actual error data itself
+    needed more room. A genuinely bad, noise-like prediction has error
+    on the scale of the STATE itself, not real_delta -- far exceeding
+    that floor -- and got clipped to the same narrow range regardless,
+    saturating the panel and hiding exactly how wrong the prediction
+    was. Reproduces the reported case directly: real_delta on a small,
+    well-behaved scale (~0.016), but error on a much larger,
+    noise-like scale (~0.9) -- exactly what a bad, large-dt
+    extrapolation produces."""
+    real_delta = np.array([-0.016, 0.016, 0.001, -0.001, 0.005, -0.008])
+    error = np.array([-0.9, 0.85, 0.3, -0.6, 0.95, -0.4])
+
+    floor_vmin, floor_vmax = _padded_bounds(real_delta, factor=0.25)
+    vmin, vmax = _error_bounds(real_delta, error)
+
+    # The OLD behavior (floor only) would have saturated -- confirm
+    # the floor alone genuinely does NOT cover the actual error range,
+    # so this test is actually exercising the fix, not a no-op.
+    assert error.max() > floor_vmax and error.min() < floor_vmin
+
+    # The FIX: actual error range must be fully covered, not clipped.
+    assert vmin <= error.min()
+    assert vmax >= error.max()
+
+
+def test_error_bounds_keeps_the_floor_for_a_genuinely_small_error():
+    """The floor's own benefit (fixed, comparable scale across images
+    for the common case) must NOT be lost -- a small, accurate
+    prediction's error panel should still use the real_delta-derived
+    floor, not blow up to match noise in a tiny error array."""
+    real_delta = np.array([-0.5, 0.5, 0.1, -0.1])
+    error = np.array([-0.01, 0.008, 0.005, -0.006])  # comfortably within the floor
+
+    floor_vmin, floor_vmax = _padded_bounds(real_delta, factor=0.25)
+    vmin, vmax = _error_bounds(real_delta, error)
+
+    assert vmin == pytest.approx(floor_vmin)
+    assert vmax == pytest.approx(floor_vmax)

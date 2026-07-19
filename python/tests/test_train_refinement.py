@@ -119,7 +119,7 @@ def _build_lds_checkpoint(path: Path):
     torch.save(checkpoint, path)
 
 
-def test_train_refinement_stage4_runs_end_to_end(tmp_path):
+def test_train_refinement_stage4_runs_end_to_end(tmp_path, isolated_project_root):
     base_path = _build_sweep(tmp_path, n_runs=6)
     ae_checkpoint_path = tmp_path / "fake-stage2.pt"
     lds_checkpoint_path = tmp_path / "fake-stage3.pt"
@@ -130,7 +130,7 @@ def test_train_refinement_stage4_runs_end_to_end(tmp_path):
     result_path = train_refinement(
         base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
         lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=True,
-        rollout_weight=1.0, recon_weight=0.1, stats_weight=0.1,
+        rollout_weight=1.0, recon0_weight=0.1, stats0_weight=0.1,
         epochs=2, batch_size=4, n_rollout_steps=1,
         min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
         checkpoint_path=checkpoint_path, device="cpu", log_every_epoch=True,
@@ -148,7 +148,7 @@ def test_train_refinement_stage4_runs_end_to_end(tmp_path):
     assert saved["stats_head_state"] is not None
 
 
-def test_train_refinement_stage5_trainable_decoder(tmp_path):
+def test_train_refinement_stage5_trainable_decoder(tmp_path, isolated_project_root):
     """freeze_decoder=False (stage 5) should still run fine, and the
     saved checkpoint should correctly record that D was trainable."""
     base_path = _build_sweep(tmp_path, n_runs=6)
@@ -161,7 +161,7 @@ def test_train_refinement_stage5_trainable_decoder(tmp_path):
     train_refinement(
         base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
         lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=False,
-        rollout_weight=0.1, recon_weight=1.0, stats_weight=0.0,
+        rollout_weight=0.1, recon0_weight=1.0, stats0_weight=0.0,
         epochs=2, batch_size=4, n_rollout_steps=1,
         min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
         checkpoint_path=checkpoint_path, device="cpu",
@@ -171,9 +171,9 @@ def test_train_refinement_stage5_trainable_decoder(tmp_path):
     assert saved["stage45_config"]["freeze_decoder"] is False
 
 
-def test_train_refinement_without_ancestor_stats_head_warns_and_skips(tmp_path, capsys):
+def test_train_refinement_without_ancestor_stats_head_warns_and_skips(tmp_path, capsys, isolated_project_root):
     """If the ancestor AE has no stats_head at all, asking for
-    stats_weight>0 should print a warning and skip L_stats gracefully,
+    stats0_weight>0 should print a warning and skip L_stats gracefully,
     not crash."""
     base_path = _build_sweep(tmp_path, n_runs=6)
     ae_checkpoint_path = tmp_path / "fake-stage2-nostats.pt"
@@ -185,7 +185,7 @@ def test_train_refinement_without_ancestor_stats_head_warns_and_skips(tmp_path, 
     train_refinement(
         base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
         lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=True,
-        rollout_weight=1.0, recon_weight=0.1, stats_weight=0.5,  # requested, but unavailable
+        rollout_weight=1.0, recon0_weight=0.1, stats0_weight=0.5,  # requested, but unavailable
         epochs=1, batch_size=4, n_rollout_steps=1,
         min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
         checkpoint_path=checkpoint_path, device="cpu",
@@ -198,7 +198,7 @@ def test_train_refinement_without_ancestor_stats_head_warns_and_skips(tmp_path, 
     assert saved["stats_config"] is None
 
 
-def test_train_refinement_mismatched_ancestors_raises_before_training(tmp_path):
+def test_train_refinement_mismatched_ancestors_raises_before_training(tmp_path, isolated_project_root):
     """The cross-ancestor validation from checkpoint_components should
     fire here too, at load time -- not partway through training."""
     base_path = _build_sweep(tmp_path, n_runs=6)
@@ -227,7 +227,7 @@ def test_train_refinement_mismatched_ancestors_raises_before_training(tmp_path):
         )
 
 
-def test_train_refinement_requires_min_step(tmp_path):
+def test_train_refinement_requires_min_step(tmp_path, isolated_project_root):
     """Only min_step is genuinely required to be non-None -- see the
     next test for confirmation that min_stdev_phi=None is fine."""
     base_path = _build_sweep(tmp_path, n_runs=6)
@@ -244,7 +244,7 @@ def test_train_refinement_requires_min_step(tmp_path):
         )
 
 
-def test_train_refinement_min_stdev_phi_none_does_not_raise(tmp_path):
+def test_train_refinement_min_stdev_phi_none_does_not_raise(tmp_path, isolated_project_root):
     """
     Regression test for the exact bug the test suite caught: min_step
     and min_stdev_phi were both treated as 'must not be None', but
@@ -269,3 +269,33 @@ def test_train_refinement_min_stdev_phi_none_does_not_raise(tmp_path):
         min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
         device="cpu",
     )
+
+
+def test_epochs_zero_actually_writes_a_checkpoint_stage4(tmp_path, isolated_project_root, capsys):
+    """Same regression test as every earlier stage's own, for
+    train_refinement -- this is the stage that would have been hit
+    NEXT in the reported scenario (Stage 4 resuming from an
+    incorrectly-still-real Stage 1b/2 ancestor), had epochs=0 ever
+    been tried there too."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_checkpoint_path = tmp_path / "fake-stage2.pt"
+    lds_checkpoint_path = tmp_path / "fake-stage3.pt"
+    _build_ae_checkpoint(ae_checkpoint_path, include_stats_head=True)
+    _build_lds_checkpoint(lds_checkpoint_path)
+
+    checkpoint_path = tmp_path / "stage4_ablation.pt"
+    assert not checkpoint_path.exists()
+
+    result = train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
+        lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=True,
+        epochs=0, batch_size=4, min_step=0, min_stdev_phi=None,
+        checkpoint_path=checkpoint_path, device="cpu", log_every_epoch=True,
+    )
+
+    assert result == checkpoint_path
+    assert checkpoint_path.exists(), "epochs=0 must still write a valid checkpoint"
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert saved["epoch"] == 0
+    output = capsys.readouterr().out
+    assert "train_set: skipped" in output, "train_set must be skipped entirely at epochs=0"

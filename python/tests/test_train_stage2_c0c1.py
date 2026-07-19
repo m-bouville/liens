@@ -1,4 +1,5 @@
 import torch
+import pytest
 from pathlib import Path
 from utils import load_datasets as load
 from training.train_ae import train_autoencoder, train_stage1b, train_stage2
@@ -44,7 +45,29 @@ def _build_sweep(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
-def test_stage2_full_c0c1_loss_end_to_end(tmp_path, isolated_project_root):
+@pytest.fixture(scope="module")
+def shared_stage1ab_ancestor(tmp_path_factory):
+    root = tmp_path_factory.mktemp("shared_stage1ab")
+    base_path = _build_sweep(root, n_runs=6, size=32)
+    stage1a_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=root / "stage1a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=root / "curve1a.png",
+    )
+    stage1b_path = train_stage1b(
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0, augment=False,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=root / "stage1b.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=root / "curve1b.png",
+    )
+    return base_path, stage1b_path
+
+
+def test_stage2_full_c0c1_loss_end_to_end(shared_stage1ab_ancestor, tmp_path, isolated_project_root):
     """THE actual redesigned stage 2, exercised end-to-end from a real
     stage 1a -> 1b chain: separate D0/D1 correctly loaded (not the old
     single-shared-decoder assumption that used to crash here), both
@@ -54,28 +77,13 @@ def test_stage2_full_c0c1_loss_end_to_end(tmp_path, isolated_project_root):
     decoders' outer layers, and the saved checkpoint carries everything
     (stats_head1_state, decoder_for_stream) needed to be a valid
     ancestor for stage 3/4/5 and every evaluation script in turn."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats_weight=0.01,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
-    )
+    base_path, stage1b_path = shared_stage1ab_ancestor
     stage1b_checkpoint = torch.load(stage1b_path, map_location="cpu", weights_only=True)
 
     stage2_path = train_stage2(
         base_path=base_path, resume_from=stage1b_path,
         deriv_weight=1.0, deriv_weight_warmup_epochs=0,
-        recon1_weight=0.5, stats_weight=0.01, stats1_weight=0.02,
+        recon1_weight=0.5, stats0_weight=0.01, stats1_weight=0.02,
         epochs=2, batch_size=4, num_workers=0,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         n_frozen_stages=1,
@@ -119,3 +127,64 @@ def test_stage2_full_c0c1_loss_end_to_end(tmp_path, isolated_project_root):
     assert not torch.equal(D0_unbottleneck_before, D0_unbottleneck_after), "D0's unbottleneck did not train"
     assert not torch.equal(D1_unbottleneck_before, D1_unbottleneck_after), "D1's unbottleneck did not train"
     print("Both D0's and D1's own inner (unfrozen) layers genuinely trained")
+
+
+def test_zero_weight_terms_omitted_from_console_output(shared_stage1ab_ancestor, tmp_path, isolated_project_root, capsys):
+    """Regression test for a real, reported clutter issue: with
+    recon1_weight=stats1_weight=0.0 (the new default -- pure L_deriv
+    training), the header/per-epoch breakdown used to still print
+    "+0.0*recon1 +0.0*stats1_diag" every single epoch for terms that
+    structurally cannot contribute anything. Confirms zero-weight terms
+    are omitted entirely, and that nonzero ones still show correctly."""
+    base_path, stage1b_path = shared_stage1ab_ancestor
+
+    capsys.readouterr()  # clear stage 1a/1b's own output first
+    train_stage2(
+        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
+        recon1_weight=0.0, stats1_weight=0.0, deriv_weight=0.02, deriv_weight_warmup_epochs=0,
+        epochs=1, batch_size=4, num_workers=0,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_zero.pt", device="cpu", seed=0,
+        log_every_epoch=True, loss_curve_path=tmp_path / "curve2_zero.png",
+    )
+    output = capsys.readouterr().out
+    formula_line = next(line for line in output.splitlines() if line.startswith("/"))
+    per_epoch_line = next(line for line in output.splitlines() if line.startswith("   1|"))
+    assert formula_line == "/  1 train = recon0/1.0 +0.01*stats0/1.0 +0.02*deriv/1.0 | valid = ...  | ema"
+    assert "recon1" not in per_epoch_line
+    assert per_epoch_line.count("+") == 4, "expected 2 '+' terms (stats0, deriv) on EACH of train/val"
+
+    capsys.readouterr()  # clear again before the second call
+    train_stage2(
+        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
+        recon1_weight=0.5, stats1_weight=0.02, deriv_weight=1.0, deriv_weight_warmup_epochs=0,
+        epochs=1, batch_size=4, num_workers=0,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_nonzero.pt", device="cpu", seed=0,
+        log_every_epoch=True, loss_curve_path=tmp_path / "curve2_nonzero.png",
+    )
+    output = capsys.readouterr().out
+    assert "recon0/1.0 +0.5*recon1/1.0 +0.01*stats0/1.0 +0.02*stats1/1.0 +1.0*deriv/1.0" in output
+
+
+def test_epochs_zero_actually_writes_a_checkpoint_stage2(shared_stage1ab_ancestor, tmp_path, isolated_project_root, capsys):
+    """Same regression test as Stage 1a/1b's own, for train_stage2."""
+    base_path, stage1b_path = shared_stage1ab_ancestor
+
+    checkpoint_path = tmp_path / "stage2_ablation.pt"
+    assert not checkpoint_path.exists()
+
+    result = train_stage2(
+        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
+        epochs=0, batch_size=4, num_workers=0,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=checkpoint_path, device="cpu", seed=0,
+        log_every_epoch=True, loss_curve_path=tmp_path / "curve2_ablation.png",
+    )
+
+    assert result == checkpoint_path
+    assert checkpoint_path.exists(), "epochs=0 must still write a valid checkpoint"
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert saved["epoch"] == 0
+    output = capsys.readouterr().out
+    assert "train_set: skipped" in output, "train_set must be skipped entirely at epochs=0"

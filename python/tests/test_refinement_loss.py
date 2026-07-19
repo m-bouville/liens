@@ -43,7 +43,7 @@ def test_forward_backward_succeeds():
     ae, f_theta, stats_head = _make_models()
     x_window, dt_window, theta = _make_batch()
     total = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
-                                  rollout_weight=1.0, recon_weight=0.1)
+                                  rollout_weight=1.0, recon0_weight=0.1)
     assert total.dim() == 0
     total.backward()  # should not raise
 
@@ -75,32 +75,32 @@ def test_rollout_alone_produces_encoder_gradient():
     ae, f_theta, stats_head = _make_models()
     x_window, dt_window, theta = _make_batch()
     total = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
-                                  rollout_weight=1.0, recon_weight=0.0, stats_weight=0.0)
+                                  rollout_weight=1.0, recon0_weight=0.0, stats0_weight=0.0)
     total.backward()
     encoder_grads = [p.grad for p in ae.encoder.parameters() if p.grad is not None]
     assert len(encoder_grads) > 0
     assert any(torch.any(g != 0) for g in encoder_grads)
 
 
-def test_decoder_gets_no_gradient_when_recon_weight_zero():
-    """L_rollout never touches D at all -- with recon_weight=0 (and no
+def test_decoder_gets_no_gradient_when_recon0_weight_zero():
+    """L_rollout never touches D at all -- with recon0_weight=0 (and no
     stats term touching D either), D's parameters should receive
     exactly zero gradient contribution, confirming L_rollout is fully
     decoder-independent."""
     ae, f_theta, stats_head = _make_models()
     x_window, dt_window, theta = _make_batch()
     total = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
-                                  rollout_weight=1.0, recon_weight=0.0, stats_weight=0.0)
+                                  rollout_weight=1.0, recon0_weight=0.0, stats0_weight=0.0)
     total.backward()
     for p in ae.decoder.parameters():
         assert p.grad is None or torch.all(p.grad == 0)
 
 
-def test_decoder_gets_gradient_when_recon_weight_nonzero():
+def test_decoder_gets_gradient_when_recon0_weight_nonzero():
     ae, f_theta, stats_head = _make_models()
     x_window, dt_window, theta = _make_batch()
     total = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
-                                  rollout_weight=1.0, recon_weight=1.0)
+                                  rollout_weight=1.0, recon0_weight=1.0)
     total.backward()
     decoder_grads = [p.grad for p in ae.decoder.parameters() if p.grad is not None]
     assert len(decoder_grads) > 0
@@ -112,9 +112,9 @@ def test_missing_stats_head_skips_stats_term_gracefully():
     x_window, dt_window, theta = _make_batch()
     total, components = compute_stage45_loss(
         ae, f_theta, None, x_window, dt_window, theta,
-        rollout_weight=1.0, stats_weight=1.0, return_components=True,
+        rollout_weight=1.0, stats0_weight=1.0, return_components=True,
     )
-    assert components["stats"].item() == 0.0
+    assert components["stats0"].item() == 0.0
     total.backward()  # still works fine with no stats term at all
 
 
@@ -124,9 +124,9 @@ def test_missing_stats_loss_fn_or_true_stats_also_skips_gracefully():
     # stats_head given, but no stats_loss_fn/true_stats -- should still skip cleanly
     _, components = compute_stage45_loss(
         ae, f_theta, stats_head, x_window, dt_window, theta,
-        rollout_weight=1.0, stats_weight=1.0, return_components=True,
+        rollout_weight=1.0, stats0_weight=1.0, return_components=True,
     )
-    assert components["stats"].item() == 0.0
+    assert components["stats0"].item() == 0.0
 
 
 def test_stats_term_matches_independent_computation():
@@ -139,7 +139,7 @@ def test_stats_term_matches_independent_computation():
 
     _, components = compute_stage45_loss(
         ae, f_theta, stats_head, x_window, dt_window, theta,
-        rollout_weight=1.0, stats_weight=1.0, stats_loss_fn=stats_loss_fn,
+        rollout_weight=1.0, stats0_weight=1.0, stats_loss_fn=stats_loss_fn,
         true_stats=true_stats, return_components=True,
     )
 
@@ -148,7 +148,7 @@ def test_stats_term_matches_independent_computation():
         pred_stats_independent = stats_head(z0_independent)
         expected_l_stats = stats_loss_fn(pred_stats_independent, true_stats)
 
-    assert torch.isclose(components["stats"], expected_l_stats, atol=1e-5)
+    assert torch.isclose(components["stats0"], expected_l_stats, atol=1e-5)
 
 
 def test_total_matches_manual_weighted_sum():
@@ -159,14 +159,14 @@ def test_total_matches_manual_weighted_sum():
     stats_loss_fn = StatsLoss(mean, std, stat_names=STAT_NAMES)
     true_stats = torch.randn(x_window.shape[0], len(STAT_NAMES))
 
-    rollout_weight, recon_weight, stats_weight = 1.0, 0.3, 0.7
+    rollout_weight, recon0_weight, stats0_weight = 1.0, 0.3, 0.7
     total, components = compute_stage45_loss(
         ae, f_theta, stats_head, x_window, dt_window, theta,
-        rollout_weight=rollout_weight, recon_weight=recon_weight, stats_weight=stats_weight,
+        rollout_weight=rollout_weight, recon0_weight=recon0_weight, stats0_weight=stats0_weight,
         stats_loss_fn=stats_loss_fn, true_stats=true_stats, return_components=True,
     )
-    expected_total = (rollout_weight * components["rollout"] + recon_weight * components["recon"]
-                       + stats_weight * components["stats"])
+    expected_total = (rollout_weight * components["rollout"] + recon0_weight * components["recon0"]
+                       + stats0_weight * components["stats0"])
     assert torch.isclose(total, expected_total, atol=1e-6)
 
 

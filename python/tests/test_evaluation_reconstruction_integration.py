@@ -244,7 +244,7 @@ def test_check_rollout_non_default_spatial_size(tmp_path, tmp_run_dir):
     ae_path = tmp_path / "fake-stage2.pt"
     lds_path = tmp_path / "fake-stage3b.pt"
     _save_ae_checkpoint(ae_path, [run_dir], size=64, latent_spatial_size=_NON_DEFAULT_SPATIAL,
-                         include_stats_head=False)
+                         include_stats_head=False, multi_stream=True)
     _save_lds_checkpoint(lds_path, ae_path, latent_spatial_size=_NON_DEFAULT_SPATIAL,
                           run_dirs=[run_dir])
 
@@ -271,7 +271,7 @@ def test_check_parameter_dependence_non_default_spatial_size(tmp_path, tmp_run_d
     ae_path = tmp_path / "fake-stage2.pt"
     lds_path = tmp_path / "fake-stage3b.pt"
     _save_ae_checkpoint(ae_path, [run_dir], size=64, latent_spatial_size=_NON_DEFAULT_SPATIAL,
-                         include_stats_head=False)
+                         include_stats_head=False, multi_stream=True)
     _save_lds_checkpoint(lds_path, ae_path, latent_spatial_size=_NON_DEFAULT_SPATIAL,
                           run_dirs=[run_dir])
 
@@ -298,3 +298,85 @@ def test_check_rollout_stale_multi_stream_metadata(tmp_path, tmp_run_dir):
         n_samples=1,
     )
     assert output_path.exists()
+
+
+def test_check_reconstruction_min_stdev_phi_is_actually_enforced(tmp_path, tmp_run_dir_with_stats):
+    """Regression test for a real, reported bug: min_stdev_phi was
+    HARDCODED to None inside check_reconstruction's own dataset
+    construction, with no parameter to override it at all -- so every
+    stage's own reconstruction sanity check always drew from the FULL
+    test set regardless of what min_stdev_phi was used during
+    training, letting degenerate, fully-coarsened frames through
+    unfiltered. tmp_run_dir_with_stats gives stdev_phi = step/1000.0
+    (0.0 through 4.0 across its 5 steps) -- min_stdev_phi=100 should
+    exclude every single window, and the old (bugged) code -- which
+    silently ignored min_stdev_phi entirely -- would NOT raise here."""
+    run_dir, steps, _ = tmp_run_dir_with_stats
+    ae_path = tmp_path / "fake-stage2.pt"
+    _save_ae_checkpoint(ae_path, [run_dir], size=64, latent_spatial_size=_NON_DEFAULT_SPATIAL)
+
+    # Sanity check first: with no filtering, this must succeed (real
+    # windows genuinely exist in the fixture).
+    output_path = check_reconstruction(
+        checkpoint_path=ae_path, device="cpu", min_step=0, min_stdev_phi=None,
+        output_path=tmp_path / "out_unfiltered.png",
+    )
+    assert output_path.exists()
+
+    # The actual fix under test: a min_stdev_phi higher than every
+    # stdev_phi value in the fixture must exclude every window,
+    # raising -- not silently ignored.
+    with pytest.raises(ValueError, match="No consecutive pairs found"):
+        check_reconstruction(
+            checkpoint_path=ae_path, device="cpu", min_step=0, min_stdev_phi=100.0,
+            output_path=tmp_path / "out_filtered.png",
+        )
+
+
+def test_check_reconstruction_derivative_panel_uses_6_cols_with_symmetric_d0(tmp_path, tmp_run_dir):
+    """Regression test for a real, reported design fix, in two stages:
+
+    (1) The predicted-derivative panel used to be D1(z1) directly --
+    meaningless checkerboard noise once Stage 2 actually runs, since D1
+    is never trained past Stage 1b (Stage 2's default
+    recon1_weight=0). Fixed to D0(z0+z1*dt) - D0(z0).
+
+    (2) That first fix left real_deriv computed from RAW PIXELS
+    ((x_next-x_t)/dt) while pred_deriv went entirely through D0 --
+    different natural scales (D0's own reconstruction noise inflates
+    one side but not the other), which visually squashed real_deriv
+    nearly to blank under a shared color scale sized for pred_deriv's
+    own larger range. Fixed by computing real_deriv AS
+    D0(z0(t+dt))-D0(z0(t)) too -- z1 is STILL never sent to a decoder
+    on either side, but now BOTH sides share the same D0
+    reconstruction-error component, so they're on a comparable scale
+    AND a real error panel between them is meaningful again (unlike
+    the old raw-pixel-vs-D0-decode pairing, where a naive difference
+    would have conflated z1's own predictive error with D0's own,
+    separate reconstruction error). n_cols should be 6 now, not 5."""
+    run_dir, steps = tmp_run_dir
+    ae_path = tmp_path / "fake-stage2.pt"
+    _save_ae_checkpoint(ae_path, [run_dir], size=64, latent_spatial_size=_NON_DEFAULT_SPATIAL,
+                         multi_stream=True)
+
+    captured = {}
+    import matplotlib.pyplot as plt
+    real_subplots = plt.subplots
+
+    def spy_subplots(*args, **kwargs):
+        fig, axes = real_subplots(*args, **kwargs)
+        captured["axes"] = axes
+        return fig, axes
+
+    import evaluation.check_reconstruction as check_reconstruction_module
+    check_reconstruction_module.plt.subplots = spy_subplots
+    try:
+        output_path = check_reconstruction(
+            checkpoint_path=ae_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
+        )
+    finally:
+        check_reconstruction_module.plt.subplots = real_subplots
+
+    assert output_path.exists()
+    axes = captured["axes"]
+    assert axes.shape[1] == 6, f"expected 6 columns with a derivative panel, got {axes.shape[1]}"

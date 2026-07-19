@@ -135,6 +135,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             check_reconstruction(
                 checkpoint_path=stage1_checkpoint, device=device,
                 min_step=stage1_kwargs.get("min_step", 0),
+                min_stdev_phi=stage1_kwargs.get("min_stdev_phi"),
                 output_path=_PYTHON_ROOT.parent / "output" / f"stage1/{stage1_checkpoint.stem}-reconstruction.png",
             )
             print()
@@ -182,6 +183,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             check_reconstruction(
                 checkpoint_path=stage1b_checkpoint, device=device,
                 min_step=stage1b_kwargs.get("min_step", 0),
+                min_stdev_phi=stage1b_kwargs.get("min_stdev_phi"),
                 output_path=_PYTHON_ROOT.parent / "output" / f"stage1b/{stage1b_checkpoint.stem}-reconstruction.png",
             )
             print()
@@ -229,6 +231,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 check_reconstruction(
                     checkpoint_path=stage2_checkpoint, device=device,
                     min_step=stage2_kwargs.get("min_step", 0),
+                    min_stdev_phi=stage2_kwargs.get("min_stdev_phi"),
                     output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-reconstruction.png",
                 )
                 print()
@@ -239,6 +242,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 check_latent_channels(
                     ae_checkpoint_path=stage2_checkpoint, device=device,
                     min_step=stage2_kwargs.get("min_step", 0),
+                    min_stdev_phi=stage2_kwargs.get("min_stdev_phi"),
                     output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-latent_channels.png",
                 )
                 print()
@@ -504,6 +508,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 check_reconstruction(
                     checkpoint_path=ae_view_path, device=device,
                     min_step=kwargs.get("min_step", 0),
+                    min_stdev_phi=kwargs.get("min_stdev_phi"),
                     output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-reconstruction.png",
                 )
                 print()
@@ -514,6 +519,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 check_latent_channels(
                     ae_checkpoint_path=ae_view_path, device=device,
                     min_step=kwargs.get("min_step", 0),
+                    min_stdev_phi=kwargs.get("min_stdev_phi"),
                     output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-latent_channels.png",
                 )
                 print()
@@ -528,7 +534,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print()
 
                 # E is trainable here with stats_head frozen -- structurally
-                # the same anchor pattern as stage 2's own stats_weight
+                # the same anchor pattern as stage 2's own stats0_weight
                 # anchor (see this module's docstring), and the same
                 # failure mode as D's checkerboard is possible in
                 # principle: E could drift into a region stats_head can no

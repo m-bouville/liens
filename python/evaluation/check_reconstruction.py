@@ -6,14 +6,16 @@ training or checkpoint selection) against their reconstructions.
 If the checkpoint has a second decodable stream beyond the
 reconstruction ("autoencoder"-mode) one -- see the project's own C0/C1
 design doc and models/latent_streams.py -- this ALSO shows that
-stream's decode compared against the real finite-difference time
-derivative, (x(t+dt)-x(t))/dt: real state | predicted state | error |
-real derivative | predicted derivative | error, six columns in ONE
-figure rather than two separate three-column ones, since state and
-derivative are closely related and worth reading side by side. Falls
-back to the original three-column layout when there's no second
-stream to show (every checkpoint saved before this redesign, and any
-single-stream run since).
+stream's PREDICTED delta (D0(z0(t)+z1(t)*dt) - D0(z0(t))) compared
+against the REAL delta (D0(z0(t+dt)) - D0(z0(t))) -- both sides
+decoded through D0, z1 never sent to a decoder at all (D1 is never
+trained past Stage 1b -- see the inline comment below): real state |
+predicted state | error | real derivative | predicted derivative |
+error, six columns in ONE figure rather than two separate three-column
+ones, since state and derivative are closely related and worth reading
+side by side. Falls back to the original three-column layout when
+there's no second stream to show (every checkpoint saved before this
+redesign, and any single-stream run since).
 
 check_reconstruction() is importable -- see main.py, which calls it
 automatically after stages 1, 2, and 4/5 with the checkpoint path it
@@ -59,6 +61,7 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py 
 
 def check_reconstruction(
     checkpoint_path: Path, n_samples: int = 6, seed: int = 0, min_step: int = 0,
+    min_stdev_phi: float | None = None,
     output_path: Path | None = None, device: str | None = None,
 ) -> Path:
     """Saves a visual comparison figure and returns its path."""
@@ -193,11 +196,12 @@ def check_reconstruction(
     # test_dirs, so this is guaranteed to be the exact same held-out
     # set that training never touched.
     dataset = MicrostructureEvolutionDataset(
-        test_dirs, encoder=None, window_length=2, min_step=min_step, min_stdev_phi=None,
+        test_dirs, encoder=None, window_length=2, min_step=min_step, min_stdev_phi=min_stdev_phi,
     )
     if len(dataset) == 0:
         raise ValueError(f"No consecutive pairs found in the checkpoint's {len(test_dirs)} "
-                          f"test_dirs (after min_step={min_step} filtering)")
+                          f"test_dirs (after min_step={min_step}, min_stdev_phi={min_stdev_phi} "
+                          f"filtering)")
 
     generator = torch.Generator().manual_seed(seed)
     n_samples = min(n_samples, len(dataset))
@@ -246,43 +250,67 @@ def check_reconstruction(
             fig.colorbar(im_diff, ax=axes[row, 2], fraction=0.046)
 
             if deriv_stream_name is not None:
-                real_deriv_np = ((x_next - x_t) / dt)[0, 0].cpu().numpy()
-                pred_deriv = _pathway_decoder(deriv_stream_name)(z[deriv_stream_name]) * torch.exp(_pathway_scale(deriv_stream_name))
-                pred_deriv_np = pred_deriv[0, 0].cpu().numpy()
-                deriv_diff_np = pred_deriv_np - real_deriv_np
-                deriv_loss = recon_loss(pred_deriv, (x_next - x_t) / dt).item()
+                # D0(z0(t+dt)) - D0(z0(t)), NOT the raw pixel
+                # difference (x_next - x_t): z0(t+dt) is encoded and
+                # decoded through D0 here for the SAME reason
+                # pred_deriv (below) never touches D1 -- so that BOTH
+                # sides of this comparison share the same D0
+                # reconstruction-error component, rather than one side
+                # being raw ground truth and the other being a decoded
+                # approximation. Without this, the two panels have
+                # genuinely different natural scales (D0's own
+                # reconstruction noise inflates one side but not the
+                # other), which is what made real_deriv look nearly
+                # blank under a shared color scale sized for
+                # pred_deriv's own, larger range -- not a sign real_deriv
+                # itself was somehow wrong.
+                z_next = encoder(x_next)
+                x_next_recon = (_pathway_decoder(recon_stream_name)(z_next[recon_stream_name])
+                                 * torch.exp(_pathway_scale(recon_stream_name)))
+                real_deriv_np = ((x_next_recon - x_recon) / dt)[0, 0].cpu().numpy()
 
-                # Real and predicted get SEPARATE, independent scales
-                # (not one shared scale, unlike the state columns) --
-                # while the deriv stream is untrained (this scoped
-                # step never gives it gradient -- see train_ae.py's own
-                # docstring on that), a random-weight decode of it has
-                # no reason to land anywhere near the real signal's
-                # magnitude, and forcing them onto one shared scale
-                # just saturates whichever one is smaller into a flat
-                # block of color instead of showing its own real
-                # structure. Once training actually touches this
-                # stream, the two should naturally converge in scale;
-                # until then, independent scales are more informative,
-                # not less.
-                real_deriv_scale = _scale(real_deriv_np, floor=1e-6)
-                pred_deriv_scale = _scale(pred_deriv_np, floor=1e-6)
-                deriv_diff_scale = _scale(deriv_diff_np, floor=1e-6)
+                # D0(z0 + z1*dt) - D0(z0), NOT D1(z1): D1 is never
+                # trained past Stage 1b (Stage 2's default
+                # recon1_weight=0 means pure L_deriv training, D1
+                # itself gets no gradient there -- see train_ae.py's
+                # own docstring), so a direct D1(z1) decode goes stale
+                # and produces meaningless checkerboard noise once
+                # Stage 2 has actually run. z1's real, trained role is
+                # as a RATE to be added to z0 and decoded through D0 --
+                # exactly how the rollout mechanism itself uses it
+                # (LatentDynamics: z(t+dt) = z(t) + dt*g_theta(z(t))),
+                # and D0 is the decoder that's actually kept reliable
+                # throughout. x_recon (already computed above) IS
+                # D0(z0) -- reused directly, not recomputed.
+                z0 = z[recon_stream_name]
+                z1 = z[deriv_stream_name]
+                x_pred_next = (_pathway_decoder(recon_stream_name)(z0 + z1 * dt)
+                                * torch.exp(_pathway_scale(recon_stream_name)))
+                pred_deriv_np = ((x_pred_next - x_recon) / dt)[0, 0].cpu().numpy()
 
-                axes[row, 3].imshow(real_deriv_np, cmap="RdBu", vmin=-real_deriv_scale, vmax=real_deriv_scale)
-                axes[row, 3].set_title(f"real derivative ('{deriv_stream_name}', dt={dt:.1f}, "
-                                        f"scale=+-{_format_small(real_deriv_scale)})" if row == 0
-                                        else f"scale=+-{_format_small(real_deriv_scale)}")
-                axes[row, 4].imshow(pred_deriv_np, cmap="RdBu", vmin=-pred_deriv_scale, vmax=pred_deriv_scale)
-                axes[row, 4].set_title(f"predicted derivative (loss={_format_small(deriv_loss)}, "
-                                        f"scale=+-{_format_small(pred_deriv_scale)})" if row == 0
-                                        else f"loss={_format_small(deriv_loss)}, "
-                                             f"scale=+-{_format_small(pred_deriv_scale)}")
-                im_deriv_diff = axes[row, 5].imshow(deriv_diff_np, cmap="RdBu",
-                                                      vmin=-deriv_diff_scale, vmax=deriv_diff_scale)
-                axes[row, 5].set_title(f"error (scale=+-{_format_small(deriv_diff_scale)})" if row == 0
-                                        else f"scale=+-{_format_small(deriv_diff_scale)}")
-                fig.colorbar(im_deriv_diff, ax=axes[row, 5], fraction=0.046)
+                deriv_err_np = pred_deriv_np - real_deriv_np
+
+                # ONE shared scale, now genuinely meaningful: both
+                # panels are D0-decoded deltas built from the same
+                # baseline (D0(z0(t))), so they're directly comparable
+                # in a way the old raw-pixel-vs-D0-decode pairing
+                # never was. A real error panel is included below for
+                # the same reason -- see the docstring note above.
+                deriv_scale = max(_scale(real_deriv_np, floor=1e-6),
+                                   _scale(pred_deriv_np, floor=1e-6))
+                deriv_err_scale = _scale(deriv_err_np, floor=1e-6)
+
+                axes[row, 3].imshow(real_deriv_np, cmap="RdBu", vmin=-deriv_scale, vmax=deriv_scale)
+                axes[row, 3].set_title(f"real derivative (D0(z0(t+dt))-D0(z0(t)), dt={dt:.1f}, "
+                                        f"scale=+-{_format_small(deriv_scale, precision=3)})" if row == 0
+                                        else f"scale=+-{_format_small(deriv_scale, precision=3)}")
+                axes[row, 4].imshow(pred_deriv_np, cmap="RdBu", vmin=-deriv_scale, vmax=deriv_scale)
+                axes[row, 4].set_title("predicted derivative\n(D0(z0+z1dt) - D0(z0))" if row == 0 else "")
+                im_deriv_err = axes[row, 5].imshow(deriv_err_np, cmap="RdBu",
+                                                     vmin=-deriv_err_scale, vmax=deriv_err_scale)
+                axes[row, 5].set_title(f"deriv error (scale=+-{_format_small(deriv_err_scale, precision=3)})"
+                                        if row == 0 else f"scale=+-{_format_small(deriv_err_scale, precision=3)}")
+                fig.colorbar(im_deriv_err, ax=axes[row, 5], fraction=0.046)
 
             for ax in axes[row]:
                 ax.set_xticks([])
@@ -290,6 +318,7 @@ def check_reconstruction(
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
+    plt.close(fig)
     print(f"Saved comparison figure to {output_path} ({n_samples} samples from "
           f"{len(test_dirs)} held-out test dirs"
           f"{', with derivative panel' if deriv_stream_name is not None else ''})")
@@ -307,6 +336,7 @@ def main():
     parser.add_argument("--n-samples", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min-step", type=int, default=0)
+    parser.add_argument("--min-stdev-phi", type=float, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
@@ -324,7 +354,8 @@ def main():
 
     check_reconstruction(
         checkpoint_path=args.checkpoint, n_samples=args.n_samples, seed=args.seed,
-        min_step=args.min_step, output_path=args.output, device=args.device,
+        min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
+        output_path=args.output, device=args.device,
     )
 
 

@@ -175,3 +175,26 @@ def test_falls_back_to_linear_when_a_zero_value_present(tmp_path, monkeypatch):
     ax = captured_axes["ax"]
     assert ax.get_yscale() == "linear"
     assert ax.get_ylim()[0] == 0
+
+
+def test_x_axis_also_log_scale(tmp_path, monkeypatch):
+    """Both axes should be log-log now, not just the y-axis."""
+    out = tmp_path / "loss_curve.png"
+    captured_axes = {}
+    real_subplots = plt.subplots
+
+    def spy_subplots(*args, **kwargs):
+        fig, ax = real_subplots(*args, **kwargs)
+        captured_axes["ax"] = ax
+        return fig, ax
+
+    monkeypatch.setattr(plt, "subplots", spy_subplots)
+    epochs = list(range(1, 6))
+    train_loss = [124.097, 7.071, 5.202, 4.147, 3.856]
+    val_loss = [7.202, 4.830, 4.321, 3.827, 3.465]
+    best_so_far = [7.202, 6.490, 5.840, 5.236, 4.705]
+    plots.loss_curve(epochs, train_loss, val_loss, best_so_far, out)
+
+    ax = captured_axes["ax"]
+    assert ax.get_xscale() == "log"
+    assert ax.get_yscale() == "log"

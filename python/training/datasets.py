@@ -609,7 +609,11 @@ class MicrostructureEvolutionDataset(Dataset):
 
     __getitem__ returns (window, dt_window, theta), or (window, dt_window,
     theta, true_stats) if stat_names was given at construction (see
-    stat_names below -- only meaningful/available in raw-pixel mode):
+    stat_names below -- only meaningful/available in raw-pixel mode), or
+    (window, window_deriv, dt_window, theta) if encode_both_streams was
+    given at construction (see that parameter below -- only meaningful
+    with encoder given; window_deriv has the same shape as window, the
+    "deriv" stream's own cached latents instead of "state"'s):
       window:    (n_r+1, latent_channels, 8, 8) if encoder was given
                  (a window of z's), or (n_r+1, 1, ny, nx) if encoder is
                  None (a window of raw frames x, encoding deferred to
@@ -668,11 +672,24 @@ class MicrostructureEvolutionDataset(Dataset):
                  min_stdev_phi: float | None = None, encode_batch_size: int = 256,
                  good_steps: dict[Path, list[int]] | None = None,
                  stat_names: list[str] | None = None, augment: bool = False,
-                 min_std_deriv: float | None = None):
+                 min_std_deriv: float | None = None, encode_both_streams: bool = False):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
         see class docstring.
+
+        encode_both_streams: False (default) -- exact prior behavior,
+        only the "state" stream (z0) gets encoded and cached. If True,
+        ALSO encodes and caches the "deriv" stream (z1) alongside it --
+        needed by the split-latent LDS architecture (LatentDynamics),
+        which requires z1(t+dt) as ground truth (to train g_theta's own
+        target), not just z0(t+dt) the way the old single-stream
+        architecture did. Only meaningful with encoder given (raises
+        otherwise, same rationale as stat_names/augment/min_std_deriv's
+        own encoder=None restrictions above) -- doubles this
+        constructor's own encoding cost (already the most expensive
+        dataset build in the pipeline), so left opt-in rather than
+        default, for callers that only need z0.
 
         window_length: n_r + 1 (e.g. window_length=5 -> n_r=4 predicted steps).
         encode_batch_size: batch size for the upfront encoding pass when
@@ -770,16 +787,25 @@ class MicrostructureEvolutionDataset(Dataset):
                 "well-defined meaning against a cached latent (see this constructor's own "
                 "docstring). Pass encoder=None if you want this filter."
             )
+        if encode_both_streams and encoder is None:
+            raise ValueError(
+                "encode_both_streams=True was given together with encoder=None (raw-pixel mode) "
+                "-- there's no encoder to run the 'deriv' stream through at all in this mode. "
+                "Pass a real encoder (cached-latent, stage-3 mode) if you want both streams."
+            )
 
         self.window_length = window_length
         self.encoder_given = encoder is not None  # which mode __getitem__ operates in
+        self.encode_both_streams = encode_both_streams
         self.stat_names = stat_names
         self.augment = augment
         self.min_std_deriv = min_std_deriv
         self._run_dirs: list[Path] = []         # run_dir per run_idx, for tracing samples back
         self._run_steps: list[list[int]] = []   # kept step numbers per run, in order
-        self._run_data: list[torch.Tensor] = []  # per run, on CPU: latents (n_kept,C,8,8) if
+        self._run_data: list[torch.Tensor] = []  # per run, on CPU: "state" latents (n_kept,C,8,8) if
                                                    # encoder given, else raw frames (n_kept,1,ny,nx)
+        self._run_data_deriv: list[torch.Tensor] = []  # per run, on CPU: "deriv" latents (n_kept,C,8,8)
+                                                   # -- ONLY populated if encode_both_streams=True
         self._run_dt_scale: list[float] = []    # metadata.dt per run
         self._run_theta: list[torch.Tensor] = []  # (n_theta,) physical params per run -- see class docstring
         self._run_nx: list[int] = []            # metadata.nx per run, only used if augment=True
@@ -823,18 +849,25 @@ class MicrostructureEvolutionDataset(Dataset):
 
             if self.encoder_given:
                 latents = []
+                latents_deriv = [] if self.encode_both_streams else None
                 with torch.no_grad():
                     for i in range(0, len(frames), encode_batch_size):
                         batch = frames[i:i + encode_batch_size].to(device)
-                        latents.append(encoder(batch)[DEFAULT_STREAM_NAME].cpu())
+                        encoded = encoder(batch)  # ONE forward pass, both streams available in the dict
+                        latents.append(encoded[DEFAULT_STREAM_NAME].cpu())
+                        if self.encode_both_streams:
+                            latents_deriv.append(encoded["deriv"].cpu())
                 run_data = torch.cat(latents, dim=0)  # (n_kept, latent_channels, 8, 8)
+                run_data_deriv = torch.cat(latents_deriv, dim=0) if self.encode_both_streams else None
             else:
                 run_data = frames  # (n_kept, 1, ny, nx) -- encoding deferred to the training loop
+                run_data_deriv = None
 
             run_idx = len(self._run_steps)
             self._run_dirs.append(run_dir)
             self._run_steps.append(kept_steps)
             self._run_data.append(run_data)
+            self._run_data_deriv.append(run_data_deriv)
             self._run_dt_scale.append(metadata.dt)
             self._run_nx.append(metadata.nx)
             self._run_ny.append(metadata.ny)
@@ -916,6 +949,10 @@ class MicrostructureEvolutionDataset(Dataset):
         )  # (window_length - 1,)
 
         theta = self._run_theta[run_idx]  # (n_theta,) -- constant across the window (same run)
+
+        if self.encode_both_streams:
+            window_deriv = self._run_data_deriv[run_idx][start:end]
+            return window, window_deriv, dt_window, theta
 
         if self.stat_names is None:
             return window, dt_window, theta

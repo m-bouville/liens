@@ -69,3 +69,87 @@ def test_step_weights_still_work_with_return_per_step():
         "with non-uniform step_weights, the weighted scalar loss should "
         "differ from a plain (unweighted) mean of per_step"
     )
+
+
+def test_exponent_deriv_default_matches_pre_existing_dt_oblivious_behavior():
+    """exponent_deriv defaults to 1.0, which must reproduce the EXACT
+    pre-existing loss (diff = z_hat - z_true directly, no dt
+    dependency at all) -- both when dt is omitted entirely (old call
+    signature) and when dt IS given (since z_hat-z_true already equals
+    dt*err for a single transition -- Euler integration, see
+    LatentDynamics' own docstring -- q=1.0 is exact backward
+    compatibility, not "no reweighting" in the sense of q=0."""
+    torch.manual_seed(0)
+    z_hat = torch.randn(4, 2, 3, 4, 4)
+    z_true = torch.randn(4, 2, 3, 4, 4)
+    dt = torch.tensor([[10.0, 20.0]] * 4)
+
+    old_style = RolloutLoss()(z_hat, z_true)  # no dt, no exponent_deriv at all
+    explicit_q1_no_dt = RolloutLoss(exponent_deriv=1.0)(z_hat, z_true)
+    explicit_q1_with_dt = RolloutLoss(exponent_deriv=1.0)(z_hat, z_true, dt=dt)
+
+    assert torch.equal(old_style, explicit_q1_no_dt)
+    assert torch.equal(old_style, explicit_q1_with_dt)
+
+
+def test_exponent_deriv_zero_equals_pure_rate_space_error():
+    """q=0.0 must equal ((z_hat-z_true)/dt)^2 exactly -- the fully
+    dt-independent rate-space error, computed independently here with
+    no knowledge of RolloutLoss's own internals beyond the definition
+    itself."""
+    torch.manual_seed(1)
+    z_hat = torch.randn(4, 2, 3, 4, 4)
+    z_true = torch.randn(4, 2, 3, 4, 4)
+    dt = torch.tensor([[10.0, 20.0]] * 4)
+
+    _, per_step = RolloutLoss(exponent_deriv=0.0)(z_hat, z_true, dt=dt, return_per_step=True)
+
+    dt_b = dt.view(4, 2, 1, 1, 1)
+    independent_err_sq = ((z_hat - z_true) / dt_b).pow(2).mean(dim=(0, 2, 3, 4))
+    assert torch.allclose(per_step, independent_err_sq, atol=1e-6)
+
+
+def test_exponent_deriv_half_matches_sqrt_dt_weighting():
+    """q=0.5 must equal dt^-1 * diff^2 exactly (the algebraic
+    simplification of ||dt^0.5 * err||^2), the specific value with a
+    physical motivation (Brownian-increment std scaling as sqrt(dt))."""
+    torch.manual_seed(2)
+    z_hat = torch.randn(3, 2, 4, 4, 4)
+    z_true = torch.randn(3, 2, 4, 4, 4)
+    dt = torch.tensor([[5.0, 15.0]] * 3)
+
+    _, per_step = RolloutLoss(exponent_deriv=0.5)(z_hat, z_true, dt=dt, return_per_step=True)
+
+    dt_b = dt.view(3, 2, 1, 1, 1)
+    diff = z_hat - z_true
+    independent = (diff.pow(2) * dt_b.pow(-1.0)).mean(dim=(0, 2, 3, 4))
+    assert torch.allclose(per_step, independent, atol=1e-6)
+
+
+def test_exponent_deriv_nonzero_requires_dt():
+    """A clear, immediate error -- not a silent wrong answer -- if dt
+    is missing when reweighting is actually requested."""
+    torch.manual_seed(3)
+    z_hat = torch.randn(2, 2, 3, 4, 4)
+    z_true = torch.randn(2, 2, 3, 4, 4)
+
+    import pytest
+    with pytest.raises(ValueError, match="dt"):
+        RolloutLoss(exponent_deriv=0.5)(z_hat, z_true)
+
+
+def test_exponent_deriv_works_with_l1_kind_too():
+    """The l1 variant (|dt^q * err| = dt^(q-1) * |diff|) gets the same
+    reweighting treatment, not just the default l2 kind."""
+    torch.manual_seed(4)
+    z_hat = torch.randn(3, 2, 3, 4, 4)
+    z_true = torch.randn(3, 2, 3, 4, 4)
+    dt = torch.tensor([[8.0, 16.0]] * 3)
+
+    _, per_step = RolloutLoss(kind="l1", exponent_deriv=0.5)(
+        z_hat, z_true, dt=dt, return_per_step=True)
+
+    dt_b = dt.view(3, 2, 1, 1, 1)
+    diff = z_hat - z_true
+    independent = (diff.abs() * dt_b.pow(-0.5)).mean(dim=(0, 2, 3, 4))
+    assert torch.allclose(per_step, independent, atol=1e-6)

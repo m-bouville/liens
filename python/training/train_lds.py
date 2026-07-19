@@ -52,7 +52,8 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_l
 def train_lds(
     size: int, base_path: Path,
     ae_checkpoint_path: Path | None = None,
-    ae_latent_channels: int | None = None, stats_weight: float | None = None,
+    ae_latent_channels: int | None = None, ae_stats_weight: float | None = None,
+    rollout_scale: float = 1.0,
     epochs: int = 100, batch_size: int = 512, lr: float = 1e-3,
     hidden_dim: int = 256, n_hidden_layers: int = 2,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
@@ -71,7 +72,7 @@ def train_lds(
     """
     Stage 3. Returns the path of the best checkpoint saved. Either give
     ae_checkpoint_path directly, or both ae_latent_channels and
-    stats_weight (the AE checkpoint's own stats_weight, used only to
+    ae_stats_weight (the AE checkpoint's own ae_stats_weight, used only to
     reconstruct its expected filename -- must be given explicitly,
     config.txt no longer provides ML training defaults).
 
@@ -141,13 +142,13 @@ def train_lds(
     # stdev-based filtering at all, matching MicrostructureEvolutionDataset's
     # own float|None semantics), unlike these three, which have no
     # meaningful None value at all.
-    missing = [name for name, v in [("size", size), ("stats_weight", stats_weight),
+    missing = [name for name, v in [("size", size), ("ae_stats_weight", ae_stats_weight),
                                      ("min_step", min_step)]
                if v is None]
     if missing:
         raise ValueError(f"train_lds() requires {', '.join(missing)} to be given explicitly "
                           f"-- config.txt no longer provides ML training defaults.")
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  stats_weight={stats_weight}")
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  ae_stats_weight={ae_stats_weight}")
     print(f"n_rollout_steps={n_rollout_steps}  one_step_weight={one_step_weight}")
     print(f"grad_clip={grad_clip}  lr_warmup_steps={lr_warmup_steps}")
 
@@ -157,7 +158,7 @@ def train_lds(
                 "Provide either ae_checkpoint_path directly, or ae_latent_channels "
                 "so the expected path can be reconstructed."
             )
-        ae_name = ae_checkpoint_name(size, ae_latent_channels, stats_weight)
+        ae_name = ae_checkpoint_name(size, ae_latent_channels, ae_stats_weight)
         ae_checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage2" / f"{ae_name}.pt"
         print(f"Reconstructed AE checkpoint path: {ae_checkpoint_path}")
 
@@ -223,14 +224,14 @@ def train_lds(
 
     if checkpoint_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
-                                    stats_weight, n_rollout_steps)
+                                    ae_stats_weight, n_rollout_steps)
         checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage3" / f"{name}.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}\n")
 
     if loss_curve_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
-                                    stats_weight, n_rollout_steps)
+                                    ae_stats_weight, n_rollout_steps)
         loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage3" / f"{name}-loss_curve.png"
 
     epoch_history: list[int] = []
@@ -249,19 +250,38 @@ def train_lds(
     print(f"{len(run_dirs)} complete runs -> "
           f"{len(train_dirs)} train / {len(val_dirs)} val / {len(test_dirs)} test dirs")
 
-    train_set = MicrostructureEvolutionDataset(
-        train_dirs, encoder=encoder, device=device, window_length=window_length,
-        min_step=min_step, min_stdev_phi=min_stdev_phi, encode_batch_size=encode_batch_size,
-    )
-    val_set = MicrostructureEvolutionDataset(
-        val_dirs, encoder=encoder, device=device, window_length=window_length,
-        min_step=min_step, min_stdev_phi=min_stdev_phi, encode_batch_size=encode_batch_size,
-    )
-    print(f"{len(train_set)} train windows, {len(val_set)} val windows "
-          f"(n_rollout_steps={n_rollout_steps}, window_length={window_length})\n")
-
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                               persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
+    if epochs == 0:
+        # Ablation mode: no training happens (see the epoch loop
+        # below), so train_set/train_loader would never be touched --
+        # skipped entirely. Especially worth skipping here: encoder=
+        # encoder means EVERY snapshot gets run through the frozen AE's
+        # forward pass at construction time, not just read/filtered --
+        # likely the most expensive dataset build in this whole
+        # pipeline, for a dataset that would then never be iterated.
+        train_set = train_loader = None
+        val_set = MicrostructureEvolutionDataset(
+            val_dirs, encoder=encoder, device=device, window_length=window_length,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, encode_batch_size=encode_batch_size,
+            encode_both_streams=True,
+        )
+        print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
+              f"{len(val_set)} val windows (n_rollout_steps={n_rollout_steps}, "
+              f"window_length={window_length})\n")
+    else:
+        train_set = MicrostructureEvolutionDataset(
+            train_dirs, encoder=encoder, device=device, window_length=window_length,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, encode_batch_size=encode_batch_size,
+            encode_both_streams=True,
+        )
+        val_set = MicrostructureEvolutionDataset(
+            val_dirs, encoder=encoder, device=device, window_length=window_length,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, encode_batch_size=encode_batch_size,
+            encode_both_streams=True,
+        )
+        print(f"{len(train_set)} train windows, {len(val_set)} val windows "
+              f"(n_rollout_steps={n_rollout_steps}, window_length={window_length})\n")
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                                   persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
                              persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
 
@@ -317,29 +337,51 @@ def train_lds(
         )
 
     def step(batch, train: bool) -> tuple[float, float]:
-        z_window, dt_window, theta = batch
-        z_window = z_window.to(device, non_blocking=True)
+        window0, window1, dt_window, theta = batch
+        window0 = window0.to(device, non_blocking=True)
+        window1 = window1.to(device, non_blocking=True)
         dt_window = dt_window.to(device, non_blocking=True)
         theta = theta.to(device, non_blocking=True)
 
-        z0 = z_window[:, 0]
-        z_true = z_window[:, 1:]
-
-        z_hat_full = f_theta.rollout(z0, dt_window, theta)
-        z_hat = z_hat_full[:, 1:]
+        z0 = window0[:, 0]
+        z0_true = window0[:, 1:]
+        # window1 passed WHOLE (not just window1[:, 0]) -- rollout()
+        # teacher-forces the REAL z1 at every step, not a predicted
+        # one (see LatentDynamics' own class docstring: this is what
+        # makes f_theta directly testable without g_theta existing).
+        z0_hat_full = f_theta.rollout(z0, window1, dt_window, theta)
+        z0_hat = z0_hat_full[:, 1:]
 
         # per_step[0] is L_1step -- the loss restricted to just the first
         # predicted step, directly comparable to a model trained with
         # n_rollout_steps=1 (see RolloutLoss.forward()'s docstring: this
         # is mathematically identical to computing L_1step independently
-        # on the same data, not an approximation).
-        loss, per_step = rollout_loss(z_hat, z_true, return_per_step=True)
-        l_1step = per_step[0]
+        # on the same data, not an approximation). No exponent_deriv here
+        # (that reweighting assumed a plain diff=dt*err relationship
+        # that no longer holds cleanly once the update rule is a mix of
+        # dt and dt^2 terms; the new architecture handles dt-scaling
+        # structurally via the explicit z1*dt + f*(dt^2/2) terms
+        # themselves, not a loss-level reweighting knob).
+        z0_loss, z0_per_step = rollout_loss(z0_hat, z0_true, return_per_step=True)
+        l_1step = z0_per_step[0]
+
         # total is what's actually optimized -- see one_step_weight's
         # docstring. At the default one_step_weight=0.0, total is
-        # exactly loss (l_1step contributes nothing, backward()
-        # reproduces the prior, rollout-only behavior precisely).
-        total = loss + one_step_weight * l_1step
+        # exactly z0_loss/rollout_scale (l_1step contributes nothing,
+        # backward() reproduces the prior, rollout-only behavior
+        # precisely). rollout_scale applies to BOTH terms -- they're
+        # the same underlying per-step loss, just different
+        # aggregations (l_1step is loss restricted to the first step
+        # only).
+        total = (z0_loss + one_step_weight * l_1step) / rollout_scale
+        # l_1step ITSELF must also be scaled before being returned --
+        # it's displayed/plotted directly (the "(1step)" figure and the
+        # loss_curve.png secondary line), not folded into total, so if
+        # only total got the /rollout_scale treatment, l_1step would be
+        # on a genuinely different scale than train_loss/val_loss
+        # whenever rollout_scale != 1 -- not actually comparable at
+        # all, despite being shown side by side every single epoch.
+        l_1step_scaled = l_1step / rollout_scale
 
         if train:
             optimizer.zero_grad()
@@ -350,7 +392,7 @@ def train_lds(
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-        return total.item(), l_1step.item()
+        return total.item(), l_1step_scaled.item()
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=ema_warmup_epochs,
                                           val_ema_decay=val_ema_decay)
@@ -365,17 +407,23 @@ def train_lds(
     else:
         print(f"/{epochs:3d}  train    valid      ema")
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         f_theta.train()
         train_loss = train_1step = 0.0
-        n_train = len(train_set)
-        for batch in train_loader:
-            bs = batch[0].size(0)
-            loss, l_1step = step(batch, train=True)
-            train_loss += loss * bs
-            train_1step += l_1step * bs
-        train_loss /= n_train
-        train_1step /= n_train
+        if epoch > 0:
+            n_train = len(train_set)
+            for batch in train_loader:
+                bs = batch[0].size(0)
+                loss, l_1step = step(batch, train=True)
+                train_loss += loss * bs
+                train_1step += l_1step * bs
+            train_loss /= n_train
+            train_1step /= n_train
+        else:
+            # epoch 0 (epochs=0 ablation only): no training at all --
+            # NaN honestly reflects that these metrics don't apply this
+            # "epoch", rather than a misleading 0.0.
+            train_loss = train_1step = float("nan")
 
         f_theta.eval()
         val_loss = val_1step = 0.0
@@ -457,10 +505,10 @@ def train_lds(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ae-latent-channels", type=int, default=None)
-    parser.add_argument("--ae-stats-weight", type=float, default=None, dest="stats_weight",
-                         help="the AE checkpoint's own stats_weight (used only to locate its "
+    parser.add_argument("--ae-stats-weight", type=float, default=None, dest="ae_stats_weight",
+                         help="the AE checkpoint's own ae_stats_weight (used only to locate its "
                               "expected filename) -- named --ae-stats-weight here since it's "
-                              "paired with --ae-latent-channels, but stored as args.stats_weight "
+                              "paired with --ae-latent-channels, but stored as args.ae_stats_weight "
                               "to match train_lds()'s actual parameter name")
     parser.add_argument("--ae-checkpoint", type=Path, default=None)
     parser.add_argument("--size", type=int, required=True,
@@ -500,7 +548,7 @@ def main():
     train_lds(
         size=args.size, base_path=args.base,
         ae_checkpoint_path=args.ae_checkpoint, ae_latent_channels=args.ae_latent_channels,
-        stats_weight=args.stats_weight,
+        ae_stats_weight=args.ae_stats_weight,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,

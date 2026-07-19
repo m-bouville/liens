@@ -273,7 +273,7 @@ def _make_joint_checkpoint(latent_channels=8, include_stats_head=True):
                         "n_rollout_steps": 1},
         "stats_config": None,
         "stage45_config": {"freeze_decoder": True, "rollout_weight": 1.0,
-                           "recon_weight": 0.1, "stats_weight": 0.0, "n_rollout_steps": 1},
+                           "recon0_weight": 0.1, "stats0_weight": 0.0, "n_rollout_steps": 1},
     }
     if include_stats_head:
         checkpoint["stats_head_state"] = {"net.0.weight": torch.randn(16, latent_channels * 64)}

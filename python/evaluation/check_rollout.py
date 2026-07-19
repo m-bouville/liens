@@ -142,13 +142,10 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
     x_t_raw = load.read_phi_half(run_dir / load.snapshot_filename(steps[0]), nx, ny)
     x_next_raw = load.read_phi_half(run_dir / load.snapshot_filename(steps[-1]), nx, ny)
 
-    dt_val = (steps[-1] - steps[0]) * metadata.dt  # total elapsed span, for display only
+    dt_total = (steps[-1] - steps[0]) * metadata.dt  # total elapsed span, for display only
     theta_val = metadata.temperature - metadata.T0  # see LatentDynamics/dataset docstrings
 
     with torch.no_grad():
-        x_t = torch.from_numpy(x_t_raw).unsqueeze(0).unsqueeze(0).to(device)
-        x_next_true_t = torch.from_numpy(x_next_raw).unsqueeze(0).unsqueeze(0).to(device)
-
         # ae.encoder(x) returns dict[str, Tensor] (one entry per latent
         # stream -- see models/latent_streams.py); resolved from
         # ae_config (already a parameter here) rather than assumed, so
@@ -160,33 +157,42 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         # has its own scope, separate from check_rollout()'s own
         # ae_encoder/ae_decoder helpers. ae_decoder specifically must
         # be recon_stream_name's own pathway decoder (not a generic
-        # "shared" fallback) -- z_t below is THAT stream's own latent,
+        # "shared" fallback) -- z0_t below is THAT stream's own latent,
         # and decoders may now be genuinely separate per stream (stage
         # 1b's own format).
         _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
         ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
         ae_decoder = (ae.pathways[recon_stream_name].decoder if hasattr(ae, "pathways")
                       else ae.decoder)
-        z_t = ae_encoder(x_t)[recon_stream_name]
-        z_next_true = ae_encoder(x_next_true_t)[recon_stream_name]
+
+        # EVERY step in the window gets encoded, not just the endpoints
+        # -- rollout() teacher-forces the REAL z1 at every step (see
+        # LatentDynamics' own class docstring), so the real z1 at each
+        # intermediate step is needed here, not just at steps[0].
+        x_all = torch.stack([
+            torch.from_numpy(load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny))
+            for step in steps
+        ]).unsqueeze(1).to(device)  # (len(steps), 1, ny, nx)
+        x_all_encoded = ae_encoder(x_all)
+        z0_t = x_all_encoded[recon_stream_name][0:1]  # only the STARTING z0 is a rollout() input
+        z1_sequence = x_all_encoded["deriv"].unsqueeze(0)  # (1, len(steps), C, 8, 8) -- every step
+        z0_next_true = x_all_encoded[recon_stream_name][-1:]
 
         # Per-TRANSITION dts, chained via rollout() -- NOT one big dt
         # covering the whole span. A single f_theta call with a large
         # dt is a fundamentally different (and untrained-for) operation
         # from n_rollout_steps chained calls at the actual per-step dts.
-        dts = torch.tensor(
-            [[(steps[i + 1] - steps[i]) * metadata.dt for i in range(len(steps) - 1)]],
-            dtype=torch.float32, device=device,
-        )
+        dt_per_step = [(steps[i + 1] - steps[i]) * metadata.dt for i in range(len(steps) - 1)]
+        dts = torch.tensor([dt_per_step], dtype=torch.float32, device=device)
         theta = torch.tensor([[theta_val]], dtype=torch.float32, device=device)
 
-        z_hat_full = f_theta.rollout(z_t, dts, theta)
-        z_next_pred = z_hat_full[:, -1]
+        z0_hat_full = f_theta.rollout(z0_t, z1_sequence, dts, theta)
+        z0_next_pred = z0_hat_full[:, -1]
 
-        x_next_pred = ae_decoder(z_next_pred)[0, 0].cpu().numpy()
-        x_next_ae_baseline = ae_decoder(z_next_true)[0, 0].cpu().numpy()
+        x_next_pred = ae_decoder(z0_next_pred)[0, 0].cpu().numpy()
+        x_next_ae_baseline = ae_decoder(z0_next_true)[0, 0].cpu().numpy()
 
-    return x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_val
+    return x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_total, dt_per_step
 
 
 def _correlation_pct(predicted, real) -> float | None:
@@ -209,7 +215,7 @@ def _correlation_pct(predicted, real) -> float | None:
     return float(np.corrcoef(predicted_flat, real_flat)[0, 1]) * 100
 
 
-def _format_small(value: float, exponent: int = -3) -> str:
+def _format_small(value: float, exponent: int = -3, precision: int = 1) -> str:
     """
     Formats a small loss value at a FIXED power of ten (default 1e-3),
     e.g. 0.0003 -> '0.3e-3' -- more legible than '%.4f' (0.0003) for
@@ -219,8 +225,14 @@ def _format_small(value: float, exponent: int = -3) -> str:
     exponent (rather than each value picking its own, e.g. '%.1e') also
     keeps mantissas directly comparable across panels/figures at a
     glance, without each one needing to be re-normalized by eye first.
+
+    precision: mantissa decimal digits, default 1. A value genuinely
+    smaller than the fixed exponent (e.g. ~1e-5 displayed at the
+    default 1e-3 exponent) rounds to a meaningless "0.0e-3" at
+    precision=1 -- pass a higher precision for panels whose values
+    routinely sit an order of magnitude or more below the exponent.
     """
-    return f"{value / (10 ** exponent):.1f}e{exponent}"
+    return f"{value / (10 ** exponent):.{precision}f}e{exponent}"
 
 
 def _padded_bounds(values, factor: float, symmetric: bool = False) -> tuple[float, float]:
@@ -269,6 +281,35 @@ def _padded_bounds(values, factor: float, symmetric: bool = False) -> tuple[floa
     if vmax <= 0:
         vmax = 1e-6
     return vmin, vmax
+
+
+def _error_bounds(real_delta, error, floor_factor: float = 0.25,
+                   headroom_factor: float = 1.2) -> tuple[float, float]:
+    """
+    (vmin, vmax) for the error (predicted - real) panel: the wider of
+    two candidates, not just one.
+
+    floor_factor*real_delta's own range is kept as a FLOOR -- what
+    keeps the error panel on a fixed, comparable scale across
+    different images/checkpoints when the error is genuinely small
+    (real_delta is the same fixed reference every image already uses
+    for the other two panels, so a small, accurate prediction's error
+    panel doesn't jump around from image to image for no reason).
+
+    But deriving the scale ONLY from that floor, never checking the
+    actual error array itself, saturates hard whenever a prediction is
+    bad enough that its own error exceeds the floor -- exactly the
+    case where seeing the true magnitude matters most (a genuinely
+    wrong, noise-like prediction has error on the scale of the STATE
+    itself, not on the scale of real_delta, e.g. dozens of times
+    larger than the 0.25x-real_delta floor was ever sized for). Taking
+    the wider of the floor and the actual error range (with its own
+    headroom) fixes this without giving up the floor's own benefit for
+    the common, small-error case.
+    """
+    floor_vmin, floor_vmax = _padded_bounds(real_delta, factor=floor_factor)
+    actual_vmin, actual_vmax = _padded_bounds(error, factor=headroom_factor)
+    return min(floor_vmin, actual_vmin), max(floor_vmax, actual_vmax)
 
 
 def check_rollout(
@@ -439,7 +480,7 @@ def check_rollout(
         axes = axes[None, :]
 
     for row, (run_dir, steps) in enumerate(windows):
-        x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_val = compute_sample(
+        x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_total, dt_per_step = compute_sample(
             run_dir, steps, ae, f_theta, ae_config, device,
         )
 
@@ -482,20 +523,18 @@ def check_rollout(
         # Error is intrinsically signed (predicted - real can go either
         # way regardless of which side real_delta itself favors), so it
         # does NOT get the symmetric treatment above -- asymmetric
-        # bounds derived from real_delta remain the right reference
-        # here. Error is typically much smaller in magnitude than Delta
-        # x itself -- a quarter of the SAME real_delta range keeps the
-        # error panel sensitive and readable, while still being the
-        # same fixed, comparable reference across images.
-        error_vmin, error_vmax = _padded_bounds(real_delta, factor=0.25)
+        # bounds remain the right shape here.
+        error_vmin, error_vmax = _error_bounds(real_delta, error)
         delta_norm = TwoSlopeNorm(vmin=delta_vmin, vcenter=0.0, vmax=delta_vmax)
         error_norm = TwoSlopeNorm(vmin=error_vmin, vcenter=0.0, vmax=error_vmax)
 
-        axes[row, 0].imshow(x_t_raw, cmap="RdBu", vmin=-state_scale, vmax=state_scale)
         n_steps_shown = len(steps) - 1
+        axes[row, 0].imshow(x_t_raw, cmap="RdBu", vmin=-state_scale, vmax=state_scale)
         span_label = f"{run_dir.name}:{steps[0]}\u2192{steps[-1]} ({n_steps_shown} step{'s' if n_steps_shown != 1 else ''})"
-        axes[row, 0].set_title(f"state(t)\n{span_label}\ndt={dt_val:.1f}" if row == 0
-                                else f"{span_label}\ndt={dt_val:.1f}", fontsize=9)
+        dt_label = (f"dt={dt_total:.1f}" if n_steps_shown == 1
+                    else f"dt_total={dt_total:.1f} (" + "+".join(f"{d:.1f}" for d in dt_per_step) + ")")
+        axes[row, 0].set_title(f"state(t)\n{span_label}\n{dt_label}" if row == 0
+                                else f"{span_label}\n{dt_label}", fontsize=9)
         axes[row, 1].imshow(real_delta, cmap="RdBu", norm=delta_norm)
         axes[row, 1].set_title(f"real \u0394x\nscale=[{delta_vmin:.3f}, {delta_vmax:.3f}]"
                                 if row == 0 else f"scale=[{delta_vmin:.3f}, {delta_vmax:.3f}]",
@@ -521,6 +560,7 @@ def check_rollout(
     fig.tight_layout()
     fig.subplots_adjust(wspace=0.3, hspace=0.4)
     fig.savefig(output_path, dpi=120)
+    plt.close(fig)
     print(f"Saved rollout comparison to {output_path} ({n_samples} samples)")
     window_strings = [f"{run_dir}:{':'.join(str(s) for s in steps)}" for run_dir, steps in windows]
     return output_path, window_strings

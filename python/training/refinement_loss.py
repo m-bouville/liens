@@ -1,14 +1,19 @@
 """
-Stage 4/5's combined training objective: L_rollout + recon_weight*L_recon
-+ stats_weight*L_stats, computed from a RAW PIXEL window (see
-MicrostructureEvolutionDataset's encoder=None mode) -- the encoder is
-trainable here, so unlike stage 3, encoding happens fresh in this
+Stage 4/5's combined training objective:
+L_rollout/rollout_scale + recon0_weight*L_recon0/recon0_scale
++ stats0_weight*L_stats0/stats0_scale, computed from a RAW PIXEL window
+(see MicrostructureEvolutionDataset's encoder=None mode) -- the encoder
+is trainable here, so unlike stage 3, encoding happens fresh in this
 function on every call, not once upfront.
+
+*_scale terms are magnitude normalization, NOT importance weights (see
+train_stage2's own docstring on this same distinction) -- default 1.0
+(no-op), live in the params file's shared preamble.
 
 One function covers both stages 4 and 5 (matching train_lds()'s 3a/3b
 pattern of sharing one function across curriculum phases): stage 4 uses
-rollout_weight=1, recon_weight=small (an anchor, D frozen via
-model_assembly's freeze_decoder); stage 5 uses recon_weight=1,
+rollout_weight=1, recon0_weight=small (an anchor, D frozen via
+model_assembly's freeze_decoder); stage 5 uses recon0_weight=1,
 rollout_weight=small (D trainable). Which term dominates is entirely a
 caller-side weight choice, not a structural difference in this function.
 """
@@ -20,8 +25,11 @@ from training.losses import ReconLoss, RolloutLoss, StatsLoss
 
 def compute_stage45_loss(
     ae, f_theta, stats_head, x_window: torch.Tensor, dt_window: torch.Tensor,
-    theta: torch.Tensor, rollout_weight: float = 1.0, recon_weight: float = 0.0,
-    stats_weight: float = 0.0, stats_loss_fn: StatsLoss | None = None,
+    theta: torch.Tensor, rollout_weight: float = 1.0, recon0_weight: float = 0.0,
+    stats0_weight: float = 0.0,
+    rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
+    exponent_deriv: float = 1.0,
+    stats_loss_fn: StatsLoss | None = None,
     true_stats: torch.Tensor | None = None, return_components: bool = False,
     recon_stream_name: str = DEFAULT_STREAM_NAME,
 ):
@@ -91,26 +99,27 @@ def compute_stage45_loss(
     z_hat_full = f_theta.rollout(z0, dt_window, theta)
     z_hat = z_hat_full[:, 1:]
 
-    rollout_loss_fn = RolloutLoss()
-    l_rollout = rollout_loss_fn(z_hat, z_true)
+    rollout_loss_fn = RolloutLoss(exponent_deriv=exponent_deriv)
+    l_rollout = rollout_loss_fn(z_hat, z_true, dt=dt_window)
 
     # L_recon: the real starting frame only, never a predicted frame --
     # matches stage 1/2's convention of anchoring recon/stats to
     # OBSERVED data.
     x0_recon = ae.decoder(z0)
-    l_recon = ReconLoss()(x0_recon, x0)
+    l_recon0 = ReconLoss()(x0_recon, x0)
 
     if stats_head is not None and stats_loss_fn is not None and true_stats is not None:
         pred_stats = stats_head(z0)
-        l_stats = stats_loss_fn(pred_stats, true_stats)
+        l_stats0 = stats_loss_fn(pred_stats, true_stats)
     else:
-        l_stats = torch.zeros((), device=x_window.device, dtype=x_window.dtype)
+        l_stats0 = torch.zeros((), device=x_window.device, dtype=x_window.dtype)
 
-    total = rollout_weight * l_rollout + recon_weight * l_recon + stats_weight * l_stats
+    total = (rollout_weight * l_rollout / rollout_scale + recon0_weight * l_recon0 / recon0_scale
+             + stats0_weight * l_stats0 / stats0_scale)
 
     if return_components:
         components = {
-            "rollout": l_rollout, "recon": l_recon, "stats": l_stats,
+            "rollout": l_rollout, "recon0": l_recon0, "stats0": l_stats0,
             "z0": z0, "z_true": z_true,
         }
         return total, components

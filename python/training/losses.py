@@ -157,23 +157,47 @@ class RolloutLoss(nn.Module):
     long-term stability is what matters"). None (default) weights all
     steps equally.
 
+    exponent_deriv (q): reweights toward the RATE-space residual err =
+    (z_hat-z_true)/dt, not the raw state-space diff compared here by
+    default. diff = z_hat - z_true ALREADY equals dt*err for a single
+    transition (LatentDynamics does explicit Euler integration --
+    z(t+dt) = z(t) + dt*g_theta(z(t),theta) -- see its own docstring),
+    so ||diff||^2 = dt^2 * err^2 ALREADY -- i.e. the DEFAULT
+    (exponent_deriv=1.0) is exact backward compatibility with the
+    original, dt-oblivious loss, not "no reweighting" in the sense of
+    q=0. Reweighting expresses L_q = E[dt^(2q) * err^2] directly:
+    q=1.0 (default): dt^0 * diff^2 = diff^2 -- today's unchanged loss.
+    q=0.0: dt^-2 * diff^2 = err^2 -- fully dt-independent rate error.
+    q=0.5: dt^-1 * diff^2 -- intermediate (variance of a Brownian
+    increment scales as dt, so its std scales as sqrt(dt) -- matches
+    this simulator's own explicit thermal noise term, see metadata.txt's
+    own noise parameter, making q=0.5 a physically-motivated choice,
+    not just an arbitrary compromise between 0 and 1).
+    0/0.5/1 (not the algebraically-equivalent 0/1/2 on err^2 directly)
+    specifically because the caller-facing quantity here is z (state),
+    not the derivative itself -- q is more directly readable as "which
+    power of dt does the RATE prediction get scaled by before squaring"
+    this way, matching how the physical reasoning above is phrased too.
+
     Same mean-reduction rationale as ReconLoss/OneStepLoss: keeps the
     loss scale independent of latent_channels and of n_r (rollout
     length) itself, so switching from a 1-step to a 6-step rollout
     doesn't rescale the loss purely from summing more terms.
     """
 
-    def __init__(self, kind: str = "l2", step_weights: torch.Tensor | None = None):
+    def __init__(self, kind: str = "l2", step_weights: torch.Tensor | None = None,
+                 exponent_deriv: float = 1.0):
         super().__init__()
         if kind not in ("l1", "l2"):
             raise ValueError(f"kind must be 'l1' or 'l2', got '{kind}'")
         self.kind = kind
+        self.exponent_deriv = exponent_deriv
         if step_weights is not None:
             self.register_buffer("step_weights", step_weights)
         else:
             self.step_weights = None
 
-    def forward(self, z_hat: torch.Tensor, z_true: torch.Tensor,
+    def forward(self, z_hat: torch.Tensor, z_true: torch.Tensor, dt: torch.Tensor | None = None,
                 return_per_step: bool = False):
         """
         z_hat, z_true: (B, n_r, C, H, W) -- predicted (chained) and true
@@ -187,8 +211,21 @@ class RolloutLoss(nn.Module):
         pass or recomputing this diff.
         """
         diff = z_hat - z_true
-        per_step = (diff ** 2).mean(dim=(0, 2, 3, 4)) if self.kind == "l2" \
-            else diff.abs().mean(dim=(0, 2, 3, 4))  # (n_r,) -- mean over batch+spatial per step
+        if self.exponent_deriv != 1.0:
+            if dt is None:
+                raise ValueError("exponent_deriv != 1.0 requires dt to be given -- the "
+                                  "per-transition dt used to convert the state-space diff "
+                                  "back to a rate before reweighting.")
+            # dt: (B, n_r) -> broadcast against diff's (B, n_r, C, H, W).
+            dt_b = dt.view(*dt.shape, 1, 1, 1)
+            if self.kind == "l2":
+                weighted = diff.pow(2) * dt_b.pow(2 * self.exponent_deriv - 2)
+            else:
+                weighted = diff.abs() * dt_b.pow(self.exponent_deriv - 1)
+            per_step = weighted.mean(dim=(0, 2, 3, 4))
+        else:
+            per_step = (diff ** 2).mean(dim=(0, 2, 3, 4)) if self.kind == "l2" \
+                else diff.abs().mean(dim=(0, 2, 3, 4))  # (n_r,) -- mean over batch+spatial per step
 
         if self.step_weights is not None:
             w = self.step_weights

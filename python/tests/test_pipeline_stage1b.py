@@ -68,13 +68,13 @@ epochs = 1
 batch_size = 4
 base_channels = 4
 latent_channels = 4
-stats_weight = 0.01
+stats0_weight = 0.01
 stat_names = avg_phi
 
 # Stage 1b
 epochs = 1
 batch_size = 4
-stats_weight = 0.01
+stats1_weight = 0.01
 
 # Stage 2
 epochs = 0
@@ -133,13 +133,13 @@ epochs = 1
 batch_size = 4
 base_channels = 4
 latent_channels = 4
-stats_weight = 0.01
+stats0_weight = 0.01
 stat_names = avg_phi
 
 # Stage 1b
 epochs = 1
 batch_size = 4
-stats_weight = 0.01
+stats1_weight = 0.01
 
 # Stage 2
 epochs = 1
@@ -197,7 +197,7 @@ epochs = 1
 batch_size = 4
 base_channels = 4
 latent_channels = 4
-stats_weight = 0.0
+stats0_weight = 0.0
 
 # Stage 2
 epochs = 1

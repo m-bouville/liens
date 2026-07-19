@@ -377,7 +377,7 @@ def check_parameter_dependence(
 
     dataset = MicrostructureEvolutionDataset(
         test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
-        min_step=min_step, min_stdev_phi=min_stdev_phi,
+        min_step=min_step, min_stdev_phi=min_stdev_phi, encode_both_streams=True,
     )
     print(f"Evaluating {len(dataset)} test windows...")
 
@@ -401,7 +401,7 @@ def check_parameter_dependence(
 
     with torch.no_grad():
         for idx in range(len(dataset)):
-            z_window, dt_window, theta = dataset[idx]
+            window0, window1, dt_window, theta = dataset[idx]
             run_dir, steps = dataset.window_info(idx)
             if run_dir not in metadata_cache:
                 metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
@@ -410,18 +410,18 @@ def check_parameter_dependence(
                 stats_cache[run_dir] = load.read_statistics_csv(run_dir / "statistics.csv")
             stats_df = stats_cache[run_dir]
 
-            z_t = z_window[0:1].to(device)
-            z_next_true = z_window[1:2].to(device)
+            z0_t = window0[0:1].to(device)
+            z1_t = window1[0:1].to(device)
+            z0_next_true = window0[1:2].to(device)
             dt = dt_window[0:1].to(device)
             theta_b = theta.unsqueeze(0).to(device)
 
-            dz = f_theta(z_t, dt, theta_b)
-            z_next_pred = z_t + dz
+            z0_next_pred = f_theta(z0_t, z1_t, dt, theta_b)
 
-            latent_loss = one_step_loss(z_next_pred, z_next_true).item()
+            latent_loss = one_step_loss(z0_next_pred, z0_next_true).item()
 
-            x_next_pred = ae_decoder(z_next_pred)
-            x_next_true = ae_decoder(z_next_true)
+            x_next_pred = ae_decoder(z0_next_pred)
+            x_next_true = ae_decoder(z0_next_true)
             pixel_loss = recon_loss(x_next_pred, x_next_true).item()
 
             dts.append(dt.item())
@@ -671,6 +671,7 @@ def check_parameter_dependence(
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
+    plt.close(fig)
     print(f"\nSaved figure to {output_path}")
     return output_path
 

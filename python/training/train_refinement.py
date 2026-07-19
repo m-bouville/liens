@@ -29,7 +29,9 @@ def train_refinement(
     base_path: Path, freeze_decoder: bool,
     ae_checkpoint_path: Path | None = None, lds_checkpoint_path: Path | None = None,
     resume_from: Path | None = None,
-    rollout_weight: float = 1.0, recon_weight: float = 0.0, stats_weight: float = 0.0,
+    rollout_weight: float = 1.0, recon0_weight: float = 0.0, stats0_weight: float = 0.0,
+    rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
+    exponent_deriv: float = 1.0,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-4,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int = 1, min_step: int | None = None, min_stdev_phi: float | None = None,
@@ -44,7 +46,7 @@ def train_refinement(
     for L_recon -- see model_assembly.build_models_from_components) or
     stage 5 (freeze_decoder=False: D trains too). Which term dominates
     the objective is entirely a weight choice (stage 4:
-    rollout_weight=1, recon_weight=small; stage 5: recon_weight=1,
+    rollout_weight=1, recon0_weight=small; stage 5: recon0_weight=1,
     rollout_weight=small), not a structural difference -- see
     compute_stage45_loss.
 
@@ -62,7 +64,7 @@ def train_refinement(
         forward from that checkpoint rather than lost.
     Give exactly one of these two options, not both, not neither.
 
-    stats_weight > 0 only has an effect if the ancestor AE actually has
+    stats0_weight > 0 only has an effect if the ancestor AE actually has
     a stats_head (trained with stats_weight > 0 back in stage 1) --
     otherwise L_stats is silently skipped (with a printed warning),
     matching compute_stage45_loss's own graceful-skip behavior rather
@@ -120,15 +122,16 @@ def train_refinement(
     print(f"Stage {'4' if freeze_decoder else '5'}: loaded {ancestor_note}")
     print(f"size={size}, latent_channels={components['encoder'].config['latent_channels']}, "
           f"freeze_decoder={freeze_decoder}")
-    print(f"rollout_weight={rollout_weight}  recon_weight={recon_weight}  "
-          f"stats_weight={stats_weight}")
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  n_rollout_steps={n_rollout_steps}\n")
+    print(f"rollout_weight={rollout_weight}  recon0_weight={recon0_weight}  "
+          f"stats0_weight={stats0_weight}")
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  n_rollout_steps={n_rollout_steps}  "
+          f"exponent_deriv={exponent_deriv}\n")
 
     stats_loss_fn = None
     stat_names = None
-    if stats_weight > 0:
+    if stats0_weight > 0:
         if stats_head is None:
-            print("WARNING: stats_weight > 0 but the ancestor AE has no stats_head "
+            print("WARNING: stats0_weight > 0 but the ancestor AE has no stats_head "
                   "(trained with stats_weight <= 0 back in stage 1) -- L_stats will be "
                   "skipped entirely for this run.\n")
         else:
@@ -144,21 +147,36 @@ def train_refinement(
                           f"check base_path/size, or that metadata.txt exists there")
     train_dirs, val_dirs, test_dirs = split_run_dirs(run_dirs, val_fraction, test_fraction, seed=seed)
 
-    train_set = MicrostructureEvolutionDataset(
-        train_dirs, encoder=None, window_length=window_length,
-        min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
-    )
-    val_set = MicrostructureEvolutionDataset(
-        val_dirs, encoder=None, window_length=window_length,
-        min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
-    )
-    print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
-          f"{len(test_dirs)} test dirs")
-    print(f"{len(train_set)} train windows, {len(val_set)} val windows "
-          f"(n_rollout_steps={n_rollout_steps}, window_length={window_length})\n")
-
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                               num_workers=num_workers, pin_memory=device.type == "cuda")
+    if epochs == 0:
+        # Ablation mode: no training happens (see the epoch loop
+        # below), so train_set/train_loader would never be touched --
+        # skipped entirely, same rationale as the other four training
+        # functions' own fix.
+        train_set = train_loader = None
+        val_set = MicrostructureEvolutionDataset(
+            val_dirs, encoder=None, window_length=window_length,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
+        )
+        print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
+              f"{len(test_dirs)} test dirs")
+        print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
+              f"{len(val_set)} val windows (n_rollout_steps={n_rollout_steps}, "
+              f"window_length={window_length})\n")
+    else:
+        train_set = MicrostructureEvolutionDataset(
+            train_dirs, encoder=None, window_length=window_length,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
+        )
+        val_set = MicrostructureEvolutionDataset(
+            val_dirs, encoder=None, window_length=window_length,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
+        )
+        print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
+              f"{len(test_dirs)} test dirs")
+        print(f"{len(train_set)} train windows, {len(val_set)} val windows "
+              f"(n_rollout_steps={n_rollout_steps}, window_length={window_length})\n")
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                                   num_workers=num_workers, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
                              num_workers=num_workers, pin_memory=device.type == "cuda")
 
@@ -193,13 +211,15 @@ def train_refinement(
         x_window, dt_window, theta = batch
         return x_window.to(device), dt_window.to(device), theta.to(device), None
 
-    def step(batch, train: bool) -> float:
+    def step(batch, train: bool):
         x_window, dt_window, theta, true_stats = unpack(batch)
-        loss = compute_stage45_loss(
+        loss, components = compute_stage45_loss(
             ae, f_theta, stats_head, x_window, dt_window, theta,
-            rollout_weight=rollout_weight, recon_weight=recon_weight, stats_weight=stats_weight,
+            rollout_weight=rollout_weight, recon0_weight=recon0_weight, stats0_weight=stats0_weight,
+            rollout_scale=rollout_scale, recon0_scale=recon0_scale, stats0_scale=stats0_scale,
+            exponent_deriv=exponent_deriv,
             stats_loss_fn=stats_loss_fn, true_stats=true_stats,
-            recon_stream_name=recon_stream_name,
+            recon_stream_name=recon_stream_name, return_components=True,
         )
         if train:
             optimizer.zero_grad()
@@ -207,7 +227,7 @@ def train_refinement(
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
             optimizer.step()
-        return loss.item()
+        return loss.item(), components["rollout"].item(), components["recon0"].item(), components["stats0"].item()
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=ema_warmup_epochs,
                                           val_ema_decay=val_ema_decay)
@@ -215,9 +235,11 @@ def train_refinement(
 
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
-    print(f"/{epochs:3d}  train      valid        ema")
+    print(f"/{epochs:3d} train = {rollout_weight}*rollout/{rollout_scale} "
+          f"+{recon0_weight}*recon0/{recon0_scale} "
+          f"+{stats0_weight}*stats0/{stats0_scale} | valid = ...  | ema")
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         ae.train()
         f_theta.train()
         # ae.train()/f_theta.train() are recursive and would otherwise
@@ -227,22 +249,42 @@ def train_refinement(
         for m in frozen_modules:
             m.eval()
 
-        train_loss = 0.0
-        n_train = len(train_set)
-        for batch in train_loader:
-            bs = batch[0].size(0)
-            train_loss += step(batch, train=True) * bs
-        train_loss /= n_train
+        train_loss = train_rollout = train_recon0 = train_stats0 = 0.0
+        if epoch > 0:
+            n_train = len(train_set)
+            for batch in train_loader:
+                bs = batch[0].size(0)
+                loss, rollout, recon0, stats0 = step(batch, train=True)
+                train_loss += loss * bs
+                train_rollout += rollout * bs
+                train_recon0 += recon0 * bs
+                train_stats0 += stats0 * bs
+            train_loss /= n_train
+            train_rollout /= n_train
+            train_recon0 /= n_train
+            train_stats0 /= n_train
+        else:
+            # epoch 0 (epochs=0 ablation only): no training at all --
+            # NaN honestly reflects that these metrics don't apply this
+            # "epoch", rather than a misleading 0.0.
+            train_loss = train_rollout = train_recon0 = train_stats0 = float("nan")
 
         ae.eval()
         f_theta.eval()
-        val_loss = 0.0
+        val_loss = val_rollout = val_recon0 = val_stats0 = 0.0
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0)
-                val_loss += step(batch, train=False) * bs
+                loss, rollout, recon0, stats0 = step(batch, train=False)
+                val_loss += loss * bs
+                val_rollout += rollout * bs
+                val_recon0 += recon0 * bs
+                val_stats0 += stats0 * bs
         val_loss /= n_val
+        val_rollout /= n_val
+        val_recon0 /= n_val
+        val_stats0 /= n_val
 
         criterion, saved_this_epoch = tracker.update(epoch, val_loss)
 
@@ -255,8 +297,15 @@ def train_refinement(
             loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
         )
 
-        ema_str = f"{tracker.val_ema:.6f}" if tracker.val_ema is not None else "  (warmup)"
-        msg = f"{epoch:4d}  {train_loss:9.5f}  {val_loss:9.5f} |{ema_str:>10}"
+        ema_str = f"{tracker.val_ema:7.4f}" if tracker.val_ema is not None else "  (warmup)"
+        msg = (f"{epoch:4d}|"
+               f"{train_loss:7.4f} ={rollout_weight*train_rollout/rollout_scale:7.4f} "
+               f"+{recon0_weight*train_recon0/recon0_scale:7.4f} "
+               f"+{stats0_weight*train_stats0/stats0_scale:7.4f} |"
+               f"{val_loss:7.4f} ={rollout_weight*val_rollout/rollout_scale:7.4f} "
+               f"+{recon0_weight*val_recon0/recon0_scale:7.4f} "
+               f"+{stats0_weight*val_stats0/stats0_scale:7.4f} |"
+               f"{ema_str:>10}")
 
         if saved_this_epoch:
             epochs_since_improvement = 0
@@ -282,7 +331,7 @@ def train_refinement(
                 ),
                 "stage45_config": {
                     "freeze_decoder": freeze_decoder, "rollout_weight": rollout_weight,
-                    "recon_weight": recon_weight, "stats_weight": stats_weight,
+                    "recon0_weight": recon0_weight, "stats0_weight": stats0_weight,
                     "n_rollout_steps": n_rollout_steps,
                 },
             }, checkpoint_path)

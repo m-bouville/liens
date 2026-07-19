@@ -93,12 +93,22 @@ def loss_curve(
     # else: no bottom=0 on a log axis (undefined) -- matplotlib auto-
     # floors to the smallest positive value actually present instead.
 
-    ax.set_xlabel("epoch")
+    # Log scale needs every value strictly > 0 -- log(0) and log(negative)
+    # are undefined. Epochs should always start at 1 in every training
+    # loop in this project (range(1, epochs+1)), but this is a shared,
+    # generic plotting function called from several places -- same
+    # defensive fallback already applied to loss values below, not an
+    # assumption this will always hold.
+    use_log_x = bool(epochs) and min(epochs) > 0
+    if use_log_x:
+        ax.set_xscale("log")
+
+    ax.set_xlabel("epoch" + (" (log scale)" if use_log_x else ""))
     ax.set_ylabel("loss" + (" (log scale)" if use_log else ""))
     if title:
         ax.set_title(title)
     ax.legend(loc="upper right", fontsize=9)
-    ax.grid(alpha=0.3, which="both" if use_log else "major")
+    ax.grid(alpha=0.3, which="both" if (use_log or use_log_x) else "major")
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

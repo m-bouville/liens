@@ -64,7 +64,7 @@ def test_stage2_rejects_single_stream_ancestor(tmp_path):
         size=32, base_path=base_path,
         epochs=1, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
         checkpoint_path=tmp_path / "stage1_single.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1.png",
     )
@@ -72,7 +72,7 @@ def test_stage2_rejects_single_stream_ancestor(tmp_path):
     with pytest.raises(ValueError, match="exactly one"):
         train_stage2(
             base_path=base_path, resume_from=stage1_path,
-            deriv_weight=1.0, stats_weight=0.0,
+            deriv_weight=1.0, stats0_weight=0.0,
             epochs=1, batch_size=4, num_workers=0,
             min_step=0, min_stdev_phi=None,
             checkpoint_path=tmp_path / "stage2_should_fail.pt", device="cpu",

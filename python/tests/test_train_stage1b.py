@@ -1,4 +1,5 @@
 import torch
+import pytest
 from pathlib import Path
 from utils import load_datasets as load
 from training.train_ae import train_autoencoder, train_stage1b
@@ -44,6 +45,21 @@ def _build_sweep(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
+@pytest.fixture(scope="module")
+def shared_stage1a_ancestor(tmp_path_factory):
+    root = tmp_path_factory.mktemp("shared_stage1a")
+    base_path = _build_sweep(root, n_runs=6, size=32)
+    stage1a_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=root / "stage1a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=root / "curve1a.png",
+    )
+    return base_path, stage1a_path
+
+
 def test_stage1b_freezes_1a_correctly_and_trains_only_new_pieces(tmp_path):
     base_path = _build_sweep(tmp_path, n_runs=6, size=32)
 
@@ -52,7 +68,7 @@ def test_stage1b_freezes_1a_correctly_and_trains_only_new_pieces(tmp_path):
         size=32, base_path=base_path,
         epochs=2, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
@@ -69,7 +85,7 @@ def test_stage1b_freezes_1a_correctly_and_trains_only_new_pieces(tmp_path):
 
     stage1b_path = train_stage1b(
         base_path=base_path, resume_from=stage1a_path,
-        stats_weight=0.01,
+        stats1_weight=0.01,
         epochs=2, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17,
         min_step=0, min_stdev_phi=None,
@@ -123,18 +139,10 @@ def test_stage1b_freezes_1a_correctly_and_trains_only_new_pieces(tmp_path):
     print("ALL CHECKS PASSED")
 
 
-def test_d1_warm_started_from_d0_before_any_training(tmp_path):
+def test_d1_warm_started_from_d0_before_any_training(shared_stage1a_ancestor, tmp_path):
     """Directly verify the warm-start claim: BEFORE stage 1b trains
     anything, D1's weights should be an EXACT copy of D0's."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
+    base_path, stage1a_path = shared_stage1a_ancestor
     stage1a_checkpoint = torch.load(stage1a_path, map_location="cpu", weights_only=True)
     D0_state = {k[len("decoder."):]: v for k, v in stage1a_checkpoint["model_state"].items()
                 if k.startswith("decoder.")}
@@ -171,24 +179,16 @@ def test_latent_spatial_size_no_longer_a_parameter(tmp_path):
     assert "latent_channels" in sig.parameters
 
 
-def test_latent_channels_can_genuinely_differ_from_state(tmp_path):
+def test_latent_channels_can_genuinely_differ_from_state(shared_stage1a_ancestor, tmp_path):
     """Unlike spatial_size, channels genuinely CAN differ per-stream
     (each stream has its own, separate bottleneck conv) -- confirm
     this actually works end-to-end (no crash), and that D1 correctly
     is NOT warm-started when shapes don't match."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
+    base_path, stage1a_path = shared_stage1a_ancestor
     # deriv stream gets a DIFFERENT channel count (8, not state's own 4)
     stage1b_path = train_stage1b(
         base_path=base_path, resume_from=stage1a_path,
-        stats_weight=0.01, latent_channels=8,
+        stats1_weight=0.01, latent_channels=8,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17,
         min_step=0, min_stdev_phi=None,
@@ -225,7 +225,7 @@ def test_frozen_trunk_batchnorm_buffers_exactly_unchanged(tmp_path):
         size=32, base_path=base_path,
         epochs=2, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
@@ -236,7 +236,7 @@ def test_frozen_trunk_batchnorm_buffers_exactly_unchanged(tmp_path):
     running_var_before = stage1a_checkpoint["model_state"][bn_running_var_key].clone()
 
     stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats_weight=0.01,
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
         epochs=2, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
@@ -256,7 +256,7 @@ def test_frozen_trunk_batchnorm_buffers_exactly_unchanged(tmp_path):
     )
 
 
-def test_deriv_log_output_scale_is_actually_trained(tmp_path):
+def test_deriv_log_output_scale_is_actually_trained(shared_stage1a_ancestor, tmp_path):
     """Regression test for a real, confirmed bug: log_output_scale is a
     genuine nn.Parameter for a DECODER-mode stream (deriv), registered
     directly on the EncoderDecoderPair object -- NOT on encoder or D1.
@@ -266,17 +266,9 @@ def test_deriv_log_output_scale_is_actually_trained(tmp_path):
     genuinely trainable -- indistinguishable, from the outside, from
     an intentionally-frozen parameter (both show exactly zero drift),
     which is exactly what made this easy to miss."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
+    base_path, stage1a_path = shared_stage1a_ancestor
     stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats_weight=0.01,
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
         epochs=2, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
@@ -290,7 +282,7 @@ def test_deriv_log_output_scale_is_actually_trained(tmp_path):
     )
 
 
-def test_pred_target_diagnostic_produces_sensible_values(tmp_path, capsys):
+def test_pred_target_diagnostic_produces_sensible_values(shared_stage1a_ancestor, tmp_path, capsys):
     """New diagnostic: pred/target norm and cosine similarity, printed
     per epoch -- distinguishes a pure scale mismatch (high cos_sim,
     mismatched norms) from pred carrying no real directional signal
@@ -301,17 +293,9 @@ def test_pred_target_diagnostic_produces_sensible_values(tmp_path, capsys):
     declared OUTSIDE the epoch loop and never reset, silently
     accumulating across the entire run instead of reporting each
     epoch's own value)."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
+    base_path, stage1a_path = shared_stage1a_ancestor
     train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats_weight=0.01,
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
         epochs=2, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
@@ -333,7 +317,7 @@ def test_pred_target_diagnostic_produces_sensible_values(tmp_path, capsys):
         assert target_norm_train >= 0
 
 
-def test_freeze_encoder_false_genuinely_unfreezes_trunk(tmp_path):
+def test_freeze_encoder_false_genuinely_unfreezes_trunk(shared_stage1a_ancestor, tmp_path):
     """freeze_encoder=False is a diagnostic override, requested to test
     whether the FROZEN trunk's own activations carry any usable
     derivative information at all, independent of the deriv
@@ -341,21 +325,13 @@ def test_freeze_encoder_false_genuinely_unfreezes_trunk(tmp_path):
     does what it claims: trunk parameters AND BatchNorm buffers both
     move (not just one or the other), while D0 stays exactly frozen
     regardless (this diagnostic is about the encoder, not D0)."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
+    base_path, stage1a_path = shared_stage1a_ancestor
     stage1a_checkpoint = torch.load(stage1a_path, map_location="cpu", weights_only=True)
     trunk_weight_before = stage1a_checkpoint["model_state"]["encoder.down_blocks.0.conv.block.0.weight"].clone()
     trunk_bn_running_mean_before = stage1a_checkpoint["model_state"]["encoder.down_blocks.0.conv.block.1.running_mean"].clone()
 
     stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats_weight=0.01,
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
         freeze_encoder=False,
         epochs=2, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
@@ -380,27 +356,19 @@ def test_freeze_encoder_false_genuinely_unfreezes_trunk(tmp_path):
     )
 
 
-def test_cos_weight_diagnostic_runs_and_affects_gradient(tmp_path):
+def test_cos_weight_diagnostic_runs_and_affects_gradient(shared_stage1a_ancestor, tmp_path):
     """cos_weight is a diagnostic-only loss term (default 0.0, off) --
     confirms it runs end to end without error, and that D1/the deriv
     bottleneck genuinely receive gradient from it (nonzero drift),
     while the frozen trunk (freeze_encoder still defaults to True here)
     stays correctly untouched -- this diagnostic is orthogonal to
     freeze_encoder, not a replacement for it."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
+    base_path, stage1a_path = shared_stage1a_ancestor
     stage1a_checkpoint = torch.load(stage1a_path, map_location="cpu", weights_only=True)
     trunk_weight_before = stage1a_checkpoint["model_state"]["encoder.down_blocks.0.conv.block.0.weight"].clone()
 
     stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats_weight=0.0,
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.0,
         cos_weight=100.0,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
@@ -418,25 +386,17 @@ def test_cos_weight_diagnostic_runs_and_affects_gradient(tmp_path):
     assert deriv_bottleneck_after.abs().sum().item() > 0, "deriv bottleneck is degenerate"
 
 
-def test_cos_weight_contribution_shown_separately_in_message(tmp_path, capsys):
+def test_cos_weight_contribution_shown_separately_in_message(shared_stage1a_ancestor, tmp_path, capsys):
     """Regression test for a real gap: cos_weight*cos_loss used to be
     folded invisibly into train_total, with only recon1/stats1 broken
     out separately -- misleading once cos_weight became a real, tuned
     part of training rather than a one-off diagnostic. Confirms the
     breakdown line appears when cos_weight > 0, and is absent when it's
     off (0.0, the default)."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
+    base_path, stage1a_path = shared_stage1a_ancestor
 
     train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats_weight=0.0,
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.0,
         cos_weight=10.0,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
@@ -448,7 +408,7 @@ def test_cos_weight_contribution_shown_separately_in_message(tmp_path, capsys):
     assert "raw cos_sim=" in output_with_cos
 
     train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats_weight=0.0,
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.0,
         cos_weight=0.0,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
@@ -457,3 +417,70 @@ def test_cos_weight_contribution_shown_separately_in_message(tmp_path, capsys):
     )
     output_without_cos = capsys.readouterr().out
     assert "||cos: train=" not in output_without_cos
+
+
+def test_epochs_zero_actually_writes_a_checkpoint_stage1a(tmp_path, capsys):
+    """Regression test for a real, serious bug: epochs=0 used to write
+    NO checkpoint at all (the only torch.save() call lived inside the
+    epoch loop, which range(1, 1) never enters) -- while
+    orchestration/pipeline.py unconditionally printed "Stage N
+    complete", giving no indication anything had failed. Any STALE
+    checkpoint already at that path from an earlier real run would
+    then get silently reused by every downstream stage, invalidating
+    an entire ablation experiment without any error or warning at all.
+    epochs=0 must now write a real, valid "epoch 0" (untrained)
+    checkpoint.
+
+    Also covers a follow-up regression: dataset construction used to
+    run unconditionally BEFORE the epoch loop, so even after the fix
+    above, epochs=0 still built train_set (a real, potentially
+    expensive scan/read over every train dir) despite it being
+    guaranteed to never be iterated over. train_set must now be
+    skipped entirely in this mode -- verified directly via the
+    printed message, not just inferred from timing."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    checkpoint_path = tmp_path / "stage1a_ablation.pt"
+    assert not checkpoint_path.exists()
+
+    result = train_autoencoder(
+        size=32, base_path=base_path, epochs=0, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=checkpoint_path, device="cpu", seed=0,
+        log_every_epoch=True, loss_curve_path=tmp_path / "curve1a_ablation.png",
+    )
+
+    assert result == checkpoint_path
+    assert checkpoint_path.exists(), "epochs=0 must still write a valid checkpoint"
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert saved["epoch"] == 0
+    output = capsys.readouterr().out
+    assert "train_set: skipped" in output, "train_set must be skipped entirely at epochs=0"
+
+
+def test_epochs_zero_actually_writes_a_checkpoint_stage1b(shared_stage1a_ancestor, tmp_path, capsys):
+    """Same regression test as Stage 1a's own, for train_stage1b --
+    this is the exact function/scenario originally reported."""
+    base_path, stage1a_path = shared_stage1a_ancestor
+
+    checkpoint_path = tmp_path / "stage1b_ablation.pt"
+    assert not checkpoint_path.exists()
+
+    result = train_stage1b(
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+        epochs=0, batch_size=4, num_workers=0, augment=False,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=checkpoint_path, device="cpu", seed=0,
+        log_every_epoch=True, loss_curve_path=tmp_path / "curve1b_ablation.png",
+    )
+
+    assert result == checkpoint_path
+    assert checkpoint_path.exists(), "epochs=0 must still write a valid checkpoint"
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert saved["epoch"] == 0
+    # D1 should be untouched from its own warm-started (copy-of-D0)
+    # initialization -- genuinely reflecting "no training happened",
+    # not silently reusing some OTHER, previously-trained D1.
+    output = capsys.readouterr().out
+    assert "(warmup)" in output or "starting 0 epochs" in output
+    assert "train_set: skipped" in output, "train_set must be skipped entirely at epochs=0"

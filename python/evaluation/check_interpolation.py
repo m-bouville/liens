@@ -275,6 +275,7 @@ def check_interpolation(
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
+    plt.close(fig)
     print(f"\nSaved plot to {output_path}")
     return output_path
 

@@ -65,19 +65,19 @@ def test_checkpoint_components_decoder_extraction_from_stage2(tmp_path, isolated
         size=32, base_path=base_path,
         epochs=1, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats_weight=0.01, stat_names=["avg_phi"],
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
     stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats_weight=0.01,
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
     )
     stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1b_path, stats_weight=0.01,
+        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
         recon1_weight=0.5, stats1_weight=0.02, deriv_weight=1.0, deriv_weight_warmup_epochs=0,
         epochs=1, batch_size=4, num_workers=0,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
