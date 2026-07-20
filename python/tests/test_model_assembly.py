@@ -88,13 +88,13 @@ def _state_dicts_equal(a, b):
 
 def test_reassembled_autoencoder_matches_original(tmp_path):
     components, original_ae, _, _ = _build_components(tmp_path)
-    ae, _, _, _ = build_models_from_components(components, device="cpu")
+    ae, _, _, _, _, _ = build_models_from_components(components, device="cpu")
     assert _state_dicts_equal(ae.state_dict(), original_ae.state_dict())
 
 
 def test_reassembled_lds_matches_original(tmp_path):
     components, _, _, original_lds = _build_components(tmp_path)
-    _, _, f_theta, _ = build_models_from_components(components, device="cpu")
+    _, _, f_theta, _, _, _ = build_models_from_components(components, device="cpu")
     assert _state_dicts_equal(f_theta.state_dict(), original_lds.state_dict())
 
 
@@ -104,7 +104,7 @@ def test_stats_head_hidden_dim_inferred_correctly(tmp_path):
     still load correctly, not silently fall back to the default and
     fail (or worse, coincidentally succeed with wrong values)."""
     components, _, original_stats_head, _ = _build_components(tmp_path, stats_hidden_dim=16)
-    _, stats_head, _, _ = build_models_from_components(components, device="cpu")
+    _, stats_head, _, _, _, _ = build_models_from_components(components, device="cpu")
     assert stats_head is not None
     assert stats_head.net[0].out_features == 16
     assert _state_dicts_equal(stats_head.state_dict(), original_stats_head.state_dict())
@@ -113,14 +113,14 @@ def test_stats_head_hidden_dim_inferred_correctly(tmp_path):
 def test_missing_stats_head_yields_none(tmp_path):
     components, _, _, _ = _build_components(tmp_path, include_stats_head=False)
     assert "stats_head" not in components
-    _, stats_head, _, frozen_modules = build_models_from_components(components, device="cpu")
+    _, stats_head, _, frozen_modules, _, _ = build_models_from_components(components, device="cpu")
     assert stats_head is None
     assert frozen_modules == []  # nothing to freeze -- no decoder freeze, no stats_head
 
 
 def test_stats_head_always_frozen(tmp_path):
     components, _, _, _ = _build_components(tmp_path)
-    _, stats_head, _, frozen_modules = build_models_from_components(
+    _, stats_head, _, frozen_modules, _, _ = build_models_from_components(
         components, device="cpu", freeze_decoder=False,
     )
     assert stats_head is not None
@@ -130,7 +130,7 @@ def test_stats_head_always_frozen(tmp_path):
 
 def test_freeze_decoder_true_freezes_decoder_not_encoder(tmp_path):
     components, _, _, _ = _build_components(tmp_path)
-    ae, _, _, frozen_modules = build_models_from_components(
+    ae, _, _, frozen_modules, _, _ = build_models_from_components(
         components, device="cpu", freeze_decoder=True,
     )
     assert all(not p.requires_grad for p in ae.decoder.parameters())
@@ -140,7 +140,7 @@ def test_freeze_decoder_true_freezes_decoder_not_encoder(tmp_path):
 
 def test_freeze_decoder_false_leaves_decoder_trainable(tmp_path):
     components, _, _, _ = _build_components(tmp_path)
-    ae, _, _, frozen_modules = build_models_from_components(
+    ae, _, _, frozen_modules, _, _ = build_models_from_components(
         components, device="cpu", freeze_decoder=False,
     )
     assert all(p.requires_grad for p in ae.decoder.parameters())

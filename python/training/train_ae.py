@@ -1185,13 +1185,13 @@ def train_stage1b(
 def train_stage2(
     base_path: Path, resume_from: Path,
     deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats0_weight: float = 0.0,
-    recon1_weight: float = 0.0, stats1_weight: float = 0.0,
+    recon1_weight: float = 0.0, stats1_weight: float = 0.0, z0_from_deriv_weight: float = 0.0,
     recon0_scale: float = 1.0, recon1_scale: float = 1.0,
     stats0_scale: float = 1.0, stats1_scale: float = 1.0, deriv_scale: float = 1.0,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     min_step: int | None = None, min_stdev_phi: float | None = None,
-    min_std_deriv: float | None = None,
+    min_std_deriv: float | None = None, augment: bool = False,
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
@@ -1345,6 +1345,44 @@ def train_stage2(
     without needing new code -- this function already freezes outer
     (pixel-space-near) layers while keeping bottleneck-adjacent ones
     trainable, which is the same split by a different name.
+
+    augment (default False): D4-dihedral + translation augmentation on
+    the TRAINING set only (never val -- val_loss stays a clean measure
+    of real, unaugmented performance). Was previously accepted by the
+    params file's own parsing but silently never threaded through to
+    the dataset here -- this stage always used encoder=None (raw
+    pixel), so nothing about augment's own encoder=None requirement
+    ever blocked it; it just wasn't wired up. Same underlying mechanism
+    train_stage1b already uses (MicrostructureEvolutionDataset's own
+    augment flag) -- same (k, flip, shift) applied consistently across
+    both frames of a window, so the derivative direction the window
+    encodes stays geometrically consistent under the transform, not
+    scrambled by it.
+
+    z0_from_deriv_weight (default 0.0): how much of L_deriv's own
+    gradient reaches z0, rather than being blocked entirely (the
+    original design -- see this loss term's own comment, right where
+    it's computed, for the full "optimizer could cheat" rationale
+    against ever letting L_deriv shape z0 at all). 0.0 reproduces that
+    original behavior exactly. A nonzero value reopens the cheating
+    risk deliberately: z0's own trajectory could start drifting toward
+    whatever makes z1's job easier rather than staying purely anchored
+    by L_recon. If z1's own error looks bias-dominated (see
+    check_parameter_dependence.py's own bias-vs-variance diagnostic) --
+    consistent with z0's own trajectory being genuinely hard for a
+    direct, first-order encoding to track, not just noisy -- letting
+    z0 adapt even a little may be the only way to close that gap,
+    since z1-only retraining (longer patience, more unfrozen encoder
+    layers, augmentation) can never change what z0 itself is doing.
+    Start SMALL (e.g. 0.05-0.2) and watch recon0/stats0 for
+    degradation -- this is z0's own reconstruction quality being put at
+    risk for z1's benefit, a real trade, not a free improvement. Also
+    consider raising deriv_weight_warmup_epochs beyond its own default
+    when using this, so the (now z0-reaching) L_deriv gradient doesn't
+    hit z0 abruptly, at full weight, before it and z1 have had time to
+    settle into a shared representation together -- a sudden, early
+    shock could genuinely destabilize a z0 that Stage 1's own training
+    already spent real time getting right.
 
     on_checkpoint_saved: see train_autoencoder(). log_every_epoch: see
     train_autoencoder() -- same behavior here.
@@ -1544,7 +1582,8 @@ def train_stage2(
     else:
         train_set = MicrostructureEvolutionDataset(train_dirs, encoder=None, window_length=2,
                                                     stat_names=stat_names, min_std_deriv=min_std_deriv,
-                                                    min_step=min_step, min_stdev_phi=min_stdev_phi)
+                                                    min_step=min_step, min_stdev_phi=min_stdev_phi,
+                                                    augment=augment)
         val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None, window_length=2,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi)
@@ -1661,17 +1700,33 @@ def train_stage2(
         # change should be -- NOT derivable from pixel-space alone (per
         # the project's own design doc), which is the whole reason this
         # is a separate objective from L_recon1 above (pixel-space:
-        # decode z1, compare against the real pixel derivative). Both
-        # z0(t) and z0(t+dt) are DETACHED here: this term must not feed
-        # gradient back into z0 through this path (z0 already gets its
-        # own gradient from L_recon above), only into z1 and whatever
-        # of the shared trunk feeds it -- otherwise the optimizer could
-        # cheat by moving z0's OWN trajectory to make z1's job easier,
-        # rather than z1 genuinely learning to predict a trajectory
-        # that's independently anchored by L_recon.
-        with torch.no_grad():
+        # decode z1, compare against the real pixel derivative).
+        #
+        # z0_from_deriv_weight controls how much of L_deriv's own
+        # gradient reaches z0 (0.0, the default, blocks it entirely --
+        # today's original design: z0 already gets its own gradient
+        # from L_recon above, and letting L_deriv ALSO shape z0 risked
+        # the optimizer cheating by warping z0's own trajectory to make
+        # z1's job easier, rather than z1 genuinely learning to predict
+        # a trajectory that's independently anchored by L_recon). A
+        # nonzero weight reopens that risk deliberately, in a
+        # controlled, partial way -- x.detach() + weight*(x-x.detach())
+        # has the exact same FORWARD value as x (detached and
+        # non-detached copies are numerically identical, so the two
+        # terms combine back to x's own value regardless of weight),
+        # but its gradient w.r.t. x is exactly `weight`, not the full
+        # 1.0 an un-detached x would give -- a genuinely controllable
+        # dial, not just an on/off switch.
+        if z0_from_deriv_weight > 0:
             z0_next = ae.encoders["shared"](x_next)[recon_stream_name]
-        target_deriv = (z0_next - z0_t.detach()) / dt
+            z0_next_for_deriv = z0_next.detach() + z0_from_deriv_weight * (z0_next - z0_next.detach())
+            z0_t_for_deriv = z0_t.detach() + z0_from_deriv_weight * (z0_t - z0_t.detach())
+        else:
+            with torch.no_grad():
+                z0_next = ae.encoders["shared"](x_next)[recon_stream_name]
+            z0_next_for_deriv = z0_next
+            z0_t_for_deriv = z0_t.detach()
+        target_deriv = (z0_next_for_deriv - z0_t_for_deriv) / dt
         deriv_loss = recon_loss(z1_t, target_deriv)
 
         total = (recon / recon0_scale + recon1_weight * recon1 / recon1_scale
@@ -1709,7 +1764,10 @@ def train_stage2(
           f", recon1_weight={recon1_weight}, stats0_weight={stats0_weight}"
           f"{' (anchor active)' if stats0_weight > 0 else ' (diagnostic only, not optimized)'}"
           f", stats1_weight={stats1_weight}"
-          f"{' (anchor active)' if stats_head1 is not None and stats1_weight > 0 else ' (inactive)'}")
+          f"{' (anchor active)' if stats_head1 is not None and stats1_weight > 0 else ' (inactive)'}"
+          f", augment={augment}"
+          f", z0_from_deriv_weight={z0_from_deriv_weight}"
+          f"{' (WARNING: nonzero -- z0 can now be shaped by L_deriv, not just L_recon)' if z0_from_deriv_weight > 0 else ''}")
     formula = " ".join(f"+{w}*{lbl}/{s}" for w, lbl, s in active_terms)
     print(f"/{epochs:3d} train = recon0/{recon0_scale} {formula} | valid = ...  | ema")
 

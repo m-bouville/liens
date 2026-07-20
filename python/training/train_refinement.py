@@ -13,7 +13,6 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
 from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
@@ -31,7 +30,6 @@ def train_refinement(
     resume_from: Path | None = None,
     rollout_weight: float = 1.0, recon0_weight: float = 0.0, stats0_weight: float = 0.0,
     rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
-    exponent_deriv: float = 1.0,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-4,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int = 1, min_step: int | None = None, min_stdev_phi: float | None = None,
@@ -114,18 +112,16 @@ def train_refinement(
                          f"{ae_checkpoint_path}, f_theta from {lds_checkpoint_path}"
         ae_checkpoint_str = str(Path(ae_checkpoint_path).resolve())
         lds_checkpoint_str = str(Path(lds_checkpoint_path).resolve())
-    ae, stats_head, f_theta, frozen_modules = build_models_from_components(
+    ae, stats_head, f_theta, frozen_modules, stream_configs, recon_stream_name = build_models_from_components(
         components, device=device, freeze_decoder=freeze_decoder,
     )
-    _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(components["encoder"].config)
     size = components["encoder"].config["size"]
     print(f"Stage {'4' if freeze_decoder else '5'}: loaded {ancestor_note}")
     print(f"size={size}, latent_channels={components['encoder'].config['latent_channels']}, "
           f"freeze_decoder={freeze_decoder}")
     print(f"rollout_weight={rollout_weight}  recon0_weight={recon0_weight}  "
           f"stats0_weight={stats0_weight}")
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  n_rollout_steps={n_rollout_steps}  "
-          f"exponent_deriv={exponent_deriv}\n")
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  n_rollout_steps={n_rollout_steps}\n")
 
     stats_loss_fn = None
     stat_names = None
@@ -217,7 +213,6 @@ def train_refinement(
             ae, f_theta, stats_head, x_window, dt_window, theta,
             rollout_weight=rollout_weight, recon0_weight=recon0_weight, stats0_weight=stats0_weight,
             rollout_scale=rollout_scale, recon0_scale=recon0_scale, stats0_scale=stats0_scale,
-            exponent_deriv=exponent_deriv,
             stats_loss_fn=stats_loss_fn, true_stats=true_stats,
             recon_stream_name=recon_stream_name, return_components=True,
         )
@@ -320,7 +315,15 @@ def train_refinement(
                 "lds_checkpoint": lds_checkpoint_str,
                 **({"resumed_from": str(Path(resume_from).resolve())} if resume_from is not None else {}),
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
-                "config": dict(components["encoder"].config),
+                "config": {
+                    **{k: v for k, v in components["encoder"].config.items() if k != "decoder_for_stream"},
+                    "stream_configs": {
+                        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
+                               "mode": cfg.mode.value}
+                        for name, cfg in stream_configs.items()
+                    },
+                    "recon_stream_name": recon_stream_name,
+                },
                 "lds_config": dict(components["lds"].config),
                 "data_config": {"min_step": min_step, "min_stdev_phi": min_stdev_phi,
                                 "window_length": window_length, "n_rollout_steps": n_rollout_steps},

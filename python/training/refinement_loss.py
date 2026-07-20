@@ -28,10 +28,9 @@ def compute_stage45_loss(
     theta: torch.Tensor, rollout_weight: float = 1.0, recon0_weight: float = 0.0,
     stats0_weight: float = 0.0,
     rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
-    exponent_deriv: float = 1.0,
     stats_loss_fn: StatsLoss | None = None,
     true_stats: torch.Tensor | None = None, return_components: bool = False,
-    recon_stream_name: str = DEFAULT_STREAM_NAME,
+    recon_stream_name: str = DEFAULT_STREAM_NAME, deriv_stream_name: str = "deriv",
 ):
     """
     x_window: (B, n_r+1, 1, ny, nx) raw pixel window -- x_window[:,0] is
@@ -67,45 +66,71 @@ def compute_stage45_loss(
     x0 = x_window[:, 0]
     x_future = x_window[:, 1:]
 
-    # z0: WITH gradient -- feeds both the rollout PREDICTION chain
-    # (z0 -> f_theta -> z_hat) and L_recon/L_stats, both anchored to
-    # this real, observed starting frame.
+    # z0, z1: WITH gradient -- z0 feeds both the rollout PREDICTION
+    # chain (z0 -> f_theta -> z_hat) and L_recon/L_stats, z1 feeds ONLY
+    # the prediction chain (z1 is teacher-forced, never decoded --
+    # matches Stage 3's own split-latent design), both anchored to this
+    # real, observed starting frame.
     #
-    # ae.encoder(x) returns dict[str, Tensor] (one entry per latent
-    # stream -- see models/latent_streams.py); this function predates
-    # the multi-stream (C0/C1) redesign and still only knows about the
-    # single default stream, so it unwraps explicitly rather than
-    # silently assuming a bare-tensor return. Will need revisiting once
-    # this function itself is redesigned to use more than one stream.
-    z0 = ae.encoder(x0)[recon_stream_name]
+    # ae.encoders["shared"](x) returns dict[str, Tensor] (one entry per
+    # latent stream -- see models/latent_streams.py). ae here is always
+    # a MultiStreamAutoencoder -- the split-latent architecture requires
+    # z1 (the "deriv" stream), which only exists on a multi-stream
+    # model; a single-stream Autoencoder has no such stream to give.
+    x0_encoded = ae.encoders["shared"](x0)
+    z0 = x0_encoded[recon_stream_name]
+    z1_0 = x0_encoded[deriv_stream_name]
 
-    # z_true: the L_rollout TARGET, built entirely under no_grad. This
-    # is the critical collapse-prevention mechanism (discussed at
-    # length before ever being implemented): without it, gradient could
-    # flow into E via BOTH the prediction path and the target path
-    # simultaneously, letting E trivially minimize L_rollout by
-    # collapsing to a constant (with f_theta just learning to output
-    # that same constant) rather than genuinely learning dynamics.
-    # no_grad() (not a plain forward pass followed by .detach()) also
-    # avoids building and immediately discarding a graph for these
-    # frames, which matters given stage 4/5 already re-encodes every
-    # frame fresh every epoch (see the dataset's own docstring on the
-    # resulting cost-model change from stage 3).
+    # z_true, z1_future: the L_rollout TARGET and the teacher-forced z1
+    # values for every step BEYOND the start, both built entirely under
+    # no_grad. This is the critical collapse-prevention mechanism
+    # (discussed at length before ever being implemented): without it,
+    # gradient could flow into E via BOTH the prediction path and the
+    # target path simultaneously, letting E trivially minimize
+    # L_rollout by collapsing to a constant (with f_theta just learning
+    # to output that same constant) rather than genuinely learning
+    # dynamics. z1_future needs the SAME treatment as z_true, not
+    # gradient like z1_0 -- it comes from the same real FUTURE frames
+    # z_true does, so the identical collapse risk applies if left
+    # with-gradient. no_grad() (not a plain forward pass followed by
+    # .detach()) also avoids building and immediately discarding a
+    # graph for these frames, which matters given stage 4/5 already
+    # re-encodes every frame fresh every epoch (see the dataset's own
+    # docstring on the resulting cost-model change from stage 3).
     with torch.no_grad():
         x_future_flat = x_future.reshape(batch_size * n_rollout_steps, *x_future.shape[2:])
-        z_true_flat = ae.encoder(x_future_flat)[recon_stream_name]
+        x_future_encoded = ae.encoders["shared"](x_future_flat)
+        z_true_flat = x_future_encoded[recon_stream_name]
+        z1_future_flat = x_future_encoded[deriv_stream_name]
     z_true = z_true_flat.reshape(batch_size, n_rollout_steps, *z_true_flat.shape[1:])
+    z1_future = z1_future_flat.reshape(batch_size, n_rollout_steps, *z1_future_flat.shape[1:])
 
-    z_hat_full = f_theta.rollout(z0, dt_window, theta)
+    # z1_sequence: z1 at EVERY step, start through the last predicted
+    # one -- exactly what rollout() teacher-forces at each step (see
+    # LatentDynamics' own class docstring).
+    z1_sequence = torch.cat([z1_0.unsqueeze(1), z1_future], dim=1)
+
+    z_hat_full = f_theta.rollout(z0, z1_sequence, dt_window, theta)
     z_hat = z_hat_full[:, 1:]
 
-    rollout_loss_fn = RolloutLoss(exponent_deriv=exponent_deriv)
-    l_rollout = rollout_loss_fn(z_hat, z_true, dt=dt_window)
+    # No exponent_deriv here -- see train_lds.py's own identical
+    # change: that reweighting assumed a plain diff=dt*err relationship
+    # that no longer holds once the update rule is a mix of dt and
+    # dt^2 terms; the split-latent architecture handles dt-scaling
+    # structurally via the explicit z1*dt + f*(dt^2/2) terms
+    # themselves, not a loss-level reweighting knob.
+    rollout_loss_fn = RolloutLoss()
+    l_rollout = rollout_loss_fn(z_hat, z_true)
 
     # L_recon: the real starting frame only, never a predicted frame --
     # matches stage 1/2's convention of anchoring recon/stats to
-    # OBSERVED data.
-    x0_recon = ae.decoder(z0)
+    # OBSERVED data. EncoderDecoderPair.forward() starts from a raw
+    # image (encodes then decodes) -- z0 is already computed above, so
+    # decode it directly instead, applying the output-scale correction
+    # manually (matches check_reconstruction.py's own established
+    # pattern for this same situation).
+    recon_pathway = ae.pathways[recon_stream_name]
+    x0_recon = recon_pathway.decoder(z0) * torch.exp(recon_pathway.log_output_scale)
     l_recon0 = ReconLoss()(x0_recon, x0)
 
     if stats_head is not None and stats_loss_fn is not None and true_stats is not None:

@@ -74,6 +74,17 @@ def check_reconstruction(
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model_cfg = checkpoint["config"]
+    # Stage 1/1b/2 saves the AE's own state under "model_state" (the
+    # only model in that checkpoint). Stage 4/5's own joint checkpoint
+    # saves it under "ae_state" instead, alongside f_theta_state/
+    # stats_head_state for the OTHER models bundled into the same file
+    # -- "model_state" would be ambiguous there (which model?).
+    ae_state = checkpoint.get("model_state", checkpoint.get("ae_state"))
+    if ae_state is None:
+        raise ValueError(
+            f"{checkpoint_path} has neither a 'model_state' nor an 'ae_state' key -- "
+            f"not a recognized checkpoint format (found: {list(checkpoint.keys())})."
+        )
     print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, "
           f"val_loss={checkpoint['val_loss']:.6f}, config={model_cfg}")
 
@@ -87,7 +98,7 @@ def check_reconstruction(
 
     stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
     stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
-        stream_configs, recon_stream_name, checkpoint["model_state"],
+        stream_configs, recon_stream_name, ae_state,
     )
 
     # Any OTHER decodable stream (not the recon one, not pure_latent)
@@ -114,7 +125,7 @@ def check_reconstruction(
     # config even though model_assembly.py only ever saves a flat,
     # single-pathway EncoderDecoderPair (it only needs the recon
     # stream), regardless of how many streams that config lists.
-    is_flat_checkpoint = any(k.startswith("encoder.") for k in checkpoint["model_state"])
+    is_flat_checkpoint = any(k.startswith("encoder.") for k in ae_state)
     if is_flat_checkpoint and deriv_stream_name is not None:
         print(f"NOTE: this checkpoint's own ancestor had a '{deriv_stream_name}' stream, but "
               f"this checkpoint itself only kept '{recon_stream_name}''s own decoder (stage 4/5 "
@@ -166,6 +177,9 @@ def check_reconstruction(
                            base_channels=model_cfg["base_channels"], stream_configs=stream_configs).to(device)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
+            if stream_configs[stream_name].mode == LatentStreamMode.PURE_LATENT:
+                continue  # no decoder pathway exists for this stream at all -- see this
+                          # function's own comment above, and MultiStreamAutoencoder's own __init__
             stream_cfg = stream_configs[stream_name]
             decoders[decoder_key] = Decoder(
                 output_size=model_cfg["size"], out_channels=1,
@@ -175,7 +189,7 @@ def check_reconstruction(
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
                                      stream_configs=stream_configs,
                                      decoder_for_stream=decoder_for_stream).to(device)
-    ae.load_state_dict(checkpoint["model_state"])
+    ae.load_state_dict(ae_state)
     ae.eval()
 
     def _pathway_scale(stream_name):

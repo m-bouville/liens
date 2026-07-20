@@ -79,5 +79,5 @@ def test_load_ae_components_handles_multi_stream_checkpoint(tmp_path):
 
     # THE actual end-to-end check: this must not raise -- neither the
     # old "everything missing" RuntimeError, nor any other failure mode.
-    ae, stats_head, f_theta, frozen_modules = build_models_from_components(components, device="cpu")
+    ae, stats_head, f_theta, frozen_modules, _, _ = build_models_from_components(components, device="cpu")
     assert ae is not None

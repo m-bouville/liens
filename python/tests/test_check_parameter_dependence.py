@@ -29,6 +29,19 @@ def fit_power_law(dt, error):
     return a, b, r2_log, sse_real, pred_real
 
 
+def robust_linear_fit(x, y, n_iter=10, huber_delta_scale=1.345):
+    slope, intercept = np.polyfit(x, y, deg=1)
+    for _ in range(n_iter):
+        residuals = y - (slope * x + intercept)
+        mad = np.median(np.abs(residuals - np.median(residuals)))
+        scale = 1.4826 * mad if mad > 0 else np.std(residuals) + 1e-12
+        huber_delta = huber_delta_scale * scale
+        abs_resid = np.abs(residuals)
+        weights = np.where(abs_resid <= huber_delta, 1.0, huber_delta / np.maximum(abs_resid, 1e-12))
+        slope, intercept = np.polyfit(x, y, deg=1, w=weights)
+    return slope, intercept
+
+
 def fit_exponential(x, error):
     log_err = np.log(np.clip(error, 1e-12, None))
     a, b = np.polyfit(x, log_err, 1)
@@ -105,6 +118,52 @@ def test_fit_power_law_recovers_known_exponent():
     assert b == pytest.approx(true_b, abs=1e-6)
     assert r2_log == pytest.approx(1.0, abs=1e-9)
     assert sse_real < 1e-9
+
+
+def test_robust_linear_fit_recovers_a_known_clean_line():
+    """Baseline sanity check with no outliers at all -- confirms the
+    IRLS mechanism itself doesn't introduce bias when there's nothing
+    to be robust AGAINST, before testing the actual robustness claim
+    below."""
+    x = np.linspace(1, 100, 50)
+    true_slope, true_intercept = 0.3, -1.5
+    y = true_slope * x + true_intercept  # exact line, no noise
+    slope, intercept = robust_linear_fit(x, y)
+    assert slope == pytest.approx(true_slope, abs=1e-6)
+    assert intercept == pytest.approx(true_intercept, abs=1e-6)
+
+
+def test_robust_linear_fit_resists_a_planted_outlier_better_than_ols():
+    """The actual claim this function exists for: with a single,
+    extreme outlier planted among otherwise-clean points on a known
+    line, plain OLS (np.polyfit) gets measurably pulled toward it,
+    while the robust fit stays much closer to the TRUE line -- verified
+    directly by comparing both fits' own distance from the known
+    ground truth, not just asserting the robust fit "looks reasonable"
+    in isolation."""
+    x = np.linspace(1, 100, 50)
+    true_slope, true_intercept = 0.3, -1.5
+    y = true_slope * x + true_intercept
+    # One extreme outlier, concentrated at a SMALL x -- mirrors the
+    # actual concern raised (small-dt windows with unusually large
+    # residuals dominating the fit).
+    y_with_outlier = y.copy()
+    y_with_outlier[0] += 500.0
+
+    ols_slope, ols_intercept = np.polyfit(x, y_with_outlier, deg=1)
+    robust_slope, robust_intercept = robust_linear_fit(x, y_with_outlier)
+
+    ols_error = abs(ols_slope - true_slope) + abs(ols_intercept - true_intercept)
+    robust_error = abs(robust_slope - true_slope) + abs(robust_intercept - true_intercept)
+    assert robust_error < ols_error / 5, (
+        f"robust fit should be MUCH closer to the true line than OLS given a single planted "
+        f"outlier -- OLS error={ols_error:.4f}, robust error={robust_error:.4f}"
+    )
+    # The robust fit shouldn't just be "less wrong" -- it should be
+    # genuinely close to the true line, not merely better than a badly
+    # wrong OLS fit.
+    assert robust_slope == pytest.approx(true_slope, abs=0.05)
+    assert robust_intercept == pytest.approx(true_intercept, abs=5.0)
 
 
 def test_fit_exponential_recovers_known_params():

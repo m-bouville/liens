@@ -333,3 +333,30 @@ def test_check_dead_relus_detects_a_genuinely_collapsed_trunk():
         "a fully stuck trunk should produce a near-constant (low-variance-relative-to-mean) "
         "f() output across genuinely different z0/z1/theta inputs"
     )
+
+
+def test_print_binned_by_dt2_uses_correct_decade_boundaries_and_medians(capsys):
+    """Verifies both the bin assignment (values land in the decade
+    their own dt2 actually falls into, not an off-by-one neighbor) and
+    that MEDIAN (not mean) is what's reported per bin -- deliberately
+    robust to a heavy-tailed outlier within a bin, which is the whole
+    point of this breakdown (see its own docstring)."""
+    from evaluation.check_f_theta import _print_binned_by_dt2
+
+    # decade 1 (10-100): 3 values, median should be 20 (not pulled by the range)
+    # decade 3 (1000-10000): 3 values, one deliberately huge outlier --
+    # median should stay at the middle value (8.0), NOT get dragged
+    # toward the outlier the way a MEAN of the same 3 values would be
+    dt2 = np.array([15.0, 20.0, 90.0, 1500.0, 2000.0, 3000.0])
+    values = np.array([10.0, 20.0, 30.0, 5.0, 8.0, 1_000_000.0])
+
+    _print_binned_by_dt2("test_metric", dt2, values)
+    output = capsys.readouterr().out
+
+    assert "1e1-1e2" in output
+    assert "n=    3" in output
+    assert "median=    2.0000e+01" in output  # median of [10, 20, 30] == 20
+
+    assert "1e3-1e4" in output
+    assert "n=    3" in output
+    assert "median=    8.0000e+00" in output  # median of [5, 8, 1_000_000] == 8, not dragged toward the outlier

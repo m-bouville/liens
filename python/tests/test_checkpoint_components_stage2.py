@@ -103,6 +103,6 @@ def test_checkpoint_components_decoder_extraction_from_stage2(tmp_path, isolated
     )
 
     # THE actual regression check: must not raise the reported ValueError.
-    ae, stats_head, f_theta_out, frozen = build_models_from_components(components, device="cpu")
+    ae, stats_head, f_theta_out, frozen, _, _ = build_models_from_components(components, device="cpu")
     assert ae is not None
     print("build_models_from_components correctly reconstructed the model from a stage 2 checkpoint")

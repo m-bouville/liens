@@ -83,3 +83,86 @@ def test_check_reconstruction_loads_flat_stage4_checkpoint(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "no derivative panel is possible" in output
     assert (tmp_path / "recon.png").exists()
+
+
+def test_check_reconstruction_loads_a_real_train_refinement_checkpoint(tmp_path):
+    """Regression test for a real, reported bug: train_refinement.py's
+    own checkpoint saves the AE's state under "ae_state" (not
+    "model_state" -- that key is reserved for Stage 1/1b/2's own,
+    single-model checkpoints; Stage 4/5's own checkpoint bundles
+    ae_state/f_theta_state/stats_head_state together, so "model_state"
+    alone would be ambiguous). check_reconstruction.py was only ever
+    written to read "model_state" -- raised a confusing KeyError on any
+    REAL Stage 4/5 checkpoint. The test above this one never caught
+    this: it hand-constructs its own checkpoint dict using
+    "model_state", so it never actually exercised train_refinement.py's
+    own real save format at all. This test calls the REAL
+    train_refinement() end to end instead, reproducing the user's own
+    exact scenario directly rather than a hand-approximated one."""
+    from models.autoencoder import MultiStreamAutoencoder
+    from models.latent_dynamics import LatentDynamics
+    from training.stats_head import StatsHead
+    from training.train_refinement import train_refinement
+
+    base_dir = tmp_path / "32x32"
+    base_dir.mkdir(parents=True)
+    run_names = [f"T800_n010_s{i}" for i in range(6)]
+    for name in run_names:
+        _build_run_dir(base_dir, name, size=32)
+    sweep_meta = "\n".join([
+        "Nx = 32", "Ny = 32", "temperatures = 0.8", "noises = 0.01",
+        f"seeds = {','.join(str(i) for i in range(6))}", "subdirs =", *run_names,
+    ])
+    (base_dir / "metadata.txt").write_text(sweep_meta)
+    for name in run_names:
+        (base_dir / name / "COMPLETE").touch()
+        import pandas as pd
+        steps = [0, 1000, 2000, 3000, 4000]
+        pd.DataFrame({"avg_phi": [s / 10000.0 for s in steps]}, index=steps).rename_axis(
+            "step").to_csv(base_dir / name / "statistics.csv")
+
+    latent_channels = 4
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=latent_channels, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+        "deriv": LatentStreamConfig(name="deriv", channels=latent_channels, spatial_size=8,
+                                     mode=LatentStreamMode.DECODER),
+    }
+    encoder = Encoder(input_size=32, in_channels=1, base_channels=4, stream_configs=stream_configs)
+    decoder = Decoder(output_size=32, out_channels=1, base_channels=4,
+                       latent_channels=latent_channels, latent_spatial_size=8)
+    ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                 stream_configs=stream_configs)
+    ae_path = tmp_path / "fake-stage2.pt"
+    torch.save({
+        "model_state": ae.state_dict(), "epoch": 1, "val_loss": 0.01, "test_dirs": [],
+        "config": {"size": 32, "base_channels": 4, "latent_channels": latent_channels,
+                   "latent_spatial_size": 8, "stats_weight": 0.01,
+                   "stream_configs": {n: {"channels": c.channels, "spatial_size": c.spatial_size,
+                                           "mode": c.mode.value} for n, c in stream_configs.items()},
+                   "recon_stream_name": "state"},
+    }, ae_path)
+
+    f_theta = LatentDynamics(latent_channels=latent_channels, n_theta=1, hidden_dim=8, n_hidden_layers=1)
+    lds_path = tmp_path / "fake-stage3.pt"
+    torch.save({
+        "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05, "ae_checkpoint": "fake",
+        "test_dirs": [],
+        "config": {"latent_channels": latent_channels, "n_theta": 1, "hidden_dim": 8, "n_hidden_layers": 1},
+        "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2, "n_rollout_steps": 1},
+    }, lds_path)
+
+    stage4_path = tmp_path / "stage4.pt"
+    train_refinement(
+        base_path=tmp_path, ae_checkpoint_path=ae_path, lds_checkpoint_path=lds_path,
+        freeze_decoder=True, rollout_weight=1.0, recon0_weight=0.1, stats0_weight=0.0,
+        epochs=1, batch_size=4, n_rollout_steps=1, min_step=0, min_stdev_phi=None,
+        val_fraction=0.3, test_fraction=0.2, num_workers=0, checkpoint_path=stage4_path,
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    assert stage4_path.exists()
+
+    # THE actual test: must not raise the "model_state" KeyError.
+    check_reconstruction(checkpoint_path=stage4_path, device="cpu", min_step=0,
+                          output_path=tmp_path / "recon_real.png")
+    assert (tmp_path / "recon_real.png").exists()

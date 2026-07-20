@@ -21,7 +21,10 @@ import pandas as pd
 import torch
 import pytest
 
-from models.autoencoder import Autoencoder
+from models.autoencoder import MultiStreamAutoencoder
+from models.encoder import Encoder
+from models.decoder import Decoder
+from models.latent_streams import LatentStreamConfig, LatentStreamMode
 from models.latent_dynamics import LatentDynamics
 from training.stats_head import StatsHead
 from training.train_refinement import train_refinement
@@ -89,12 +92,27 @@ def _build_sweep(tmp_path: Path, n_runs: int = 6) -> Path:
 
 
 def _build_ae_checkpoint(path: Path, include_stats_head: bool = True):
-    ae = Autoencoder(size=SIZE, channels=1, base_channels=4, latent_channels=LATENT_CHANNELS)
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=LATENT_CHANNELS, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+        "deriv": LatentStreamConfig(name="deriv", channels=LATENT_CHANNELS, spatial_size=8,
+                                     mode=LatentStreamMode.DECODER),
+    }
+    encoder = Encoder(input_size=SIZE, in_channels=1, base_channels=4, stream_configs=stream_configs)
+    decoder = Decoder(output_size=SIZE, out_channels=1, base_channels=4,
+                       latent_channels=LATENT_CHANNELS, latent_spatial_size=8)
+    ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                 stream_configs=stream_configs)
     checkpoint = {
         "model_state": ae.state_dict(), "epoch": 1, "val_loss": 0.01,
         "val_loss_ema": 0.01, "test_dirs": [],
         "config": {"size": SIZE, "base_channels": 4, "latent_channels": LATENT_CHANNELS,
-                   "stats_weight": 0.01},
+                   "latent_spatial_size": 8, "stats_weight": 0.01,
+                   "stream_configs": {
+                       "state": {"channels": LATENT_CHANNELS, "spatial_size": 8, "mode": "autoencoder"},
+                       "deriv": {"channels": LATENT_CHANNELS, "spatial_size": 8, "mode": "decoder"},
+                   },
+                   "recon_stream_name": "state"},
     }
     if include_stats_head:
         stats_head = StatsHead(latent_channels=LATENT_CHANNELS, stat_names=STAT_NAMES, hidden_dim=8)

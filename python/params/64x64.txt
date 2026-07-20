@@ -9,8 +9,6 @@ min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
 min_std_deriv = 0.0002		# skip time derivatives whose stdev is below this
 
 
-exponent_deriv= 0.5			# loss based on dx/dt · Δt^exponent
-
 recon0_scale  = 0.0001
 recon1_scale  = 0.2
 
@@ -56,24 +54,26 @@ batches		  = 128
 freeze_encoder= True
 cos_weight	  = 2
 
-force 	      = True
+# force 	      = True
 
 
 # Stage 2
 #   latent-space validation (interpolation-consistency fine-tuning)
 
-# recon1_weight = 1  # was 0.0005		# multiplies a number 3 orders of magnitude larger
-stats0_weight  = 1  # was 0.01     	# weight of L_stats0 relative to L_recon0
-# stats1_weight = 1  # was 0.0002    	# weight of L_stats1 relative to L_recon0
-deriv_weight  = 1  # was 0.2
+# recon1_weight = 0			# multiplies a number 3 orders of magnitude larger
+stats0_weight   = 0.5     	# weight of L_stats0 relative to L_recon0
+# stats1_weight = 0    		# weight of L_stats1 relative to L_recon0
+deriv_weight    =10.  # was 1.
 
-n_frozen_stages= 2
+n_frozen_stages= 0
+z0_from_deriv_weight=1.	# in [0, 1], was (de facto) 0.
+deriv_weight_warmup_epochs=5  # was (de facto) 0.
 
-epochs 		  =  100		# note: stage 2 is not augmented
-patience 	  =   10
+epochs 		  =  30		# note: stage 2 is not augmented
+patience 	  =   5
 batches 	  = same
 
-# force 	      = True
+force 	      = True
 
 
 # Stage 3a
@@ -85,7 +85,7 @@ batches		  = 512
 epochs 		  = 500
 patience 	  =  50
 
-force 	      = True
+# force 	      = True
 
 
 # Stage 3b
@@ -99,7 +99,7 @@ batches		  = 512
 epochs 		  = 500
 patience 	  =  50
 
-force 	      = True
+# force 	      = True
 
 
 # Stage 4

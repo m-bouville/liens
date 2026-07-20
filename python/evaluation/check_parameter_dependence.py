@@ -24,6 +24,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.constants import LATENT_SPATIAL_SIZE
@@ -34,7 +35,6 @@ from models.latent_streams import (
     cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
 )
 from training.datasets import MicrostructureEvolutionDataset
-from training.losses import OneStepLoss, ReconLoss
 from utils import load_datasets as load
 
 # GENERAL POLICY (matches training/train_refinement.py's own
@@ -66,6 +66,47 @@ def max_autocorr_dist(nx: int, ny: int) -> int:
     the simulation actually produced, not an approximation of it.
     """
     return min(nx * 2 // 3, ny * 2 // 3)
+
+
+def robust_linear_fit(x: np.ndarray, y: np.ndarray, n_iter: int = 10, huber_delta_scale: float = 1.345):
+    """
+    Robust linear fit (y = slope*x + intercept) via IRLS with Huber
+    weights -- self-contained (no scipy/sklearn dependency), since
+    np.polyfit already supports weighted least-squares directly.
+
+    Ordinary least squares (a single np.polyfit call) is heavily
+    influenced by a small number of extreme-magnitude points -- exactly
+    the failure mode motivating this function: a handful of small-dt
+    windows with unusually large |residual| can dominate an OLS fit
+    entirely, even though most of the data disagrees with the line
+    those few points imply. IRLS refits repeatedly, each time
+    DOWN-WEIGHTING points whose current residual is large (a Huber-type
+    weight: full weight within `huber_delta_scale` MAD-scaled residuals
+    of zero, decreasing weight beyond that) -- points that are
+    genuinely outliers relative to the bulk of the data end up
+    contributing little to the final fit, rather than being fit exactly
+    at the expense of everything else.
+
+    huber_delta_scale=1.345 is the standard choice for Huber's own
+    estimator (95% efficiency under a purely Gaussian residual
+    distribution) -- not tuned specifically for this application, just
+    the well-established default.
+    """
+    slope, intercept = np.polyfit(x, y, deg=1)
+    for _ in range(n_iter):
+        residuals = y - (slope * x + intercept)
+        # MAD (median absolute deviation), scaled to be a consistent
+        # estimator of the standard deviation under a Gaussian residual
+        # distribution (the standard 1.4826 factor) -- robust to the
+        # same outliers the weights themselves are meant to down-weight,
+        # unlike using the residuals' own (outlier-sensitive) std.
+        mad = np.median(np.abs(residuals - np.median(residuals)))
+        scale = 1.4826 * mad if mad > 0 else np.std(residuals) + 1e-12
+        huber_delta = huber_delta_scale * scale
+        abs_resid = np.abs(residuals)
+        weights = np.where(abs_resid <= huber_delta, 1.0, huber_delta / np.maximum(abs_resid, 1e-12))
+        slope, intercept = np.polyfit(x, y, deg=1, w=weights)
+    return slope, intercept
 
 
 def fit_power_law(dt: np.ndarray, error: np.ndarray):
@@ -292,6 +333,18 @@ def check_parameter_dependence(
 ) -> Path:
     """Saves the dt/temperature/noise-vs-error figure and returns its path."""
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if device.type == "cuda" and not torch.cuda.is_available():
+        # See this function's own docstring on why this re-check exists,
+        # rather than trusting device unconditionally.
+        print("WARNING: device='cuda' was requested (or defaulted to, from an "
+              "argparse default computed at a DIFFERENT time than this actual "
+              "run), but torch.cuda.is_available() is False right now -- falling "
+              "back to CPU instead of letting torch.load() fail with a confusing "
+              "deserialization error. If this is unexpected, check that CUDA is "
+              "actually usable from THIS environment specifically (e.g. running "
+              "from the command line vs. an IDE's own kernel can pick up a "
+              "different Python/CUDA environment).")
+        device = torch.device("cpu")
 
     if output_path is None:
         output_path = (_PYTHON_ROOT.parent / "output" / "stage3"
@@ -381,9 +434,6 @@ def check_parameter_dependence(
     )
     print(f"Evaluating {len(dataset)} test windows...")
 
-    one_step_loss = OneStepLoss(kind="l1")
-    recon_loss = ReconLoss(kind="l1")
-
     # metadata.txt read once per run_dir, not once per window -- most
     # runs contribute several windows, and temperature/noise are
     # constant across all of them (unlike dt, which varies per window
@@ -397,46 +447,117 @@ def check_parameter_dependence(
     stats_cache: dict[Path, object] = {}
 
     dts, temperatures, noises, run_dirs, length_scales = [], [], [], [], []
-    latent_losses, pixel_losses = [], []
+    latent_losses, pixel_losses, euler_losses = [], [], []
+    latent_losses_signed, euler_losses_signed = [], []
 
+    def _per_sample_l1(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+        """(B, ...) -> (B,) mean absolute error per sample -- matches
+        OneStepLoss/ReconLoss's own L1 definition (mean over all
+        non-batch dims), but WITHOUT their forward()'s own further
+        reduction over the batch dim too, which would collapse an
+        entire batch to one scalar -- exactly what per-window
+        correlation against dt/temperature/etc needs to NOT happen."""
+        return (pred - true).abs().flatten(start_dim=1).mean(dim=1)
+
+    def _per_sample_signed_mean(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+        """(B, ...) -> (B,) mean SIGNED residual per sample -- same
+        reduction as _per_sample_l1 but WITHOUT the .abs(), so positive
+        and negative components can cancel within a window. Used
+        specifically for the linear panel: the formula it checks is
+        written in terms of the signed residual, not |residual|."""
+        return (pred - true).flatten(start_dim=1).mean(dim=1)
+
+    signed_residual_sum = None  # accumulated (C, H, W) sum of z0_euler_pred - z0_next_true,
+                                 # summed (not yet averaged) across ALL windows -- see the
+                                 # bias-vs-variance analysis after the loop for why this needs
+                                 # to stay SIGNED, unlike everything else computed here.
+    n_total = 0
+
+    loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
+    idx = 0
     with torch.no_grad():
-        for idx in range(len(dataset)):
-            window0, window1, dt_window, theta = dataset[idx]
-            run_dir, steps = dataset.window_info(idx)
-            if run_dir not in metadata_cache:
-                metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
-            metadata = metadata_cache[run_dir]
-            if run_dir not in stats_cache:
-                stats_cache[run_dir] = load.read_statistics_csv(run_dir / "statistics.csv")
-            stats_df = stats_cache[run_dir]
+        for window0, window1, dt_window, theta in loader:
+            batch_size = window0.shape[0]
+            window0 = window0.to(device)
+            window1 = window1.to(device)
+            dt_window = dt_window.to(device)
+            theta = theta.to(device)
 
-            z0_t = window0[0:1].to(device)
-            z1_t = window1[0:1].to(device)
-            z0_next_true = window0[1:2].to(device)
-            dt = dt_window[0:1].to(device)
-            theta_b = theta.unsqueeze(0).to(device)
+            z0_t = window0[:, 0]
+            z1_t = window1[:, 0]
+            z0_next_true = window0[:, 1]
+            dt = dt_window[:, 0]
+            theta_b = theta
 
             z0_next_pred = f_theta(z0_t, z1_t, dt, theta_b)
+            # The pure, hard-coded Euler term ALONE -- z0(t) + z1(t)*dt,
+            # no f_theta correction at all. Comparing this against
+            # z0_next_pred's own error (both against the SAME
+            # z0_next_true, same dt, same window) is what actually
+            # disentangles the two Taylor orders: the FIRST-order term
+            # (z1*dt) is hard-coded, never learned, so its own error is
+            # entirely a property of z1's own quality and the physics'
+            # own curvature -- f_theta (the SECOND-order, TRAINED
+            # correction) can only ever act on top of it. If f_theta is
+            # adding real value, its own (full) error should fall off
+            # FASTER with dt (a higher power-law exponent) than this
+            # Euler-only baseline does -- see the dedicated panel below
+            # for the direct visual/numeric comparison.
+            dt_r = dt.view(-1, 1, 1, 1)
+            z0_euler_pred = z0_t + z1_t * dt_r
 
-            latent_loss = one_step_loss(z0_next_pred, z0_next_true).item()
+            latent_loss_batch = _per_sample_l1(z0_next_pred, z0_next_true)
+            euler_loss_batch = _per_sample_l1(z0_euler_pred, z0_next_true)
+            latent_loss_signed_batch = _per_sample_signed_mean(z0_next_pred, z0_next_true)
+            euler_loss_signed_batch = _per_sample_signed_mean(z0_euler_pred, z0_next_true)
 
             x_next_pred = ae_decoder(z0_next_pred)
             x_next_true = ae_decoder(z0_next_true)
-            pixel_loss = recon_loss(x_next_pred, x_next_true).item()
+            pixel_loss_batch = _per_sample_l1(x_next_pred, x_next_true)
 
-            dts.append(dt.item())
-            temperatures.append(metadata.temperature)
-            noises.append(metadata.noise)
-            run_dirs.append(run_dir)
-            # Ground-truth length scale (first peak in the autocorrelation
-            # function), read from the SIMULATION's own precomputed
-            # statistics.csv -- not re-derived from the (possibly
-            # decoder-distorted) reconstructed frame -- at the window's
-            # starting step, i.e. the length scale of the microstructure
-            # this rollout step is actually predicting FROM.
-            length_scales.append(stats_df.loc[steps[0], "autocorr_length"])
-            latent_losses.append(latent_loss)
-            pixel_losses.append(pixel_loss)
+            latent_losses.extend(latent_loss_batch.cpu().tolist())
+            euler_losses.extend(euler_loss_batch.cpu().tolist())
+            latent_losses_signed.extend(latent_loss_signed_batch.cpu().tolist())
+            euler_losses_signed.extend(euler_loss_signed_batch.cpu().tolist())
+            pixel_losses.extend(pixel_loss_batch.cpu().tolist())
+            dts.extend(dt.cpu().tolist())
+
+            # SIGNED (not .abs()'d) euler-only residual, summed over the
+            # batch dim only -- keeps the full (C, H, W) shape, so
+            # element-wise cancellation across DIFFERENT windows is what
+            # actually happens here (a random +/- residual at any given
+            # element genuinely cancels when summed across many
+            # windows; .abs() before summing would never let it).
+            batch_signed_residual = (z0_euler_pred - z0_next_true).sum(dim=0)
+            signed_residual_sum = (batch_signed_residual if signed_residual_sum is None
+                                    else signed_residual_sum + batch_signed_residual)
+            n_total += batch_size
+
+            # Per-window metadata: cheap, CPU-bound, inherently
+            # per-index -- not a tensor op, so batching it wouldn't
+            # help; stays in its own loop, synchronized to the same
+            # dataset ordering the DataLoader above preserves
+            # (shuffle=False).
+            for i in range(batch_size):
+                run_dir, steps = dataset.window_info(idx)
+                if run_dir not in metadata_cache:
+                    metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
+                metadata = metadata_cache[run_dir]
+                if run_dir not in stats_cache:
+                    stats_cache[run_dir] = load.read_statistics_csv(run_dir / "statistics.csv")
+                stats_df = stats_cache[run_dir]
+
+                temperatures.append(metadata.temperature)
+                noises.append(metadata.noise)
+                run_dirs.append(run_dir)
+                # Ground-truth length scale (first peak in the autocorrelation
+                # function), read from the SIMULATION's own precomputed
+                # statistics.csv -- not re-derived from the (possibly
+                # decoder-distorted) reconstructed frame -- at the window's
+                # starting step, i.e. the length scale of the microstructure
+                # this rollout step is actually predicting FROM.
+                length_scales.append(stats_df.loc[steps[0], "autocorr_length"])
+                idx += 1
 
     dts = np.array(dts)
     temperatures = np.array(temperatures)
@@ -444,6 +565,34 @@ def check_parameter_dependence(
     length_scales = np.array(length_scales, dtype=float)
     latent_losses = np.array(latent_losses)
     pixel_losses = np.array(pixel_losses)
+    euler_losses = np.array(euler_losses)
+    latent_losses_signed = np.array(latent_losses_signed)
+    euler_losses_signed = np.array(euler_losses_signed)
+
+    # Bias vs variance in z1's own error: euler_losses (E[|residual|],
+    # mean ABSOLUTE error) can never distinguish "z1 is wrong by the
+    # same amount, in the same direction, every time" (a bias -- in
+    # principle correctable, e.g. by retraining z1 differently) from
+    # "z1 is wrong by that much, but in a random direction each time"
+    # (variance -- an irreducible floor no retraining on the SAME kind
+    # of data could remove). |E[residual]| (mean of the SIGNED
+    # residual's own norm, NOT mean of the norm) answers this directly:
+    # random, cancelling errors average toward zero across many
+    # windows; a genuine, consistent bias does not.
+    mean_signed_residual = signed_residual_sum / n_total  # (C, H, W), SIGN preserved
+    bias_magnitude = mean_signed_residual.abs().mean().item()
+    total_magnitude = float(euler_losses.mean())
+    bias_fraction = bias_magnitude / total_magnitude if total_magnitude > 0 else float("nan")
+    print(f"\nz1's own euler-only error: bias vs variance (n={n_total} windows):")
+    print(f"  E[|residual|]  (total error magnitude, already reported above as euler-only): "
+          f"{total_magnitude:.6e}")
+    print(f"  |E[residual]|  (the part that does NOT cancel across windows -- the bias): "
+          f"{bias_magnitude:.6e}")
+    print(f"  bias fraction = |E[residual]| / E[|residual|] = {bias_fraction:.3f}")
+    print(f"  (near 1.0 -> error is mostly a consistent, SYSTEMATIC bias in the same "
+          f"direction every time -- in principle correctable by retraining z1 differently. "
+          f"near 0.0 -> error is mostly VARIANCE/NOISE, cancelling across windows -- an "
+          f"irreducible floor that retraining on the same KIND of data is unlikely to fix.)")
 
     # ---- dt: unchanged from check_dt_dependence.py -- log-log, with
     # the power-law vs saturating-exponential model comparison. dt
@@ -468,6 +617,49 @@ def check_parameter_dependence(
           f"SSE(real space)={sse_sat:.6f}")
     better = "saturating exponential" if sse_sat < sse_power else "power law"
     print(f"  -> {better} fits better (lower SSE).")
+
+    # Euler-only (hard-coded first-order term alone, no f_theta) vs the
+    # full, f_theta-corrected prediction -- SAME z0_next_true, SAME dt,
+    # SAME window for both, so this is a genuine, point-by-point
+    # decomposition, not just two separately-fit trends.
+    #
+    # THEORY, if z1 were an EXACT derivative and f_theta an EXACT
+    # curvature: raw euler_error ~ dt^2 (euler_error/dt ~ dt^1), raw
+    # full_error ~ dt^3 (full_error/dt ~ dt^2) -- z1 being hard-coded
+    # first-order means its error is entirely the curvature term
+    # f_theta's own trained correction should be cancelling.
+    #
+    # WHAT WE ACTUALLY SEE (confirmed on real 64x64 data): euler-only
+    # exponent ~1.0, not ~2.0. euler_error/dt is then ~dt^0, i.e. a
+    # NON-VANISHING CONSTANT as dt->0 -- exactly z1(t) - z0_dot(t), z1's
+    # own systematic bias against the true derivative. euler_error/dt
+    # is measuring z1's own error directly, not curvature at all.
+    #
+    # A higher exponent alone does NOT mean full is actually better --
+    # it only describes the asymptotic trend toward dt=0, which may lie
+    # well below every dt actually observed. The direct magnitude
+    # comparison below is what actually answers "which one is smaller,
+    # in practice, over the range that matters."
+    a_euler, b_euler, r2_log_euler, sse_power_euler, pred_power_euler = fit_power_law(dts, euler_losses)
+    print(f"\nEuler-only (z0+z1*dt, no f_theta) vs full (f_theta-corrected) prediction, "
+          f"same windows/dt:")
+    print(f"  euler-only:  error ~ dt^{a_euler:.3f}")
+    print(f"  full (f_theta): error ~ dt^{a:.3f}")
+    print(f"  (a higher exponent only describes the asymptotic trend toward dt->0 -- "
+          f"see the direct magnitude comparison below for which is ACTUALLY smaller "
+          f"over the observed dt range)")
+
+    ratio = np.array(latent_losses) / np.maximum(np.array(euler_losses), 1e-12)
+    frac_full_worse = float((ratio > 1).mean())
+    print(f"\nDirect magnitude comparison (full / euler-only), per window:")
+    print(f"  mean(full)={np.mean(latent_losses):.6f}  mean(euler-only)={np.mean(euler_losses):.6f}  "
+          f"ratio of means={np.mean(latent_losses) / np.mean(euler_losses):.4f}")
+    print(f"  mean(full/euler-only ratio)={ratio.mean():.4f}  median={np.median(ratio):.4f}")
+    print(f"  full prediction is WORSE than euler-only on {frac_full_worse:.1%} of windows")
+    if frac_full_worse > 0.5:
+        print(f"  -> f_theta's own trained correction is making the prediction WORSE on "
+              f"most windows, despite a higher fit exponent -- it is NOT currently adding "
+              f"value in practice, whatever its asymptotic behavior would eventually be.")
 
     print("\ndt decade      n       mean latent_loss   mean pixel_loss")
     edges = np.floor(log_dt.min()), np.ceil(log_dt.max())
@@ -570,7 +762,7 @@ def check_parameter_dependence(
         print(f"  {run_dir_list[i].name}: T={run_temps[i]:.3f}  noise={run_noises[i]:.4f}  "
               f"mean_loss={run_mean_loss[i]:.6f}  ({run_n_windows[i]} windows)")
 
-    fig, axes = plt.subplots(2, 3, figsize=(17, 10))
+    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
 
     for ax, losses, name, corr in [
         (axes[0, 0], latent_losses, "latent-space (L1)", corr_dt_latent),
@@ -580,7 +772,16 @@ def check_parameter_dependence(
         ax.set_yscale("log")
         ax.set_xlabel("dt")
         ax.set_ylabel(f"{name} one-step error")
-        ax.set_title(f"{name}\ncorr(log dt, log error) = {corr:.3f}")
+        if ax is axes[0, 0]:
+            # Exponent shown here (not pixel-space) since this is the
+            # ONE panel with the power-law fit actually drawn below --
+            # directly answers "is this first-order (~dt^1) or
+            # second-order (~dt^2) Taylor remainder behavior" without
+            # cross-referencing the printed console output.
+            ax.set_title(f"{name}\ncorr(log dt, log error) = {corr:.3f}, "
+                         f"power-law exponent = {a:.3f}")
+        else:
+            ax.set_title(f"{name}\ncorr(log dt, log error) = {corr:.3f}")
 
     order_dt = np.argsort(dts)
     axes[0, 0].plot(dts[order_dt], pred_power[order_dt], "--", color="tab:red",
@@ -588,6 +789,26 @@ def check_parameter_dependence(
     axes[0, 0].plot(dts[order_dt], pred_sat[order_dt], "--", color="tab:green",
                      label=f"saturating exp, tau={tau:.0f} (SSE={sse_sat:.4f})")
     axes[0, 0].legend(fontsize=8)
+
+    # Euler-only (hard-coded first-order term alone) vs full
+    # (f_theta-corrected) prediction, SAME windows/dt for both -- see
+    # this quantity's own computation above for the full rationale.
+    # Scatter, not boxplot: the two series need to stay visually
+    # distinguishable at each dt, which a side-by-side boxplot pair
+    # would clutter given dt's own wide, non-uniform sampling.
+    axes[0, 3].scatter(dts, euler_losses / dts, s=8, alpha=0.35, color="tab:orange", label="euler-only / dt")
+    axes[0, 3].scatter(dts, latent_losses / dts, s=8, alpha=0.35, color="tab:blue", label="full (f_theta) / dt")
+    axes[0, 3].plot(dts[order_dt], pred_power_euler[order_dt] / dts[order_dt], "--", color="tab:orange",
+                     label=f"euler-only fit: dt^{a_euler:.3f}, /dt -> dt^{a_euler - 1:.3f}")
+    axes[0, 3].plot(dts[order_dt], pred_power[order_dt] / dts[order_dt], "--", color="tab:blue",
+                     label=f"full fit: dt^{a:.3f}, /dt -> dt^{a - 1:.3f}")
+    axes[0, 3].set_xscale("log")
+    axes[0, 3].set_yscale("log")
+    axes[0, 3].set_xlabel("dt")
+    axes[0, 3].set_ylabel("euler-only/dt, full/dt")
+    axes[0, 3].set_title("Euler-only/dt vs full/dt\n(same normalization for both -- direct, "
+                          "same-footing comparison)")
+    axes[0, 3].legend(fontsize=7)
 
     # The key actionable panel: which (temperature, noise) region has
     # the highest error, aggregated per run so points don't overplot.
@@ -668,6 +889,72 @@ def check_parameter_dependence(
     axes[1, 2].axvline(cell_size_px, color="black", linestyle=":", linewidth=1)
     axes[1, 2].text(cell_size_px, axes[1, 2].get_ylim()[1], " latent cell size",
                      fontsize=7, ha="left", va="top", rotation=90)
+
+    # LINEAR-scale version of the same two quantities, to directly
+    # check the formula's own predicted structure and read off its
+    # coefficients numerically -- a log-log plot obscures this: the
+    # derivation (dz1 = z1-true_derivative, df = f_theta-true_curvature)
+    # gives, dividing BOTH residuals by dt (not dt^2 -- removes the
+    # divergent 1/dt term entirely, a cleaner comparison):
+    #   euler_residual/dt ~  dz1 + B*dt          (B = -true_curvature/2)
+    #   full_residual/dt  ~  dz1 + (df/2)*dt      (SAME intercept dz1 --
+    #                                              both reduce to the
+    #                                              same first-order term
+    #                                              as dt->0, since z1 is
+    #                                              the SAME z1 either way)
+    # so on a straight, LINEAR x/y scale, each should show up as an
+    # actual straight line, with the fitted Y-INTERCEPT directly giving
+    # dz1 (from EITHER fit -- a genuine check is whether the two
+    # intercepts actually agree with each other), and the fitted SLOPE
+    # giving B (euler) or df/2 (full) directly -- readable as real
+    # numbers, not just a power-law exponent.
+    #
+    # Uses the SIGNED residual (euler_losses_signed/latent_losses_signed),
+    # not the L1 magnitude used everywhere else in this figure -- the
+    # formula above is written in terms of the signed residual (positive
+    # and negative components genuinely cancelling), and |residual|
+    # would silently answer a different question.
+    #
+    # Robust (IRLS/Huber) fit, not plain least-squares: a small number
+    # of small-dt windows with unusually large residuals can otherwise
+    # dominate the line entirely (most visible on euler-only), even
+    # though the bulk of the data disagrees with the slope/intercept
+    # that a handful of outliers would imply -- see robust_linear_fit's
+    # own docstring for the mechanism.
+    euler_over_dt = euler_losses_signed / dts
+    full_over_dt = latent_losses_signed / dts
+    euler_lin_slope, euler_lin_intercept = robust_linear_fit(dts, euler_over_dt)
+    full_lin_slope, full_lin_intercept = robust_linear_fit(dts, full_over_dt)
+
+    axes[1, 3].scatter(dts, euler_over_dt, s=8, alpha=0.35, color="tab:orange", label="euler-only / dt")
+    axes[1, 3].scatter(dts, full_over_dt, s=8, alpha=0.35, color="tab:blue", label="full (f_theta) / dt")
+    # Fit line drawn across the FULL dt range (all data used for the
+    # fit itself) -- only the axis's own displayed window is cut below,
+    # via set_xlim, so the line doesn't visually stop short even though
+    # the view does.
+    dt_lin_range = np.array([dts.min(), dts.max()])
+    axes[1, 3].plot(dt_lin_range, euler_lin_intercept + euler_lin_slope * dt_lin_range, "--",
+                     color="tab:orange",
+                     label=f"euler-only robust fit: intercept={euler_lin_intercept:.4e} (~dz1), "
+                           f"slope={euler_lin_slope:.4e} (~B)")
+    axes[1, 3].plot(dt_lin_range, full_lin_intercept + full_lin_slope * dt_lin_range, "--",
+                     color="tab:blue",
+                     label=f"full robust fit: intercept={full_lin_intercept:.4e} (~dz1 too, "
+                           f"if theory holds), slope={full_lin_slope:.4e} (~df/2)")
+    # Cut the DISPLAYED x-axis to the 90th percentile of dt -- dt spans
+    # several orders of magnitude but is sampled densely at the low end,
+    # so an axis scaled to the true max leaves most of its own width
+    # showing only a handful of the largest-dt points. The regression
+    # above is entirely unaffected -- it already used every point,
+    # before this view was ever applied.
+    dt_90 = np.percentile(dts, 90)
+    if dt_90 > dts.min():
+        axes[1, 3].set_xlim(dts.min(), dt_90)
+    axes[1, 3].set_xlabel("dt (linear, x-axis cut at 90th percentile -- fit itself uses ALL data)")
+    axes[1, 3].set_ylabel("euler-only/dt, full/dt (linear, signed)")
+    axes[1, 3].set_title("Linear-scale version of the panel above\n(checking the formula's own "
+                          "predicted linear structure directly)")
+    axes[1, 3].legend(fontsize=6)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)

@@ -294,6 +294,25 @@ def _print_summary(name: str, values: np.ndarray) -> None:
           f"max={values.max():14.4e}  p90={np.percentile(values, 90):14.4e}")
 
 
+def _print_binned_by_dt2(name: str, dt2: np.ndarray, values: np.ndarray) -> None:
+    """Median of `values` within each dt2 decade -- median (not mean),
+    deliberately: this is specifically about separating a genuine,
+    widespread effect from a small-dt2 numerical-amplification
+    artifact, and a heavy-tailed artifact would otherwise dominate the
+    MEAN of any bin it's present in, defeating the point of splitting
+    by decade in the first place. Matches
+    check_parameter_dependence.py's own dt-decade convention."""
+    log_dt2 = np.log10(np.maximum(dt2, 1e-12))
+    decade_min, decade_max = int(np.floor(log_dt2.min())), int(np.ceil(log_dt2.max()))
+    print(f"  {name}:")
+    for decade in range(decade_min, decade_max):
+        mask = (log_dt2 >= decade) & (log_dt2 < decade + 1)
+        n = mask.sum()
+        if n == 0:
+            continue
+        print(f"    1e{decade}-1e{decade + 1}  n={n:5d}  median={np.median(values[mask]):14.4e}")
+
+
 def check_f_theta(
     lds_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
     output_path: Path | None = None, device: str | None = None,
@@ -442,6 +461,15 @@ def check_f_theta(
           f"qualitatively worse failure than a magnitude error alone):")
     _print_summary("cos_sim_real (baseline)", d["cos_sim_real"])
     _print_summary("cos_sim_chained", d["cos_sim_chained"])
+
+    print(f"\nSame ratio_real/cos_sim_real, broken down by dt2 decade -- the ideal-target "
+          f"formula divides by dt2^2/2, so ANY noise in the numerator (including z1's own "
+          f"approximation error -- z1 is never the exact derivative) gets massively amplified "
+          f"for SMALL dt2. If the aggregate numbers above look bad mostly because of that "
+          f"amplification, this breakdown should show badness concentrated at small dt2, NOT "
+          f"uniform across all scales -- a genuine calibration problem would show up everywhere:")
+    _print_binned_by_dt2("ratio_real (median)", d["dt2"], d["ratio_real"])
+    _print_binned_by_dt2("cos_sim_real (median)", d["dt2"], d["cos_sim_real"])
 
     corr_f1_dt1 = _log_corr(d["dt1"], d["f1_real_norm"])
     corr_f2real_dt2 = _log_corr(d["dt2"], d["f2_real_norm"])

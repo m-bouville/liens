@@ -9,9 +9,11 @@ Run from python/ (imports rely on that root being on sys.path):
 import torch
 import pytest
 
-from models.autoencoder import Autoencoder
+from models.autoencoder import MultiStreamAutoencoder
+from models.encoder import Encoder
+from models.decoder import Decoder
+from models.latent_streams import DEFAULT_STREAM_NAME, LatentStreamConfig, LatentStreamMode
 from models.latent_dynamics import LatentDynamics
-from models.latent_streams import DEFAULT_STREAM_NAME
 from training.stats_head import StatsHead
 from training.losses import StatsLoss
 from training.refinement_loss import compute_stage45_loss
@@ -22,8 +24,17 @@ STAT_NAMES = ["angle", "avg_phi", "stdev_phi"]
 
 
 def _make_models(base_channels=4, hidden_dim=16, n_hidden_layers=1, include_stats_head=True):
-    ae = Autoencoder(size=64, channels=1, base_channels=base_channels,
-                      latent_channels=LATENT_CHANNELS)
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=LATENT_CHANNELS, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+        "deriv": LatentStreamConfig(name="deriv", channels=LATENT_CHANNELS, spatial_size=8,
+                                     mode=LatentStreamMode.DECODER),
+    }
+    encoder = Encoder(input_size=64, in_channels=1, base_channels=base_channels, stream_configs=stream_configs)
+    decoder = Decoder(output_size=64, out_channels=1, base_channels=base_channels,
+                       latent_channels=LATENT_CHANNELS, latent_spatial_size=8)
+    ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                 stream_configs=stream_configs)
     f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=1,
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers)
     stats_head = StatsHead(latent_channels=LATENT_CHANNELS, stat_names=STAT_NAMES,
@@ -77,7 +88,7 @@ def test_rollout_alone_produces_encoder_gradient():
     total = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
                                   rollout_weight=1.0, recon0_weight=0.0, stats0_weight=0.0)
     total.backward()
-    encoder_grads = [p.grad for p in ae.encoder.parameters() if p.grad is not None]
+    encoder_grads = [p.grad for p in ae.encoders["shared"].parameters() if p.grad is not None]
     assert len(encoder_grads) > 0
     assert any(torch.any(g != 0) for g in encoder_grads)
 
@@ -92,7 +103,7 @@ def test_decoder_gets_no_gradient_when_recon0_weight_zero():
     total = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
                                   rollout_weight=1.0, recon0_weight=0.0, stats0_weight=0.0)
     total.backward()
-    for p in ae.decoder.parameters():
+    for p in ae.pathways[DEFAULT_STREAM_NAME].decoder.parameters():
         assert p.grad is None or torch.all(p.grad == 0)
 
 
@@ -102,7 +113,7 @@ def test_decoder_gets_gradient_when_recon0_weight_nonzero():
     total = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
                                   rollout_weight=1.0, recon0_weight=1.0)
     total.backward()
-    decoder_grads = [p.grad for p in ae.decoder.parameters() if p.grad is not None]
+    decoder_grads = [p.grad for p in ae.pathways[DEFAULT_STREAM_NAME].decoder.parameters() if p.grad is not None]
     assert len(decoder_grads) > 0
     assert any(torch.any(g != 0) for g in decoder_grads)
 
@@ -144,7 +155,7 @@ def test_stats_term_matches_independent_computation():
     )
 
     with torch.no_grad():
-        z0_independent = ae.encoder(x_window[:, 0])[DEFAULT_STREAM_NAME]
+        z0_independent = ae.encoders["shared"](x_window[:, 0])[DEFAULT_STREAM_NAME]
         pred_stats_independent = stats_head(z0_independent)
         expected_l_stats = stats_loss_fn(pred_stats_independent, true_stats)
 
@@ -185,8 +196,17 @@ def test_rollout_component_matches_independent_rollout_loss():
     )
 
     with torch.no_grad():
-        z0_independent = ae.encoder(x_window[:, 0])[DEFAULT_STREAM_NAME]
-        z_hat_full = f_theta.rollout(z0_independent, dt_window, theta)
+        batch_size, n_rollout_steps = x_window.shape[0], x_window.shape[1] - 1
+        x0 = x_window[:, 0]
+        x_future = x_window[:, 1:]
+        x0_encoded = ae.encoders["shared"](x0)
+        z0_independent = x0_encoded[DEFAULT_STREAM_NAME]
+        z1_0 = x0_encoded["deriv"]
+        x_future_flat = x_future.reshape(batch_size * n_rollout_steps, *x_future.shape[2:])
+        x_future_encoded = ae.encoders["shared"](x_future_flat)
+        z1_future = x_future_encoded["deriv"].reshape(batch_size, n_rollout_steps, *z1_0.shape[1:])
+        z1_seq = torch.cat([z1_0.unsqueeze(1), z1_future], dim=1)
+        z_hat_full = f_theta.rollout(z0_independent, z1_seq, dt_window, theta)
         z_hat_independent = z_hat_full[:, 1:]
         expected_rollout = RolloutLoss()(z_hat_independent, components["z_true"])
 

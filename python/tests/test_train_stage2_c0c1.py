@@ -188,3 +188,109 @@ def test_epochs_zero_actually_writes_a_checkpoint_stage2(shared_stage1ab_ancesto
     assert saved["epoch"] == 0
     output = capsys.readouterr().out
     assert "train_set: skipped" in output, "train_set must be skipped entirely at epochs=0"
+
+
+def test_augment_is_actually_threaded_through_to_the_train_set_only(
+    shared_stage1ab_ancestor, tmp_path, isolated_project_root, monkeypatch,
+):
+    """Regression test for a real gap: augment was previously accepted by
+    the params-file parsing layer but silently never passed to the
+    dataset here at all (train_stage2 had no augment parameter). Patches
+    MicrostructureEvolutionDataset itself to record what augment value
+    each construction call actually received -- confirms train_set gets
+    augment=True and val_set does NOT (val_loss must stay a clean
+    measure of real, unaugmented performance), rather than just trusting
+    that passing augment=True doesn't raise."""
+    import training.train_ae as train_ae_module
+
+    base_path, stage1b_path = shared_stage1ab_ancestor
+    real_dataset_cls = train_ae_module.MicrostructureEvolutionDataset
+    recorded_augment_values = []
+
+    class _RecordingDataset(real_dataset_cls):
+        def __init__(self, *args, augment=False, **kwargs):
+            recorded_augment_values.append(augment)
+            super().__init__(*args, augment=augment, **kwargs)
+
+    monkeypatch.setattr(train_ae_module, "MicrostructureEvolutionDataset", _RecordingDataset)
+
+    train_stage2(
+        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0, augment=True,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_augment.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_augment.png",
+    )
+
+    # train_set constructed first, val_set second (see train_stage2's own
+    # construction order) -- exactly one True (train), one False (val).
+    assert recorded_augment_values == [True, False], (
+        f"expected train_set augment=True, val_set augment=False (in that "
+        f"construction order), got {recorded_augment_values}"
+    )
+
+
+def test_gradient_scaling_trick_preserves_forward_value_exactly():
+    """Isolated unit test of the exact math z0_from_deriv_weight relies
+    on: x.detach() + weight*(x - x.detach()) must have the SAME forward
+    value as x itself, for ANY weight -- if this weren't exactly true,
+    the feature would silently change what deriv_loss's own target
+    actually IS, not just how much gradient flows through it."""
+    torch.manual_seed(0)
+    x = torch.randn(4, 3, 8, 8, requires_grad=True)
+    for weight in [0.0, 0.05, 0.2, 0.5, 1.0, 2.0]:
+        scaled = x.detach() + weight * (x - x.detach())
+        assert torch.allclose(scaled, x, atol=1e-6), (
+            f"forward value changed at weight={weight}: max diff "
+            f"{(scaled - x).abs().max().item()}"
+        )
+
+
+def test_gradient_scaling_trick_scales_gradient_exactly():
+    """The other half: gradient w.r.t. x must be exactly `weight`, not
+    0 (fully blocked) or 1 (fully un-detached) regardless of what
+    weight is requested."""
+    torch.manual_seed(0)
+    for weight in [0.0, 0.1, 0.3, 1.0]:
+        x = torch.randn(4, 3, 8, 8, requires_grad=True)
+        scaled = x.detach() + weight * (x - x.detach())
+        scaled.sum().backward()
+        expected_grad = torch.full_like(x, weight)
+        assert torch.allclose(x.grad, expected_grad, atol=1e-6), (
+            f"expected gradient == {weight} everywhere, got range "
+            f"[{x.grad.min().item()}, {x.grad.max().item()}]"
+        )
+
+
+def test_z0_from_deriv_weight_runs_end_to_end_across_its_range(
+    shared_stage1ab_ancestor, tmp_path, isolated_project_root,
+):
+    """End-to-end smoke test across z0_from_deriv_weight's own valid
+    range, including the boundary values (0.0 -- today's original
+    behavior; 1.0 -- fully un-detached). The precise mechanism itself
+    (forward value exactly unchanged, gradient exactly scaled by
+    weight) is already verified in isolation by the two tests above --
+    this only confirms the new code path (the removed no_grad(), the
+    new branch computing z0_next WITH gradient tracking) doesn't break
+    anything when actually exercised through the real training loop.
+    Does NOT attempt to prove encoder weights stay identical across
+    weight values -- the encoder's own bottleneck is a SINGLE, shared
+    module across streams (confirmed directly: checkpoint state_dict
+    keys are "encoders.shared.bottlenecks", not split per-stream), so
+    z1's own gradient path through those SAME weights legitimately
+    differs with deriv_weight regardless of z0_from_deriv_weight --
+    that isn't a bug, just a fact about this architecture that made an
+    earlier, weight-identity version of this test provably wrong."""
+    base_path, stage1b_path = shared_stage1ab_ancestor
+
+    for weight in [0.0, 0.1, 1.0]:
+        ckpt_path = tmp_path / f"stage2_zfd_range_{weight}.pt"
+        train_stage2(
+            base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
+            deriv_weight=1.0, deriv_weight_warmup_epochs=0, z0_from_deriv_weight=weight,
+            epochs=1, batch_size=4, num_workers=0,
+            val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+            checkpoint_path=ckpt_path, device="cpu", seed=0,
+            log_every_epoch=False, loss_curve_path=tmp_path / f"curve_zfd_range_{weight}.png",
+        )
+        assert ckpt_path.exists(), f"training failed to complete at z0_from_deriv_weight={weight}"
