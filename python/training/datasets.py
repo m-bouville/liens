@@ -5,6 +5,7 @@ PyTorch Dataset classes for loading phase-field runs off disk.
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -914,6 +915,32 @@ class MicrostructureEvolutionDataset(Dataset):
         if self.augment:
             n *= _N_AUGMENT_VARIANTS
         return n
+
+    def all_dts(self) -> np.ndarray:
+        """
+        Every per-transition dt value across every BASE window in this
+        dataset, flattened into a single 1D array -- (n_base_windows *
+        (window_length-1),). Computed directly from the already-loaded,
+        lightweight run metadata (self._index/_run_steps/_run_dt_scale)
+        -- the SAME computation __getitem__ does for a single window's
+        own dt_window, just without ever touching self._run_data (the
+        actual frame tensors), which this has no need to load at all.
+
+        Deliberately excludes augmentation's own multiplicity: augment
+        repeats every base window by the SAME factor
+        (_N_AUGMENT_VARIANTS), regardless of that window's own dt -- so
+        it changes the ABSOLUTE window count uniformly, not the
+        RELATIVE proportion of windows falling in each dt decade, which
+        is the only thing a caller of this method (e.g. computing
+        global per-decade loss weights) actually needs.
+        """
+        all_dts = []
+        for run_idx, start in self._index:
+            end = start + self.window_length
+            steps = self._run_steps[run_idx][start:end]
+            dt_scale = self._run_dt_scale[run_idx]
+            all_dts.extend((steps[i + 1] - steps[i]) * dt_scale for i in range(len(steps) - 1))
+        return np.array(all_dts, dtype=np.float32)
 
     def __getitem__(self, idx: int):
         if self.augment:

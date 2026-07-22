@@ -2,6 +2,7 @@
 Loss functions for autoencoder and latent-dynamics training.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -136,6 +137,140 @@ class OneStepLoss(nn.Module):
         return self.loss_fn(z_next_pred, z_next_true)
 
 
+class DtDecadeWeights:
+    """
+    Precomputed per-decade loss reweighting -- built ONCE from the full
+    training set's own dt distribution AND its own raw per-transition
+    loss (see compute_dt_decade_weights), then queried per-batch during
+    training to produce a weights tensor matching that batch's own dt
+    shape, for RolloutLoss's own `weights` parameter.
+
+    Directly counteracts a training set where a small fraction of
+    windows (extreme-dt ones) carry a large majority of the raw loss
+    MASS -- confirmed empirically (~7% of windows carrying ~68% of the
+    total loss, in one real measurement) -- by giving each dt DECADE
+    equal total loss-mass contribution, rather than each WINDOW equal
+    weight (today's implicit default, which lets whichever decade
+    happens to have the largest raw errors dominate the gradient
+    regardless of how few windows produce it).
+
+    BUG THIS FIXES (previous version of this class): the first attempt
+    at this weighting equalized each decade's WINDOW COUNT contribution
+    -- weight_d = K / n_d, using only how many windows fall in decade
+    d, never their actual loss magnitude. That is a DIFFERENT problem
+    than the one being solved here, and conflating them made things
+    worse, not better: in a real measurement, decade 4 (extreme dt) had
+    both the FEWEST windows (220 of 3058, ~7% -- matching the original
+    imbalance finding) AND the LARGEST per-window raw error (~123,277,
+    vs ~49 in decade 1 -- a ~2500x difference). Weighting by 1/n_d alone
+    gave that same decade the LARGEST weight of all four (its small
+    count), which then multiplied an already-enormous per-window error
+    by the biggest weight available -- actively amplifying the exact
+    imbalance this class exists to correct, not fixing it (confirmed by
+    a real run getting WORSE after the fix: Stage 3a's full/euler ratio
+    rose to 321.4 from an unweighted 281.7, and Stage 3b's loss spikes
+    were unchanged). Equalizing window-count contribution and
+    equalizing loss-mass contribution are different problems; only the
+    latter is what actually needs fixing here.
+
+    CORRECTED formula: weight_d = K / (n_d * mean_loss_d), where
+    mean_loss_d is the decade's own empirically-measured mean raw loss
+    (see compute_dt_decade_weights for how it's measured) and K is
+    chosen so the AVERAGE weight across all windows is 1 (keeps the
+    overall loss scale roughly where it was before). This makes each
+    decade's OWN total contribution to the weighted loss
+    (n_d * weight_d * mean_loss_d = K) equal across every decade,
+    regardless of how many windows populate it AND regardless of how
+    large its raw per-window error is -- both count and magnitude are
+    accounted for, not just one of them.
+
+    Computed GLOBALLY (once, from the full training set), not
+    per-batch: a per-batch version would give windows in a sparsely-
+    represented decade an enormous individual weight whenever a given
+    batch happens to draw few or none of them, reintroducing
+    instability from a different angle -- exactly the problem this
+    exists to fix, just relocated to a new source.
+    """
+
+    def __init__(self, all_dts: np.ndarray, all_losses: np.ndarray):
+        if len(all_dts) == 0:
+            raise ValueError("all_dts is empty -- cannot compute per-decade weights from no data.")
+        if len(all_dts) != len(all_losses):
+            raise ValueError(f"all_dts and all_losses must be the same length -- one raw loss "
+                              f"value is required per dt (got {len(all_dts)} dts and "
+                              f"{len(all_losses)} losses).")
+        log_dt = np.log10(np.maximum(all_dts, 1e-12))
+        decades = np.floor(log_dt).astype(np.int64)
+        unique_decades, counts = np.unique(decades, return_counts=True)
+        total_n = len(all_dts)
+
+        # Empirical mean raw loss PER DECADE -- this, not window count
+        # alone, is what the corrected weighting inverts. See this
+        # class's own docstring for why count alone was the bug.
+        mean_loss_per_decade: dict[int, float] = {}
+        for d in unique_decades:
+            decade_losses = all_losses[decades == d]
+            mean_loss = float(decade_losses.mean())
+            if not (mean_loss > 0):
+                raise ValueError(f"decade {int(d)} has non-positive mean raw loss "
+                                  f"({mean_loss}) -- cannot invert a zero/negative loss "
+                                  f"mass into a finite weight.")
+            mean_loss_per_decade[int(d)] = mean_loss
+        counts_by_decade = {int(d): int(c) for d, c in zip(unique_decades, counts)}
+
+        # K normalizes so the AVERAGE weight (over all windows, i.e.
+        # weighted by count) is 1: sum_d(count_d * weight_d) = total_n,
+        # with weight_d = K / (count_d * mean_loss_d) substituted in
+        # gives sum_d(K / mean_loss_d) = total_n, i.e. K = total_n /
+        # sum_d(1 / mean_loss_d). With this K, each decade's own total
+        # weighted-loss contribution (count_d * weight_d * mean_loss_d)
+        # collapses to exactly K for every decade -- equal loss mass
+        # per decade, the actual goal.
+        inv_mean_loss_sum = sum(1.0 / m for m in mean_loss_per_decade.values())
+        K = total_n / inv_mean_loss_sum
+        self.decade_weight: dict[int, float] = {
+            d: K / (counts_by_decade[d] * mean_loss_per_decade[d]) for d in mean_loss_per_decade
+        }
+        self.min_decade = int(unique_decades.min())
+        self.max_decade = int(unique_decades.max())
+
+    def __call__(self, dt: torch.Tensor) -> torch.Tensor:
+        """
+        dt: any shape. Returns a weights tensor of the SAME shape,
+        looking up each element's own decade against the global fit.
+
+        Decades never seen during the original fit (e.g. a val/test dt
+        that happens to fall in a decade absent from train) are CLAMPED
+        to the nearest known decade's own weight, rather than raising
+        or silently defaulting to weight=1 (which would inconsistently
+        favor unseen-decade windows relative to their in-range
+        neighbors).
+        """
+        log_dt = torch.log10(dt.clamp(min=1e-12))
+        decades = torch.floor(log_dt).long()
+        decades_clamped = decades.clamp(min=self.min_decade, max=self.max_decade)
+        weights = torch.zeros_like(dt)
+        for d, w in self.decade_weight.items():
+            weights = torch.where(decades_clamped == d, torch.full_like(dt, w), weights)
+        return weights
+
+
+def compute_dt_decade_weights(all_dts: np.ndarray, all_losses: np.ndarray) -> DtDecadeWeights:
+    """See DtDecadeWeights' own docstring, especially the "BUG THIS
+    FIXES" section -- all_losses is not optional decoration, it's the
+    quantity the whole scheme is actually built to invert. Typical
+    usage (see training/train_lds.py's compute_euler_only_losses for
+    how all_losses gets measured in practice -- a single pass with a
+    freshly-initialized f_theta, BEFORE any real training):
+        all_dts, all_losses = compute_euler_only_losses(f_theta, train_set, device)
+        weights_fn = compute_dt_decade_weights(all_dts, all_losses)
+        ...
+        weights = weights_fn(dt_window)  # per batch, inside the training loop
+        loss = rollout_loss(z_hat, z_true, weights=weights)
+    """
+    return DtDecadeWeights(all_dts, all_losses)
+
+
 class RolloutLoss(nn.Module):
     """
     L_rollout = sum_{i=1}^{Nr} || z_hat(t_{k+i}) - z(t_{k+i}) ||_2^2 (docs/neural_nets.md),
@@ -179,6 +314,21 @@ class RolloutLoss(nn.Module):
     power of dt does the RATE prediction get scaled by before squaring"
     this way, matching how the physical reasoning above is phrased too.
 
+    weights (passed to forward(), not __init__ -- varies per BATCH, not
+    fixed for the whole loss instance): per-window, per-step weights,
+    same shape as dt -- (B, n_r). Independent of, and composable with,
+    exponent_deriv above: exponent_deriv rescales each element's own
+    loss MAGNITUDE based on its own dt (a physical rate-vs-state
+    distinction); weights rescales each window's RELATIVE CONTRIBUTION
+    to the batch average (a training-distribution correction -- see
+    compute_dt_decade_weights, built specifically to counteract a small
+    fraction of extreme-dt windows otherwise dominating the loss mass
+    entirely, confirmed empirically: ~7% of windows carrying ~68% of
+    the raw loss in one real measurement -- and see that function's own
+    docstring for why the weighting must invert per-decade loss MASS,
+    not window count alone). None (default) is a plain, unweighted mean
+    -- today's unchanged behavior.
+
     Same mean-reduction rationale as ReconLoss/OneStepLoss: keeps the
     loss scale independent of latent_channels and of n_r (rollout
     length) itself, so switching from a 1-step to a 6-step rollout
@@ -198,11 +348,13 @@ class RolloutLoss(nn.Module):
             self.step_weights = None
 
     def forward(self, z_hat: torch.Tensor, z_true: torch.Tensor, dt: torch.Tensor | None = None,
-                return_per_step: bool = False):
+                weights: torch.Tensor | None = None, return_per_step: bool = False):
         """
         z_hat, z_true: (B, n_r, C, H, W) -- predicted (chained) and true
         continuations, NOT including the shared starting point z0 (i.e.
         LatentDynamics.rollout()'s output with index 0 already dropped).
+
+        weights: (B, n_r) or None -- see this class's own docstring.
 
         return_per_step: if True, ALSO returns the (n_r,) per-step
         tensor (before averaging across steps) -- e.g. so a caller can
@@ -219,13 +371,22 @@ class RolloutLoss(nn.Module):
             # dt: (B, n_r) -> broadcast against diff's (B, n_r, C, H, W).
             dt_b = dt.view(*dt.shape, 1, 1, 1)
             if self.kind == "l2":
-                weighted = diff.pow(2) * dt_b.pow(2 * self.exponent_deriv - 2)
+                per_element = diff.pow(2) * dt_b.pow(2 * self.exponent_deriv - 2)
             else:
-                weighted = diff.abs() * dt_b.pow(self.exponent_deriv - 1)
-            per_step = weighted.mean(dim=(0, 2, 3, 4))
+                per_element = diff.abs() * dt_b.pow(self.exponent_deriv - 1)
         else:
-            per_step = (diff ** 2).mean(dim=(0, 2, 3, 4)) if self.kind == "l2" \
-                else diff.abs().mean(dim=(0, 2, 3, 4))  # (n_r,) -- mean over batch+spatial per step
+            per_element = diff ** 2 if self.kind == "l2" else diff.abs()
+
+        # Spatial mean only (dim 2,3,4) first -- (B, n_r) -- so `weights`
+        # (also (B, n_r)) can be applied at exactly this point, before
+        # collapsing the batch dimension. Splitting this reduction into
+        # two stages (spatial, then batch) is what makes that possible;
+        # previously both were done in a single .mean(dim=(0,2,3,4)) call.
+        per_window_step = per_element.mean(dim=(2, 3, 4))  # (B, n_r)
+        if weights is not None:
+            per_step = (per_window_step * weights).sum(dim=0) / weights.sum(dim=0).clamp(min=1e-12)
+        else:
+            per_step = per_window_step.mean(dim=0)  # (n_r,) -- unchanged from before
 
         if self.step_weights is not None:
             w = self.step_weights

@@ -19,6 +19,7 @@ import argparse
 from collections.abc import Callable
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -32,7 +33,7 @@ from models.latent_streams import (
 )
 from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
-from training.losses import RolloutLoss
+from training.losses import RolloutLoss, compute_dt_decade_weights
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
 from utils.plots import loss_curve
 
@@ -47,6 +48,84 @@ from utils.plots import loss_curve
 # to THIS FILE's own on-disk location instead, which is invariant
 # regardless of how/from-where the process was launched.
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_lds.py -> python/
+
+
+def compute_euler_only_losses(
+    f_theta: LatentDynamics, train_set, device: torch.device,
+    batch_size: int = 512, num_workers: int = 0,
+) -> tuple["np.ndarray", "np.ndarray"]:
+    """
+    One pass over train_set with a FRESHLY-INITIALIZED f_theta (its
+    weights exactly as constructed, before any training step and
+    before any resume_from checkpoint is loaded into it) -- measures
+    how raw per-transition loss actually scales with dt, so
+    compute_dt_decade_weights can invert the real per-decade LOSS MASS
+    (see that function's own docstring for the bug this fixes) rather
+    than assuming it from window count alone.
+
+    "Euler-only" because at init, f_theta's own output is (by
+    LatentDynamics' own construction) ~0, so the rollout below reduces
+    to the hard-coded z0 + z1*dt term alone -- exactly the same
+    well-understood, stable proxy used elsewhere in this project (see
+    check_parameter_dependence.py's own euler-only baseline) for how
+    raw error scales with dt BEFORE any learned correction exists.
+    Deliberately reuses f_theta.rollout() itself (the actual
+    training-time computation), not a separately hand-coded z0+z1*dt
+    formula -- keeps this measurement mechanically identical to what
+    real training will later reweight, rather than a parallel
+    implementation that could quietly drift out of sync with it.
+
+    MUST be called before f_theta is trained, and before resume_from is
+    loaded into it -- calling this on a partially- or fully-trained
+    model would measure THAT model's own residual error (already
+    shaped by whatever it has learned), not the raw, pre-training
+    dt-vs-error relationship this weighting exists to correct for.
+
+    Returns (all_dts, all_losses): both flat 1-D numpy arrays, one
+    entry per (window, rollout step) transition -- i.e. length
+    len(train_set) * n_rollout_steps, matching exactly the granularity
+    at which dt_decade_weights_fn(dt_window) is later looked up and
+    applied during real training (per (B, n_r) element, not just once
+    per window).
+    """
+    loader = DataLoader(train_set, batch_size=batch_size, shuffle=False,
+                         num_workers=num_workers, pin_memory=device.type == "cuda")
+    was_training = f_theta.training
+    f_theta.eval()
+    all_dts_parts = []
+    all_losses_parts = []
+    with torch.no_grad():
+        for batch in loader:
+            window0, window1, dt_window, theta = batch
+            window0 = window0.to(device, non_blocking=True)
+            window1 = window1.to(device, non_blocking=True)
+            dt_window = dt_window.to(device, non_blocking=True)
+            theta = theta.to(device, non_blocking=True)
+
+            z0 = window0[:, 0]
+            z0_true = window0[:, 1:]
+            # Same teacher-forced rollout call the real training step()
+            # uses (see its own docstring) -- at init this is
+            # equivalent to the hard-coded Euler term, but going
+            # through the real code path keeps this measurement exactly
+            # consistent with what gets reweighted later, not a
+            # separate approximation of it.
+            z0_hat_full = f_theta.rollout(z0, window1, dt_window, theta)
+            z0_hat = z0_hat_full[:, 1:]
+
+            diff = z0_hat - z0_true
+            # Same reduction RolloutLoss itself uses (spatial mean
+            # only, BEFORE any weighting) -- (B, n_r).
+            per_window_step = diff.pow(2).mean(dim=(2, 3, 4))
+
+            all_dts_parts.append(dt_window.detach().cpu().numpy().reshape(-1))
+            all_losses_parts.append(per_window_step.detach().cpu().numpy().reshape(-1))
+    if was_training:
+        f_theta.train()
+
+    all_dts = np.concatenate(all_dts_parts)
+    all_losses = np.concatenate(all_losses_parts)
+    return all_dts, all_losses
 
 
 def train_lds(
@@ -68,6 +147,8 @@ def train_lds(
     step_weights: list[float] | None = None,
     loss_curve_path: Path | None = None,
     one_step_weight: float = 0.0,
+    use_dt_decade_weights: bool = False,
+    z0_noise_scale: float = 0.0,
 ) -> Path:
     """
     Stage 3. Returns the path of the best checkpoint saved. Either give
@@ -127,6 +208,72 @@ def train_lds(
     Should be small (epsilon), matching every other primary+epsilon*
     secondary weight in this project -- not yet validated at any
     specific value.
+
+    use_dt_decade_weights (default False): global, per-decade loss
+    rebalancing (see training.losses.compute_dt_decade_weights and
+    compute_euler_only_losses above) -- directly counteracts a training
+    set where a small fraction of windows (extreme-dt ones) carry a
+    large majority of the raw loss MASS (confirmed empirically: ~7% of
+    windows carrying ~68% of the total loss, in one real measurement),
+    which otherwise dominates the gradient regardless of how few
+    windows produce it. Computed ONCE, before training starts, from a
+    single pass over train_set's own data with a freshly-initialized
+    f_theta measuring both its dt distribution AND its actual raw loss
+    per decade -- weighting by dt distribution alone (an earlier,
+    buggy version of this) is NOT equivalent and actively made things
+    worse: see compute_dt_decade_weights' own docstring for the full
+    story. Not per-batch (a per-batch version would give windows in a
+    sparsely-represented decade an enormous individual weight whenever
+    a given batch happens to draw few of them, reintroducing
+    instability from a different angle). Applied to the TRAINING loss
+    only, never validation -- val_loss stays a clean, naturally-
+    distributed measure of real performance, and the EMA-based
+    checkpoint criterion keeps selecting on that, not on the
+    artificially-rebalanced training objective.
+
+    z0_noise_scale (default 0.0, off -- reproduces exact prior
+    behavior): trains f_theta against a z0 deliberately perturbed away
+    from the true value, to fix a specific, diagnosed failure mode
+    (see evaluation.check_f_theta): single-step training here NEVER
+    shows f_theta anything but the exact true z0 as input (window_length
+    is only 2), so it has no learned behavior for a slightly-wrong z0 --
+    and empirically, feeding it one anyway (as multi-step rollout
+    training necessarily does, chaining its own prior-step prediction
+    into the next step) makes ||f|| blow up by 3-5 orders of magnitude
+    at the SAME dt, with corr(log(z0_step1_error), log(||f2_chained||))
+    exceeding even corr(log(dt2), log(||f2_chained||)) -- direct
+    evidence this is an off-distribution generalization gap, not an
+    intrinsic dt-dependence, and one that resuming straight into
+    multi-step rollout training (n_rollout_steps>1) was NOT able to fix
+    on its own: it either blew up outright, or (at a heavily-protected
+    one_step_weight) quietly stopped degrading single-step accuracy
+    while the rollout term stayed catastrophic regardless -- i.e. the
+    rollout loss alone could not teach this robustness, only trade it
+    off against something else.
+
+    The perturbation is scaled PER WINDOW to that window's own actual
+    Euler-step magnitude, |z1(t0)| * dt(t0->t1) -- the dominant term in
+    z0_hat itself (see the z1*dt + f*dt^2/2 update rule) -- rather than
+    a single fixed or dataset-global scale, specifically because the
+    natural scale of "how wrong a real predicted z0 might plausibly be"
+    is itself hugely dt-dependent (per-decade raw loss spans ~4 orders
+    of magnitude in this project's own measurements -- see
+    compute_dt_decade_weights). A fixed absolute noise scale would be
+    wildly wrong for either the smallest or largest dt decade; scaling
+    to each window's own characteristic step size keeps the injected
+    perturbation the right order of magnitude everywhere.
+
+    Applied ONLY when train=True, to z0 alone (never z0_true, window1,
+    or dt_window) -- val_loss must stay computed against the exact same
+    clean, unperturbed inputs as always, or it stops being the
+    naturally-distributed measure of real performance the checkpoint
+    criterion depends on (same rationale as use_dt_decade_weights being
+    train-only, above). A small nonzero value (this project's own
+    diagnostics suggest starting an order of magnitude or two below 1.0)
+    is the intended range -- this reproduces a REALISTIC step-1 error,
+    not an adversarial one; too large a value teaches robustness to
+    inputs the model will never actually encounter, at the cost of
+    fitting the real, clean data distribution well.
     """
     if n_rollout_steps < 1:
         raise ValueError(f"n_rollout_steps must be >= 1 (got {n_rollout_steps})")
@@ -150,7 +297,8 @@ def train_lds(
                           f"-- config.txt no longer provides ML training defaults.")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  ae_stats_weight={ae_stats_weight}")
     print(f"n_rollout_steps={n_rollout_steps}  one_step_weight={one_step_weight}")
-    print(f"grad_clip={grad_clip}  lr_warmup_steps={lr_warmup_steps}")
+    print(f"grad_clip={grad_clip}  lr_warmup_steps={lr_warmup_steps}  z0_noise_scale={z0_noise_scale}")
+    print(f"lr={lr}  seed={seed}")
 
     if ae_checkpoint_path is None:
         if ae_latent_channels is None:
@@ -285,9 +433,35 @@ def train_lds(
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
                              persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
 
+    # f_theta must exist BEFORE the decade-weight measurement below (it
+    # needs a freshly-initialized model to measure against -- see
+    # compute_euler_only_losses' own docstring for why), so construction
+    # is here, ahead of resume_from's own loading further down: that
+    # load must stay AFTER this measurement, or it would measure an
+    # already-trained model's residual error instead of the raw,
+    # pre-training dt-vs-error relationship this weighting needs.
     f_theta = LatentDynamics(latent_channels=ae_config["latent_channels"], n_theta=1,
                               latent_spatial=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers).to(device)
+
+    # Global per-decade loss weights, computed ONCE from train_set's own
+    # full dt distribution AND its own raw per-transition loss
+    # (measured with f_theta exactly as freshly constructed above) --
+    # see use_dt_decade_weights' own docstring for the full rationale,
+    # and compute_dt_decade_weights' own docstring for why BOTH dt and
+    # measured loss are required, not dt alone. None if disabled, or if
+    # train_set itself was skipped (epochs=0 ablation) -- there's no
+    # training loss to reweight in that case regardless.
+    dt_decade_weights_fn = None
+    if use_dt_decade_weights and train_set is not None:
+        all_dts, all_losses = compute_euler_only_losses(
+            f_theta, train_set, device, batch_size=batch_size, num_workers=num_workers,
+        )
+        dt_decade_weights_fn = compute_dt_decade_weights(all_dts, all_losses)
+        print(f"use_dt_decade_weights=True: per-decade weights computed from "
+              f"{len(dt_decade_weights_fn.decade_weight)} decades in train_set's own dt "
+              f"distribution, weighted by each decade's own measured raw loss mass -- "
+              f"{dict(sorted(dt_decade_weights_fn.decade_weight.items()))}\n")
 
     if resume_from is not None:
         # Curriculum rollout: train with n_rollout_steps=1 first (stable,
@@ -345,6 +519,25 @@ def train_lds(
 
         z0 = window0[:, 0]
         z0_true = window0[:, 1:]
+
+        # z0_noise_scale=0.0 (default) is a strict no-op -- everything
+        # below this block is byte-identical to before it existed. See
+        # z0_noise_scale's own docstring for the full rationale; the
+        # short version: teach f_theta to behave reasonably on a z0
+        # that's plausibly-wrong, at the SAME order of magnitude a real
+        # chained step-1 error would be, BEFORE multi-step rollout
+        # training ever has to chain it for real. Scaled per-window by
+        # |z1(t0)| * dt(t0->t1) -- the dominant term in z0_hat itself --
+        # not a fixed scale, since the natural error magnitude here is
+        # itself hugely dt-dependent (see compute_dt_decade_weights).
+        # TRAIN ONLY: val_loss must stay computed against the exact
+        # same clean z0 as always (see this parameter's own docstring).
+        if train and z0_noise_scale > 0:
+            z1_step0 = window1[:, 0]
+            dt_step0 = dt_window[:, 0].view(-1, *([1] * (z0.dim() - 1)))
+            euler_step_scale = (z1_step0 * dt_step0).abs()
+            z0 = z0 + z0_noise_scale * euler_step_scale * torch.randn_like(z0)
+
         # window1 passed WHOLE (not just window1[:, 0]) -- rollout()
         # teacher-forces the REAL z1 at every step, not a predicted
         # one (see LatentDynamics' own class docstring: this is what
@@ -352,17 +545,26 @@ def train_lds(
         z0_hat_full = f_theta.rollout(z0, window1, dt_window, theta)
         z0_hat = z0_hat_full[:, 1:]
 
+        # No exponent_deriv here (that reweighting assumed a plain
+        # diff=dt*err relationship that no longer holds cleanly once
+        # the update rule is a mix of dt and dt^2 terms; the new
+        # architecture handles dt-scaling structurally via the
+        # explicit z1*dt + f*(dt^2/2) terms themselves, not a
+        # loss-level reweighting knob). dt_decade_weights_fn IS applied
+        # here instead -- a genuinely different mechanism (see its own
+        # docstring): not rescaling each element's own loss magnitude
+        # by its dt, but rescaling each WINDOW's relative contribution
+        # to the batch average, so a small number of extreme-dt windows
+        # can't dominate the gradient the way they otherwise do. TRAIN
+        # only -- val_loss must stay an unweighted, naturally-
+        # distributed measure of real performance.
+        weights = dt_decade_weights_fn(dt_window) if (train and dt_decade_weights_fn is not None) else None
+        z0_loss, z0_per_step = rollout_loss(z0_hat, z0_true, weights=weights, return_per_step=True)
         # per_step[0] is L_1step -- the loss restricted to just the first
         # predicted step, directly comparable to a model trained with
         # n_rollout_steps=1 (see RolloutLoss.forward()'s docstring: this
         # is mathematically identical to computing L_1step independently
-        # on the same data, not an approximation). No exponent_deriv here
-        # (that reweighting assumed a plain diff=dt*err relationship
-        # that no longer holds cleanly once the update rule is a mix of
-        # dt and dt^2 terms; the new architecture handles dt-scaling
-        # structurally via the explicit z1*dt + f*(dt^2/2) terms
-        # themselves, not a loss-level reweighting knob).
-        z0_loss, z0_per_step = rollout_loss(z0_hat, z0_true, return_per_step=True)
+        # on the same data, not an approximation).
         l_1step = z0_per_step[0]
 
         # total is what's actually optimized -- see one_step_weight's
@@ -478,6 +680,7 @@ def train_lds(
                 "data_config": {
                     "min_step": min_step, "min_stdev_phi": min_stdev_phi,
                     "window_length": window_length, "n_rollout_steps": n_rollout_steps,
+                    "z0_noise_scale": z0_noise_scale,
                 },
             }, checkpoint_path)
             msg += "  -> saved"
@@ -532,6 +735,11 @@ def main():
     parser.add_argument("--early-stopping-patience", type=int, default=None)
     parser.add_argument("--lr-warmup-steps", type=int, default=20)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--z0-noise-scale", type=float, default=0.0,
+                         help="perturb z0 during training only, scaled per-window to that "
+                              "window's own |z1(t0)|*dt Euler-step magnitude -- see "
+                              "train_lds()'s own docstring for the full rationale (default "
+                              "0.0: off, exact prior behavior)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--resume-from", type=Path, default=None,
@@ -558,6 +766,7 @@ def main():
         ema_warmup_epochs=args.ema_warmup_epochs,
         early_stopping_patience=args.early_stopping_patience,
         lr_warmup_steps=args.lr_warmup_steps, grad_clip=args.grad_clip,
+        z0_noise_scale=args.z0_noise_scale,
         seed=args.seed, checkpoint_path=args.checkpoint, device=args.device,
         resume_from=args.resume_from, log_every_epoch=not args.quiet,
     )

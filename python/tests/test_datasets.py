@@ -77,6 +77,25 @@ def test_window_info_matches_dataset_content(tmp_run_dir):
             assert torch.allclose(window[i], torch.full_like(window[i], expected_value), atol=1e-3)
 
 
+def test_all_dts_matches_every_windows_own_getitem_dt(tmp_run_dir):
+    """all_dts() computes dt values directly from lightweight metadata,
+    WITHOUT calling __getitem__ (specifically to avoid loading real
+    frame data it has no use for) -- cross-checked here against every
+    window's own __getitem__-derived dt_window directly, not just
+    trusted as a separate, parallel implementation of the same idea."""
+    run_dir, steps = tmp_run_dir
+    ds = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=3, min_step=0, min_stdev_phi=None,
+    )
+    expected_dts = []
+    for idx in range(len(ds)):
+        _, dt_window, _ = ds[idx]
+        expected_dts.extend(dt_window.tolist())
+
+    all_dts = ds.all_dts()
+    assert sorted(all_dts.tolist()) == sorted(expected_dts)
+
+
 def test_snapshot_dataset_frame_info_unaugmented(tmp_run_dir):
     """frame_info's reported (run_dir, step) should always correspond
     to what __getitem__ actually returned for that index -- the

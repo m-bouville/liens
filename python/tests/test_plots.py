@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless backend, no display needed for tests
 
 import matplotlib.pyplot as plt
+import numpy as np
 
 from utils import plots  # NOT "import utils.plots" -- that binds 'utils'
                            # in this namespace, not 'plots', so
@@ -31,16 +32,28 @@ def test_produces_a_real_file(tmp_path):
     assert out.stat().st_size > 0
 
 
-def test_y_axis_capped_at_2x_first_train_loss(tmp_path, monkeypatch):
-    """The core behavior this module exists for: a huge early spike
-    must not stretch the y-axis so far that later, more informative
-    convergence gets squashed -- checked against the ACTUAL rendered
-    axis limits (captured via the real plt.subplots call the function
-    makes), not just independently recomputed and trusted."""
-    epochs = list(range(1, 6))
-    train_loss = [10.0, 8.0, 5000.0, 6.0, 5.0]  # huge spike at epoch 3
-    val_loss = [11.0, 9.0, 6000.0, 7.0, 6.0]
-    best_so_far = [11.0, 9.0, 9.0, 7.0, 6.0]
+def test_y_axis_capped_at_99th_percentile_of_all_curves(tmp_path, monkeypatch):
+    """The core behavior this module exists for: a huge, rare spike must
+    not stretch the y-axis so far that the other 99% of the run's data
+    gets squashed into an unreadable flat line -- checked against the
+    ACTUAL rendered axis limits (captured via the real plt.subplots call
+    the function makes), not just independently recomputed and trusted.
+
+    Uses a realistically-sized run (100 epochs, 300 concatenated values
+    across train/val/best_so_far) with 2 rare spike epochs -- a tiny
+    handful of points (as in the earlier 5-epoch version of this test)
+    isn't enough for a 99th-percentile cut to mean anything (with n=15,
+    the 99th percentile sits almost AT the max, barely excluding
+    anything); this needs enough points that the top ~1% is a genuinely
+    small, separable slice, matching how this actually gets used (a
+    real training run with hundreds of epochs)."""
+    n = 100
+    epochs = list(range(1, n + 1))
+    train_loss = [10.0 - 0.05 * i for i in range(n)]
+    val_loss = [11.0 - 0.05 * i for i in range(n)]
+    best_so_far = [11.0 - 0.05 * i for i in range(n)]
+    train_loss[49] = 5000.0  # one rare, huge spike epoch
+    val_loss[49] = 6000.0
     out = tmp_path / "loss_curve.png"
 
     captured_axes = {}
@@ -57,7 +70,8 @@ def test_y_axis_capped_at_2x_first_train_loss(tmp_path, monkeypatch):
 
     ax = captured_axes["ax"]
     ymin, ymax = ax.get_ylim()
-    expected_cap = 2 * train_loss[0]  # 20.0 -- NOT anywhere near the 5000/6000 spike
+    all_values = train_loss + val_loss + best_so_far
+    expected_cap = 1.5 * np.percentile(all_values, 99)
     assert ymax == expected_cap, f"expected y-axis top exactly {expected_cap}, got {ymax}"
     # NOT ymin == 0: all values here are positive, so loss_curve() now
     # uses a log-scale y-axis by default (see its own docstring) --
@@ -67,12 +81,12 @@ def test_y_axis_capped_at_2x_first_train_loss(tmp_path, monkeypatch):
     assert ymax < max(val_loss), "the cap should be far below the actual spike -- confirms it's a real cap"
 
 
-def test_y_axis_not_capped_when_nothing_exceeds_it(tmp_path, monkeypatch):
-    """The new behavior this test guards: a well-behaved run where
-    nothing ever reaches 2x the first epoch's loss should NOT have its
-    axis artificially stretched to that unused cap -- it should
-    auto-scale to the real (tighter) range instead, same rendered-axis
-    verification approach as the capped case above."""
+def test_y_axis_not_capped_when_nothing_exceeds_the_percentile(tmp_path, monkeypatch):
+    """The companion behavior this test guards: a well-behaved run where
+    the top 1% of values already IS the observed max (no real outlier)
+    should NOT have its axis artificially stretched to a cap that
+    equals the max anyway -- it should auto-scale normally instead, same
+    rendered-axis verification approach as the capped case above."""
     epochs = list(range(1, 6))
     train_loss = [10.0, 8.0, 6.0, 5.0, 4.0]  # smooth decline, no spike
     val_loss = [11.0, 9.0, 7.0, 6.0, 5.0]
@@ -93,9 +107,13 @@ def test_y_axis_not_capped_when_nothing_exceeds_it(tmp_path, monkeypatch):
 
     ax = captured_axes["ax"]
     ymin, ymax = ax.get_ylim()
-    unused_cap = 2 * train_loss[0]  # 20.0 -- nothing in this run reaches it
-    assert ymax < unused_cap, (
-        f"axis should auto-scale below the unused cap ({unused_cap}), got ymax={ymax}"
+    all_values = train_loss + val_loss + best_so_far
+    # With this data, np.percentile(all_values, 99) == max(all_values)
+    # (no real outlier to trim), so the cap is never engaged -- matplotlib
+    # auto-scales instead, which pads slightly ABOVE the true max rather
+    # than clamping exactly to it.
+    assert ymax >= max(all_values), (
+        f"axis should auto-scale to at least the real max ({max(all_values)}), got ymax={ymax}"
     )
     # NOT ymin == 0 -- see the identical comment in the capped test above.
     assert ymin > 0

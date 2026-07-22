@@ -10,10 +10,10 @@ min_std_deriv = 0.0002		# skip time derivatives whose stdev is below this
 
 
 recon0_scale  = 0.0001
-recon1_scale  = 0.2
+#recon1_scale  = 0.2
 
 stats0_scale  = 0.01
-stats1_scale  = 0.005
+#stats1_scale  = 0.005
 
 deriv_scale   = 0.00002
 rollout_scale = 100000 		# was 0.00001 (!)
@@ -60,20 +60,18 @@ cos_weight	  = 2
 # Stage 2
 #   latent-space validation (interpolation-consistency fine-tuning)
 
-# recon1_weight = 0			# multiplies a number 3 orders of magnitude larger
 stats0_weight   = 0.5     	# weight of L_stats0 relative to L_recon0
-# stats1_weight = 0    		# weight of L_stats1 relative to L_recon0
-deriv_weight    =10.  # was 1.
+deriv_weight    = 4.  # was 1.
 
 n_frozen_stages= 0
 z0_from_deriv_weight=1.	# in [0, 1], was (de facto) 0.
 deriv_weight_warmup_epochs=5  # was (de facto) 0.
 
-epochs 		  =  30		# note: stage 2 is not augmented
-patience 	  =   5
+epochs 		  =  60		# note: stage 2 is not augmented
+patience 	  =  10
 batches 	  = same
 
-force 	      = True
+# force 	      = True
 
 
 # Stage 3a
@@ -81,11 +79,16 @@ force 	      = True
 n_rollout_steps= 1
 ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
 
-batches		  = 512
-epochs 		  = 500
-patience 	  =  50
+use_dt_decade_weights = True  # was (de facto) False
 
-# force 	      = True
+batches		  =1024
+epochs 		  = 500
+patience 	  = 100
+
+lr 			  =   0.00001  # default: 0.001
+z0_noise_scale=   0.5
+
+force 	      = True
 
 
 # Stage 3b
@@ -93,13 +96,17 @@ patience 	  =  50
 n_rollout_steps= 2
 
 ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
-one_step_weight= 0.1
+one_step_weight= 10000.
 
-batches		  = 512
+use_dt_decade_weights = True  # was (de facto) False
+
+batches		  =1024
 epochs 		  = 500
-patience 	  =  50
+patience 	  = 100
 
-# force 	      = True
+lr 			  =   0.000005  # default: 0.001
+
+force 	      = True
 
 
 # Stage 4
@@ -111,7 +118,7 @@ stats0_weight   = 1  # was 0.01
 n_rollout_steps= same
 
 batches		  = 128
-epochs 		  =  50
+epochs 		  =  0 	# 50
 patience 	  =   5 	# tends to shoot up: patience won't pay
 
 force 	      = True
@@ -126,7 +133,7 @@ stats0_weight   = 1  # was 0.01
 n_rollout_steps= same      # match stage 4's -- same reasoning as before
 
 batches        = 128
-epochs         =  30
+epochs         =  0 	# 30
 patience       =   5
 
 force 	       = True

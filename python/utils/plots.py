@@ -7,6 +7,7 @@ from pathlib import Path
 
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
+import numpy as np
 
 from . import load_datasets as load
 
@@ -36,22 +37,31 @@ def loss_curve(
     condition as the console's own show_1step). Plotted as thinner,
     dashed lines so the primary loss stays visually dominant.
 
-    Y-axis capped at 2x the FIRST epoch's train_loss, but ONLY when the
-    data actually exceeds that cap -- multi-step rollout training in
-    particular is prone to large, transient early spikes (seen
-    repeatedly in this project's own stage-3b runs) that would otherwise
-    stretch the y-axis so far that the later, more informative
-    convergence behavior gets squashed into an unreadable flat line near
-    zero. When nothing in the run actually reaches 2x the first epoch's
-    loss, the cap is skipped entirely and the axis auto-scales to the
-    real range instead -- always applying the cap regardless of whether
-    it was needed just stretches well-behaved runs unnecessarily, hiding
-    real (if small) variation in the same way an unwarranted spike-driven
-    stretch would. Deliberately based on train_loss[0] specifically (not
-    the max seen so far) -- a fixed, predictable reference, same
-    reasoning as check_rollout.py's real-Delta-x-derived scales: capping
-    at the observed max would just chase whatever the worst spike happens
-    to be, defeating the point of a stable, comparable scale.
+    Y-axis capped at 1.5x the 99th percentile of every value across ALL
+    plotted curves (train, valid, best_so_far, and secondary if given --
+    concatenated together, not computed per-curve), but ONLY when the
+    data actually exceeds that cap -- training here is prone to large,
+    transient early spikes (seen repeatedly in this project's own
+    stage-3 runs) that would otherwise stretch the y-axis so far that
+    the later, more informative convergence behavior gets squashed into
+    an unreadable flat line near zero. When nothing in the run actually
+    reaches 1.5x the 99th percentile (i.e. even the top 1% of values
+    don't clear that margin -- e.g. a short or already-smooth run), the
+    cap is skipped entirely, auto-scaling to the real range instead --
+    always applying the cap regardless of whether it was needed just
+    stretches well-behaved runs unnecessarily, hiding real (if small)
+    variation in the same way an unwarranted spike-driven stretch would.
+    The 1.5x margin above the raw percentile (not the percentile itself)
+    exists so the plot doesn't read as if it were hard-clipped exactly
+    at the 99th-percentile line -- a bit of headroom above it keeps the
+    handful of points that DO exceed the percentile visible near the
+    top of the plot, rather than pinned flat against the ceiling.
+    Percentile-of-all-values, not a multiple of the first epoch's
+    train_loss (an earlier version of this): the first epoch isn't
+    always the worst offender (a spike can land anywhere in a run), and
+    a fixed multiplier of it has no way to adapt to how MANY extreme
+    points there are -- percentile naturally trims exactly the top slice
+    regardless of where in the run it occurs or how much of it there is.
     """
     fig, ax = plt.subplots(figsize=(8, 5))
 
@@ -80,14 +90,19 @@ def loss_curve(
     if use_log:
         ax.set_yscale("log")
 
-    if train_loss and train_loss[0] > 0:
-        cap = 2 * train_loss[0]
-        observed_max = max(all_values) if all_values else 0
-        if observed_max > cap:
+    if all_values:
+        cap = 1.5 * float(np.percentile(all_values, 99))
+        observed_max = max(all_values)
+        # observed_max > cap is false whenever even the top 1% of values,
+        # with the 1.5x margin included, don't clear the real max (short
+        # runs, or a run with no real outliers) -- exactly when
+        # auto-scaling to the real range is already the tighter, more
+        # accurate choice (see docstring). cap > 0 guards the degenerate
+        # all-zero/all-tiny case, where capping at 0 would make the plot
+        # blank rather than doing nothing useful.
+        if observed_max > cap and cap > 0:
             ax.set_ylim(top=cap)
-        # else: leave the top unset -- auto-scale to the real range,
-        # which is already <= cap and gives a tighter, more accurate
-        # bound than always stretching to a value nothing reaches.
+        # else: leave the top unset -- auto-scale to the real range.
     if not use_log:
         ax.set_ylim(bottom=0)
     # else: no bottom=0 on a log axis (undefined) -- matplotlib auto-
