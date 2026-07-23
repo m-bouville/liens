@@ -77,7 +77,12 @@ def compute_stage45_loss(
     # a MultiStreamAutoencoder -- the split-latent architecture requires
     # z1 (the "deriv" stream), which only exists on a multi-stream
     # model; a single-stream Autoencoder has no such stream to give.
-    x0_encoded = ae.encoders["shared"](x0)
+    #
+    # theta passed here too (this function's own parameter, previously
+    # accepted but never actually forwarded into either encode call) --
+    # needed because a theta-conditioned "deriv" stream requires it,
+    # regardless of z0/z1_0 being the only entries this line keeps.
+    x0_encoded = ae.encoders["shared"](x0, theta=theta)
     z0 = x0_encoded[recon_stream_name]
     z1_0 = x0_encoded[deriv_stream_name]
 
@@ -99,7 +104,16 @@ def compute_stage45_loss(
     # docstring on the resulting cost-model change from stage 3).
     with torch.no_grad():
         x_future_flat = x_future.reshape(batch_size * n_rollout_steps, *x_future.shape[2:])
-        x_future_encoded = ae.encoders["shared"](x_future_flat)
+        # theta expanded to match x_future_flat's own flattening
+        # (batch_size*n_rollout_steps rows, sample b's own theta
+        # repeated across its n_rollout_steps consecutive rows) -- theta
+        # is constant PER SAMPLE across all its own rollout steps (same
+        # run, same temperature), but the reshape above flattens the
+        # (B, n_r) structure away, so theta needs the identical
+        # expand-then-reshape to stay aligned row-for-row with it.
+        theta_future_flat = theta.unsqueeze(1).expand(-1, n_rollout_steps, -1).reshape(
+            batch_size * n_rollout_steps, -1)
+        x_future_encoded = ae.encoders["shared"](x_future_flat, theta=theta_future_flat)
         z_true_flat = x_future_encoded[recon_stream_name]
         z1_future_flat = x_future_encoded[deriv_stream_name]
     z_true = z_true_flat.reshape(batch_size, n_rollout_steps, *z_true_flat.shape[1:])

@@ -7,23 +7,19 @@ Ny			  =  64
 min_step 	  = 3000       	# skip snapshots earlier than this step
 min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
 min_std_deriv = 0.0002		# skip time derivatives whose stdev is below this
-
+min_passing_steps= 12		# any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
 recon0_scale  = 0.0001
-#recon1_scale  = 0.2
-
 stats0_scale  = 0.01
-#stats1_scale  = 0.005
 
 deriv_scale   = 0.00002
 rollout_scale = 100000 		# was 0.00001 (!)
 
-# weight_old * value == 0.1e-3 => value == 1.e-4 / weight_old
-# weight * value / scale == 1 => scale == 1 * (1.e-4 / weight_old)
-
 # force 	      = True
 
 augment       = True		# False: speed things up for quick tests
+condition_on_theta= True
+
 
 
 
@@ -35,9 +31,10 @@ latent_channels = 6  		# 8 * 8x8 = 512 DoF  [64x64 = 4096]
 
 stats0_weight  = 1  # was 0.01     	# weight of L_stats relative to L_recon
 
-epochs 		  =  20			# note: stage 1 is augmented
-patience 	  =   4       	# renamed to early_stopping_patience internally
+epochs 		  =  50			# note: stage 1 is augmented
+patience 	  =  10       	# renamed to early_stopping_patience internally
 batches		  = 128
+
 
 
 # Stage 1b
@@ -57,6 +54,7 @@ cos_weight	  = 2
 # force 	      = True
 
 
+
 # Stage 2
 #   latent-space validation (interpolation-consistency fine-tuning)
 
@@ -71,7 +69,8 @@ epochs 		  =  60		# note: stage 2 is not augmented
 patience 	  =  10
 batches 	  = same
 
-# force 	      = True
+force 	      = True
+
 
 
 # Stage 3a
@@ -81,14 +80,17 @@ ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
 
 use_dt_decade_weights = True  # was (de facto) False
 
-batches		  =1024
-epochs 		  = 500
-patience 	  = 100
+epochs 		  =1000
+patience 	  = 150
 
-lr 			  =   0.00001  # default: 0.001
-z0_noise_scale=   0.5
+num_workers	  =   8
+batches		  =4096
+
+lr 			  =  20e-6  # default: 0.001
+z0_noise_scale=   0.2
 
 force 	      = True
+
 
 
 # Stage 3b
@@ -96,17 +98,21 @@ force 	      = True
 n_rollout_steps= 2
 
 ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
-one_step_weight= 10000.
+one_step_weight= 20000.
 
 use_dt_decade_weights = True  # was (de facto) False
 
-batches		  =1024
-epochs 		  = 500
+epochs 		  =1000
 patience 	  = 100
 
-lr 			  =   0.000005  # default: 0.001
+num_workers	  =   8
+batches		  =4096
+
+lr 			  =   5e-6  # default: 0.001
+z0_noise_scale=   0.1
 
 force 	      = True
+
 
 
 # Stage 4
@@ -118,10 +124,11 @@ stats0_weight   = 1  # was 0.01
 n_rollout_steps= same
 
 batches		  = 128
-epochs 		  =  0 	# 50
+epochs 		  =  50
 patience 	  =   5 	# tends to shoot up: patience won't pay
 
 force 	      = True
+
 
 
 # Stage 5
@@ -133,7 +140,7 @@ stats0_weight   = 1  # was 0.01
 n_rollout_steps= same      # match stage 4's -- same reasoning as before
 
 batches        = 128
-epochs         =  0 	# 30
+epochs         =  30
 patience       =   5
 
 force 	       = True

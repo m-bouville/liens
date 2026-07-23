@@ -315,6 +315,7 @@ def _print_binned_by_dt2(name: str, dt2: np.ndarray, values: np.ndarray) -> None
 
 def check_f_theta(
     lds_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_passing_steps: int | None = None,
     output_path: Path | None = None, device: str | None = None,
 ) -> Path:
     """Prints the f_theta diagnostic summary and saves a comparison figure; returns the figure's path."""
@@ -331,10 +332,19 @@ def check_f_theta(
     data_config = lds_checkpoint.get("data_config")
     if data_config is None:
         print("WARNING: checkpoint has no saved data_config -- falling back to "
-              "min_step=0, min_stdev_phi=None, window_length=3 (may not match training).")
+              "min_step=0, min_stdev_phi=None, min_passing_steps=None, window_length=3 "
+              "(may not match training).")
         data_config = {"min_step": 0, "min_stdev_phi": None, "window_length": 3}
     min_step = min_step if min_step is not None else data_config["min_step"]
     min_stdev_phi = min_stdev_phi if min_stdev_phi is not None else data_config["min_stdev_phi"]
+    # .get(), not [...]: a checkpoint trained before min_passing_steps
+    # existed at all has no such key in its saved data_config -- None
+    # (its own default, "no whole-run filtering") is the correct
+    # fallback, not a KeyError.
+    min_passing_steps = (min_passing_steps if min_passing_steps is not None
+                          else data_config.get("min_passing_steps"))
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps} "
+          f"(from checkpoint's own data_config unless overridden above)")
     # window_length=3 regardless of what THIS checkpoint was trained at
     # (e.g. even a stage-3a, n_rollout_steps=1 checkpoint's own f_theta
     # can be probed this way) -- the diagnostic needs step 1 AND step
@@ -406,7 +416,8 @@ def check_f_theta(
 
     dataset = MicrostructureEvolutionDataset(
         test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
-        min_step=min_step, min_stdev_phi=min_stdev_phi, encode_both_streams=True,
+        min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+        encode_both_streams=True,
     )
     print(f"Evaluating {len(dataset)} test windows (window_length={window_length})...")
 
@@ -522,8 +533,13 @@ def main():
     parser.add_argument("--lds-checkpoint", type=Path, required=True,
             help="a stage3a or stage3b checkpoint -- window_length=3 is used for the "
                  "diagnostic regardless of what this checkpoint was itself trained at")
-    parser.add_argument("--min-step", type=int, default=None)
-    parser.add_argument("--min-stdev-phi", type=float, default=None)
+    parser.add_argument("--min-step", type=int, default=None,
+                         help="default: whatever the checkpoint's own saved data_config used")
+    parser.add_argument("--min-stdev-phi", type=float, default=None,
+                         help="default: whatever the checkpoint's own saved data_config used")
+    parser.add_argument("--min-passing-steps", type=int, default=None,
+                         help="default: whatever the checkpoint's own saved data_config used "
+                              "(None for checkpoints trained before this parameter existed)")
     parser.add_argument("--output", type=Path, default=None,
             help="default: <repo root>/output/stage3/<lds checkpoint name>-f_theta_diagnostic.png")
     parser.add_argument("--device", type=str,
@@ -532,7 +548,8 @@ def main():
 
     check_f_theta(
         lds_checkpoint_path=args.lds_checkpoint, min_step=args.min_step,
-        min_stdev_phi=args.min_stdev_phi, output_path=args.output, device=args.device,
+        min_stdev_phi=args.min_stdev_phi, min_passing_steps=args.min_passing_steps,
+        output_path=args.output, device=args.device,
     )
 
 

@@ -121,7 +121,8 @@ def check_perturbation(
         ).to(device)
     elif decoder_for_stream is None:
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs)
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
         decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
                            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
@@ -129,7 +130,8 @@ def check_perturbation(
                                      stream_configs=stream_configs).to(device)
     else:
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs)
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             stream_cfg = stream_configs[stream_name]
@@ -182,7 +184,17 @@ def check_perturbation(
         for run_dir, step in chosen:
             x_np = load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny)
             x = torch.from_numpy(x_np).unsqueeze(0).unsqueeze(0).to(device)
-            z = ae_encoder(x)[recon_stream_name]
+            # theta passed unconditionally -- Encoder.forward accepts it
+            # regardless of whether any of its own streams actually need
+            # conditioning; needed here because Encoder computes EVERY
+            # stream in one pass internally, so a theta-conditioned
+            # "deriv" stream existing alongside "state" (the only one
+            # this loop actually keeps, via [recon_stream_name]) still
+            # requires theta to be given, or this call raises.
+            metadata = load.read_metadata(run_dir / "metadata.txt")
+            theta = torch.tensor([[metadata.temperature - metadata.T0]],
+                                  dtype=torch.float32, device=device)
+            z = ae_encoder(x, theta=theta)[recon_stream_name]
             stats_z = stats_head(z)  # baseline stats(z), NOT ground truth
 
             deltas = []

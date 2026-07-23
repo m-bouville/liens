@@ -157,7 +157,8 @@ def check_reconstruction(
     elif decoder_for_stream is None:
         # Stage 2's own format: every stream shares ONE decoder.
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs).to(device)
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
+                           n_theta=1).to(device)
         decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
                            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size).to(device)
@@ -174,7 +175,8 @@ def check_reconstruction(
         # wins if more than one ever mapped to the same decoder, same
         # as any dict-building loop).
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs).to(device)
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
+                           n_theta=1).to(device)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             if stream_configs[stream_name].mode == LatentStreamMode.PURE_LATENT:
@@ -236,12 +238,21 @@ def check_reconstruction(
 
     with torch.no_grad():
         for row, idx in enumerate(indices):
-            window, dt_window, _theta = dataset[idx]
+            window, dt_window, theta = dataset[idx]
             x_t = window[0:1].to(device)     # (1, 1, H, W)
             x_next = window[1:2].to(device)
             dt = dt_window[0].item()
+            # theta: (n_theta,) per dataset's own convention -- unsqueezed
+            # to (1, n_theta) to match x_t's own batch-of-1 shape. Passed
+            # unconditionally (Encoder.forward accepts it regardless of
+            # whether any stream actually needs it); was previously
+            # unpacked and discarded (_theta) -- needed now because
+            # Encoder computes every stream in one pass internally, so a
+            # theta-conditioned "deriv" stream requires it even though
+            # this loop only keeps [recon_stream_name] ("state").
+            theta = theta.unsqueeze(0).to(device)
 
-            z = encoder(x_t)
+            z = encoder(x_t, theta=theta)
             x_recon = _pathway_decoder(recon_stream_name)(z[recon_stream_name]) * torch.exp(_pathway_scale(recon_stream_name))
             loss = recon_loss(x_recon, x_t).item()
 
@@ -278,7 +289,7 @@ def check_reconstruction(
                 # blank under a shared color scale sized for
                 # pred_deriv's own, larger range -- not a sign real_deriv
                 # itself was somehow wrong.
-                z_next = encoder(x_next)
+                z_next = encoder(x_next, theta=theta)
                 x_next_recon = (_pathway_decoder(recon_stream_name)(z_next[recon_stream_name])
                                  * torch.exp(_pathway_scale(recon_stream_name)))
                 real_deriv_np = ((x_next_recon - x_recon) / dt)[0, 0].cpu().numpy()

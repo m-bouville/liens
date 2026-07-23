@@ -45,36 +45,15 @@ class ComponentCheckpoint:
     provenance: dict
 
 
-def _strip_prefix(state_dict: dict, prefix: str, specific_key: str | None = None) -> dict:
+def _strip_prefix(state_dict: dict, prefix: str) -> dict:
     """
     'encoder.down_blocks.0.conv1.weight' -> 'down_blocks.0.conv1.weight'
     for prefix='encoder' -- so the result loads directly into a
     standalone Encoder()/Decoder() instance, not just back into the
-    combined model it was saved from.
-
-    Tries, in order: the SPECIFIC container key if given (e.g.
-    "decoders.D0." when specific_key="D0" -- stage 1b/2's own format,
-    separate per-stream decoders, see autoencoder.py's
-    MultiStreamAutoencoder), then the older, flat "encoder."/"decoder."
-    prefix (Autoencoder, and pre-MultiStreamAutoencoder checkpoints),
-    then "encoders.shared."/"decoders.shared." (MultiStreamAutoencoder
-    with one shared decoder -- the pre-stage-1b multi-stream format).
-    A checkpoint has exactly one of these shapes, never more than one
-    -- silently returning an empty dict for an unrecognized prefix (the
-    OLD bug here) makes every key the fresh Encoder/Decoder needs look
-    "missing" downstream, not a clean failure at the point where the
-    real mismatch actually is.
+    combined Autoencoder it was saved from.
     """
-    candidates = []
-    if specific_key is not None:
-        candidates.append(f"{prefix}s.{specific_key}.")
-    candidates.append(f"{prefix}.")
-    candidates.append(f"{prefix}s.shared.")
-    for full_prefix in candidates:
-        stripped = {k[len(full_prefix):]: v for k, v in state_dict.items() if k.startswith(full_prefix)}
-        if stripped:
-            return stripped
-    return {}
+    full_prefix = prefix + "."
+    return {k[len(full_prefix):]: v for k, v in state_dict.items() if k.startswith(full_prefix)}
 
 
 def load_ae_components(checkpoint_path: str | Path,
@@ -115,22 +94,51 @@ def load_ae_components(checkpoint_path: str | Path,
         _resolved_streams, _resolved_recon_name, ae_state,
     )
     ae_component_config["stream_configs"] = {
-        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size, "mode": cfg.mode.value}
+        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size, "mode": cfg.mode.value,
+               "condition_on_theta": cfg.condition_on_theta}
         for name, cfg in _resolved_streams.items()
     }
     ae_component_config["recon_stream_name"] = _resolved_recon_name
-    _decoder_for_stream = model_cfg.get("decoder_for_stream")
-    _decoder_key = (_decoder_for_stream.get(_resolved_recon_name)
-                     if _decoder_for_stream is not None else None)
+
+    # Two possible prefixes, depending on which class saved this
+    # checkpoint (see autoencoder.py's own docstring): a flat
+    # Autoencoder saves "encoder."/"decoder." directly; a
+    # MultiStreamAutoencoder saves "encoders.shared." for its encoder
+    # (always -- MultiStreamAutoencoder hard-requires exactly one
+    # shared encoder trunk, always stored under the "shared" key, so
+    # this part never varies) but its DECODER(s) under whichever keys
+    # decoder_for_stream actually maps to -- "decoders.shared." only
+    # when every stream shares one decoder; a stage-1b/2-derived
+    # checkpoint instead has SEPARATE per-stream decoders
+    # ("decoders.D0."/"decoders.D1.", see decoder_for_stream in
+    # model_cfg). This component extracts THE decoder for the RECON
+    # stream specifically (the one thing model_assembly.py's
+    # single-decoder reassembly path actually needs), looked up via
+    # decoder_for_stream[recon_stream_name] when that mapping exists,
+    # not just assumed to be "shared" -- an earlier version of this did
+    # assume "shared" unconditionally, which silently produced an EMPTY
+    # decoder component (no key starts with "decoders.shared." when
+    # they actually start with "decoders.D0.") for exactly this
+    # stage-1b/2-derived case, surfacing downstream as "every decoder
+    # key is missing" -- a confusing failure far from its actual cause.
+    is_multi_stream = any(k.startswith("encoders.shared.") for k in ae_state)
+    encoder_prefix = "encoders.shared" if is_multi_stream else "encoder"
+    if is_multi_stream:
+        decoder_for_stream = model_cfg.get("decoder_for_stream")
+        decoder_key = (decoder_for_stream.get(_resolved_recon_name, "shared")
+                        if decoder_for_stream is not None else "shared")
+        decoder_prefix = f"decoders.{decoder_key}"
+    else:
+        decoder_prefix = "decoder"
 
     components = {
         "encoder": ComponentCheckpoint(
-            state_dict=_strip_prefix(ae_state, "encoder"),
+            state_dict=_strip_prefix(ae_state, encoder_prefix),
             config=dict(ae_component_config),
             provenance=dict(shared_provenance),
         ),
         "decoder": ComponentCheckpoint(
-            state_dict=_strip_prefix(ae_state, "decoder", specific_key=_decoder_key),
+            state_dict=_strip_prefix(ae_state, decoder_prefix),
             config=dict(ae_component_config),
             provenance=dict(shared_provenance),
         ),
@@ -274,13 +282,11 @@ def load_joint_refinement_checkpoint(checkpoint_path: str | Path,
         _resolved_streams, _resolved_recon_name, ae_state,
     )
     ae_component_config["stream_configs"] = {
-        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size, "mode": cfg.mode.value}
+        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size, "mode": cfg.mode.value,
+               "condition_on_theta": cfg.condition_on_theta}
         for name, cfg in _resolved_streams.items()
     }
     ae_component_config["recon_stream_name"] = _resolved_recon_name
-    _decoder_for_stream = model_cfg.get("decoder_for_stream")
-    _decoder_key = (_decoder_for_stream.get(_resolved_recon_name)
-                     if _decoder_for_stream is not None else None)
 
     components = {
         "encoder": ComponentCheckpoint(
@@ -289,7 +295,7 @@ def load_joint_refinement_checkpoint(checkpoint_path: str | Path,
             provenance=dict(shared_provenance),
         ),
         "decoder": ComponentCheckpoint(
-            state_dict=_strip_prefix(ae_state, "decoder", specific_key=_decoder_key),
+            state_dict=_strip_prefix(ae_state, "decoder"),
             config=dict(ae_component_config),
             provenance=dict(shared_provenance),
         ),

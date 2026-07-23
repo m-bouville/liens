@@ -73,12 +73,25 @@ class LatentStreamConfig:
     around -- so a caller always looks a stream up BY NAME (e.g.
     z["deriv"]) rather than by a positional index that a reorder or
     rename could silently invalidate.
+
+    condition_on_theta: whether Encoder should FiLM-condition THIS
+    stream's own bottleneck on theta (temperature, centered at T0 -- see
+    LatentDynamics' own docstring for the same convention downstream).
+    Per-stream, not global: e.g. "deriv" needs it (the driving force
+    a(T)=a0*(T-T0) genuinely vanishes near T0 -- critical slowing down --
+    so a state-only encoder can get the DIRECTION of change right but
+    has no way to know the physically-correct MAGNITUDE without T), while
+    "state" (a well-posed function of the image alone, no reason to
+    depend on which run produced it) should not be. Deliberately NOT
+    made to also depend on dt -- see Encoder's own docstring for why
+    that's a materially different (and NOT done here) proposal.
     """
     name: str
     channels: int
     spatial_size: int
     mode: LatentStreamMode
     description: str = ""
+    condition_on_theta: bool = False
 
 
 def decode_stream(decoder, z, stream: LatentStreamConfig):
@@ -245,7 +258,12 @@ def resolve_stream_configs_from_checkpoint_config(model_cfg: dict) -> tuple[dict
     }
     stream_configs = {
         name: LatentStreamConfig(name=name, channels=cfg["channels"],
-                                  spatial_size=cfg["spatial_size"], mode=LatentStreamMode(cfg["mode"]))
+                                  spatial_size=cfg["spatial_size"], mode=LatentStreamMode(cfg["mode"]),
+                                  # .get(..., False): checkpoints saved before theta-conditioning
+                                  # existed have no such key -- False (no conditioning) is the
+                                  # correct fallback, matching this project's usual backward-compat
+                                  # convention rather than requiring every old checkpoint migrated.
+                                  condition_on_theta=cfg.get("condition_on_theta", False))
         for name, cfg in stream_configs_raw.items()
     }
     return stream_configs, recon_stream_name

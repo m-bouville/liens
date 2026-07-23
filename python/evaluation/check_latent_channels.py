@@ -136,10 +136,25 @@ def rank_channel_importance(
 
     latent_channels = None
     total_delta = None
+    metadata_cache: dict[Path, object] = {}
     with torch.no_grad():
         for idx in indices:
             x = dataset[idx].unsqueeze(0).to(device)
-            z = ae_encoder(x)[recon_stream_name]
+            # theta looked up via frame_info (this dataset's own
+            # index->source mapping, same pattern as
+            # MicrostructureEvolutionDataset's window_info) -- passed
+            # unconditionally (Encoder.forward accepts it regardless of
+            # whether any stream actually needs it); needed because
+            # Encoder computes every stream in one pass internally, so a
+            # theta-conditioned "deriv" stream requires it even though
+            # this loop only ever keeps [recon_stream_name] ("state").
+            run_dir, _step = dataset.frame_info(idx)
+            if run_dir not in metadata_cache:
+                metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
+            metadata = metadata_cache[run_dir]
+            theta = torch.tensor([[metadata.temperature - metadata.T0]],
+                                  dtype=torch.float32, device=device)
+            z = ae_encoder(x, theta=theta)[recon_stream_name]
             if latent_channels is None:
                 latent_channels = z.shape[1]
                 total_delta = np.zeros(latent_channels)
@@ -200,7 +215,8 @@ def check_latent_channels(
         ).to(device)
     elif decoder_for_stream is None:
         encoder = Encoder(input_size=ae_config["size"], in_channels=1,
-                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
@@ -208,7 +224,8 @@ def check_latent_channels(
                                      stream_configs=stream_configs).to(device)
     else:
         encoder = Encoder(input_size=ae_config["size"], in_channels=1,
-                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             stream_cfg = stream_configs[stream_name]
@@ -282,15 +299,25 @@ def check_latent_channels(
         for run_dir, step in frames:
             x_raw = load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny)
             x = torch.from_numpy(x_raw).unsqueeze(0).unsqueeze(0).to(device)
-            z_dict = ae_encoder(x)
+            # theta passed unconditionally (Encoder.forward accepts it
+            # regardless of whether any stream actually needs it) --
+            # needed because Encoder computes every stream in one pass
+            # internally, so a theta-conditioned "deriv" stream requires
+            # it even on a call that only cares about visualizing raw z
+            # maps. metadata_cache populated here (moved up from the
+            # other_stream_names branch below, which reuses the same
+            # cache) rather than duplicating the read.
+            if run_dir not in metadata_cache:
+                metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
+            metadata = metadata_cache[run_dir]
+            theta = torch.tensor([[metadata.temperature - metadata.T0]],
+                                  dtype=torch.float32, device=device)
+            z_dict = ae_encoder(x, theta=theta)
             all_x.append(x_raw)
             all_z.append({name: z_dict[name][0].cpu().numpy() for name in stream_order})
 
             real_deriv_np = None
             if other_stream_names:
-                if run_dir not in metadata_cache:
-                    metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
-                metadata = metadata_cache[run_dir]
                 paired_step = _find_paired_step(step, metadata.save_steps)
                 if paired_step is not None:
                     x_paired_raw = load.read_phi_half(

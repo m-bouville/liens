@@ -29,7 +29,8 @@ from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_dynamics import LatentDynamics
 from models.latent_streams import (
-    cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
+    LatentStreamMode, cross_check_stream_configs_against_state_dict,
+    resolve_stream_configs_from_checkpoint_config,
 )
 from training.checkpoint_criterion import CheckpointCriterionTracker
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
@@ -137,6 +138,8 @@ def train_lds(
     hidden_dim: int = 256, n_hidden_layers: int = 2,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int = 1, min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_passing_steps: int | None = None,
+    condition_on_theta: bool | None = None,
     encode_batch_size: int = 256, val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5,
     early_stopping_patience: int | None = None,
     lr_warmup_steps: int = 20, grad_clip: float = 1.0,
@@ -295,7 +298,8 @@ def train_lds(
     if missing:
         raise ValueError(f"train_lds() requires {', '.join(missing)} to be given explicitly "
                           f"-- config.txt no longer provides ML training defaults.")
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  ae_stats_weight={ae_stats_weight}")
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps}  "
+          f"ae_stats_weight={ae_stats_weight}")
     print(f"n_rollout_steps={n_rollout_steps}  one_step_weight={one_step_weight}")
     print(f"grad_clip={grad_clip}  lr_warmup_steps={lr_warmup_steps}  z0_noise_scale={z0_noise_scale}")
     print(f"lr={lr}  seed={seed}")
@@ -319,6 +323,36 @@ def train_lds(
         stream_configs, recon_stream_name, ae_checkpoint["model_state"],
     )
     recon_stream = stream_configs[recon_stream_name]
+
+    # condition_on_theta is NOT decided here -- deriv's theta-FiLM
+    # conditioning is a structural property fixed once, when the stream
+    # is CREATED (stage 1b; see train_stage1b's own docstring). Stage 3
+    # only ever loads an already-built, FROZEN encoder, so there is
+    # nothing to set -- only something to VALIDATE, same rationale and
+    # same error as train_stage2's own identical check. None (default)
+    # skips this entirely, trusting whatever the loaded checkpoint has.
+    if condition_on_theta is not None:
+        deriv_candidates = [n for n, c in stream_configs.items()
+                             if n != recon_stream_name and c.mode != LatentStreamMode.PURE_LATENT]
+        if len(deriv_candidates) == 1:
+            deriv_stream_name = deriv_candidates[0]
+            deriv_stream = stream_configs[deriv_stream_name]
+            if deriv_stream.condition_on_theta != condition_on_theta:
+                raise ValueError(
+                    f"condition_on_theta={condition_on_theta} was requested, but "
+                    f"{ae_checkpoint_path}'s own '{deriv_stream_name}' stream has "
+                    f"condition_on_theta={deriv_stream.condition_on_theta} -- this was decided when "
+                    f"the stream was CREATED (stage 1b), not something stage 3 can change by loading "
+                    f"a different value. Retrain from stage 1b with condition_on_theta="
+                    f"{condition_on_theta} if you actually want a different ancestor, or drop this "
+                    f"parameter here to match whatever {ae_checkpoint_path} already has."
+                )
+        # len(deriv_candidates) != 1 (0 or ambiguous): nothing meaningful
+        # to validate against -- silently skipped rather than raising a
+        # SECOND, less specific error here; whatever actually needs a
+        # deriv stream to exist (the dataset construction below) will
+        # raise its own clear error shortly regardless.
+
     decoder_for_stream = ae_config.get("decoder_for_stream")
     if len(stream_configs) == 1:
         ae = Autoencoder(size=ae_config["size"], channels=1, base_channels=ae_config["base_channels"],
@@ -327,7 +361,8 @@ def train_lds(
     elif decoder_for_stream is None:
         # Stage 2's own (pre-stage-1b) format: every stream shares ONE decoder.
         _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
-                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs,
+                                   n_theta=1)
         _decoder_module = Decoder(output_size=ae_config["size"], out_channels=1,
                                    base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                                    latent_spatial_size=recon_stream.spatial_size)
@@ -341,7 +376,8 @@ def train_lds(
         # own keys to match at all -- their actual weights are inert
         # here, never read again after this load.
         _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
-                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs,
+                                   n_theta=1)
         _decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             stream_cfg = stream_configs[stream_name]
@@ -409,7 +445,8 @@ def train_lds(
         train_set = train_loader = None
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
-            min_step=min_step, min_stdev_phi=min_stdev_phi, encode_batch_size=encode_batch_size,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            encode_batch_size=encode_batch_size,
             encode_both_streams=True,
         )
         print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
@@ -418,12 +455,14 @@ def train_lds(
     else:
         train_set = MicrostructureEvolutionDataset(
             train_dirs, encoder=encoder, device=device, window_length=window_length,
-            min_step=min_step, min_stdev_phi=min_stdev_phi, encode_batch_size=encode_batch_size,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            encode_batch_size=encode_batch_size,
             encode_both_streams=True,
         )
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
-            min_step=min_step, min_stdev_phi=min_stdev_phi, encode_batch_size=encode_batch_size,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            encode_batch_size=encode_batch_size,
             encode_both_streams=True,
         )
         print(f"{len(train_set)} train windows, {len(val_set)} val windows "
@@ -510,7 +549,7 @@ def train_lds(
             optimizer, start_factor=0.01, total_iters=lr_warmup_steps,
         )
 
-    def step(batch, train: bool) -> tuple[float, float]:
+    def step(batch, train: bool) -> tuple[torch.Tensor, torch.Tensor]:
         window0, window1, dt_window, theta = batch
         window0 = window0.to(device, non_blocking=True)
         window1 = window1.to(device, non_blocking=True)
@@ -594,7 +633,23 @@ def train_lds(
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-        return total.item(), l_1step_scaled.item()
+        # Returned as GPU tensors, NOT .item()'d here -- .item() blocks
+        # the CPU until the GPU actually finishes and forces a full
+        # round trip EVERY batch. With a model this small (a few
+        # hundred latent values, hidden_dim=256), that per-batch sync
+        # latency dwarfs the actual compute -- exactly why GPU
+        # utilization stays low even while wall-clock time doesn't:
+        # the GPU is repeatedly finishing near-instantly, then sitting
+        # idle while the CPU waits on the sync before it can even
+        # launch the NEXT batch's kernels. .detach() (not .item()) --
+        # keeps the value as a scalar GPU tensor, cheap to accumulate
+        # into a running sum on-device (see the epoch loop below,
+        # which now does exactly ONE .item() per epoch, not one per
+        # batch) -- while dropping the autograd graph, which backward()
+        # above has already consumed and which would otherwise be kept
+        # alive (and keep growing) for the rest of the epoch if left
+        # attached.
+        return total.detach(), l_1step_scaled.detach()
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=ema_warmup_epochs,
                                           val_ema_decay=val_ema_decay)
@@ -611,16 +666,21 @@ def train_lds(
 
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         f_theta.train()
-        train_loss = train_1step = 0.0
+        # GPU-resident accumulators, not Python floats -- see step()'s
+        # own docstring/comment: `loss * bs` below stays a GPU tensor
+        # op (no sync), so the ONLY host sync in this whole loop is the
+        # single .item() call after it ends, not one per batch.
+        train_loss_sum = torch.zeros((), device=device)
+        train_1step_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
             for batch in train_loader:
                 bs = batch[0].size(0)
                 loss, l_1step = step(batch, train=True)
-                train_loss += loss * bs
-                train_1step += l_1step * bs
-            train_loss /= n_train
-            train_1step /= n_train
+                train_loss_sum += loss * bs
+                train_1step_sum += l_1step * bs
+            train_loss = (train_loss_sum / n_train).item()
+            train_1step = (train_1step_sum / n_train).item()
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
@@ -628,16 +688,17 @@ def train_lds(
             train_loss = train_1step = float("nan")
 
         f_theta.eval()
-        val_loss = val_1step = 0.0
+        val_loss_sum = torch.zeros((), device=device)
+        val_1step_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0)
                 loss, l_1step = step(batch, train=False)
-                val_loss += loss * bs
-                val_1step += l_1step * bs
-        val_loss /= n_val
-        val_1step /= n_val
+                val_loss_sum += loss * bs
+                val_1step_sum += l_1step * bs
+        val_loss = (val_loss_sum / n_val).item()
+        val_1step = (val_1step_sum / n_val).item()
 
         criterion, saved_this_epoch = tracker.update(epoch, val_loss)
 
@@ -679,6 +740,7 @@ def train_lds(
                 },
                 "data_config": {
                     "min_step": min_step, "min_stdev_phi": min_stdev_phi,
+                    "min_passing_steps": min_passing_steps,
                     "window_length": window_length, "n_rollout_steps": n_rollout_steps,
                     "z0_noise_scale": z0_noise_scale,
                 },
@@ -729,6 +791,14 @@ def main():
     parser.add_argument("--n-rollout-steps", type=int, default=1)
     parser.add_argument("--min-step", type=int, default=None)
     parser.add_argument("--min-stdev-phi", type=float, default=None)
+    parser.add_argument("--min-passing-steps", type=int, default=None,
+                         help="exclude an entire run when fewer than this many of its steps clear "
+                              "min-stdev-phi -- see build_good_steps' own docstring in "
+                              "training/datasets.py")
+    parser.add_argument("--condition-on-theta", action=argparse.BooleanOptionalAction, default=None,
+                         help="VALIDATES against the loaded AE checkpoint's own deriv stream -- "
+                              "stage 3 cannot change this (decided at stage 1b); omit to skip "
+                              "validation and trust whatever the checkpoint already has")
     parser.add_argument("--encode-batch-size", type=int, default=256)
     parser.add_argument("--val-ema-decay", type=float, default=0.7)
     parser.add_argument("--ema-warmup-epochs", type=int, default=5)
@@ -762,6 +832,8 @@ def main():
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
         num_workers=args.num_workers, n_rollout_steps=args.n_rollout_steps,
         min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
+        min_passing_steps=args.min_passing_steps,
+        condition_on_theta=args.condition_on_theta,
         encode_batch_size=args.encode_batch_size, val_ema_decay=args.val_ema_decay,
         ema_warmup_epochs=args.ema_warmup_epochs,
         early_stopping_patience=args.early_stopping_patience,

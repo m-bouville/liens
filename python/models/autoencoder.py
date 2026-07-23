@@ -73,8 +73,18 @@ class EncoderDecoderPair(nn.Module):
         else:
             self.log_output_scale = nn.Parameter(torch.zeros(()))
 
-    def forward(self, x: torch.Tensor):
-        z = self.encoder(x)[self.stream_name]
+    def forward(self, x: torch.Tensor, theta: torch.Tensor | None = None):
+        # theta: only actually required if THIS pathway's own stream
+        # requests conditioning (Encoder.forward's own check handles
+        # that -- raises clearly if theta=None but the stream needs it,
+        # silently ignored if given but the stream doesn't). Passed
+        # through unconditionally rather than branching on self.mode
+        # here too -- Encoder is the one place that actually knows
+        # which streams are conditioned (via stream_configs), and is
+        # already the single source of truth for that; duplicating the
+        # check here would just be a second place it could drift out
+        # of sync with the real config.
+        z = self.encoder(x, theta=theta)[self.stream_name]
         x_recon = self.decoder(z) * torch.exp(self.log_output_scale)
         return x_recon, z
 

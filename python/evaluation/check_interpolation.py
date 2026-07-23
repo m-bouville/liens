@@ -160,7 +160,8 @@ def check_interpolation(
         ).to(device)
     elif decoder_for_stream is None:
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs)
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
         decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
                            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
@@ -170,7 +171,8 @@ def check_interpolation(
         # Stage 1b's own format: a SEPARATE decoder per stream (see
         # autoencoder.py's MultiStreamAutoencoder).
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs)
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             stream_cfg = stream_configs[stream_name]
@@ -228,9 +230,19 @@ def check_interpolation(
             x2 = torch.from_numpy(x2_np).unsqueeze(0).unsqueeze(0).to(device)
             x3 = torch.from_numpy(x3_np).unsqueeze(0).unsqueeze(0).to(device)
 
-            z1 = ae_encoder(x1)[recon_stream_name]
-            z2 = ae_encoder(x2)[recon_stream_name]
-            z3 = ae_encoder(x3)[recon_stream_name]
+            # theta passed unconditionally -- Encoder.forward accepts it
+            # regardless of whether any of its own streams actually need
+            # conditioning (see its own docstring); needed here because
+            # Encoder computes EVERY stream in one pass internally, so a
+            # theta-conditioned "deriv" stream existing alongside "state"
+            # (the only one this loop actually keeps, via
+            # [recon_stream_name]) still requires theta to be given, or
+            # this call raises.
+            theta = torch.tensor([[metadata.temperature - metadata.T0]],
+                                  dtype=torch.float32, device=device)
+            z1 = ae_encoder(x1, theta=theta)[recon_stream_name]
+            z2 = ae_encoder(x2, theta=theta)[recon_stream_name]
+            z3 = ae_encoder(x3, theta=theta)[recon_stream_name]
             z_tilde = (1 - alpha) * z1 + alpha * z3
 
             stats_z_tilde = stats_head(z_tilde)

@@ -173,7 +173,16 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
             torch.from_numpy(load.read_phi_half(run_dir / load.snapshot_filename(step), nx, ny))
             for step in steps
         ]).unsqueeze(1).to(device)  # (len(steps), 1, ny, nx)
-        x_all_encoded = ae_encoder(x_all)
+        # theta broadcast across all len(steps) rows -- every frame here
+        # comes from the SAME run_dir, hence the same theta_val, unlike
+        # x_all's own per-frame variation. Passed unconditionally
+        # (Encoder.forward accepts it regardless of whether any stream
+        # actually needs it); needed because Encoder computes every
+        # stream in one pass internally, so a theta-conditioned "deriv"
+        # stream requires it even though z0_t/z0_next_true below only
+        # ever read the recon stream's own output.
+        theta_encode = torch.full((len(steps), 1), theta_val, dtype=torch.float32, device=device)
+        x_all_encoded = ae_encoder(x_all, theta=theta_encode)
         z0_t = x_all_encoded[recon_stream_name][0:1]  # only the STARTING z0 is a rollout() input
         z1_sequence = x_all_encoded["deriv"].unsqueeze(0)  # (1, len(steps), C, 8, 8) -- every step
         z0_next_true = x_all_encoded[recon_stream_name][-1:]
@@ -364,7 +373,8 @@ def check_rollout(
         ).to(device)
     elif decoder_for_stream is None:
         encoder = Encoder(input_size=ae_config["size"], in_channels=1,
-                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
@@ -372,7 +382,8 @@ def check_rollout(
                                      stream_configs=stream_configs).to(device)
     else:
         encoder = Encoder(input_size=ae_config["size"], in_channels=1,
-                           base_channels=ae_config["base_channels"], stream_configs=stream_configs)
+                           base_channels=ae_config["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             stream_cfg = stream_configs[stream_name]

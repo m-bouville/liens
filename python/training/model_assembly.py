@@ -123,17 +123,31 @@ def build_models_from_components(
         # function's own docstring on why (z1 is teacher-forced, never
         # decoded, and only the recon stream's own decoder was ever
         # preserved by checkpoint_components.py in the first place).
+        # condition_on_theta is explicitly CARRIED OVER, not left at its
+        # dataclass default (False): a theta-conditioned stream's own
+        # Encoder still has a real theta_conditioners submodule with its
+        # own trained weights, saved in the checkpoint's state_dict
+        # regardless of this stream's DECODE mode being changed here --
+        # PURE_LATENT only affects whether the stream can be decoded,
+        # not how it was encoded. Dropping this (an earlier version of
+        # this function did) builds an Encoder with no theta_conditioners
+        # submodule at all, which then fails to load the REAL state_dict
+        # (which does have theta_conditioners.deriv.* weights) with a
+        # confusing "shape mismatch" -- actually an unexpected-key
+        # mismatch from a structurally wrong model, not a real version
+        # skew between checkpoint and code.
         pure_latent_stream_configs = {
             name: (cfg if name == recon_stream_name
                    else LatentStreamConfig(name=cfg.name, channels=cfg.channels,
                                             spatial_size=cfg.spatial_size,
-                                            mode=LatentStreamMode.PURE_LATENT))
+                                            mode=LatentStreamMode.PURE_LATENT,
+                                            condition_on_theta=cfg.condition_on_theta))
             for name, cfg in stream_configs.items()
         }
         final_stream_configs = pure_latent_stream_configs
         encoder = Encoder(input_size=encoder_cfg["size"], in_channels=in_channels,
                            base_channels=encoder_cfg["base_channels"],
-                           stream_configs=pure_latent_stream_configs)
+                           stream_configs=pure_latent_stream_configs, n_theta=1)
         decoder = Decoder(output_size=encoder_cfg["size"], out_channels=in_channels,
                            base_channels=encoder_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)

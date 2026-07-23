@@ -14,6 +14,42 @@ from .constants import LATENT_SPATIAL_SIZE
 from .latent_streams import LatentStreamConfig
 
 
+class _ThetaFiLMConditioner(nn.Module):
+    """
+    theta -> (gamma, beta), applied to a stream's OWN trunk features
+    (BEFORE that stream's own bottleneck conv, not shared with any
+    other stream) as x * (1 + gamma) + beta, per-channel -- standard
+    FiLM (Feature-wise Linear Modulation).
+
+    (1 + gamma), not gamma alone, and this module's own FINAL layer
+    zero-initialized (both weight and bias): together, these make
+    conditioning an EXACT no-op at initialization (gamma=0 -> scale=1,
+    beta=0 -> no shift) -- training starts numerically IDENTICAL to the
+    unconditioned baseline and has to actively learn to use theta,
+    rather than being forced to depend on a randomly-initialized
+    conditioning signal from step one (the same zero-init-the-part-that-
+    changes-behavior pattern LatentDynamics' own f_theta uses on its own
+    final layer, for the same reason).
+    """
+
+    def __init__(self, n_theta: int, n_channels: int, hidden_dim: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_theta, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2 * n_channels),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        self.n_channels = n_channels
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.net(theta).chunk(2, dim=-1)  # each (B, n_channels)
+        gamma = gamma.view(*gamma.shape, 1, 1)
+        beta = beta.view(*beta.shape, 1, 1)
+        return x * (1 + gamma) + beta
+
+
 class Encoder(nn.Module):
     """
     A SHARED trunk (repeated DownBlocks halving spatial resolution)
@@ -47,6 +83,25 @@ class Encoder(nn.Module):
     with multiple streams, which stream(s) a future skip-connections
     path would feed is not yet decided -- flagged in the design doc,
     not resolved here.
+
+    THETA CONDITIONING: any stream with stream_configs[name].
+    condition_on_theta=True gets its OWN FiLM conditioner (applied to
+    the shared trunk features, before that stream's own bottleneck --
+    other streams' own projections are completely unaffected), built
+    from theta alone -- deliberately NOT also from dt. theta is a
+    property of the STATE (which run produced this image -- the same
+    for every window that image participates in), so a stream
+    conditioned on it stays a well-defined, single, cacheable function
+    of a snapshot -- exactly like an unconditioned stream, just with one
+    more (still snapshot-level) input. dt is a property of a WINDOW
+    (the same snapshot is the start of many windows, each its own dt) --
+    conditioning a stream on dt as well would mean that stream is no
+    longer a function of a snapshot at all, breaking the "encode once,
+    cache forever" premise every downstream consumer (training/datasets.py's
+    own bulk-encoding, every evaluation/check_*.py script) relies on. Not
+    done here; any dt-dependent correction belongs downstream, where dt
+    already lives explicitly (f_theta, g_theta), not pushed back into the
+    encoder itself.
     """
 
     def __init__(
@@ -57,6 +112,7 @@ class Encoder(nn.Module):
         base_channels: int = 32,
         norm: str = "batch",
         use_skips: bool = False,
+        n_theta: int = 1,
     ):
         super().__init__()
 
@@ -85,6 +141,7 @@ class Encoder(nn.Module):
         self.n_stages = n_stages
         self.use_skips = use_skips
         self.stream_configs = dict(stream_configs)
+        self.n_theta = n_theta
 
         # channels[0] = input channels, channels[i] = output channels of stage i.
         # Doubling per stage is a starting choice, not dictated by the docs --
@@ -102,11 +159,27 @@ class Encoder(nn.Module):
             for name, cfg in stream_configs.items()
         })
 
-    def forward(self, x: torch.Tensor):
+        # ONE conditioner per theta-conditioned stream, not shared --
+        # each stream's own bottleneck is already independent (see this
+        # class's own docstring on why), so its own conditioner is too;
+        # nothing here for a stream that doesn't request conditioning
+        # (empty dict entry simply doesn't exist, not a no-op module).
+        self.theta_conditioners = nn.ModuleDict({
+            name: _ThetaFiLMConditioner(n_theta=n_theta, n_channels=channels[-1])
+            for name, cfg in stream_configs.items() if cfg.condition_on_theta
+        })
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor | None = None):
         if x.shape[-2] != self.input_size or x.shape[-1] != self.input_size:
             raise ValueError(
                 f"Encoder built for input_size={self.input_size}, "
                 f"got input of shape {tuple(x.shape[-2:])}"
+            )
+        if self.theta_conditioners and theta is None:
+            raise ValueError(
+                f"stream(s) {list(self.theta_conditioners)} require theta conditioning "
+                f"(condition_on_theta=True in their own stream_configs), but forward() "
+                f"was called with theta=None"
             )
 
         skips = []
@@ -118,11 +191,17 @@ class Encoder(nn.Module):
         # so insertion order -- Python 3.7+ dict order -- matches
         # stream_configs' own order, keeping z's key order predictable):
         # EACH entry built directly from its OWN bottleneck conv, applied
-        # to the SAME shared trunk features -- this is the one place
-        # correctness between a stream's NAME and its VALUE is actually
-        # established (see latent_streams.decode_stream's own docstring
-        # for why nothing downstream can re-establish it if this is wrong).
-        z = {name: bottleneck(x) for name, bottleneck in self.bottlenecks.items()}
+        # to the SAME shared trunk features (or, for a theta-conditioned
+        # stream, that same trunk conditioned by THAT stream's own FiLM
+        # module first -- every OTHER stream's own features are entirely
+        # unaffected) -- this is the one place correctness between a
+        # stream's NAME and its VALUE is actually established (see
+        # latent_streams.decode_stream's own docstring for why nothing
+        # downstream can re-establish it if this is wrong).
+        z = {}
+        for name, bottleneck in self.bottlenecks.items():
+            feat = self.theta_conditioners[name](x, theta) if name in self.theta_conditioners else x
+            z[name] = bottleneck(feat)
 
         if self.use_skips:
             return z, skips

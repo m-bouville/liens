@@ -86,6 +86,7 @@ def train_autoencoder(
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     augment: bool = True,
     min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_passing_steps: int | None = None,
     stat_names: list[str] | None = None, stats0_weight: float | None = None,
     recon0_scale: float = 1.0, stats0_scale: float = 1.0,
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
@@ -169,7 +170,8 @@ def train_autoencoder(
     if missing:
         raise ValueError(f"train_autoencoder() requires {', '.join(missing)} to be given "
                           f"explicitly -- config.txt no longer provides ML training defaults.")
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  stats0_weight={stats0_weight}")
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps}  "
+          f"stats0_weight={stats0_weight}")
 
     include_stats = stats0_weight > 1e-6
 
@@ -224,7 +226,7 @@ def train_autoencoder(
         train_set = train_loader = None
         val_set = MicrostructureSnapshotDataset(
             val_dirs, cache_in_memory=True, augment=False,
-            min_step=min_step, min_stdev_phi=min_stdev_phi,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             include_stats=include_stats, stat_names=stat_names,
         )
         print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
@@ -232,7 +234,7 @@ def train_autoencoder(
     else:
         train_set = MicrostructureSnapshotDataset(
             train_dirs, cache_in_memory=True, augment=augment,
-            min_step=min_step, min_stdev_phi=min_stdev_phi,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             include_stats=include_stats, stat_names=stat_names,
         )
         # Lock val's stat_names to whatever train resolved (auto-detection is
@@ -241,7 +243,7 @@ def train_autoencoder(
         val_stat_names = train_set.stat_names if include_stats else None
         val_set = MicrostructureSnapshotDataset(
             val_dirs, cache_in_memory=True, augment=False,
-            min_step=min_step, min_stdev_phi=min_stdev_phi,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             include_stats=include_stats, stat_names=val_stat_names,
         )
         if augment:
@@ -602,7 +604,9 @@ def train_stage1b(
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     augment: bool = True,
     min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_passing_steps: int | None = None,
     min_std_deriv: float | None = None,
+    condition_on_theta: bool = True,
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
@@ -658,6 +662,27 @@ def train_stage1b(
     trained this way is not a valid stage-2 ancestor -- z0 will very
     likely destabilize, the exact problem stage 1a/1b was built to
     avoid.
+
+    condition_on_theta: True (default) is the real, intended mode -- the
+    new deriv bottleneck is FiLM-conditioned on theta (temperature,
+    centered at T0), because the driving force a(T)=a0*(T-T0)
+    genuinely vanishes near T0 (critical slowing down): a state-only
+    encoder can get the DIRECTION of change right from the image alone,
+    but has no way to know the correct MAGNITUDE without T (see
+    models/encoder.py's own docstring for the full rationale). THIS is
+    the only place that decision gets made -- deriv is CREATED here,
+    once; stage 2 (which only ever resumes an already-built encoder)
+    has no equivalent parameter, because there's no structural decision
+    left to make by the time stage 2 runs, only weights left to keep
+    training. False is a DIAGNOSTIC override for A/B comparison against
+    the theta-conditioned version -- e.g. to check how much of any
+    downstream improvement is actually attributable to theta
+    conditioning specifically, not some other simultaneous change.
+    Only meaningful at THIS stage: once a checkpoint is saved with a
+    given condition_on_theta, every later stage that resumes from it
+    (1b's own continuation runs, stage 2) inherits that same
+    structural choice from the checkpoint's own saved stream_configs,
+    not from anything passed to them directly.
 
     cos_weight: 0.0 (default, off) is the real loss -- L_recon1
     unmodified. > 0 adds cos_weight * (1 - cos_sim(pred_deriv,
@@ -754,19 +779,31 @@ def train_stage1b(
     stream_configs = {
         state_name: state_cfg,
         "deriv": LatentStreamConfig(name="deriv", channels=deriv_channels,
-                                     spatial_size=deriv_spatial, mode=LatentStreamMode.DECODER),
+                                     spatial_size=deriv_spatial, mode=LatentStreamMode.DECODER,
+                                     condition_on_theta=condition_on_theta),
     }
 
     # Encoder EXTENDED with the new deriv bottleneck -- built fresh
     # (random init for EVERY parameter, including the trunk+state
     # bottleneck), then the trunk+state parts are overwritten with
-    # stage 1a's own trained weights; the deriv bottleneck is left at
-    # its own fresh random init, since stage 1a never had one.
+    # stage 1a's own trained weights; the deriv bottleneck (and its own
+    # theta-FiLM conditioner -- see condition_on_theta=True above, and
+    # Encoder's own docstring for why deriv specifically needs it: the
+    # driving force a(T)=a0*(T-T0) genuinely vanishes near T0, so a
+    # state-only encoder can get the DIRECTION of change right from the
+    # image alone but has no way to know the correct MAGNITUDE without
+    # T) are left at their own fresh random init, since stage 1a never
+    # had either.
     encoder = Encoder(input_size=size, in_channels=1, base_channels=base_channels,
-                       stream_configs=stream_configs)
+                       stream_configs=stream_configs, n_theta=1)
     old_encoder_state = _strip_prefix(prev["model_state"], "encoder")
     load_result = encoder.load_state_dict(old_encoder_state, strict=False)
-    unexpected_missing = [k for k in load_result.missing_keys if not k.startswith("bottlenecks.deriv.")]
+    # bottlenecks.deriv.* (the new stream) AND theta_conditioners.deriv.*
+    # (its new FiLM conditioner) are BOTH expected-missing -- stage 1a's
+    # checkpoint had neither, by construction (state-only, no theta
+    # conditioning existed at all yet).
+    unexpected_missing = [k for k in load_result.missing_keys
+                           if not (k.startswith("bottlenecks.deriv.") or k.startswith("theta_conditioners.deriv."))]
     if unexpected_missing or load_result.unexpected_keys:
         raise ValueError(
             f"Loading stage 1a's encoder weights into the extended (state+deriv) encoder didn't "
@@ -820,7 +857,19 @@ def train_stage1b(
     # freedom to adapt.
     if freeze_encoder:
         for name, p in encoder.named_parameters():
-            if not name.startswith("bottlenecks.deriv."):
+            # BOTH the new deriv bottleneck itself AND its own
+            # theta_conditioners (see models/encoder.py's own
+            # _ThetaFiLMConditioner) stay trainable -- an earlier
+            # version of this only unfroze "bottlenecks.deriv.", which
+            # left theta_conditioners.deriv.* frozen at its own
+            # zero-init forever (see that class's own docstring: zero-
+            # init is deliberate, an exact no-op UNTIL training moves
+            # it) -- structurally present, but with literally zero
+            # actual effect, since nothing ever trained it away from
+            # that no-op state. Silent: nothing about the forward pass
+            # or loss looks wrong, condition_on_theta=True just quietly
+            # does nothing.
+            if not (name.startswith("bottlenecks.deriv.") or name.startswith("theta_conditioners.deriv.")):
                 p.requires_grad_(False)
     else:
         print("freeze_encoder=False -- DIAGNOSTIC MODE. The trunk + state bottleneck are "
@@ -896,14 +945,16 @@ def train_stage1b(
     else:
         train_set = MicrostructureEvolutionDataset(
             train_dirs, encoder=None, window_length=2, augment=augment,
-            min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
+            min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            min_std_deriv=min_std_deriv,
             stat_names=stat_names if include_stats else None,
         )
         train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
                                    persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
     val_set = MicrostructureEvolutionDataset(
         val_dirs, encoder=None, window_length=2,
-        min_step=min_step, min_stdev_phi=min_stdev_phi, min_std_deriv=min_std_deriv,
+        min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+        min_std_deriv=min_std_deriv,
         stat_names=stat_names if include_stats else None,
     )
     if epochs > 0:
@@ -917,17 +968,27 @@ def train_stage1b(
 
     def step(batch, train: bool):
         if include_stats:
-            window, dt_window, _theta, stats_target = batch
+            window, dt_window, theta, stats_target = batch
             stats_target = stats_target.to(device, non_blocking=True)
         else:
-            window, dt_window, _theta = batch
+            window, dt_window, theta = batch
         window = window.to(device, non_blocking=True)
         dt_window = dt_window.to(device, non_blocking=True)
+        theta = theta.to(device, non_blocking=True)
         x_t = window[:, 0]
         x_next = window[:, 1]
         dt = dt_window[:, 0].view(-1, 1, 1, 1)
 
-        pred_deriv, z1 = ae.pathways["deriv"](x_t)
+        # theta now actually used (previously unpacked and discarded --
+        # see Encoder's own docstring for why the deriv stream needs it:
+        # the driving force a(T)=a0*(T-T0) vanishes near T0, so a
+        # state-only encoder can get the DIRECTION of change right but
+        # not the correct MAGNITUDE without it). Zero-initialized FiLM
+        # (see encoder.py's _ThetaFiLMConditioner) means passing theta
+        # from the very start of stage 1b (not waiting for stage 2) is
+        # harmless at initialization and lets the conditioner start
+        # learning immediately rather than only once stage 2 begins.
+        pred_deriv, z1 = ae.pathways["deriv"](x_t, theta=theta)
         (z1_train_stats if train else z1_val_stats).update(z1)
         target_deriv = (x_next - x_t) / dt
         # Per-SAMPLE normalized ratio, not plain MSE -- same rationale
@@ -1103,7 +1164,7 @@ def train_stage1b(
                     "stats_weight": model_cfg["stats_weight"],
                     "stream_configs": {
                         name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                               "mode": cfg.mode.value}
+                               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
                         for name, cfg in stream_configs.items()
                     },
                     "recon_stream_name": state_name,
@@ -1191,7 +1252,9 @@ def train_stage2(
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_passing_steps: int | None = None,
     min_std_deriv: float | None = None, augment: bool = False,
+    condition_on_theta: bool | None = None,
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
@@ -1450,6 +1513,29 @@ def train_stage2(
     deriv_stream_name = other_decodable[0]
     deriv_stream = stream_configs[deriv_stream_name]
 
+    # condition_on_theta is NOT decided here -- deriv's theta-FiLM
+    # conditioning is a structural property fixed once, when the stream
+    # is CREATED (see train_stage1b's own docstring for the full
+    # rationale). Stage 2 only ever resumes an already-built encoder,
+    # so there is nothing to set -- only something to VALIDATE. None
+    # (default) skips this entirely, trusting whatever the resumed
+    # checkpoint has, same as before this parameter existed. Given
+    # explicitly (e.g. via a preamble value applied to every stage,
+    # even ones where it isn't a structural decision), a MISMATCH
+    # raises immediately and clearly, rather than silently training
+    # stage 2 against a differently-conditioned ancestor than intended
+    # -- a mistake that would otherwise show up only much later, if at
+    # all, as an unexplained difference from a comparison run.
+    if condition_on_theta is not None and deriv_stream.condition_on_theta != condition_on_theta:
+        raise ValueError(
+            f"condition_on_theta={condition_on_theta} was requested, but {resume_from}'s own "
+            f"'{deriv_stream_name}' stream has condition_on_theta={deriv_stream.condition_on_theta} "
+            f"-- this was decided when the stream was CREATED (stage 1b), not something stage 2 "
+            f"can change by resuming with a different value. Retrain from stage 1b with "
+            f"condition_on_theta={condition_on_theta} if you actually want a different ancestor, "
+            f"or drop this parameter here to match whatever {resume_from} already has."
+        )
+
     # Always MultiStreamAutoencoder: the multi-stream requirement above
     # guarantees len(stream_configs) >= 2 by this point, unlike
     # train_autoencoder's own construction (which still needs to
@@ -1465,7 +1551,7 @@ def train_stage2(
     # back to sharing one decoder, matching what such a checkpoint's
     # own state_dict actually has.
     encoder = Encoder(input_size=size, in_channels=1, base_channels=model_cfg["base_channels"],
-                       stream_configs=stream_configs)
+                       stream_configs=stream_configs, n_theta=1)
     decoder_for_stream = model_cfg.get("decoder_for_stream")
     if decoder_for_stream is None:
         decoder = Decoder(output_size=size, out_channels=1, base_channels=model_cfg["base_channels"],
@@ -1576,17 +1662,20 @@ def train_stage2(
         train_set = train_loader = None
         val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None, window_length=2,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
-                                                  min_step=min_step, min_stdev_phi=min_stdev_phi)
+                                                  min_step=min_step, min_stdev_phi=min_stdev_phi,
+                                                  min_passing_steps=min_passing_steps)
         print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
               f"{len(val_set)} val consecutive-pair windows")
     else:
         train_set = MicrostructureEvolutionDataset(train_dirs, encoder=None, window_length=2,
                                                     stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                     min_step=min_step, min_stdev_phi=min_stdev_phi,
+                                                    min_passing_steps=min_passing_steps,
                                                     augment=augment)
         val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None, window_length=2,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
-                                                  min_step=min_step, min_stdev_phi=min_stdev_phi)
+                                                  min_step=min_step, min_stdev_phi=min_stdev_phi,
+                                                  min_passing_steps=min_passing_steps)
         print(f"{len(train_set)} train / {len(val_set)} val consecutive-pair windows")
         train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
                                    persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
@@ -1632,13 +1721,21 @@ def train_stage2(
         window, dt_window, theta, true_stats = batch
         window = window.to(device, non_blocking=True)
         dt_window = dt_window.to(device, non_blocking=True)
+        theta = theta.to(device, non_blocking=True)
         true_stats = true_stats.to(device, non_blocking=True)
 
         x_t = window[:, 0]
         x_next = window[:, 1]
         dt = dt_window[:, 0].view(-1, 1, 1, 1)
 
-        z_t = ae.encoders["shared"](x_t)
+        # theta (temperature, centered at T0) now actually used -- see
+        # Encoder's own docstring for why the deriv stream specifically
+        # needs it: the driving force a(T)=a0*(T-T0) genuinely vanishes
+        # near T0, so a state-only encoder can get the DIRECTION of
+        # change right from the image alone but has no way to know the
+        # correct MAGNITUDE without T. Was previously unpacked from the
+        # batch and never used at all.
+        z_t = ae.encoders["shared"](x_t, theta=theta)
         z0_t = z_t[recon_stream_name]
         z1_t = z_t[deriv_stream_name]
 
@@ -1718,12 +1815,18 @@ def train_stage2(
         # 1.0 an un-detached x would give -- a genuinely controllable
         # dial, not just an on/off switch.
         if z0_from_deriv_weight > 0:
-            z0_next = ae.encoders["shared"](x_next)[recon_stream_name]
+            # theta passed even though only the state stream's output is
+            # kept below -- Encoder.forward computes EVERY stream in one
+            # pass internally (see its own docstring), so it still needs
+            # theta if ANY of its streams (deriv, here) requires it,
+            # regardless of which single stream this particular call
+            # site goes on to use.
+            z0_next = ae.encoders["shared"](x_next, theta=theta)[recon_stream_name]
             z0_next_for_deriv = z0_next.detach() + z0_from_deriv_weight * (z0_next - z0_next.detach())
             z0_t_for_deriv = z0_t.detach() + z0_from_deriv_weight * (z0_t - z0_t.detach())
         else:
             with torch.no_grad():
-                z0_next = ae.encoders["shared"](x_next)[recon_stream_name]
+                z0_next = ae.encoders["shared"](x_next, theta=theta)[recon_stream_name]
             z0_next_for_deriv = z0_next
             z0_t_for_deriv = z0_t.detach()
         target_deriv = (z0_next_for_deriv - z0_t_for_deriv) / dt
@@ -1884,7 +1987,7 @@ def train_stage2(
                     "stats_weight": ancestor_stats_weight,
                     "stream_configs": {
                         name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                               "mode": cfg.mode.value}
+                               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
                         for name, cfg in stream_configs.items()
                     },
                     "recon_stream_name": recon_stream_name,
@@ -1958,6 +2061,10 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--min-step", type=int, default=None)
     parser.add_argument("--min-stdev-phi", type=float, default=None)
+    parser.add_argument("--min-passing-steps", type=int, default=None,
+                         help="exclude an entire run when fewer than this many of its steps clear "
+                              "min-stdev-phi -- see build_good_steps' own docstring in "
+                              "training/datasets.py")
     parser.add_argument("--stat-names", type=str, nargs="+", default=None)
     parser.add_argument("--stats-weight", type=float, default=None)
     parser.add_argument("--val-ema-decay", type=float, default=0.7)
@@ -1989,6 +2096,7 @@ def main():
         base_channels=args.base_channels, latent_channels=args.latent_channels,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
         num_workers=args.num_workers, min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
+        min_passing_steps=args.min_passing_steps,
         stat_names=args.stat_names, stats0_weight=args.stats_weight,
         val_ema_decay=args.val_ema_decay, early_stopping_patience=args.early_stopping_patience,
         seed=args.seed, checkpoint_path=args.checkpoint, resume_from=args.resume_from,

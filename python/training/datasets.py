@@ -2,7 +2,9 @@
 PyTorch Dataset classes for loading phase-field runs off disk.
 """
 
+import inspect
 import math
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -230,6 +232,7 @@ def _filtered_steps(metadata: "load.RunMetadata", bad_steps: set[int],
 
 def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
                       min_step: int = 0, min_stdev_phi: float | None = None,
+                      min_passing_steps: int | None = None,
                       ) -> dict[Path, list[int]]:
     """
     Scan run_dirs ONCE and return a stable {run_dir: [kept_step, ...]}
@@ -248,8 +251,48 @@ def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
     Evolution dataset built from the same run_dirs/filter settings (via
     their optional good_steps= argument) to skip the scan entirely on
     the second construction, rather than paying for it twice.
+
+    min_passing_steps: if set, an ENTIRE run is excluded (kept_steps=[])
+    when FEWER than this many of its steps pass min_stdev_phi -- not
+    just those individual under-threshold steps, which min_stdev_phi
+    alone already excludes regardless of this parameter. Requires
+    min_stdev_phi to also be set (there's nothing to "pass" otherwise).
+
+    Rationale: min_stdev_phi alone still lets a run through on however
+    few steps happen to individually clear the threshold, even if that's
+    a tiny fraction of the run -- a real example from this project's own
+    sweep: T990_n007_s599, 65 saved steps, only 2-4 EVER clear a 1%
+    stdev_phi threshold (near T0, phase separation may simply never
+    substantially develop within the simulated window -- critical
+    slowing down, not a filtering artifact; confirmed by this project's
+    own evaluation/check_stdev_phi_temperature.py, where the collapse
+    persists unchanged even after excluding the first min_step steps).
+    Those 2-4 survivors are themselves marginal BY CONSTRUCTION -- steps
+    that just barely clear a threshold almost nothing else in the run
+    clears are, definitionally, right at the boundary between genuine
+    structure and noise floor, not confidently on the "real signal"
+    side of it. And because so few steps survive, spread across the
+    whole run, windows built from them span unusually large, irregular
+    time gaps -- landing exactly in the large-dt regime this project's
+    own diagnostics have separately shown to have the worst error
+    (see losses.py's own DtDecadeWeights docstring). A per-run summary
+    ("T990_n007_s599 performs poorly") built from a handful of such
+    windows says little about general model quality -- it's dominated
+    by whatever that one run's few borderline survivors happen to
+    produce, not by anything representative.
+
+    Applied consistently everywhere build_good_steps itself is used
+    (train, val, test alike -- there is no special-cased subset), the
+    same way min_step/min_stdev_phi already are: this changes what data
+    EXISTS at all under the given filter configuration, not what a
+    model sees at train time vs. what it's graded on at test time, so
+    it introduces no train/test inconsistency by construction.
     """
+    if min_passing_steps is not None and min_stdev_phi is None:
+        raise ValueError("min_passing_steps requires min_stdev_phi to also be set -- "
+                          "there's no 'passing' threshold to count against otherwise")
     good_steps: dict[Path, list[int]] = {}
+    n_runs_dropped_for_too_few_passing = 0
     for run_dir in run_dirs:
         run_dir = Path(run_dir)
         metadata = load.read_metadata(run_dir / "metadata.txt")
@@ -264,8 +307,16 @@ def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
 
         stats_df = load.read_statistics_csv(run_dir / "statistics.csv") \
             if min_stdev_phi is not None else None
-        good_steps[run_dir] = _filtered_steps(metadata, bad_steps, min_step, min_stdev_phi,
-                                               stats_df)
+        kept_steps = _filtered_steps(metadata, bad_steps, min_step, min_stdev_phi, stats_df)
+        if min_passing_steps is not None and len(kept_steps) < min_passing_steps:
+            n_runs_dropped_for_too_few_passing += 1
+            kept_steps = []
+        good_steps[run_dir] = kept_steps
+
+    if min_passing_steps is not None and n_runs_dropped_for_too_few_passing:
+        print(f"build_good_steps: {n_runs_dropped_for_too_few_passing}/{len(run_dirs)} runs "
+              f"dropped ENTIRELY -- fewer than min_passing_steps={min_passing_steps} steps "
+              f"cleared min_stdev_phi={min_stdev_phi}")
 
     return good_steps
 
@@ -331,7 +382,7 @@ class MicrostructureSnapshotDataset(Dataset):
 
     def __init__(self, run_dirs: list[str | Path], skip_bad: bool = True,
                  cache_in_memory: bool = False, augment: bool = False, min_step: int = 0,
-                 min_stdev_phi: float | None = None,
+                 min_stdev_phi: float | None = None, min_passing_steps: int | None = None,
                  include_stats: bool = False, stat_names: list[str] | None = None,
                  good_steps: dict[Path, list[int]] | None = None):
         """
@@ -339,7 +390,8 @@ class MicrostructureSnapshotDataset(Dataset):
         from build_good_steps(), to skip re-scanning run_dirs when
         another dataset (e.g. a paired MicrostructureEvolutionDataset
         over the same run_dirs) already computed it with the same
-        skip_bad/min_step/min_stdev_phi. Default None computes it here.
+        skip_bad/min_step/min_stdev_phi/min_passing_steps. Default None
+        computes it here.
 
         min_step: skip snapshots earlier than this step. Kept as a cheap,
         always-available filter that needs no statistics.csv, but a fixed
@@ -395,7 +447,7 @@ class MicrostructureSnapshotDataset(Dataset):
 
         run_dirs = [Path(d) for d in run_dirs]
         if good_steps is None:
-            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi)
+            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi, min_passing_steps)
 
         for run_dir in run_dirs:
             metadata = load.read_metadata(run_dir / "metadata.txt")
@@ -670,10 +722,12 @@ class MicrostructureEvolutionDataset(Dataset):
     def __init__(self, run_dirs: list[str | Path], encoder: torch.nn.Module | None,
                  device: str | torch.device = "cpu", window_length: int = 5,
                  skip_bad: bool = True, min_step: int = 0,
-                 min_stdev_phi: float | None = None, encode_batch_size: int = 256,
+                 min_stdev_phi: float | None = None, min_passing_steps: int | None = None,
+                 encode_batch_size: int = 256,
                  good_steps: dict[Path, list[int]] | None = None,
                  stat_names: list[str] | None = None, augment: bool = False,
-                 min_std_deriv: float | None = None, encode_both_streams: bool = False):
+                 min_std_deriv: float | None = None, encode_both_streams: bool = False,
+                 read_workers: int = 16):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
@@ -695,7 +749,14 @@ class MicrostructureEvolutionDataset(Dataset):
         window_length: n_r + 1 (e.g. window_length=5 -> n_r=4 predicted steps).
         encode_batch_size: batch size for the upfront encoding pass when
         encoder is given; unused (raw frames aren't encoded here) when
-        encoder is None.
+        encoder is None. Chunks span RUN BOUNDARIES -- every kept frame
+        across every run is concatenated first, then encoded in
+        encode_batch_size chunks over that single combined tensor, not
+        run-by-run -- so this can be sized for GPU/VRAM throughput
+        without worrying about how many frames any individual run
+        happens to have (a run with fewer frames than this no longer
+        means an undersized, launch-overhead-bound encode batch for
+        just that run).
         good_steps: a precomputed {run_dir: [kept_step, ...]} mapping
         from build_good_steps(), to skip re-scanning run_dirs when a
         paired MicrostructureSnapshotDataset over the same run_dirs
@@ -764,6 +825,33 @@ class MicrostructureEvolutionDataset(Dataset):
         latent). Computed directly from each candidate window's own
         already-loaded frames (no extra disk I/O), so this is cheap
         even though it's a per-window check rather than a per-step one.
+
+        read_workers: 16 (default) -- every raw snapshot file is read
+        via its own read_phi_half() call (see that function's own
+        docstring: a single, small np.fromfile per file, no header, no
+        batching across files at the OS level). Read one at a time,
+        that's thousands of small, independently-blocking file reads
+        across a real sweep (hundreds of runs x dozens-to-hundreds of
+        snapshots each) with NOTHING else happening while each one is
+        in flight -- I/O-latency-bound, not CPU- or GPU-bound (measured
+        directly: both sit well under saturated during this phase).
+        Reading is spread across a ThreadPoolExecutor instead of a
+        plain per-run list comprehension specifically because
+        np.fromfile releases the GIL for the actual read syscall, so
+        multiple threads can have reads genuinely in flight
+        concurrently despite Python's GIL -- this is NOT compute
+        parallelism (do not expect a read_workers-x speedup; expect a
+        speedup bounded by how much read LATENCY, not CPU time, was
+        actually being wasted). ONE pool is created for this whole
+        constructor call (see its use below), not one per run --
+        creating/tearing down a pool per run_dir would add its own
+        fixed overhead on every single run, largely cancelling out the
+        benefit for runs with only a handful of snapshots each. Set to
+        1 to reproduce the exact prior sequential-read behavior (still
+        correct, just slow) if concurrent reads are ever undesirable
+        (e.g. a networked filesystem that penalizes concurrent access
+        rather than benefiting from it -- worth checking directly for
+        your own storage if this doesn't help as expected).
         """
         if stat_names is not None and encoder is not None:
             raise ValueError(
@@ -816,54 +904,194 @@ class MicrostructureEvolutionDataset(Dataset):
 
         run_dirs = [Path(d) for d in run_dirs]
         if good_steps is None:
-            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi)
+            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi, min_passing_steps)
 
         if self.encoder_given:
             encoder = encoder.to(device).eval()
+        # Checked ONCE, up front, not assumed: encoder is typed as any
+        # torch.nn.Module, not specifically the real Encoder class (test
+        # fixtures, older/simplified stand-ins, or any future variant
+        # may have a forward(x) with no theta parameter at all) --
+        # calling such an encoder with theta=... would raise TypeError,
+        # not silently ignore it. inspect, not try/except: an explicit
+        # signature check can't mask an unrelated TypeError from
+        # elsewhere inside the real call the way a broad except would.
+        encoder_accepts_theta = (
+            self.encoder_given and "theta" in inspect.signature(encoder.forward).parameters
+        )
         n_windowless_runs = 0
         n_degenerate_deriv_windows = 0
 
-        for run_dir in run_dirs:
-            metadata = load.read_metadata(run_dir / "metadata.txt")
-            kept_steps = good_steps[run_dir]
+        pending_meta = []       # (run_dir, metadata, kept_steps), one per run that passed the length check
+        run_data_list = []      # filled in incrementally, ends up aligned index-for-index with pending_meta
+        run_data_deriv_list = []  # ditto -- entries are None unless encode_both_streams
 
-            if len(kept_steps) < window_length:
-                n_windowless_runs += 1
-                continue  # not enough consecutive kept steps for even one window
+        # Bounded-memory streaming buffer for cross-run batched encoding.
+        # An EARLIER version of this accumulated every run's raw frames
+        # into one big list BEFORE encoding any of it -- correct, but a
+        # real problem at real sweep sizes, not just a theoretical one:
+        # read_phi_half converts every frame to float32 in memory (see
+        # its own docstring: raw storage is float16, read_phi_half's
+        # return value is not), so a sweep with N total kept frames
+        # needs 4*ny*nx*N bytes just for the raw frames -- for a 7GB
+        # (on-disk, float16) 256x256 sweep, that's ~14GB of raw frames
+        # alone if ever held all at once, on top of whatever else the
+        # process needs. The buffer below is instead flushed (encoded,
+        # then discarded) as soon as it reaches encode_batch_size,
+        # keeping peak raw-frame memory bounded by roughly
+        # encode_batch_size + one run's own frame count, REGARDLESS of
+        # how large the full sweep is -- while still getting almost all
+        # of cross-run batching's actual benefit (see the encode call
+        # below): most flushes still span several runs at close to the
+        # requested batch size, not one tiny call per run.
+        buffer_frames = []  # raw frame tensors not yet encoded, one entry per buffered run
+        buffer_sizes = []   # frame count per buffered entry, same order as buffer_frames
+        buffer_thetas = []  # theta broadcast to (n_kept, n_theta) per buffered run, same order
+        buffer_total = 0
 
-            if self.stat_names is not None:
-                stats_df = load.read_statistics_csv(run_dir / "statistics.csv")
-                missing = set(self.stat_names) - set(stats_df.columns)
-                if missing:
-                    raise ValueError(f"{run_dir}/statistics.csv is missing columns {missing}")
-                self._stats_by_run[run_dir] = stats_df
+        def _flush_buffer():
+            """
+            Encode everything currently buffered (spanning however many
+            runs happen to be in it) in ONE pass, splitting the result
+            back per run. Safe to batch across runs specifically because
+            encoder.eval() was already called above, BEFORE this: the
+            encoder here DOES contain BatchNorm2d (see train_ae.py's own
+            extensive freeze/eval-mode handling, and
+            test_train_stage1b.py's drift tests), but in eval() mode it
+            normalizes using its saved running_mean/running_var, not
+            live per-batch statistics -- so a given frame's own encoded
+            output is unaffected by which OTHER frames happen to share
+            its batch (verified directly, not just assumed: a real
+            BatchNorm2d layer in eval() mode gave byte-identical output
+            whether encoded alone, per-run, or batched across run
+            boundaries). This WOULD be unsafe in train() mode -- another
+            reason .eval() being called first, and never reset to
+            .train() anywhere in this constructor, matters. A no-op
+            (returns empty lists) if the buffer is currently empty, so
+            callers never need to check emptiness themselves.
 
-            # Read every kept step once (this is the only place raw
-            # snapshots are touched -- everything after this is pure
-            # bookkeeping over whichever of latents/frames we end up with).
-            frames = torch.stack([
-                torch.from_numpy(load.read_phi_half(
-                    run_dir / load.snapshot_filename(step), metadata.nx, metadata.ny
-                )).unsqueeze(0)
-                for step in kept_steps
-            ])  # (n_kept, 1, ny, nx)
+            theta is passed to EVERY encode call unconditionally (not
+            only when some stream is known to need it) -- Encoder.forward
+            computes every one of its streams in a single pass (see its
+            own docstring), so it needs theta if ANY of them requires
+            conditioning, regardless of which stream(s) this dataset
+            instance actually keeps; Encoder itself is the single place
+            that knows which streams actually use it, and simply ignores
+            theta for a model with no conditioned streams at all.
+            """
+            nonlocal buffer_frames, buffer_sizes, buffer_thetas, buffer_total
+            if not buffer_frames:
+                return [], []
+            combined = torch.cat(buffer_frames, dim=0)
+            combined_theta = torch.cat(buffer_thetas, dim=0) if encoder_accepts_theta else None
+            latents = []
+            latents_deriv = [] if self.encode_both_streams else None
+            with torch.no_grad():
+                for i in range(0, len(combined), encode_batch_size):
+                    batch = combined[i:i + encode_batch_size].to(device)
+                    if encoder_accepts_theta:
+                        theta_batch = combined_theta[i:i + encode_batch_size].to(device)
+                        encoded = encoder(batch, theta=theta_batch)
+                    else:
+                        encoded = encoder(batch)  # ONE forward pass, both streams available in the dict
+                    latents.append(encoded[DEFAULT_STREAM_NAME].cpu())
+                    if self.encode_both_streams:
+                        latents_deriv.append(encoded["deriv"].cpu())
+            del combined, combined_theta  # no longer needed -- everything from them is now in latents/latents_deriv
+            latents = torch.cat(latents, dim=0)
+            latents_deriv = torch.cat(latents_deriv, dim=0) if self.encode_both_streams else None
+
+            result = list(torch.split(latents, buffer_sizes))
+            result_deriv = (list(torch.split(latents_deriv, buffer_sizes))
+                             if self.encode_both_streams else [None] * len(buffer_sizes))
+            buffer_frames, buffer_sizes, buffer_thetas, buffer_total = [], [], [], 0
+            return result, result_deriv
+
+        # ONE pool for the whole constructor call -- see read_workers'
+        # own docstring for why not one per run_dir. Reading and
+        # (buffered) encoding now happen in the SAME per-run pass --
+        # merging them back together, after the streaming buffer above
+        # made accumulating a separate whole-dataset frame list
+        # unnecessary, avoids ever building that list at all.
+        with ThreadPoolExecutor(max_workers=read_workers) as read_pool:
+            for run_dir in run_dirs:
+                metadata = load.read_metadata(run_dir / "metadata.txt")
+                kept_steps = good_steps[run_dir]
+
+                if len(kept_steps) < window_length:
+                    n_windowless_runs += 1
+                    continue  # not enough consecutive kept steps for even one window
+
+                if self.stat_names is not None:
+                    stats_df = load.read_statistics_csv(run_dir / "statistics.csv")
+                    missing = set(self.stat_names) - set(stats_df.columns)
+                    if missing:
+                        raise ValueError(f"{run_dir}/statistics.csv is missing columns {missing}")
+                    self._stats_by_run[run_dir] = stats_df
+
+                # Read every kept step once (this is the only place raw
+                # snapshots are touched -- everything after this is pure
+                # bookkeeping over whichever of latents/frames we end up
+                # with). read_pool.map preserves kept_steps' own order
+                # (like the plain list comprehension it replaces) even
+                # though the underlying reads complete out of order --
+                # window construction below depends on that ordering.
+                snapshot_paths = [run_dir / load.snapshot_filename(step) for step in kept_steps]
+                frames = torch.stack([
+                    torch.from_numpy(arr).unsqueeze(0)
+                    for arr in read_pool.map(
+                        lambda p: load.read_phi_half(p, metadata.nx, metadata.ny), snapshot_paths
+                    )
+                ])  # (n_kept, 1, ny, nx)
+                pending_meta.append((run_dir, metadata, kept_steps))
+
+                if self.encoder_given:
+                    buffer_frames.append(frames)
+                    buffer_sizes.append(frames.size(0))
+                    buffer_total += frames.size(0)
+                    if encoder_accepts_theta:
+                        # SAME convention as _run_theta below (theta =
+                        # temperature centered at T0, see LatentDynamics'
+                        # own docstring) -- computed here too, not only
+                        # in the bookkeeping loop, because encoding
+                        # happens BEFORE bookkeeping and needs it NOW.
+                        # Broadcast to one row per frame in THIS run
+                        # (theta is constant across a run, but the
+                        # buffer mixes frames from several runs at once,
+                        # so each frame needs its own copy to stay
+                        # aligned with buffer_frames/buffer_sizes).
+                        run_theta = torch.tensor([metadata.temperature - metadata.T0], dtype=torch.float32)
+                        buffer_thetas.append(run_theta.unsqueeze(0).expand(frames.size(0), -1))
+                    if buffer_total >= encode_batch_size:
+                        flushed, flushed_deriv = _flush_buffer()
+                        run_data_list.extend(flushed)
+                        run_data_deriv_list.extend(flushed_deriv)
+                else:
+                    run_data_list.append(frames)  # (n_kept, 1, ny, nx) -- encoding deferred to the training loop
+                    run_data_deriv_list.append(None)
 
             if self.encoder_given:
-                latents = []
-                latents_deriv = [] if self.encode_both_streams else None
-                with torch.no_grad():
-                    for i in range(0, len(frames), encode_batch_size):
-                        batch = frames[i:i + encode_batch_size].to(device)
-                        encoded = encoder(batch)  # ONE forward pass, both streams available in the dict
-                        latents.append(encoded[DEFAULT_STREAM_NAME].cpu())
-                        if self.encode_both_streams:
-                            latents_deriv.append(encoded["deriv"].cpu())
-                run_data = torch.cat(latents, dim=0)  # (n_kept, latent_channels, 8, 8)
-                run_data_deriv = torch.cat(latents_deriv, dim=0) if self.encode_both_streams else None
-            else:
-                run_data = frames  # (n_kept, 1, ny, nx) -- encoding deferred to the training loop
-                run_data_deriv = None
+                flushed, flushed_deriv = _flush_buffer()  # final, possibly-partial buffer
+                run_data_list.extend(flushed)
+                run_data_deriv_list.extend(flushed_deriv)
 
+        if self.encoder_given and torch.device(device).type == "cuda":
+            # Returns the encoder's peak VRAM usage back to the CUDA
+            # driver/allocator pool now that encoding is done, rather
+            # than leaving it cached-but-idle in this process for
+            # whatever comes next (e.g. training itself, or -- since
+            # this constructor commonly runs 3x in a row for train/val/
+            # test -- the NEXT MicrostructureEvolutionDataset built
+            # right after this one). Not correctness-critical (PyTorch's
+            # own caching allocator would reuse these blocks for later
+            # allocations in this same process regardless), but matters
+            # if anything else (another process, or just accurate
+            # nvidia-smi output) needs to see that VRAM as free.
+            torch.cuda.empty_cache()
+
+        for (run_dir, metadata, kept_steps), run_data, run_data_deriv in zip(
+            pending_meta, run_data_list, run_data_deriv_list
+        ):
             run_idx = len(self._run_steps)
             self._run_dirs.append(run_dir)
             self._run_steps.append(kept_steps)
@@ -1035,7 +1263,7 @@ class MicrostructureTripletDataset(Dataset):
 
     def __init__(self, run_dirs: list[str | Path], stat_names: list[str],
                  skip_bad: bool = True, min_step: int = 0,
-                 min_stdev_phi: float | None = None,
+                 min_stdev_phi: float | None = None, min_passing_steps: int | None = None,
                  good_steps: dict[Path, list[int]] | None = None):
         """
         stat_names: REQUIRED and must match the stage-2 checkpoint's
@@ -1047,7 +1275,7 @@ class MicrostructureTripletDataset(Dataset):
         """
         run_dirs = [Path(d) for d in run_dirs]
         if good_steps is None:
-            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi)
+            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi, min_passing_steps)
 
         self.stat_names = stat_names
         self._index: list[tuple[Path, int, int, int]] = []  # (run_dir, t1, t2, t3)
