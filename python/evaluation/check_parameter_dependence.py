@@ -68,47 +68,6 @@ def max_autocorr_dist(nx: int, ny: int) -> int:
     return min(nx * 2 // 3, ny * 2 // 3)
 
 
-def robust_linear_fit(x: np.ndarray, y: np.ndarray, n_iter: int = 10, huber_delta_scale: float = 1.345):
-    """
-    Robust linear fit (y = slope*x + intercept) via IRLS with Huber
-    weights -- self-contained (no scipy/sklearn dependency), since
-    np.polyfit already supports weighted least-squares directly.
-
-    Ordinary least squares (a single np.polyfit call) is heavily
-    influenced by a small number of extreme-magnitude points -- exactly
-    the failure mode motivating this function: a handful of small-dt
-    windows with unusually large |residual| can dominate an OLS fit
-    entirely, even though most of the data disagrees with the line
-    those few points imply. IRLS refits repeatedly, each time
-    DOWN-WEIGHTING points whose current residual is large (a Huber-type
-    weight: full weight within `huber_delta_scale` MAD-scaled residuals
-    of zero, decreasing weight beyond that) -- points that are
-    genuinely outliers relative to the bulk of the data end up
-    contributing little to the final fit, rather than being fit exactly
-    at the expense of everything else.
-
-    huber_delta_scale=1.345 is the standard choice for Huber's own
-    estimator (95% efficiency under a purely Gaussian residual
-    distribution) -- not tuned specifically for this application, just
-    the well-established default.
-    """
-    slope, intercept = np.polyfit(x, y, deg=1)
-    for _ in range(n_iter):
-        residuals = y - (slope * x + intercept)
-        # MAD (median absolute deviation), scaled to be a consistent
-        # estimator of the standard deviation under a Gaussian residual
-        # distribution (the standard 1.4826 factor) -- robust to the
-        # same outliers the weights themselves are meant to down-weight,
-        # unlike using the residuals' own (outlier-sensitive) std.
-        mad = np.median(np.abs(residuals - np.median(residuals)))
-        scale = 1.4826 * mad if mad > 0 else np.std(residuals) + 1e-12
-        huber_delta = huber_delta_scale * scale
-        abs_resid = np.abs(residuals)
-        weights = np.where(abs_resid <= huber_delta, 1.0, huber_delta / np.maximum(abs_resid, 1e-12))
-        slope, intercept = np.polyfit(x, y, deg=1, w=weights)
-    return slope, intercept
-
-
 def robust_polynomial_fit(x: np.ndarray, y: np.ndarray, basis_funcs: list,
                            n_iter: int = 10, huber_delta_scale: float = 1.345):
     """
@@ -169,7 +128,7 @@ def robust_polynomial_fit(x: np.ndarray, y: np.ndarray, basis_funcs: list,
 def fit_taylor_residual_coefficients(dts: np.ndarray, euler_losses_signed: np.ndarray,
                                       latent_losses_signed: np.ndarray,
                                       n_iter: int = 10, huber_delta_scale: float = 1.345,
-                                      label: str = "") -> dict:
+                                      label: str = "", euler_only: bool = False) -> dict:
     """
     Fits the FULL Taylor-residual model (not the plain-linear
     approximation robust_linear_fit's own 2-term model reduces to),
@@ -256,6 +215,17 @@ def fit_taylor_residual_coefficients(dts: np.ndarray, euler_losses_signed: np.nd
     full dataset, to check whether a specific region of parameter space
     is driving a large stderr) doesn't read as one undifferentiated
     block.
+
+    euler_only: False (default) does the full joint fit described
+    above. True skips it entirely and fits a single, simpler 4-term
+    model (eps, eps', C, -A -- no D, no joint stacking, no independent-
+    fit diagnostic) against euler_losses_signed ALONE -- for exactly
+    the situation where latent_losses_signed IS euler_losses_signed
+    (the same array passed twice; see check_parameter_dependence's own
+    euler_only substitution), where the joint/independent-fit machinery
+    above would otherwise silently fit a perfectly degenerate model
+    (D == C by construction, mean_f_theta_minus_z0_ddot == 0.0 always)
+    and print it as if it were a real finding.
     """
     n = len(dts)
     if n < 50:
@@ -271,6 +241,44 @@ def fit_taylor_residual_coefficients(dts: np.ndarray, euler_losses_signed: np.nd
     # axis everywhere else.
     dt_scale = float(np.exp(np.mean(np.log(dts))))
     u = dts / dt_scale
+    basis_funcs = [lambda uu: np.ones_like(uu), lambda uu: uu, lambda uu: uu ** 2, lambda uu: uu ** 3]
+    unscale4 = np.array([1.0, dt_scale, dt_scale ** 2, dt_scale ** 3])
+
+    if euler_only:
+        # Single 4-term fit against euler_losses_signed ALONE -- no
+        # joint stacking, no independent-fit diagnostic (there's only
+        # one model here, nothing to compare against or reconcile). See
+        # this function's own docstring for why this branch exists
+        # instead of just letting the joint fit below run on
+        # euler_losses_signed passed in twice.
+        coefs_u, stderr_u = robust_polynomial_fit(u, euler_losses_signed, basis_funcs,
+                                                    n_iter=n_iter, huber_delta_scale=huber_delta_scale)
+        coefs_phys = coefs_u / unscale4
+        stderr_phys = stderr_u / unscale4
+        eps, eps_prime, C, neg_A = coefs_phys
+        eps_se, eps_prime_se, C_se, neg_A_se = stderr_phys
+        mean_z0_ddot = -2 * C
+        A = -neg_A
+        param_names = ["eps", "eps'", "C (dt^2, ~-z0_ddot/2)", "-A (dt^3)"]
+
+        result = {
+            "param_names": param_names, "euler_only": True,
+            "joint_coefs": coefs_phys, "joint_stderr": stderr_phys,
+            "eps": eps, "eps_stderr": eps_se,
+            "eps_prime": eps_prime, "eps_prime_stderr": eps_prime_se,
+            "C": C, "C_stderr": C_se, "A": A, "A_stderr": neg_A_se,
+            "mean_z0_ddot": mean_z0_ddot,
+            "dt_scale": dt_scale,
+        }
+        print("\n" + "=" * 70)
+        print(f"Taylor-residual coefficient fit (euler-only)" + (f"  [{label}]" if label else ""))
+        print("=" * 70)
+        for name, c, se in zip(param_names, coefs_phys, stderr_phys):
+            print(f"    {name:<26} = {c: .6e}  (stderr {se:.2e})")
+        print(f"\n  derived quantity:")
+        print(f"    mean(z0_ddot) [true curvature, from C] = {mean_z0_ddot:.4e}")
+        print("=" * 70)
+        return result
 
     # ---- Independent per-model fits (diagnostic only -- see docstring
     # for why these are NOT the recommended estimate, kept here purely
@@ -280,12 +288,10 @@ def fit_taylor_residual_coefficients(dts: np.ndarray, euler_losses_signed: np.nd
     # an earlier version of this function did) -- both the
     # heteroscedasticity and conditioning fixes apply here as much as
     # to the joint fit.
-    basis_funcs = [lambda uu: np.ones_like(uu), lambda uu: uu, lambda uu: uu ** 2, lambda uu: uu ** 3]
     indep_euler_u, indep_euler_se_u = robust_polynomial_fit(u, euler_losses_signed, basis_funcs,
                                                               n_iter=n_iter, huber_delta_scale=huber_delta_scale)
     indep_full_u, indep_full_se_u = robust_polynomial_fit(u, latent_losses_signed, basis_funcs,
                                                             n_iter=n_iter, huber_delta_scale=huber_delta_scale)
-    unscale4 = np.array([1.0, dt_scale, dt_scale ** 2, dt_scale ** 3])
     indep_euler = indep_euler_u / unscale4
     indep_full = indep_full_u / unscale4
     eps_euler_indep, eps_prime_euler_indep = indep_euler[0], indep_euler[1]
@@ -472,6 +478,112 @@ def _print_binned_summary(name: str, values: np.ndarray, latent_losses: np.ndarr
               f"{latent_losses[mask].mean():.6f}         {pixel_losses[mask].mean():.6f}")
 
 
+def _mean_curves_by_unique_value(x_values: np.ndarray, y_signed: np.ndarray, y_abs: np.ndarray,
+                                  round_decimals: int = 6):
+    """
+    For DISCRETE x (temperature/noise -- a handful of fixed sweep
+    values, not a continuous range): groups by each unique (rounded)
+    x value -- same rounding convention as _boxplot_by_x, for the same
+    reason (float round-trip through a text metadata file can turn one
+    intended sweep value into many bit-distinct floats) -- and returns
+    (sorted unique x values, mean(y_signed) per value, mean(y_abs) per
+    value, window count per value). Two curves instead of
+    _boxplot_by_x's full per-value distribution: simpler to read at a
+    glance, at the cost of not showing spread -- an intentional trade a
+    boxplot-per-value grid doesn't make.
+    """
+    rounded = np.round(x_values, round_decimals)
+    unique_x = np.unique(rounded)
+    masks = [rounded == v for v in unique_x]
+    mean_signed = np.array([y_signed[m].mean() for m in masks])
+    mean_abs = np.array([y_abs[m].mean() for m in masks])
+    n_windows = np.array([int(m.sum()) for m in masks])
+    return unique_x, mean_signed, mean_abs, n_windows
+
+
+def _mean_curves_by_bin(x_values: np.ndarray, y_signed: np.ndarray, y_abs: np.ndarray,
+                         n_bins: int = 8, log_bins: bool = False):
+    """
+    For CONTINUOUS x (length_scale -- computed per window, a different
+    value nearly every time; or dt, which additionally spans several
+    orders of magnitude): n_bins bins -- equal-width in LINEAR space by
+    default (matching _print_binned_summary's own console table, for
+    temperature/noise-like ranges), or equal-width in LOG space when
+    log_bins=True (appropriate for dt, which is naturally log-uniformly
+    sampled -- see dt_scale's own geometric-mean choice in
+    fit_taylor_residual_coefficients for the same reasoning). Returns
+    (bin centers, mean(y_signed) per bin, mean(y_abs) per bin, window
+    count per bin), skipping any bin with no points in it. Bin centers
+    are geometric-mean centers under log_bins=True (consistent with the
+    log-spaced edges), arithmetic-mean otherwise.
+    """
+    if log_bins:
+        edges = np.geomspace(x_values.min(), x_values.max(), n_bins + 1)
+    else:
+        edges = np.linspace(x_values.min(), x_values.max(), n_bins + 1)
+    centers, mean_signed, mean_abs, n_windows = [], [], [], []
+    for i in range(n_bins):
+        lo, hi = edges[i], edges[i + 1]
+        mask = (x_values >= lo) & (x_values <= hi if i == n_bins - 1 else x_values < hi)
+        if mask.sum() == 0:
+            continue
+        centers.append(np.sqrt(lo * hi) if log_bins else (lo + hi) / 2)
+        mean_signed.append(y_signed[mask].mean())
+        mean_abs.append(y_abs[mask].mean())
+        n_windows.append(int(mask.sum()))
+    return np.array(centers), np.array(mean_signed), np.array(mean_abs), np.array(n_windows)
+
+
+def _size_by_count(n_windows: np.ndarray, min_size: float = 20.0, max_size: float = 150.0) -> np.ndarray:
+    """
+    Marker AREA (matplotlib scatter's own s= convention -- area, not
+    diameter; see [0,2]'s own comment on this) scaled linearly between
+    min_size and max_size across THIS call's own observed range of
+    window counts. Proportional in spirit to [0,2]'s own window-count
+    sizing, but re-normalized per panel here rather than reusing that
+    panel's literal additive formula (30 + 10*n) -- these panels' window
+    counts (pooled per temperature/noise VALUE, or per length_scale
+    BIN) are typically on a very different scale than [0,2]'s own
+    (pooled per sweep point), and reusing a formula tuned for one scale
+    on the other would produce either imperceptibly-similar dots or
+    absurdly oversized ones.
+    """
+    n_windows = np.asarray(n_windows, dtype=float)
+    lo, hi = n_windows.min(), n_windows.max()
+    if hi <= lo:
+        return np.full_like(n_windows, (min_size + max_size) / 2)
+    return min_size + (max_size - min_size) * (n_windows - lo) / (hi - lo)
+
+
+def _symmetric_left_zero_right_ylim(left_axes, right_axes):
+    """
+    For a group of twin-axis panels sharing one signed quantity (left,
+    "mean(error)"-style) and one non-negative quantity (right,
+    "mean|error|"-style): computes ONE shared y-range per side, from
+    each axis's own current (already-autoscaled) limits.
+
+    Left: symmetric about 0 -- (-a, +a), a = the largest magnitude seen
+    across every left axis in the group. Not just "start below the most
+    negative point" -- a symmetric range makes it possible to judge "is
+    this curve mostly positive or mostly negative" at a glance (equal
+    visual weight either side of the y=0 reference line), which an
+    asymmetric range skews toward whichever sign happens to have the
+    larger excursion.
+
+    Right: floored at 0 (never negative -- this axis's own quantity
+    never is either), extending up to the largest value actually seen.
+
+    Returns (left_ylim, right_ylim); does not itself call set_ylim --
+    the caller applies these to every axis in the group.
+    """
+    left_los, left_his = zip(*(ax.get_ylim() for ax in left_axes))
+    right_los, right_his = zip(*(ax.get_ylim() for ax in right_axes))
+    a = max(abs(min(left_los)), abs(max(left_his)))
+    left_ylim = (-a, a)
+    right_ylim = (0.0, max(right_his))
+    return left_ylim, right_ylim
+
+
 def _boxplot_by_x(ax, x_values: np.ndarray, y_values: np.ndarray, log_x: bool = False,
                    round_decimals: int = 6):
     """
@@ -601,9 +713,36 @@ def _local_widths(unique_x: np.ndarray, factor: float = 0.6) -> np.ndarray:
 def check_parameter_dependence(
     lds_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
     min_passing_steps: int | None = None,
+    base_path: Path | None = None, size: int | None = None,
+    ae_stats_weight: float | None = None, hidden_dim: int = 256, n_hidden_layers: int = 2,
+    condition_on_theta: bool | None = None,
+    euler_only: bool | None = None,
     output_path: Path | None = None, device: str | None = None,
 ) -> Path:
-    """Saves the dt/temperature/noise-vs-error figure and returns its path."""
+    """Saves the dt/temperature/noise-vs-error figure and returns its path.
+
+    lds_checkpoint_path may ALSO be a stage-1/1b/2 (AE-family)
+    checkpoint, not just a real stage-3 one -- see
+    checkpoint_identification.ensure_lds_checkpoint's own docstring for
+    the full mechanism (an ephemeral, UNTRAINED f_theta gets trained
+    against it for epochs=0). base_path/size are REQUIRED (and
+    otherwise unused) specifically for this AE-family-conversion path;
+    a real stage-3 checkpoint needs neither.
+
+    euler_only: None (default) auto-detects -- True whenever
+    lds_checkpoint_path actually got converted (an AE-family checkpoint
+    was given, so f_theta is untrained and "full" is meaningless), False
+    otherwise (a real stage-3 checkpoint, both euler-only and full shown
+    as usual). Every panel/fit/print that would otherwise report on
+    "full" (f_theta-corrected) numbers reports on euler-only ones
+    instead in this mode, and the full-vs-euler-only COMPARISONS
+    themselves (which have nothing to compare against here) are
+    skipped rather than printed as a meaningless ratio of 1.0. Force
+    True/False explicitly to override the auto-detection either way
+    (e.g. to see the euler-only-only report for a real stage-3
+    checkpoint too, for a same-scale comparison against an AE-family
+    run).
+    """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if device.type == "cuda" and not torch.cuda.is_available():
         # See this function's own docstring on why this re-check exists,
@@ -622,6 +761,29 @@ def check_parameter_dependence(
         output_path = (_PYTHON_ROOT.parent / "output" / "stage3"
                        / f"{lds_checkpoint_path.stem}-parameter_dependence.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    from orchestration.checkpoint_identification import ensure_lds_checkpoint
+    _original_checkpoint_path = lds_checkpoint_path
+    lds_checkpoint_path = ensure_lds_checkpoint(
+        lds_checkpoint_path, base_path=base_path, size=size, device=device,
+        min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+        ae_stats_weight=ae_stats_weight, hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
+        condition_on_theta=condition_on_theta,
+    )
+    # ensure_lds_checkpoint returns its OWN input UNCHANGED for an
+    # already-stage-3 checkpoint, and a NEW (tempfile) path only when it
+    # actually converted something -- so this comparison is a reliable,
+    # side-effect-free way to detect "did conversion actually happen"
+    # without ensure_lds_checkpoint needing to return anything more than
+    # a path.
+    was_converted = lds_checkpoint_path != _original_checkpoint_path
+    if euler_only is None:
+        euler_only = was_converted
+    if euler_only:
+        print("EULER-ONLY MODE: every 'full' (f_theta-corrected) number below is replaced by "
+              "its euler-only (z0+z1*dt, no f_theta) equivalent, and full-vs-euler-only "
+              "comparisons are skipped -- " + ("f_theta is untrained (AE-family checkpoint "
+              "converted above)." if was_converted else "requested explicitly."))
 
     lds_checkpoint = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
     lds_config = lds_checkpoint["config"]
@@ -729,7 +891,7 @@ def check_parameter_dependence(
     stats_cache: dict[Path, object] = {}
 
     dts, temperatures, noises, run_dirs, length_scales = [], [], [], [], []
-    latent_losses, pixel_losses, euler_losses = [], [], []
+    latent_losses, pixel_losses, euler_losses, euler_pixel_losses = [], [], [], []
     latent_losses_signed, euler_losses_signed = [], []
 
     def _per_sample_l1(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
@@ -796,12 +958,21 @@ def check_parameter_dependence(
             x_next_pred = ae_decoder(z0_next_pred)
             x_next_true = ae_decoder(z0_next_true)
             pixel_loss_batch = _per_sample_l1(x_next_pred, x_next_true)
+            # Decoded unconditionally (not just when euler_only=True) --
+            # keeps this loop's own behavior identical regardless of
+            # that flag, rather than adding a second code path that
+            # only sometimes builds this array. The extra decoder call
+            # is cheap relative to everything else already happening
+            # per batch here.
+            x_next_euler_pred = ae_decoder(z0_euler_pred)
+            euler_pixel_loss_batch = _per_sample_l1(x_next_euler_pred, x_next_true)
 
             latent_losses.extend(latent_loss_batch.cpu().tolist())
             euler_losses.extend(euler_loss_batch.cpu().tolist())
             latent_losses_signed.extend(latent_loss_signed_batch.cpu().tolist())
             euler_losses_signed.extend(euler_loss_signed_batch.cpu().tolist())
             pixel_losses.extend(pixel_loss_batch.cpu().tolist())
+            euler_pixel_losses.extend(euler_pixel_loss_batch.cpu().tolist())
             dts.extend(dt.cpu().tolist())
 
             # SIGNED (not .abs()'d) euler-only residual, summed over the
@@ -848,8 +1019,29 @@ def check_parameter_dependence(
     latent_losses = np.array(latent_losses)
     pixel_losses = np.array(pixel_losses)
     euler_losses = np.array(euler_losses)
+    euler_pixel_losses = np.array(euler_pixel_losses)
     latent_losses_signed = np.array(latent_losses_signed)
     euler_losses_signed = np.array(euler_losses_signed)
+
+    # euler_only substitution: EVERY panel/fit/print below this point
+    # reads latent_losses/pixel_losses/latent_losses_signed as "the
+    # thing worth showing" -- rather than threading an if euler_only
+    # branch through each ~15 of those individually (panels [0,0],
+    # [0,1], [0,2], [1,0], [1,1], [1,2], every fit/correlation/binned-
+    # summary derived from them), aliasing these three names to their
+    # own euler-only equivalents ONCE, here, makes every one of those
+    # downstream consumers automatically report on euler-only data
+    # without any of them needing to know euler_only exists at all. The
+    # two panels that explicitly show BOTH euler-only and full
+    # side-by-side ([0,3], [1,3]) are the only ones that still check
+    # euler_only directly -- see their own comments below for why they
+    # can't use this same trick (they'd become a redundant "euler-only
+    # vs itself" comparison instead of correctly just dropping the
+    # full/blue trace).
+    if euler_only:
+        latent_losses = euler_losses
+        pixel_losses = euler_pixel_losses
+        latent_losses_signed = euler_losses_signed
 
     # Bias vs variance in z1's own error: euler_losses (E[|residual|],
     # mean ABSOLUTE error) can never distinguish "z1 is wrong by the
@@ -887,11 +1079,12 @@ def check_parameter_dependence(
     corr_dt_latent = np.corrcoef(log_dt, log_latent)[0, 1]
     corr_dt_pixel = np.corrcoef(log_dt, log_pixel)[0, 1]
 
-    print(f"\ncorrelation(log10(dt), log10(latent_loss)) = {corr_dt_latent:.3f}")
-    print(f"correlation(log10(dt), log10(pixel_loss))  = {corr_dt_pixel:.3f}")
+    print(f"\ncorrelation(log10(dt), log10(latent_loss)) = {corr_dt_latent*100:.1f}%")
+    print(f"correlation(log10(dt), log10(pixel_loss))  = {corr_dt_pixel*100:.1f}%")
     print("(near 0 = no dt dependence; positive = error grows with dt)")
 
-    print("\nModel comparison (latent_loss vs dt): power law vs saturating exponential")
+    print(f"\nModel comparison ({'euler-only' if euler_only else 'latent_loss'} vs dt): "
+          f"power law vs saturating exponential")
     a, b, r2_log, sse_power, pred_power = fit_power_law(dts, latent_losses)
     c, tau, r2_sat, sse_sat, pred_sat = fit_saturating_exponential(dts, latent_losses)
     print(f"  power law:     error ~ dt^{a:.3f}, SSE(real space)={sse_power:.6f}")
@@ -900,50 +1093,69 @@ def check_parameter_dependence(
     better = "saturating exponential" if sse_sat < sse_power else "power law"
     print(f"  -> {better} fits better (lower SSE).")
 
-    # Euler-only (hard-coded first-order term alone, no f_theta) vs the
-    # full, f_theta-corrected prediction -- SAME z0_next_true, SAME dt,
-    # SAME window for both, so this is a genuine, point-by-point
-    # decomposition, not just two separately-fit trends.
-    #
-    # THEORY, if z1 were an EXACT derivative and f_theta an EXACT
-    # curvature: raw euler_error ~ dt^2 (euler_error/dt ~ dt^1), raw
-    # full_error ~ dt^3 (full_error/dt ~ dt^2) -- z1 being hard-coded
-    # first-order means its error is entirely the curvature term
-    # f_theta's own trained correction should be cancelling.
-    #
-    # WHAT WE ACTUALLY SEE (confirmed on real 64x64 data): euler-only
-    # exponent ~1.0, not ~2.0. euler_error/dt is then ~dt^0, i.e. a
-    # NON-VANISHING CONSTANT as dt->0 -- exactly z1(t) - z0_dot(t), z1's
-    # own systematic bias against the true derivative. euler_error/dt
-    # is measuring z1's own error directly, not curvature at all.
-    #
-    # A higher exponent alone does NOT mean full is actually better --
-    # it only describes the asymptotic trend toward dt=0, which may lie
-    # well below every dt actually observed. The direct magnitude
-    # comparison below is what actually answers "which one is smaller,
-    # in practice, over the range that matters."
-    a_euler, b_euler, r2_log_euler, sse_power_euler, pred_power_euler = fit_power_law(dts, euler_losses)
-    print(f"\nEuler-only (z0+z1*dt, no f_theta) vs full (f_theta-corrected) prediction, "
-          f"same windows/dt:")
-    print(f"  euler-only:  error ~ dt^{a_euler:.3f}")
-    print(f"  full (f_theta): error ~ dt^{a:.3f}")
-    print(f"  (a higher exponent only describes the asymptotic trend toward dt->0 -- "
-          f"see the direct magnitude comparison below for which is ACTUALLY smaller "
-          f"over the observed dt range)")
+    if euler_only:
+        # latent_losses IS euler_losses here (see the substitution
+        # above) -- a "euler-only vs full" comparison would just be
+        # comparing that array against itself (ratio of means = 1.0,
+        # "0.0% worse" every time), not a real finding. Skipped
+        # entirely rather than printed as if it meant something.
+        #
+        # a_euler set to the ALREADY-computed a from the fit just
+        # above, not recomputed via a separate fit_power_law(dts,
+        # euler_losses) call -- that fit would be numerically IDENTICAL
+        # anyway (same data, latent_losses IS euler_losses here), just
+        # wastefully repeated. Still needed below regardless of this
+        # mode: a_euler feeds the dt-decade table's own header. (The
+        # power-law FIT CURVE itself, pred_power/pred_power_euler, is
+        # no longer plotted anywhere -- panel [0,3] plots the same
+        # Taylor-residual regression as panel [1,3] instead; only the
+        # exponent a/a_euler is still reported, in text.)
+        a_euler = a
+    else:
+        # Euler-only (hard-coded first-order term alone, no f_theta) vs the
+        # full, f_theta-corrected prediction -- SAME z0_next_true, SAME dt,
+        # SAME window for both, so this is a genuine, point-by-point
+        # decomposition, not just two separately-fit trends.
+        #
+        # THEORY, if z1 were an EXACT derivative and f_theta an EXACT
+        # curvature: raw euler_error ~ dt^2 (euler_error/dt ~ dt^1), raw
+        # full_error ~ dt^3 (full_error/dt ~ dt^2) -- z1 being hard-coded
+        # first-order means its error is entirely the curvature term
+        # f_theta's own trained correction should be cancelling.
+        #
+        # WHAT WE ACTUALLY SEE (confirmed on real 64x64 data): euler-only
+        # exponent ~1.0, not ~2.0. euler_error/dt is then ~dt^0, i.e. a
+        # NON-VANISHING CONSTANT as dt->0 -- exactly z1(t) - z0_dot(t), z1's
+        # own systematic bias against the true derivative. euler_error/dt
+        # is measuring z1's own error directly, not curvature at all.
+        #
+        # A higher exponent alone does NOT mean full is actually better --
+        # it only describes the asymptotic trend toward dt=0, which may lie
+        # well below every dt actually observed. The direct magnitude
+        # comparison below is what actually answers "which one is smaller,
+        # in practice, over the range that matters."
+        a_euler, _b_euler, _r2_log_euler, _sse_power_euler, _pred_power_euler = fit_power_law(dts, euler_losses)
+        print(f"\nEuler-only (z0+z1*dt, no f_theta) vs full (f_theta-corrected) prediction, "
+              f"same windows/dt:")
+        print(f"  euler-only:  error ~ dt^{a_euler:.3f}")
+        print(f"  full (f_theta): error ~ dt^{a:.3f}")
+        print(f"  (a higher exponent only describes the asymptotic trend toward dt->0 -- "
+              f"see the direct magnitude comparison below for which is ACTUALLY smaller "
+              f"over the observed dt range)")
 
-    ratio = np.array(latent_losses) / np.maximum(np.array(euler_losses), 1e-12)
-    frac_full_worse = float((ratio > 1).mean())
-    print(f"\nDirect magnitude comparison (full / euler-only), per window:")
-    print(f"  mean(full)={np.mean(latent_losses):.6f}  mean(euler-only)={np.mean(euler_losses):.6f}  "
-          f"ratio of means={np.mean(latent_losses) / np.mean(euler_losses):.4f}")
-    print(f"  mean(full/euler-only ratio)={ratio.mean():.4f}  median={np.median(ratio):.4f}")
-    print(f"  full prediction is WORSE than euler-only on {frac_full_worse:.1%} of windows")
-    if frac_full_worse > 0.5:
-        print(f"  -> f_theta's own trained correction is making the prediction WORSE on "
-              f"most windows, despite a higher fit exponent -- it is NOT currently adding "
-              f"value in practice, whatever its asymptotic behavior would eventually be.")
+        ratio = np.array(latent_losses) / np.maximum(np.array(euler_losses), 1e-12)
+        frac_full_worse = float((ratio > 1).mean())
+        print(f"\nDirect magnitude comparison (full / euler-only), per window:")
+        print(f"  mean(full)={np.mean(latent_losses):.6f}  mean(euler-only)={np.mean(euler_losses):.6f}  "
+              f"ratio of means={np.mean(latent_losses) / np.mean(euler_losses):.4f}")
+        print(f"  mean(full/euler-only ratio)={ratio.mean():.4f}  median={np.median(ratio):.4f}")
+        print(f"  full prediction is WORSE than euler-only on {frac_full_worse:.1%} of windows")
+        if frac_full_worse > 0.5:
+            print(f"  -> f_theta's own trained correction is making the prediction WORSE on "
+                  f"most windows, despite a higher fit exponent -- it is NOT currently adding "
+                  f"value in practice, whatever its asymptotic behavior would eventually be.")
 
-    print("\ndt decade      n       mean latent_loss   mean pixel_loss")
+    print(f"\ndt decade      n       mean {'euler-only' if euler_only else 'latent'}_loss   mean pixel_loss")
     edges = np.floor(log_dt.min()), np.ceil(log_dt.max())
     for lo in np.arange(edges[0], edges[1] + 1):
         mask = (log_dt >= lo) & (log_dt < lo + 1)
@@ -953,10 +1165,24 @@ def check_parameter_dependence(
               f"{latent_losses[mask].mean():.6f}         {pixel_losses[mask].mean():.6f}")
 
     # ---- temperature and noise: linear-space correlation + binned summary
-    corr_temp_latent = np.corrcoef(temperatures, log_latent)[0, 1]
-    corr_noise_latent = np.corrcoef(noises, log_latent)[0, 1]
-    print(f"\ncorrelation(temperature, log10(latent_loss)) = {corr_temp_latent:.3f}")
-    print(f"correlation(noise, log10(latent_loss))       = {corr_noise_latent:.3f}")
+    # Correlated against |error| and error DIRECTLY (latent_losses/
+    # latent_losses_signed), NOT log10(|error|) -- panels [1,0]/[1,1]
+    # themselves are LINEAR-scale (mean(error)/mean|error| twin axes,
+    # not a log-scale boxplot the way they used to be), so a log-based
+    # correlation number doesn't actually describe what those panels
+    # show. Both signed and absolute reported now, not just absolute --
+    # the panels themselves plot BOTH quantities (mean(error) on the
+    # left, mean|error| on the right), so it's worth knowing whether
+    # temperature/noise correlate with the DIRECTION of the bias too,
+    # not just its magnitude.
+    corr_temp_abs = np.corrcoef(temperatures, latent_losses)[0, 1]
+    corr_temp_signed = np.corrcoef(temperatures, latent_losses_signed)[0, 1]
+    corr_noise_abs = np.corrcoef(noises, latent_losses)[0, 1]
+    corr_noise_signed = np.corrcoef(noises, latent_losses_signed)[0, 1]
+    print(f"\ncorrelation(temperature, |error|) = {corr_temp_abs * 100:.1f}%   "
+          f"correlation(temperature, error) = {corr_temp_signed * 100:.1f}%")
+    print(f"correlation(noise, |error|)       = {corr_noise_abs * 100:.1f}%   "
+          f"correlation(noise, error)       = {corr_noise_signed * 100:.1f}%")
     _print_binned_summary("temperature", temperatures, latent_losses, pixel_losses)
     _print_binned_summary("noise", noises, latent_losses, pixel_losses)
 
@@ -990,7 +1216,7 @@ def check_parameter_dependence(
     log_latent_for_length = log_latent[~saturated]
 
     corr_length_latent = np.corrcoef(length_scales_valid, log_latent_for_length)[0, 1]
-    print(f"correlation(length_scale, log10(latent_loss)) = {corr_length_latent:.3f} "
+    print(f"correlation(length_scale, log10(latent_loss)) = {corr_length_latent*100:.1f}% "
           f"(n={len(length_scales_valid)}, excluding saturated)")
     print("(if this is the dominant driver, error should track length_scale more "
           "cleanly than it tracks dt/temperature/noise individually above)")
@@ -1022,48 +1248,105 @@ def check_parameter_dependence(
     better_len = "saturating exponential" if sse_sat_len < sse_exp_len else "exponential"
     print(f"  -> {better_len} fits better (lower SSE).")
 
-    # ---- per-run aggregation for the 2D (temperature, noise) view --
-    # the most directly actionable panel: raw per-WINDOW points at the
-    # same (temperature, noise) would just overplot (many windows share
-    # one run's fixed temperature/noise), so this averages per run first,
-    # giving one point per run, colored by that run's mean one-step error.
+    # ---- per-(temperature, noise) aggregation for the 2D view -- the
+    # most directly actionable panel: raw per-WINDOW points at the same
+    # (temperature, noise) would just overplot (many windows share one
+    # sweep point's fixed temperature/noise), so this pools first,
+    # giving one point per sweep point, colored by its mean one-step
+    # error.
+    #
+    # Keyed by (temperature, noise), NOT run_dir: this project's own
+    # sweep runs several SEEDS at each (temperature, noise) grid point
+    # (see the "T..._n..._s..." run-directory naming used throughout --
+    # the trailing s### is the seed). Keying by run_dir would give each
+    # seed its own separate bubble at the SAME (x, y) location --
+    # several overlapping, indistinguishable bubbles per sweep point,
+    # not one. Pooling by (temperature, noise) instead means the
+    # reported mean/window-count reflect ALL windows from ALL seeds at
+    # that sweep point, which is what "one bubble per sweep point"
+    # should mean. Rounded before use as a dict key for the same reason
+    # _boxplot_by_x/_mean_curves_by_unique_value round first: float
+    # round-trip through a text metadata file can turn one intended
+    # sweep value into several bit-distinct floats.
+    per_point: dict[tuple[float, float], dict] = {}
+    for t, n, ll in zip(temperatures, noises, latent_losses):
+        key = (round(float(t), 6), round(float(n), 6))
+        entry = per_point.setdefault(key, {"temperature": key[0], "noise": key[1], "losses": []})
+        entry["losses"].append(ll)
+    run_temps = np.array([v["temperature"] for v in per_point.values()])
+    run_noises = np.array([v["noise"] for v in per_point.values()])
+    run_mean_loss = np.array([np.mean(v["losses"]) for v in per_point.values()])
+    run_n_windows = np.array([len(v["losses"]) for v in per_point.values()])
+
+    # ---- per-RUN aggregation (kept separate from per_point above) --
+    # for the "which specific run/seed performs worst" report just
+    # below, which needs each seed identified individually, unlike
+    # panel [0,2]'s own pooled-across-seeds view.
     per_run: dict[Path, dict] = {}
     for run_dir, t, n, ll in zip(run_dirs, temperatures, noises, latent_losses):
         entry = per_run.setdefault(run_dir, {"temperature": t, "noise": n, "losses": []})
         entry["losses"].append(ll)
-    run_temps = np.array([v["temperature"] for v in per_run.values()])
-    run_noises = np.array([v["noise"] for v in per_run.values()])
-    run_mean_loss = np.array([np.mean(v["losses"]) for v in per_run.values()])
-    run_n_windows = np.array([len(v["losses"]) for v in per_run.values()])
+    per_run_mean_loss = np.array([np.mean(v["losses"]) for v in per_run.values()])
+    per_run_temps = np.array([v["temperature"] for v in per_run.values()])
+    per_run_noises = np.array([v["noise"] for v in per_run.values()])
+    per_run_n_windows = np.array([len(v["losses"]) for v in per_run.values()])
 
     print(f"\n{len(per_run)} distinct runs contributing windows. "
           f"Runs with the highest mean one-step error:")
-    order = np.argsort(run_mean_loss)[::-1]
+    order = np.argsort(per_run_mean_loss)[::-1]
     run_dir_list = list(per_run.keys())
     for i in order[:10]:
-        print(f"  {run_dir_list[i].name}: T={run_temps[i]:.3f}  noise={run_noises[i]:.4f}  "
-              f"mean_loss={run_mean_loss[i]:.6f}  ({run_n_windows[i]} windows)")
+        print(f"  {run_dir_list[i].name}: T={per_run_temps[i]:.3f}  noise={per_run_noises[i]:.4f}  "
+              f"mean_loss={per_run_mean_loss[i]:.6f}  ({per_run_n_windows[i]} windows)")
 
     fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+    # Computed HERE (early, right after figure creation) rather than
+    # right before the T<0.9/T>=0.9 console-only diagnostic calls below
+    # (where it originally lived) -- panel [1,3] plots this SAME
+    # regression (the one this function's own docstring recommends),
+    # and its own position later in this function needs it already
+    # available. [0,3] no longer needs it (it now shows the same
+    # binned-empirical-mean style as [1,0]/[1,1] instead of a
+    # regression curve), but leaving this computed early is still
+    # correct -- just no longer serves two panels, only one. See this
+    # call's own original location (still nearby, just below) for why
+    # the T<0.9/T>=0.9 splits themselves stay console-only and don't
+    # get their own variable here: neither is plotted, only this
+    # ALL-DATA fit is.
+    taylor_fit = fit_taylor_residual_coefficients(dts, euler_losses_signed, latent_losses_signed,
+                                                    label="ALL DATA", euler_only=euler_only)
+    if euler_only:
+        # ONE figure-level banner, not per-panel edits everywhere: every
+        # panel not explicitly labeled otherwise (temperature/noise
+        # boxplots, length-scale, the per-run scatter) is ALSO showing
+        # euler-only data here (via the latent_losses/pixel_losses
+        # substitution above), even though their own individual titles
+        # don't each say so -- this makes that fact impossible to miss
+        # regardless of which panel someone looks at first.
+        fig.suptitle("EULER-ONLY MODE -- every panel below reports on the euler-only "
+                      "(z0+z1*dt, no f_theta) prediction; f_theta is either untrained "
+                      "(AE-family checkpoint) or excluded by request",
+                      fontsize=11, color="tab:red")
 
+    _euler_tag = " [euler-only]" if euler_only else ""
     for ax, losses, name, corr in [
-        (axes[0, 0], latent_losses, "latent-space (L1)", corr_dt_latent),
-        (axes[0, 1], pixel_losses, "pixel-space (L1, decoded)", corr_dt_pixel),
+        (axes[0, 0], latent_losses, f"latent-space (L1){_euler_tag}", corr_dt_latent),
+        (axes[0, 1], pixel_losses, f"pixel-space (L1, decoded){_euler_tag}", corr_dt_pixel),
     ]:
         _boxplot_by_x(ax, dts, losses, log_x=True)
         ax.set_yscale("log")
         ax.set_xlabel("dt")
-        ax.set_ylabel(f"{name} one-step error")
+        ax.set_ylabel(f"{name} one-step |error|")
         if ax is axes[0, 0]:
             # Exponent shown here (not pixel-space) since this is the
             # ONE panel with the power-law fit actually drawn below --
             # directly answers "is this first-order (~dt^1) or
             # second-order (~dt^2) Taylor remainder behavior" without
             # cross-referencing the printed console output.
-            ax.set_title(f"{name}\ncorr(log dt, log error) = {corr:.3f}, "
+            ax.set_title(f"{name}\ncorr(log dt, log |error|) = {corr * 100:.1f}%, "
                          f"power-law exponent = {a:.3f}")
         else:
-            ax.set_title(f"{name}\ncorr(log dt, log error) = {corr:.3f}")
+            ax.set_title(f"{name}\ncorr(log dt, log |error|) = {corr * 100:.1f}%")
 
     order_dt = np.argsort(dts)
     axes[0, 0].plot(dts[order_dt], pred_power[order_dt], "--", color="tab:red",
@@ -1072,25 +1355,146 @@ def check_parameter_dependence(
                      label=f"saturating exp, tau={tau:.0f} (SSE={sse_sat:.4f})")
     axes[0, 0].legend(fontsize=8)
 
-    # Euler-only (hard-coded first-order term alone) vs full
-    # (f_theta-corrected) prediction, SAME windows/dt for both -- see
-    # this quantity's own computation above for the full rationale.
-    # Scatter, not boxplot: the two series need to stay visually
-    # distinguishable at each dt, which a side-by-side boxplot pair
-    # would clutter given dt's own wide, non-uniform sampling.
-    axes[0, 3].scatter(dts, euler_losses / dts, s=8, alpha=0.35, color="tab:orange", label="euler-only / dt")
-    axes[0, 3].scatter(dts, latent_losses / dts, s=8, alpha=0.35, color="tab:blue", label="full (f_theta) / dt")
-    axes[0, 3].plot(dts[order_dt], pred_power_euler[order_dt] / dts[order_dt], "--", color="tab:orange",
-                     label=f"euler-only fit: dt^{a_euler:.3f}, /dt -> dt^{a_euler - 1:.3f}")
-    axes[0, 3].plot(dts[order_dt], pred_power[order_dt] / dts[order_dt], "--", color="tab:blue",
-                     label=f"full fit: dt^{a:.3f}, /dt -> dt^{a - 1:.3f}")
-    axes[0, 3].set_xscale("log")
-    axes[0, 3].set_yscale("log")
-    axes[0, 3].set_xlabel("dt")
-    axes[0, 3].set_ylabel("euler-only/dt, full/dt")
-    axes[0, 3].set_title("Euler-only/dt vs full/dt\n(same normalization for both -- direct, "
-                          "same-footing comparison)")
-    axes[0, 3].legend(fontsize=7)
+    # SAME binned-mean-curve style as [1,0]/[1,1] (see that loop's own
+    # comments for the full rationale on twin axes / symmetric-left /
+    # window-count sizing), applied here to dt and to error/dt instead
+    # of error directly -- and to [1,3] as well (see that panel's own
+    # code, further below): both now share this exact style, [0,3]
+    # showing whatever the current mode's quantity is (full when not
+    # euler_only, matching latent_losses' own substitution), [1,3]
+    # ALWAYS showing the euler-only quantity specifically, regardless of
+    # mode, for a direct side-by-side comparison between the two.
+    #
+    # dt is grouped by UNIQUE value (_mean_curves_by_unique_value), NOT
+    # binned (_mean_curves_by_bin) -- dt is INTRINSICALLY discrete here,
+    # not a continuous quantity artificially made to look discrete:
+    # every dt is (later_step - earlier_step) * metadata.dt, a product
+    # of an INTEGER step difference and this sweep's own fixed per-step
+    # dt, so the full SET of dt values actually occurring is itself
+    # finite and exact -- matching how [0,0]/[0,1] already treat it
+    # (_boxplot_by_x's own per-unique-value grouping), not the
+    # continuous-range binning length_scale used (back when it was
+    # still plotted) or that dt itself used here before this fix.
+    dt_x, dt_signed, dt_abs, dt_n = _mean_curves_by_unique_value(
+        dts, latent_losses_signed / dts, latent_losses / dts)
+
+    # [1,3] built HERE too (not at its former, separate location later
+    # in this function) -- both panels need exactly the same already-
+    # available data (dts, taylor_fit, euler_losses/_signed), and
+    # building them together is what makes the shared-axis alignment
+    # below straightforward, rather than needing a second pass back
+    # over [0,3] after [1,3] is built elsewhere.
+    #
+    # [1,3] ALWAYS uses euler_losses/euler_losses_signed specifically
+    # (NOT the latent_losses/_signed substitution [0,3] and every other
+    # panel use) -- regardless of the overall euler_only mode, so it's
+    # always a meaningful "euler-only" reference to compare [0,3]
+    # against. Under euler_only=True, [0,3] and [1,3] end up showing
+    # the same thing (latent_losses IS euler_losses in that mode) --
+    # an expected, harmless redundancy in that specific mode, not a
+    # bug, since [1,3]'s own point is to stay meaningful specifically
+    # when [0,3] is NOT already euler-only.
+    dt_x_13, dt_signed_13, dt_abs_13, dt_n_13 = _mean_curves_by_unique_value(
+        dts, euler_losses_signed / dts, euler_losses / dts)
+
+    # Regression curve overlay: eps/eps'/A are SHARED (the joint fit's
+    # own point, or the only fit there is under euler_only=True); C is
+    # ALWAYS the euler-only-specific coefficient (present in both fit
+    # modes), D only exists under euler_only=False (the joint fit) --
+    # [0,3] uses whichever of C/D actually matches its own CURRENT
+    # quantity, [1,3] always uses C, matching its own always-euler-only
+    # quantity. Curve evaluated over a SMOOTH, continuous dt range (not
+    # just at the discrete dt_x/dt_x_13 values above) for visual
+    # smoothness, overlaid on the discrete empirical points -- the
+    # regression itself was fit against ALL windows regardless of what
+    # gets drawn here (see fit_taylor_residual_coefficients' own
+    # docstring), this is purely a display choice.
+    eps, eps_prime, A = taylor_fit["eps"], taylor_fit["eps_prime"], taylor_fit["A"]
+    C = taylor_fit["C"]
+    D_or_C = C if euler_only else taylor_fit["D"]
+    dt_curve = np.geomspace(dts.min(), dts.max(), 400)
+
+    panel03_13_specs = [
+        (axes[0, 3], dt_x, dt_signed, dt_abs, dt_n, "dt", D_or_C),
+        (axes[1, 3], dt_x_13, dt_signed_13, dt_abs_13, dt_n_13, "dt (euler-only)", C),
+    ]
+    # PASS 1: empirical data only (scatter + connecting line) -- the
+    # y-range gets locked from THIS alone, before the regression curve
+    # (pass 2, below) is ever drawn. The curve is a smooth THEORETICAL
+    # overlay evaluated across the full dt range, including near
+    # dts.min() where the model's own 1/dt term genuinely diverges (see
+    # fit_taylor_residual_coefficients' own docstring) -- letting
+    # autoscale see the curve before the range is fixed means that
+    # divergence alone decides the axis, crushing the actual data (the
+    # dots this panel is actually ABOUT) into a thin band for reasons
+    # having nothing to do with where the data itself sits.
+    twin_axes_0313 = []
+    for ax, x, mean_signed, mean_abs, n_windows, title, curve_coef in panel03_13_specs:
+        twin = ax.twinx()
+        twin_axes_0313.append(twin)
+        sizes = _size_by_count(n_windows)
+        ax.axhline(0, color="gray", linewidth=0.7, linestyle=":")
+        ax.plot(x, mean_signed, "-", color="tab:blue", linewidth=1, zorder=1)
+        ax.scatter(x, mean_signed, s=sizes, color="tab:blue", zorder=2,
+                   edgecolors="black", linewidths=0.3, label="mean(error)/dt")
+        twin.plot(x, mean_abs, "-", color="tab:orange", linewidth=1, zorder=1)
+        twin.scatter(x, mean_abs, s=sizes, color="tab:orange", zorder=2,
+                     edgecolors="black", linewidths=0.3, label="mean|error|/dt")
+
+    # y-ranges aligned ACROSS [0,3] and [1,3] specifically (a separate
+    # group from [1,0]/[1,1]'s own alignment above/below -- different
+    # quantity, error/dt vs error directly) -- same symmetric-left/
+    # zero-right treatment, same rationale. Computed and APPLIED here,
+    # from the empirical data alone (pass 1 above) -- set_ylim() turns
+    # off this axis's own autoscaling until autoscale() is explicitly
+    # called again, so pass 2's regression curve, plotted after this,
+    # gets visually clipped wherever it exceeds this range rather than
+    # silently re-expanding it (verified directly, not assumed).
+    left_ylim0313, right_ylim0313 = _symmetric_left_zero_right_ylim(
+        [axes[0, 3], axes[1, 3]], twin_axes_0313)
+    for ax, twin in zip([axes[0, 3], axes[1, 3]], twin_axes_0313):
+        ax.set_ylim(left_ylim0313)
+        twin.set_ylim(right_ylim0313)
+
+    # PASS 2: regression curve overlay, NOW that the axis range is
+    # already locked to the data. eps/eps'/A are SHARED (the joint
+    # fit's own point, or the only fit there is under euler_only=True);
+    # C is ALWAYS the euler-only-specific coefficient (present in both
+    # fit modes), D only exists under euler_only=False (the joint fit)
+    # -- [0,3] uses whichever of C/D actually matches its own CURRENT
+    # quantity, [1,3] always uses C, matching its own always-euler-only
+    # quantity. Curve evaluated over a SMOOTH, continuous dt range (not
+    # just at the discrete dt_x/dt_x_13 values from pass 1) for visual
+    # smoothness -- the regression itself was fit against ALL windows
+    # regardless of what gets drawn here (see
+    # fit_taylor_residual_coefficients' own docstring), this is purely
+    # a display choice.
+    for ax, twin, (_, _, _, _, _, _, curve_coef) in zip(
+            [axes[0, 3], axes[1, 3]], twin_axes_0313, panel03_13_specs):
+        # LEFT (signed) only -- no equivalent curve on the RIGHT
+        # (mean|error|/dt) axis. abs() of this same curve was tried and
+        # removed: it tracks E[signed residual] (the bias), not
+        # E[|residual|] (what the orange points themselves show), and
+        # on real data it doesn't just undershoot -- it can sit flat,
+        # visibly describing nothing about the actual mean|error|/dt
+        # trend. Better to show no curve there than a wrong one.
+        raw_curve = eps + eps_prime * dt_curve + curve_coef * dt_curve ** 2 - A * dt_curve ** 3
+        signed_curve = raw_curve / dt_curve
+        ax.plot(dt_curve, signed_curve, "--", color="tab:blue", linewidth=1,
+                label=f"fit: eps={eps:.3e}, eps'={eps_prime:.3e}")
+
+    for ax, twin, (_, _, _, _, _, title, _) in zip(
+            [axes[0, 3], axes[1, 3]], twin_axes_0313, panel03_13_specs):
+        ax.set_xscale("log")
+        ax.set_xlabel("dt")
+        ax.set_ylabel("mean(error)/dt", color="tab:blue")
+        twin.set_ylabel("mean|error|/dt", color="tab:orange")
+        ax.tick_params(axis="y", labelcolor="tab:blue")
+        twin.tick_params(axis="y", labelcolor="tab:orange")
+        ax.set_title(f"{title}\n(point size ~ windows contributed)")
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = twin.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=6, loc="best")
 
     # The key actionable panel: which (temperature, noise) region has
     # the highest error, aggregated per run so points don't overplot.
@@ -1106,71 +1510,119 @@ def check_parameter_dependence(
     # problem by DISTORTING the coordinates instead of revealing it, and
     # the exact (temperature, noise) value is the actual thing this
     # panel exists to let someone read off precisely.
-    sc = axes[0, 2].scatter(run_temps, run_noises, c=run_mean_loss, s=30 + 10 * run_n_windows,
-                             cmap="viridis", edgecolors="black", linewidths=0.3, alpha=0.7)
+    # vmin=0 (not matplotlib's own auto-picked min, which lands slightly
+    # above 0 since mean_latent_loss is a genuinely positive quantity
+    # with no run actually AT zero error) -- 0 is the real, physically
+    # meaningful floor for a loss, so the colorbar should start there,
+    # not at whatever the smallest observed run happens to be. Same
+    # reasoning for the y-axis (noise) below: 0 is noise's own real
+    # floor, not "the smallest noise value in this sweep".
+    # s is marker AREA in matplotlib (points^2), and diameter ~ sqrt(s)
+    # -- reducing diameter by a quarter (new = 0.75 * old) means scaling
+    # area by 0.75^2 = 0.5625, not by 0.75 itself.
+    sc = axes[0, 2].scatter(run_temps, run_noises, c=run_mean_loss,
+                             s=0.5625 * (30 + 10 * run_n_windows),
+                             cmap="viridis", edgecolors="black", linewidths=0.3, alpha=0.7, vmin=0)
     axes[0, 2].set_xlabel("temperature")
     axes[0, 2].set_ylabel("noise")
-    axes[0, 2].set_title("mean one-step latent error per run\n(point size ~ windows contributed)")
-    fig.colorbar(sc, ax=axes[0, 2], label="mean latent_loss")
+    axes[0, 2].set_ylim(bottom=0)
+    axes[0, 2].set_title("mean one-step latent |error| per run\n(point size ~ windows contributed)")
+    fig.colorbar(sc, ax=axes[0, 2], label="mean |latent_loss|")
 
-    for ax, values, name, corr in [
-        (axes[1, 0], temperatures, "temperature", corr_temp_latent),
-        (axes[1, 1], noises, "noise", corr_noise_latent),
-    ]:
-        _boxplot_by_x(ax, values, latent_losses, log_x=False)
-        ax.set_yscale("log")
-        ax.set_xlabel(name)
-        ax.set_ylabel("latent-space one-step error")
-        ax.set_title(f"{name}\ncorr({name}, log error) = {corr:.3f}")
-
-    # Scatter, NOT a boxplot: temperature/noise are discrete because
-    # they're SWEEP INPUTS (a handful of fixed values chosen for the
-    # simulation grid); length_scale is continuous because it's
-    # CALCULATED per window from the actual microstructure, with a
-    # different value nearly every time. Binning it first (as an
-    # earlier version of this plot did) manufactures artificial
-    # discreteness that isn't really there in the underlying data.
+    # Two curves per panel -- mean(error) (signed -- can be negative,
+    # shows whether the bias itself has a consistent direction) and
+    # mean|error| (the magnitude, same quantity _boxplot_by_x used to
+    # show as a full distribution before this) -- on SEPARATE y-axes
+    # (ax.twinx()), not sharing one: mean|error| is never negative and,
+    # by the Jensen's-inequality relationship established earlier this
+    # session, is generally LARGER in magnitude than mean(error) --
+    # sharing one axis would visually flatten whichever curve has the
+    # smaller range. Marker size at each point scales with how many
+    # windows went into it (via _size_by_count, normalized per panel --
+    # see its own docstring for why NOT [0,2]'s literal formula), same
+    # idea as [0,2]'s own window-count sizing.
     #
-    # Uses length_scales_valid/latent_losses_for_length (saturated
-    # points already excluded above) -- NOT the full arrays -- so the
-    # plot matches the correlation and fit exactly, rather than showing
-    # points the regression itself was never fit against.
-    axes[1, 2].scatter(length_scales_valid, latent_losses_for_length, s=8, alpha=0.35,
-                        color="tab:blue", edgecolors="none")
-    axes[1, 2].set_yscale("log")
-    axes[1, 2].set_xlabel("length scale (autocorr_length)")
-    axes[1, 2].set_ylabel("latent-space one-step error")
-    axes[1, 2].set_title("length scale\n"
-                          f"corr(length_scale, log error) = {corr_length_latent:.3f}")
-    order_len = np.argsort(length_scales_valid)
-    axes[1, 2].plot(length_scales_valid[order_len], pred_exp_len[order_len], "--", color="tab:red",
-                     label=f"exponential (SSE={sse_exp_len:.4f})")
-    axes[1, 2].plot(length_scales_valid[order_len], pred_sat_len[order_len], "--", color="tab:green",
-                     label=f"saturating exp, tau={tau_len:.1f} (SSE={sse_sat_len:.4f})")
-    axes[1, 2].legend(fontsize=8)
-    # y-axis explicitly matched to the temperature/noise panels (rather
-    # than left to its own autoscale) -- all three show the same
-    # quantity (latent-space one-step error), and excluding the
-    # saturated length_scale points above narrows this panel's own y
-    # range slightly, which would otherwise make the panels subtly
-    # harder to visually compare side by side.
-    axes[1, 2].set_ylim(axes[1, 0].get_ylim())
-    # Reference line at the latent bottleneck's own cell size in pixels
-    # (Nx / latent_spatial_size). Uses THIS checkpoint's own actual
-    # latent_spatial_size (falling back to the shared default,
-    # models.constants.LATENT_SPATIAL_SIZE, for older checkpoints saved
-    # before that field existed) -- no longer an independently
-    # duplicated magic number, see models/constants.py. Purely visual:
-    # makes it possible to see by eye whether error spikes specifically
-    # for length scales at or below one latent cell, rather than
-    # reading that off the correlation coefficient alone (which -- like
-    # temperature's -- may not be trustworthy if the true relationship
-    # isn't linear/monotonic).
-    latent_spatial_size = ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
-    cell_size_px = ae_config["size"] / latent_spatial_size
-    axes[1, 2].axvline(cell_size_px, color="black", linestyle=":", linewidth=1)
-    axes[1, 2].text(cell_size_px, axes[1, 2].get_ylim()[1], " latent cell size",
-                     fontsize=7, ha="left", va="top", rotation=90)
+    # Grouped by unique sweep value (temperature/noise are discrete
+    # sweep inputs, not a continuous range -- see
+    # _mean_curves_by_unique_value's own docstring).
+    temp_x, temp_signed, temp_abs, temp_n = _mean_curves_by_unique_value(
+        temperatures, latent_losses_signed, latent_losses)
+    noise_x, noise_signed, noise_abs, noise_n = _mean_curves_by_unique_value(
+        noises, latent_losses_signed, latent_losses)
+
+    # [1,2] (length_scale) REMOVED entirely -- its own values are
+    # computed from only the non-saturated subset (windows where
+    # autocorr_length actually decayed within the search range), which
+    # this project's own data shows is disproportionately the LOW-error
+    # windows (near-T0/high-noise windows tend to have less-developed
+    # structure, hence "never decayed", hence EXCLUDED here) -- so this
+    # panel's own values are typically ~1000x smaller than
+    # temperature/noise's, not because length_scale's own effect is
+    # negligible, but because it's drawn from a systematically
+    # different, lower-error subpopulation. Including it in the SAME
+    # shared-axis alignment as temperature/noise was actively
+    # misleading (forcing their own, meaningful ranges to accommodate
+    # its near-zero one) rather than just uninformative on its own.
+    # length_scale's own correlation/model-comparison console output
+    # above is UNCHANGED -- only this plotted panel is gone.
+    panel_specs = [
+        (axes[1, 0], temp_x, temp_signed, temp_abs, temp_n, "temperature", "temperature",
+         corr_temp_signed, corr_temp_abs),
+        (axes[1, 1], noise_x, noise_signed, noise_abs, noise_n, "noise", "noise",
+         corr_noise_signed, corr_noise_abs),
+    ]
+    twin_axes = []
+    for ax, x, mean_signed, mean_abs, n_windows, xlabel, corr_name, corr_s, corr_a in panel_specs:
+        twin = ax.twinx()
+        twin_axes.append(twin)
+        sizes = _size_by_count(n_windows)
+        ax.axhline(0, color="gray", linewidth=0.7, linestyle=":")
+        ax.plot(x, mean_signed, "-", color="tab:blue", linewidth=1, zorder=1)
+        ax.scatter(x, mean_signed, s=sizes, color="tab:blue", zorder=2,
+                   edgecolors="black", linewidths=0.3, label="mean(error)")
+        twin.plot(x, mean_abs, "-", color="tab:orange", linewidth=1, zorder=1)
+        twin.scatter(x, mean_abs, s=sizes, color="tab:orange", zorder=2,
+                     edgecolors="black", linewidths=0.3, label="mean|error|")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("mean(error)", color="tab:blue")
+        twin.set_ylabel("mean|error|", color="tab:orange")
+        ax.tick_params(axis="y", labelcolor="tab:blue")
+        twin.tick_params(axis="y", labelcolor="tab:orange")
+        # Correlated against |error| and error DIRECTLY (matching this
+        # panel's own linear y-axes), not log |error| -- see the console
+        # print's own comment above for the full rationale.
+        ax.set_title(f"{xlabel}\ncorr({corr_name}, |error|) = {corr_a * 100:.1f}%, "
+                     f"corr({corr_name}, error) = {corr_s * 100:.1f}%\n"
+                     f"(point size ~ windows contributed)")
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = twin.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=6, loc="best")
+
+    # noise, like length_scale, is a non-negative physical quantity --
+    # starts its x-axis at 0 for the same reason [0,2]/(the former)
+    # [1,2] do. temperature is NOT included here (deliberately) -- it's
+    # not a quantity with a meaningful zero in this context (this
+    # sweep's own temperature range starts well above 0, and 0 has no
+    # special physical significance for it the way it does for a
+    # magnitude like noise).
+    axes[1, 1].set_xlim(left=0)
+
+    # y-ranges: LEFT (mean(error)) symmetric about 0, RIGHT (mean|error|)
+    # floored at 0 -- see _symmetric_left_zero_right_ylim's own
+    # docstring for why. Shared across [1,0]/[1,1] (only the two panels
+    # remaining), computed from what's actually autoscaled after every
+    # artist is in place.
+    left_ylim, right_ylim = _symmetric_left_zero_right_ylim(
+        [axes[1, 0], axes[1, 1]], twin_axes)
+    for i in range(2):
+        axes[1, i].set_ylim(left_ylim)
+        twin_axes[i].set_ylim(right_ylim)
+
+    # [1,2]'s own subplot axes removed entirely (not just left empty) --
+    # nothing is plotted there anymore, and an empty-but-visible box
+    # with its own tick marks/spines would look like an oversight, not
+    # a deliberate omission.
+    fig.delaxes(axes[1, 2])
 
     # LINEAR-scale version of the same two quantities, to directly
     # check the formula's own predicted structure and read off its
@@ -1213,13 +1665,13 @@ def check_parameter_dependence(
     # large stderr on eps/C (both consistent with zero in the all-data
     # fit) is coming disproportionately from the high-temperature
     # (T>=0.9) region specifically, rather than being spread evenly
-    # across the whole dataset. The PLOTTED curve below still uses the
-    # all-data fit (the T<0.9 comparison is a console-only diagnostic,
-    # not a second set of plotted points) -- restricting the plot's own
-    # data to a temperature subset would need its own dedicated panel
-    # to be meaningful, not just swapped into this one.
-    taylor_fit = fit_taylor_residual_coefficients(dts, euler_losses_signed, latent_losses_signed,
-                                                    label="ALL DATA")
+    # across the whole dataset. The PLOTTED curve in panel [0,3]/[1,3]
+    # still uses the all-data fit (computed earlier, right after figure
+    # creation, specifically so panel [0,3] can use it too) -- the
+    # T<0.9 comparison here is a console-only diagnostic, not a second
+    # set of plotted points; restricting the plot's own data to a
+    # temperature subset would need its own dedicated panel to be
+    # meaningful, not just swapped into this one.
     t_mask = temperatures < 0.9
     if t_mask.sum() >= 2 and (~t_mask).sum() >= 2:
         # BOTH T<0.9 and T>=0.9 run, not just the former excluding the
@@ -1230,64 +1682,18 @@ def check_parameter_dependence(
         # -- two very different findings that look identical if you
         # only ever run the T<0.9 side.
         fit_taylor_residual_coefficients(dts[t_mask], euler_losses_signed[t_mask],
-                                          latent_losses_signed[t_mask], label="T < 0.9 SUBSET")
+                                          latent_losses_signed[t_mask], label="T < 0.9 SUBSET",
+                                          euler_only=euler_only)
         fit_taylor_residual_coefficients(dts[~t_mask], euler_losses_signed[~t_mask],
-                                          latent_losses_signed[~t_mask], label="T >= 0.9 SUBSET")
+                                          latent_losses_signed[~t_mask], label="T >= 0.9 SUBSET",
+                                          euler_only=euler_only)
     else:
         print(f"\n  Skipping T-split regressions -- {t_mask.sum()} of {len(temperatures)} "
               f"windows have T<0.9 (not enough on one side of the split to fit against).")
-    euler_over_dt = euler_losses_signed / dts
-    full_over_dt = latent_losses_signed / dts
-
-    axes[1, 3].scatter(dts, euler_over_dt, s=8, alpha=0.35, color="tab:orange", label="euler-only / dt")
-    axes[1, 3].scatter(dts, full_over_dt, s=8, alpha=0.35, color="tab:blue", label="full (f_theta) / dt")
-    # Fit CURVE (not a straight line -- the corrected model has dt^2 and
-    # dt^3 terms too) drawn across the FULL dt range (all data used for
-    # the fit itself) -- only the axis's own displayed window is cut
-    # below, via set_xlim, so the curve doesn't visually stop short even
-    # though the view does. log-spaced sampling matches how dt is
-    # actually distributed (see dt_scale's own geometric-mean choice in
-    # fit_taylor_residual_coefficients).
-    #
-    # The REGRESSION itself was fit against the UNDIVIDED residual (see
-    # that function's own docstring for why -- avoiding the
-    # heteroscedasticity dividing by dt introduces), but what's PLOTTED
-    # here is still R = residual/dt (the quantity with the direct
-    # theoretical interpretation, -> eps as dt->0) -- so the fitted
-    # (eps + eps'*dt + [C or D]*dt^2 - A*dt^3) curve is evaluated first,
-    # THEN divided by dt_curve, not fit directly in R-space.
-    dt_curve = np.geomspace(dts.min(), dts.max(), 400)
-    eps = taylor_fit["eps"]
-    eps_prime = taylor_fit["eps_prime"]
-    C = taylor_fit["C"]
-    D = taylor_fit["D"]
-    A = taylor_fit["A"]
-    euler_raw_curve = eps + eps_prime * dt_curve + C * dt_curve ** 2 - A * dt_curve ** 3
-    full_raw_curve = eps + eps_prime * dt_curve + D * dt_curve ** 2 - A * dt_curve ** 3
-    euler_curve = euler_raw_curve / dt_curve
-    full_curve = full_raw_curve / dt_curve
-    axes[1, 3].plot(dt_curve, euler_curve, "--", color="tab:orange",
-                     label=f"euler-only joint fit: eps={eps:.3e}, eps'={eps_prime:.3e}")
-    axes[1, 3].plot(dt_curve, full_curve, "--", color="tab:blue",
-                     label=f"full joint fit: eps={eps:.3e} (shared), eps'={eps_prime:.3e} (shared)")
-    # Cut the DISPLAYED x-axis to the 90th percentile of dt -- dt spans
-    # several orders of magnitude but is sampled densely at the low end,
-    # so an axis scaled to the true max leaves most of its own width
-    # showing only a handful of the largest-dt points. The regression
-    # above is entirely unaffected -- it already used every point,
-    # before this view was ever applied.
-    dt_90 = np.percentile(dts, 90)
-    if dt_90 > dts.min():
-        axes[1, 3].set_xlim(dts.min(), dt_90)
-    axes[1, 3].set_xlabel("dt (linear, x-axis cut at 90th percentile -- fit itself uses ALL data)")
-    axes[1, 3].set_ylabel("euler-only/dt, full/dt (linear, signed)")
-    axes[1, 3].set_title("Linear-scale version of the panel above\n(joint fit, eps/eps'/A shared -- "
-                          "see console for the full decomposition)")
-    axes[1, 3].legend(fontsize=6)
 
 
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 1, 0.96) if euler_only else (0, 0, 1, 1))
     fig.savefig(output_path, dpi=120)
     plt.close(fig)
     print(f"\nSaved figure to {output_path}")
@@ -1298,7 +1704,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lds-checkpoint", type=Path, required=True,
             help="no default -- multiple LDS variants can now coexist under "
-                 "../checkpoints/stage3/")
+                 "../checkpoints/stage3/. ALSO accepts a stage-1/1b/2 checkpoint -- see "
+                 "check_parameter_dependence()'s own docstring for what that does and, "
+                 "importantly, which parts of the report become uninformative in that mode")
     parser.add_argument("--min-step", type=int, default=None,
                          help="default: whatever the checkpoint's own saved data_config used")
     parser.add_argument("--min-stdev-phi", type=float, default=None,
@@ -1306,6 +1714,27 @@ def main():
     parser.add_argument("--min-passing-steps", type=int, default=None,
                          help="default: whatever the checkpoint's own saved data_config used "
                               "(None for checkpoints trained before this parameter existed)")
+    parser.add_argument("--base-path", type=Path, default=None,
+                         help="REQUIRED only if --lds-checkpoint is a stage-1/1b/2 checkpoint "
+                              "(needed to build the ephemeral stage-3 wrapper). The SWEEP ROOT "
+                              "(e.g. '../datasets'), NOT including the size-specific subdirectory "
+                              "-- train_lds() appends '{size}x{size}' itself; including it here "
+                              "too doubles it")
+    parser.add_argument("--size", type=int, default=None,
+                         help="only used if --lds-checkpoint is a stage-1/1b/2 checkpoint -- "
+                              "auto-derived from that checkpoint's own saved config if omitted, "
+                              "so only needed to override or if that checkpoint predates this field")
+    parser.add_argument("--ae-stats-weight", type=float, default=None)
+    parser.add_argument("--hidden-dim", type=int, default=256,
+                         help="only affects the ephemeral f_theta built for an AE-family "
+                              "checkpoint -- arbitrary, since that network is never trained here")
+    parser.add_argument("--n-hidden-layers", type=int, default=2, help="see --hidden-dim")
+    parser.add_argument("--condition-on-theta", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--euler-only", action=argparse.BooleanOptionalAction, default=None,
+                         help="default: auto-detect (True if --lds-checkpoint got converted from "
+                              "an AE-family checkpoint, False for a real stage-3 one). Force "
+                              "either way to override -- e.g. --euler-only on a real stage-3 "
+                              "checkpoint too, for a same-scale comparison against an AE-family run")
     parser.add_argument("--output", type=Path, default=None,
             help="default: <repo root>/output/stage3/<lds checkpoint name>-parameter_dependence.png")
     parser.add_argument("--device", type=str,
@@ -1315,6 +1744,9 @@ def main():
     check_parameter_dependence(
         lds_checkpoint_path=args.lds_checkpoint, min_step=args.min_step,
         min_stdev_phi=args.min_stdev_phi, min_passing_steps=args.min_passing_steps,
+        base_path=args.base_path, size=args.size, ae_stats_weight=args.ae_stats_weight,
+        hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
+        condition_on_theta=args.condition_on_theta, euler_only=args.euler_only,
         output_path=args.output, device=args.device,
     )
 

@@ -316,15 +316,46 @@ def _print_binned_by_dt2(name: str, dt2: np.ndarray, values: np.ndarray) -> None
 def check_f_theta(
     lds_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
     min_passing_steps: int | None = None,
+    base_path: Path | None = None, size: int | None = None,
+    ae_stats_weight: float | None = None, hidden_dim: int = 256, n_hidden_layers: int = 2,
+    condition_on_theta: bool | None = None,
     output_path: Path | None = None, device: str | None = None,
 ) -> Path:
-    """Prints the f_theta diagnostic summary and saves a comparison figure; returns the figure's path."""
+    """Prints the f_theta diagnostic summary and saves a comparison figure; returns the figure's path.
+
+    lds_checkpoint_path may ALSO be a stage-1/1b/2 (AE-family)
+    checkpoint -- see checkpoint_identification.ensure_lds_checkpoint's
+    own docstring for the conversion mechanism (an ephemeral, UNTRAINED
+    f_theta gets trained against it for epochs=0). Read that before
+    using this here specifically: UNLIKE check_parameter_dependence.py
+    (which still has a genuinely useful euler-only-only sub-report),
+    almost EVERYTHING this script reports -- stuck-activation counts,
+    ||f||, f2_chained/f2_real, ratio_real/cos_sim_real, every
+    correlation involving ||f_real||/||f_chained|| -- is directly ABOUT
+    f_theta's own learned behavior, which doesn't exist yet in this
+    mode (fresh random init, its own final layer zero-initialized).
+    Expect near-zero, noise-dominated, or degenerate (e.g. 0/0) numbers
+    throughout, not a meaningful report on the AE checkpoint itself --
+    check_parameter_dependence.py is the better tool if what you
+    actually want is to evaluate an AE-family checkpoint on its own.
+    base_path/size are REQUIRED (and otherwise unused) specifically for
+    this AE-family-conversion path; a real stage-3 checkpoint needs
+    neither.
+    """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     if output_path is None:
         output_path = (_PYTHON_ROOT.parent / "output" / "stage3"
                         / f"{lds_checkpoint_path.stem}-f_theta_diagnostic.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    from orchestration.checkpoint_identification import ensure_lds_checkpoint
+    lds_checkpoint_path = ensure_lds_checkpoint(
+        lds_checkpoint_path, base_path=base_path, size=size, device=device,
+        min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+        ae_stats_weight=ae_stats_weight, hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
+        condition_on_theta=condition_on_theta,
+    )
 
     lds_checkpoint = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
     lds_config = lds_checkpoint["config"]
@@ -532,7 +563,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lds-checkpoint", type=Path, required=True,
             help="a stage3a or stage3b checkpoint -- window_length=3 is used for the "
-                 "diagnostic regardless of what this checkpoint was itself trained at")
+                 "diagnostic regardless of what this checkpoint was itself trained at. ALSO "
+                 "accepts a stage-1/1b/2 checkpoint -- see check_f_theta()'s own docstring "
+                 "for what that does and why almost everything reported becomes uninformative "
+                 "in that mode specifically (unlike check_parameter_dependence.py)")
     parser.add_argument("--min-step", type=int, default=None,
                          help="default: whatever the checkpoint's own saved data_config used")
     parser.add_argument("--min-stdev-phi", type=float, default=None,
@@ -540,6 +574,22 @@ def main():
     parser.add_argument("--min-passing-steps", type=int, default=None,
                          help="default: whatever the checkpoint's own saved data_config used "
                               "(None for checkpoints trained before this parameter existed)")
+    parser.add_argument("--base-path", type=Path, default=None,
+                         help="REQUIRED only if --lds-checkpoint is a stage-1/1b/2 checkpoint "
+                              "(needed to build the ephemeral stage-3 wrapper). The SWEEP ROOT "
+                              "(e.g. '../datasets'), NOT including the size-specific subdirectory "
+                              "-- train_lds() appends '{size}x{size}' itself; including it here "
+                              "too doubles it")
+    parser.add_argument("--size", type=int, default=None,
+                         help="only used if --lds-checkpoint is a stage-1/1b/2 checkpoint -- "
+                              "auto-derived from that checkpoint's own saved config if omitted, "
+                              "so only needed to override or if that checkpoint predates this field")
+    parser.add_argument("--ae-stats-weight", type=float, default=None)
+    parser.add_argument("--hidden-dim", type=int, default=256,
+                         help="only affects the ephemeral f_theta built for an AE-family "
+                              "checkpoint -- arbitrary, since that network is never trained here")
+    parser.add_argument("--n-hidden-layers", type=int, default=2, help="see --hidden-dim")
+    parser.add_argument("--condition-on-theta", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--output", type=Path, default=None,
             help="default: <repo root>/output/stage3/<lds checkpoint name>-f_theta_diagnostic.png")
     parser.add_argument("--device", type=str,
@@ -549,6 +599,9 @@ def main():
     check_f_theta(
         lds_checkpoint_path=args.lds_checkpoint, min_step=args.min_step,
         min_stdev_phi=args.min_stdev_phi, min_passing_steps=args.min_passing_steps,
+        base_path=args.base_path, size=args.size, ae_stats_weight=args.ae_stats_weight,
+        hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
+        condition_on_theta=args.condition_on_theta,
         output_path=args.output, device=args.device,
     )
 

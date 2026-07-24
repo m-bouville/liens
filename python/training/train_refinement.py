@@ -319,7 +319,7 @@ def train_refinement(
                     **{k: v for k, v in components["encoder"].config.items() if k != "decoder_for_stream"},
                     "stream_configs": {
                         name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                               "mode": cfg.mode.value}
+                               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
                         for name, cfg in stream_configs.items()
                     },
                     "recon_stream_name": recon_stream_name,
