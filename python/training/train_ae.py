@@ -1717,7 +1717,7 @@ def train_stage2(
     params = [p for p in ae.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(params, lr=lr)
 
-    def step(batch, train: bool, effective_deriv_weight: float):
+    def step(batch, train: bool, deriv_weight_used: float):
         window, dt_window, theta, true_stats = batch
         window = window.to(device, non_blocking=True)
         dt_window = dt_window.to(device, non_blocking=True)
@@ -1835,7 +1835,7 @@ def train_stage2(
         total = (recon / recon0_scale + recon1_weight * recon1 / recon1_scale
                  + stats0_weight * stats_loss_val / stats0_scale
                  + stats1_weight * stats1_loss_val / stats1_scale
-                 + effective_deriv_weight * deriv_loss / deriv_scale)
+                 + deriv_weight_used * deriv_loss / deriv_scale)
 
         if train:
             optimizer.zero_grad()
@@ -1863,7 +1863,7 @@ def train_stage2(
     print(f"Stage 2: starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size}), "
           f"deriv_weight={deriv_weight}"
-          f"{f' (ramped over {deriv_weight_warmup_epochs} epochs)' if deriv_weight_warmup_epochs > 0 else ''}"
+          f"{f' (ramped over {deriv_weight_warmup_epochs} epochs for training)' if deriv_weight_warmup_epochs > 0 else ''}"
           f", recon1_weight={recon1_weight}, stats0_weight={stats0_weight}"
           f"{' (anchor active)' if stats0_weight > 0 else ' (diagnostic only, not optimized)'}"
           f", stats1_weight={stats1_weight}"
@@ -1884,6 +1884,22 @@ def train_stage2(
             deriv_weight if deriv_weight_warmup_epochs <= 0
             else deriv_weight * min(1.0, epoch / deriv_weight_warmup_epochs)
         )
+        # val_deriv_weight is NEVER ramped, unlike effective_deriv_weight
+        # above -- the ramp's own purpose (see deriv_weight_warmup_epochs'
+        # docstring) is protecting the TRAINING gradient from a transient
+        # shock through the shared trunk; val_loss is never backpropagated,
+        # so it never needed that protection, and using the ramped weight
+        # for it too was just an artifact of sharing one variable across
+        # both calls below, not a deliberate design choice. Keeping val's
+        # own weight constant from epoch 1 means best_val_loss comparisons
+        # stay meaningful across the whole run -- no discontinuity when the
+        # ramp completes, and no need for the kind of best_val_loss reset
+        # CheckpointCriterionTracker already does for ITS OWN, different
+        # warmup (raw-vs-EMA) -- that reset fixes a real problem there but
+        # introduces a visible non-monotonic jump in best_so_far_history,
+        # which this avoids by never letting the comparison target drift
+        # in the first place.
+        val_deriv_weight = deriv_weight
 
         ae.train()
         # stats_head stays in eval mode always -- frozen, never trained
@@ -1902,7 +1918,7 @@ def train_stage2(
             for batch in train_loader:
                 bs = batch[0].size(0)
                 total, recon, recon1, stats, stats1, deriv = step(
-                    batch, train=True, effective_deriv_weight=effective_deriv_weight)
+                    batch, train=True, deriv_weight_used=effective_deriv_weight)
                 train_total += total * bs
                 train_recon += recon * bs
                 train_recon1 += recon1 * bs
@@ -1928,7 +1944,7 @@ def train_stage2(
             for batch in val_loader:
                 bs = batch[0].size(0)
                 total, recon, recon1, stats, stats1, deriv = step(
-                    batch, train=False, effective_deriv_weight=effective_deriv_weight)
+                    batch, train=False, deriv_weight_used=val_deriv_weight)
                 val_total += total * bs
                 val_recon += recon * bs
                 val_recon1 += recon1 * bs
@@ -1955,15 +1971,30 @@ def train_stage2(
             loss_curve_path, title="Stage 2 loss",
         )
 
+        # (train_weight, val_weight, scale, train_value, val_value) for
+        # every entry, uniformly -- even recon1/stats0/stats1, whose two
+        # weights are always equal, since they're never ramped. Only
+        # "deriv" actually has train_weight != val_weight now -- giving
+        # every entry the same 5-tuple shape keeps the two loops below
+        # simple, rather than special-casing "deriv" alone. Necessary,
+        # not just tidy: these ARE what actually reproduces train_total/
+        # val_total's own deriv component (step() only returns the raw,
+        # unweighted deriv_loss; the weight multiplication happens HERE,
+        # in the printed breakdown, separately from step()'s own total
+        # computation) -- using one shared weight for both sides here
+        # would silently print a val breakdown that no longer sums to
+        # the correct val_total, even though val_total itself (computed
+        # inside step(), which DOES already use the right weight) stayed
+        # correct.
         term_values = {
-            "recon1": (recon1_weight, recon1_scale, train_recon1, val_recon1),
-            stats_label: (stats0_weight, stats0_scale, train_stats, val_stats),
-            stats1_label: (stats1_weight, stats1_scale, train_stats1, val_stats1),
-            "deriv": (effective_deriv_weight, deriv_scale, train_deriv, val_deriv),
+            "recon1": (recon1_weight, recon1_weight, recon1_scale, train_recon1, val_recon1),
+            stats_label: (stats0_weight, stats0_weight, stats0_scale, train_stats, val_stats),
+            stats1_label: (stats1_weight, stats1_weight, stats1_scale, train_stats1, val_stats1),
+            "deriv": (effective_deriv_weight, val_deriv_weight, deriv_scale, train_deriv, val_deriv),
         }
-        train_terms = " ".join(f"+{w*tv/s:7.4f}" for lbl, (w, s, tv, _) in term_values.items()
+        train_terms = " ".join(f"+{tw*tv/s:7.4f}" for lbl, (tw, _, s, tv, _) in term_values.items()
                                 if any(lbl == l for _, l, _ in active_terms))
-        val_terms = " ".join(f"+{w*vv/s:7.4f}" for lbl, (w, s, _, vv) in term_values.items()
+        val_terms = " ".join(f"+{vw*vv/s:7.4f}" for lbl, (_, vw, s, _, vv) in term_values.items()
                               if any(lbl == l for _, l, _ in active_terms))
         msg = (f"{epoch:4d}|"
                f"{train_total:7.4f} ={train_recon/recon0_scale:7.4f} {train_terms} |"

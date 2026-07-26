@@ -207,7 +207,7 @@ def _log_corr(x: np.ndarray, y: np.ndarray) -> float | None:
 
 
 def _fmt_corr(c: float | None) -> str:
-    return "N/A (zero variance)" if c is None else f"{c:.3f}"
+    return "N/A (zero variance)" if c is None else f"{c * 100:.1f}%"
 
 
 def check_dead_relus(f_theta: LatentDynamics, dataset: MicrostructureEvolutionDataset,
@@ -517,39 +517,90 @@ def check_f_theta(
     corr_f2real_dt2 = _log_corr(d["dt2"], d["f2_real_norm"])
     corr_f2chained_dt2 = _log_corr(d["dt2"], d["f2_chained_norm"])
     corr_f2chained_err = _log_corr(d["z0_step1_error"], d["f2_chained_norm"])
-    print(f"\ncorrelation(log10(dt1), log10(||f1_real||))        = {_fmt_corr(corr_f1_dt1)}")
-    print(f"correlation(log10(dt2), log10(||f2_real||))        = {_fmt_corr(corr_f2real_dt2)}")
-    print(f"correlation(log10(dt2), log10(||f2_chained||))     = {_fmt_corr(corr_f2chained_dt2)}")
-    print(f"correlation(log10(z0_step1_error), log10(||f2_chained||)) = {_fmt_corr(corr_f2chained_err)}")
+    # corr(log dt2, log ||f||) combines real/chained into one line (same
+    # x, two y's) -- the other two each have their own distinct x, so
+    # there's no shared variable to factor out the same way.
+    print(f"\ncorr(log dt1, log ||f1_real||)          = {_fmt_corr(corr_f1_dt1)}")
+    print(f"corr(log dt2, log ||f||): real = {_fmt_corr(corr_f2real_dt2)}, "
+          f"chained = {_fmt_corr(corr_f2chained_dt2)}")
+    print(f"corr(log z0_step1_error, log ||f2_chained||) = {_fmt_corr(corr_f2chained_err)}")
     print("(if the LAST correlation is much stronger than the dt-based ones above, ||f|| tracks "
           "how wrong the chained input is more than it tracks dt itself -- direct evidence for "
           "off-distribution blowup over intrinsic dt-dependence)")
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
-    axes[0].scatter(d["f2_real_norm"], d["f2_chained_norm"], s=8, alpha=0.4)
+    axes[0, 0].scatter(d["f2_real_norm"], d["f2_chained_norm"], s=8, alpha=0.4)
     lims = [0, max(d["f2_real_norm"].max(), d["f2_chained_norm"].max()) * 1.05]
-    axes[0].plot(lims, lims, "k--", linewidth=1, label="y = x (no difference)")
-    axes[0].set_xlabel("||f2_real|| (real z0 input)")
-    axes[0].set_ylabel("||f2_chained|| (chained z0 input)")
-    axes[0].set_title("Same dt2/theta -- only z0 differs")
-    axes[0].legend()
+    axes[0, 0].plot(lims, lims, "k--", linewidth=1, label="y = x (no difference)")
+    axes[0, 0].set_xlabel("||f2_real|| (real z0 input)")
+    axes[0, 0].set_ylabel("||f2_chained|| (chained z0 input)")
+    axes[0, 0].set_title("Same dt2/theta -- only z0 differs")
+    axes[0, 0].legend()
 
-    axes[1].scatter(d["dt2"], d["f2_real_norm"], s=8, alpha=0.4, label="f2_real")
-    axes[1].scatter(d["dt2"], d["f2_chained_norm"], s=8, alpha=0.4, label="f2_chained")
-    axes[1].set_xscale("log")
-    axes[1].set_yscale("log")
-    axes[1].set_xlabel("dt2")
-    axes[1].set_ylabel("||f||")
-    axes[1].set_title("||f|| vs dt2, real vs chained z0")
-    axes[1].legend()
+    axes[0, 1].scatter(d["dt2"], d["f2_real_norm"], s=8, alpha=0.4, label="f2_real")
+    axes[0, 1].scatter(d["dt2"], d["f2_chained_norm"], s=8, alpha=0.4, label="f2_chained")
+    axes[0, 1].set_xscale("log")
+    axes[0, 1].set_yscale("log")
+    axes[0, 1].set_xlabel("dt2")
+    axes[0, 1].set_ylabel("||f||")
+    axes[0, 1].set_title("||f|| vs dt2, real vs chained z0")
+    axes[0, 1].legend()
 
-    axes[2].scatter(d["z0_step1_error"], d["f2_chained_norm"], s=8, alpha=0.4)
-    axes[2].set_xscale("log")
-    axes[2].set_yscale("log")
-    axes[2].set_xlabel("||z0_hat(t1) - z0(t1)|| (step-1 error)")
-    axes[2].set_ylabel("||f2_chained||")
-    axes[2].set_title("||f2_chained|| vs how off-distribution z0 is")
+    axes[0, 2].scatter(d["z0_step1_error"], d["f2_chained_norm"], s=8, alpha=0.4)
+    axes[0, 2].set_xscale("log")
+    axes[0, 2].set_yscale("log")
+    axes[0, 2].set_xlabel("||z0_hat(t1) - z0(t1)|| (step-1 error)")
+    axes[0, 2].set_ylabel("||f2_chained||")
+    axes[0, 2].set_title("||f2_chained|| vs how off-distribution z0 is")
+
+    # Row 1: ratio_real/ratio_chained and cos_sim_real/cos_sim_chained
+    # were already computed and printed in full above, but never
+    # visualized -- these three panels show that same data directly,
+    # rather than only as console summary statistics.
+    axes[1, 0].scatter(d["ratio_real"], d["ratio_chained"], s=8, alpha=0.4)
+    _ratio_lims = [min(d["ratio_real"].min(), d["ratio_chained"].min()) * 0.9,
+                   max(d["ratio_real"].max(), d["ratio_chained"].max()) * 1.1]
+    axes[1, 0].plot(_ratio_lims, _ratio_lims, "k--", linewidth=1, label="y = x")
+    axes[1, 0].axhline(1.0, color="gray", linewidth=0.7, linestyle=":", label="ratio = 1 (ideal)")
+    axes[1, 0].axvline(1.0, color="gray", linewidth=0.7, linestyle=":")
+    axes[1, 0].set_xscale("log")
+    axes[1, 0].set_yscale("log")
+    axes[1, 0].set_xlabel("ratio_real (||f2_actual||/||f2_ideal||, real z0)")
+    axes[1, 0].set_ylabel("ratio_chained (same, chained z0)")
+    axes[1, 0].set_title("Over/under-shooting: real vs chained z0")
+    axes[1, 0].legend(fontsize=8)
+
+    axes[1, 1].scatter(d["cos_sim_real"], d["cos_sim_chained"], s=8, alpha=0.4)
+    axes[1, 1].plot([-1, 1], [-1, 1], "k--", linewidth=1, label="y = x")
+    axes[1, 1].axhline(0.0, color="gray", linewidth=0.7, linestyle=":", label="cos_sim = 0")
+    axes[1, 1].axvline(0.0, color="gray", linewidth=0.7, linestyle=":")
+    axes[1, 1].set_xlim(-1.05, 1.05)
+    axes[1, 1].set_ylim(-1.05, 1.05)
+    axes[1, 1].set_xlabel("cos_sim_real (f2_actual vs f2_ideal, real z0)")
+    axes[1, 1].set_ylabel("cos_sim_chained (same, chained z0)")
+    axes[1, 1].set_title("Directional correctness: real vs chained z0")
+    axes[1, 1].legend(fontsize=8)
+
+    # Directly visualizes the question the console's own dt2-decade
+    # breakdown asks: is badness in ratio_real/cos_sim_real concentrated
+    # at small dt2 (an artifact of dividing by dt2^2/2, amplifying any
+    # noise in the numerator) or spread uniformly (a genuine calibration
+    # problem)? Twin axes -- ratio_real (log, can span orders of
+    # magnitude) and cos_sim_real (linear, bounded [-1, 1]) don't share
+    # a sensible common scale.
+    ax_ratio = axes[1, 2]
+    ax_cos = ax_ratio.twinx()
+    ax_ratio.scatter(d["dt2"], d["ratio_real"], s=8, alpha=0.4, color="tab:blue")
+    ax_cos.scatter(d["dt2"], d["cos_sim_real"], s=8, alpha=0.4, color="tab:orange")
+    ax_ratio.set_xscale("log")
+    ax_ratio.set_yscale("log")
+    ax_ratio.set_xlabel("dt2")
+    ax_ratio.set_ylabel("ratio_real", color="tab:blue")
+    ax_cos.set_ylabel("cos_sim_real", color="tab:orange")
+    ax_ratio.tick_params(axis="y", labelcolor="tab:blue")
+    ax_cos.tick_params(axis="y", labelcolor="tab:orange")
+    ax_ratio.set_title("ratio_real / cos_sim_real vs dt2 (real z0 only)")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
