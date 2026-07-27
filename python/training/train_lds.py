@@ -152,6 +152,7 @@ def train_lds(
     one_step_weight: float = 0.0,
     use_dt_decade_weights: bool = False,
     z0_noise_scale: float = 0.0,
+    dt_cap: float = float("inf"),
 ) -> Path:
     """
     Stage 3. Returns the path of the best checkpoint saved. Either give
@@ -481,7 +482,8 @@ def train_lds(
     # pre-training dt-vs-error relationship this weighting needs.
     f_theta = LatentDynamics(latent_channels=ae_config["latent_channels"], n_theta=1,
                               latent_spatial=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
-                              hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers).to(device)
+                              hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
+                              dt_cap=dt_cap).to(device)
 
     # Global per-decade loss weights, computed ONCE from train_set's own
     # full dt distribution AND its own raw per-transition loss
@@ -517,6 +519,23 @@ def train_lds(
                     [("latent_channels", ae_config["latent_channels"]),
                      ("hidden_dim", hidden_dim), ("n_hidden_layers", n_hidden_layers)]
                     if prev_config[k] != v]
+        # dt_cap checked separately, not folded into the list above --
+        # unlike the other three keys (always present, any checkpoint
+        # this project has produced), dt_cap may be absent from an older
+        # checkpoint's own saved config, and prev_config[k] direct
+        # indexing above would KeyError on those rather than falling
+        # back cleanly. Not a weight-shape mismatch load_state_dict
+        # would ever catch on its own (it's a plain float attribute,
+        # not a learnable parameter/buffer) -- but resuming under a
+        # DIFFERENT dt_cap than the loaded weights were actually trained
+        # under is exactly the kind of silent, dangerous inconsistency
+        # this whole check exists to catch. .get(..., inf) on the old
+        # side means resuming from a pre-dt_cap checkpoint against a
+        # new, also-default (inf) dt_cap doesn't spuriously flag a
+        # mismatch that was never really there.
+        prev_dt_cap = prev_config.get("dt_cap", float("inf"))
+        if prev_dt_cap != dt_cap:
+            mismatch.append(("dt_cap", prev_dt_cap, dt_cap))
         if prev_latent_spatial_size != current_latent_spatial_size:
             mismatch.append(("latent_spatial_size", prev_latent_spatial_size, current_latent_spatial_size))
         if mismatch:
@@ -540,7 +559,27 @@ def train_lds(
     if step_weights_tensor is not None and step_weights_tensor.shape != (n_rollout_steps,):
         raise ValueError(f"step_weights has {len(step_weights)} entries, but "
                           f"n_rollout_steps={n_rollout_steps} -- need exactly one weight per step.")
-    rollout_loss = RolloutLoss(step_weights=step_weights_tensor)
+    # exponent_deriv=0.0 (not the class's own default of 1.0): divides
+    # the z0-space reconstruction error by dt before squaring, rather
+    # than leaving it unweighted. f_theta's own architecture (self.f
+    # takes z0, z1, theta -- no dt) means this changes ONLY the relative
+    # weight different-dt windows get in the loss, not what f_theta
+    # itself converges to -- the minimum of a dt-weighted squared error
+    # sits at the same place as the unweighted one. Concretely, for
+    # f_theta's dt^2/2 structure specifically (NOT the dt-independent
+    # "rate error" this class's own docstring describes for q=0 --
+    # that description holds for a linear, first-order model, not this
+    # one): this reduces the raw loss's own dt-scaling from dt^4 (the
+    # unweighted default) to dt^2, rather than eliminating dt-dependence
+    # entirely. Still a substantial reduction -- it's what stops
+    # use_dt_decade_weights from needing to suppress large-dt decades
+    # as severely as it currently must (observed directly in Stage 3a's
+    # own log: decade 4 weighted ~3000x lower than decade 1) just to
+    # counteract the raw loss's own dt^4 blowup, which was leaving
+    # f_theta with almost no effective gradient signal at large dt --
+    # exactly where check_parameter_dependence.py's dt_dependence.png
+    # shows the full (f_theta-corrected) prediction going wrong.
+    rollout_loss = RolloutLoss(step_weights=step_weights_tensor, exponent_deriv=0.0)
     optimizer = torch.optim.Adam(f_theta.parameters(), lr=lr)
 
     lr_scheduler = None
@@ -584,21 +623,35 @@ def train_lds(
         z0_hat_full = f_theta.rollout(z0, window1, dt_window, theta)
         z0_hat = z0_hat_full[:, 1:]
 
-        # No exponent_deriv here (that reweighting assumed a plain
-        # diff=dt*err relationship that no longer holds cleanly once
-        # the update rule is a mix of dt and dt^2 terms; the new
-        # architecture handles dt-scaling structurally via the
-        # explicit z1*dt + f*(dt^2/2) terms themselves, not a
-        # loss-level reweighting knob). dt_decade_weights_fn IS applied
-        # here instead -- a genuinely different mechanism (see its own
-        # docstring): not rescaling each element's own loss magnitude
-        # by its dt, but rescaling each WINDOW's relative contribution
-        # to the batch average, so a small number of extreme-dt windows
-        # can't dominate the gradient the way they otherwise do. TRAIN
+        # exponent_deriv=0.0 (set at RolloutLoss's own construction
+        # above) DOES apply here now, via dt=dt_window below -- this
+        # reverses an earlier decision, made on reasoning that turned
+        # out to be incomplete: the claim was that reweighting "no
+        # longer holds cleanly" once the update rule mixes dt and dt^2
+        # terms, since f_theta's own architecture (self.f takes z0, z1,
+        # theta -- no dt) means diff's dt-dependence comes entirely
+        # from the explicit (dt^2/2) multiplier, not from any implicit
+        # diff=dt*err relationship -- but that's exactly why the
+        # reweighting still works: dividing diff by dt before squaring
+        # rescales this window's own loss MAGNITUDE without moving
+        # where f_theta's output has to sit to minimize it (still the
+        # same dt^2/2-normalized curvature target either way). It just
+        # doesn't produce a fully dt-independent "rate error" the way
+        # RolloutLoss's own docstring describes for q=0 -- that
+        # description holds for a linear, first-order model, not this
+        # dt^2/2 one -- it reduces the raw loss's dt-scaling from dt^4
+        # to dt^2, a real and substantial reduction, not a complete
+        # elimination. dt_decade_weights_fn is STILL applied too, on
+        # top of this -- a genuinely different, composable mechanism
+        # (see its own docstring): not rescaling each element's own
+        # loss magnitude by its dt (exponent_deriv's own job), but
+        # rescaling each WINDOW's relative contribution to the batch
+        # average, so a small number of extreme-dt windows can't
+        # dominate the gradient the way they otherwise do. TRAIN
         # only -- val_loss must stay an unweighted, naturally-
         # distributed measure of real performance.
         weights = dt_decade_weights_fn(dt_window) if (train and dt_decade_weights_fn is not None) else None
-        z0_loss, z0_per_step = rollout_loss(z0_hat, z0_true, weights=weights, return_per_step=True)
+        z0_loss, z0_per_step = rollout_loss(z0_hat, z0_true, dt=dt_window, weights=weights, return_per_step=True)
         # per_step[0] is L_1step -- the loss restricted to just the first
         # predicted step, directly comparable to a model trained with
         # n_rollout_steps=1 (see RolloutLoss.forward()'s docstring: this
@@ -737,6 +790,7 @@ def train_lds(
                     "latent_channels": ae_config["latent_channels"], "n_theta": 1,
                     "latent_spatial_size": ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                     "hidden_dim": hidden_dim, "n_hidden_layers": n_hidden_layers,
+                    "dt_cap": dt_cap,
                 },
                 "data_config": {
                     "min_step": min_step, "min_stdev_phi": min_stdev_phi,
@@ -810,6 +864,14 @@ def main():
                               "window's own |z1(t0)|*dt Euler-step magnitude -- see "
                               "train_lds()'s own docstring for the full rationale (default "
                               "0.0: off, exact prior behavior)")
+    parser.add_argument("--dt-cap", type=float, default=float("inf"),
+                         help="caps dt INSIDE f_theta's own second-order correction term only "
+                              "(f_val*(min(dt,dt_cap)^2/2)), not the first-order z1*dt term -- "
+                              "see LatentDynamics.__init__'s own docstring for why this, rather "
+                              "than saturating f_val's own output, is what actually guarantees "
+                              "the first-order term dominates again at large dt instead of just "
+                              "delaying when the second-order term overtakes it (default inf: "
+                              "off, exact prior behavior)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--resume-from", type=Path, default=None,
@@ -829,6 +891,7 @@ def main():
         ae_stats_weight=args.ae_stats_weight,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
+        dt_cap=args.dt_cap,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
         num_workers=args.num_workers, n_rollout_steps=args.n_rollout_steps,
         min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,

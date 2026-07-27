@@ -67,10 +67,31 @@ class LatentDynamics(nn.Module):
 
     def __init__(self, latent_channels: int, n_theta: int = 1,
                  latent_spatial: int = LATENT_SPATIAL_SIZE, hidden_dim: int = 256,
-                 n_hidden_layers: int = 2):
+                 n_hidden_layers: int = 2, dt_cap: float = float("inf")):
         super().__init__()
         self.latent_channels = latent_channels
         self.latent_spatial = latent_spatial
+        # dt_cap: caps dt ITSELF inside the second-order term only
+        # (f_val*(dt^2/2) becomes f_val*(min(dt,dt_cap)^2/2)), NOT the
+        # first-order z1*dt term, which keeps growing unbounded. Default
+        # inf is an exact no-op (min(dt,inf)=dt always) -- every existing
+        # caller that doesn't know about this parameter gets identical
+        # behavior to before it existed.
+        #
+        # Why cap dt here rather than cap f_val's own output: the two
+        # terms are |z1|*dt (first order) and |f_val|*(dt^2/2) (second
+        # order) -- even a SATURATED f_val (bounded to some f_max) still
+        # has a term that grows as dt^2, which inevitably overtakes a
+        # term growing only as dt for large enough dt (crossover at
+        # dt*=2|z1|/f_max, always finite for any f_max>0 -- saturating
+        # f_val only pushes that crossover further out, never eliminates
+        # it). Capping dt here instead makes the second-order term's own
+        # growth stop entirely past dt_cap, while z1*dt keeps growing --
+        # guaranteeing the first-order term eventually dominates again
+        # for dt > roughly 2|z1|*dt_cap/f_max, an actual structural
+        # reversal back toward the correct euler-dominated large-dt
+        # regime, not just a delay of the point where it breaks down.
+        self.dt_cap = dt_cap
 
         flat_dim = latent_channels * latent_spatial * latent_spatial
         in_dim = 2 * flat_dim + n_theta  # z0 + z1 + theta -- dt is not a network input (see forward())
@@ -140,14 +161,22 @@ class LatentDynamics(nn.Module):
         dt: (B,) or (B, 1)
         theta: (B, n_theta)
 
-        Returns z0_next: (B, C, 8, 8) = z0 + z1*dt + f(z0,z1,theta)*(dt^2/2).
+        Returns z0_next: (B, C, 8, 8) = z0 + z1*dt + f(z0,z1,theta)*(min(dt,dt_cap)^2/2).
+        The dt_cap clamp applies ONLY inside the second-order term, not
+        to the z1*dt term -- see __init__'s own docstring for why capping
+        dt here (rather than saturating f_val's own output) is what
+        actually guarantees the first-order term eventually dominates
+        again at large dt, rather than merely delaying when the
+        second-order term overtakes it. self.dt_cap defaults to inf, an
+        exact no-op recovering the original, uncapped formula.
         ONLY z0 is predicted -- z1's own next value is the caller's
         responsibility to supply (real data during training/testing;
         g_theta's own job once it exists).
         """
         f_val = self.f(z0, z1, theta)
         dt_r = dt.view(-1, 1, 1, 1)  # broadcast against (B, C, 8, 8), works for (B,) or (B,1) input
-        return z0 + z1 * dt_r + f_val * (dt_r ** 2 / 2)
+        dt_capped = torch.clamp(dt_r, max=self.dt_cap)
+        return z0 + z1 * dt_r + f_val * (dt_capped ** 2 / 2)
 
     def rollout(self, z0: torch.Tensor, z1_sequence: torch.Tensor, dts: torch.Tensor,
                 theta: torch.Tensor) -> torch.Tensor:

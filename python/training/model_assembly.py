@@ -123,19 +123,23 @@ def build_models_from_components(
         # function's own docstring on why (z1 is teacher-forced, never
         # decoded, and only the recon stream's own decoder was ever
         # preserved by checkpoint_components.py in the first place).
-        # condition_on_theta is explicitly CARRIED OVER, not left at its
+        # condition_on_theta explicitly CARRIED OVER, not left at its
         # dataclass default (False): a theta-conditioned stream's own
         # Encoder still has a real theta_conditioners submodule with its
         # own trained weights, saved in the checkpoint's state_dict
         # regardless of this stream's DECODE mode being changed here --
         # PURE_LATENT only affects whether the stream can be decoded,
-        # not how it was encoded. Dropping this (an earlier version of
-        # this function did) builds an Encoder with no theta_conditioners
-        # submodule at all, which then fails to load the REAL state_dict
-        # (which does have theta_conditioners.deriv.* weights) with a
-        # confusing "shape mismatch" -- actually an unexpected-key
-        # mismatch from a structurally wrong model, not a real version
-        # skew between checkpoint and code.
+        # not how it was encoded. Omitting this builds an Encoder with
+        # no theta_conditioners submodule at all, which then fails to
+        # load the REAL state_dict (which does have
+        # theta_conditioners.deriv.* weights) with a confusing "shape
+        # mismatch" -- actually an unexpected-key mismatch from a
+        # structurally wrong model, not a real version skew between
+        # checkpoint and code. A previously-fixed regression: this
+        # carry-over was correct here before, and was accidentally lost
+        # when a later edit (adding dt_cap to the LatentDynamics
+        # construction further below) was built from an outdated
+        # snapshot of this file rather than the actual, current one.
         pure_latent_stream_configs = {
             name: (cfg if name == recon_stream_name
                    else LatentStreamConfig(name=cfg.name, channels=cfg.channels,
@@ -147,7 +151,7 @@ def build_models_from_components(
         final_stream_configs = pure_latent_stream_configs
         encoder = Encoder(input_size=encoder_cfg["size"], in_channels=in_channels,
                            base_channels=encoder_cfg["base_channels"],
-                           stream_configs=pure_latent_stream_configs, n_theta=1)
+                           stream_configs=pure_latent_stream_configs)
         decoder = Decoder(output_size=encoder_cfg["size"], out_channels=in_channels,
                            base_channels=encoder_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
@@ -200,7 +204,11 @@ def build_models_from_components(
     f_theta = LatentDynamics(latent_channels=lds_cfg["latent_channels"], n_theta=lds_cfg["n_theta"],
                               latent_spatial=lds_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=lds_cfg["hidden_dim"],
-                              n_hidden_layers=lds_cfg["n_hidden_layers"]).to(device)
+                              n_hidden_layers=lds_cfg["n_hidden_layers"],
+                              # inf (exact no-op) for any checkpoint saved
+                              # before dt_cap existed -- same reasoning as
+                              # latent_spatial_size's own .get() above.
+                              dt_cap=lds_cfg.get("dt_cap", float("inf"))).to(device)
     f_theta.load_state_dict(components["lds"].state_dict)
 
     return ae, stats_head, f_theta, frozen_modules, final_stream_configs, recon_stream_name

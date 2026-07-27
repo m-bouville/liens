@@ -9,11 +9,11 @@ min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
 min_std_deriv = 0.00015		# skip time derivatives whose stdev is below this
 min_passing_steps= 12		# any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
-recon0_scale  = 0.0001
+recon0_scale  = 0.1e-3
 stats0_scale  = 0.01
 
-deriv_scale   = 0.00002
-rollout_scale = 100000
+deriv_scale   = 0.02e-3
+rollout_scale = 1e-6
 
 # force 	      = True
 
@@ -72,7 +72,7 @@ deriv_weight_warmup_epochs= 15  # with 10: training loss increases slightly at e
 
 batches 	  = same
 
-force 	      = True
+# force 	      = True
 
 
 
@@ -83,14 +83,15 @@ ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
 
 use_dt_decade_weights = True  # was (de facto) False
 
-epochs 		  =1000
-patience 	  = 200
+epochs 		  = 500
+patience 	  =  50
 
 num_workers	  =   8
-batches		  =4096
+batches		  =8192
 
-lr 			  =  20e-6  # default: 0.001
-z0_noise_scale=   0.2
+lr 			  = 100e-6  # was 20e-6,  default: 0.001
+z0_noise_scale=   0.175
+dt_cap		  =   500
 
 force 	      = True
 
@@ -105,14 +106,15 @@ one_step_weight= 20000.
 
 use_dt_decade_weights = True  # was (de facto) False
 
-epochs 		  =1000
-patience 	  = 100
+epochs 		  = 500
+patience 	  =  50
 
 num_workers	  =   8
-batches		  =4096
+batches		  =8192
 
 lr 			  =   5e-6  # default: 0.001
 z0_noise_scale=   0.1
+dt_cap		  =   same
 
 force 	      = True
 

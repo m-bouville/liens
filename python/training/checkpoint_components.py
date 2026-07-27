@@ -56,6 +56,75 @@ def _strip_prefix(state_dict: dict, prefix: str) -> dict:
     return {k[len(full_prefix):]: v for k, v in state_dict.items() if k.startswith(full_prefix)}
 
 
+def _strip_encoder_or_decoder_prefix(state_dict: dict, role: str) -> dict:
+    """
+    role: "encoder" or "decoder". Tries BOTH prefix conventions this
+    codebase actually uses, since load_ae_components (the only caller
+    that needs this -- load_joint_refinement_checkpoint's own ae_state
+    always comes from MultiStreamAutoencoder specifically, so it can
+    use "encoders.shared"/"decoders.shared" directly) is shared between
+    two genuinely different checkpoint shapes:
+      - Stage 1's plain Autoencoder: self.encoder/self.decoder directly
+        (no ModuleDict wrapping) -> "encoder."/"decoder." keys.
+      - Stage 1b/2's MultiStreamAutoencoder: self.encoders/self.decoders
+        are nn.ModuleDict({"shared": ...}) -> "encoders.shared."/
+        "decoders.shared." keys (see autoencoder.py's own __init__).
+    _strip_prefix silently returns an empty dict when its given prefix
+    doesn't match anything, rather than raising -- exactly the failure
+    mode that made load_joint_refinement_checkpoint's own equivalent
+    bug so hard to trace back from "every key is missing" several
+    functions downstream. Trying the ModuleDict-wrapped convention
+    first (it's the newer, currently more common of the two), falling
+    back to the plain, unwrapped one only if that comes up empty.
+
+    For "decoder" specifically, this covers the single-shared-decoder
+    MultiStreamAutoencoder case ("decoders.shared.") -- NOT stage 1b/2's
+    own separate-per-stream-decoder case ("decoders.D0."/"decoders.D1."),
+    which has no single "shared" key at all. See
+    _strip_decoder_prefix_for_stream below for that case -- it's the
+    one load_ae_components actually needs for real stage 1b/2
+    checkpoints, since those are exactly the ones with named,
+    per-stream decoders rather than one shared decoder.
+    """
+    wrapped = _strip_prefix(state_dict, f"{role}s.shared")
+    if wrapped:
+        return wrapped
+    return _strip_prefix(state_dict, role)
+
+
+def _strip_decoder_prefix_for_stream(state_dict: dict, model_cfg: dict, recon_stream_name: str) -> dict:
+    """
+    Regression fix for a real, reported crash: build_models_from_
+    components() failed with "missing keys: decoder.*" on a real stage
+    4 run resuming from a stage 2 checkpoint. Root cause: a stage 1b/2
+    checkpoint doesn't necessarily have ONE shared decoder at all --
+    train_stage1b/train_stage2 construct SEPARATE per-stream decoders
+    (typically "D0" for the recon stream, "D1" for "deriv" -- see
+    train_ae.py's own decoder_for_stream={state_name: "D0", "deriv":
+    "D1"}), so "decoders.shared." matches nothing and
+    _strip_encoder_or_decoder_prefix's own fallback to "decoder." (the
+    plain, non-multi-stream Autoencoder shape) matches nothing either
+    -- both silently return an empty dict, making every real decoder
+    key look "missing" only much later, at the actual load_state_dict
+    call in build_models_from_components.
+
+    Tries, in order: (1) the checkpoint's own decoder_for_stream
+    mapping, if present, to find which named decoder ("D0", etc.)
+    actually serves recon_stream_name -- the precise, correct answer
+    when available, not a guess; (2) "decoders.shared." (the
+    single-shared-decoder MultiStreamAutoencoder shape); (3) plain
+    "decoder." (Stage 1's own Autoencoder shape, no ModuleDict at all).
+    """
+    decoder_for_stream = model_cfg.get("decoder_for_stream")
+    if decoder_for_stream is not None:
+        decoder_key = decoder_for_stream.get(recon_stream_name)
+        if decoder_key is not None:
+            named = _strip_prefix(state_dict, f"decoders.{decoder_key}")
+            if named:
+                return named
+    return _strip_encoder_or_decoder_prefix(state_dict, "decoder")
+
+
 def load_ae_components(checkpoint_path: str | Path,
                         device: str | None = None) -> dict[str, ComponentCheckpoint]:
     """
@@ -93,52 +162,33 @@ def load_ae_components(checkpoint_path: str | Path,
     _resolved_streams, _resolved_recon_name = cross_check_stream_configs_against_state_dict(
         _resolved_streams, _resolved_recon_name, ae_state,
     )
+    # condition_on_theta included explicitly -- omitting it here doesn't
+    # just drop a config field, it actively corrupts anything read back
+    # from this serialization: resolve_stream_configs_from_checkpoint_
+    # config's own deserialization does cfg.get("condition_on_theta",
+    # False), so a stream that's genuinely theta-conditioned (e.g.
+    # "deriv") silently comes back as condition_on_theta=False on the
+    # round trip through this dict -- which then makes
+    # build_models_from_components construct an Encoder with no
+    # theta_conditioners submodule at all for that stream, failing to
+    # load the real checkpoint's own theta_conditioners.deriv.* weights
+    # with an "unexpected keys" error that looks like a version
+    # mismatch but was actually caused right here.
     ae_component_config["stream_configs"] = {
-        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size, "mode": cfg.mode.value,
-               "condition_on_theta": cfg.condition_on_theta}
+        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
+               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
         for name, cfg in _resolved_streams.items()
     }
     ae_component_config["recon_stream_name"] = _resolved_recon_name
 
-    # Two possible prefixes, depending on which class saved this
-    # checkpoint (see autoencoder.py's own docstring): a flat
-    # Autoencoder saves "encoder."/"decoder." directly; a
-    # MultiStreamAutoencoder saves "encoders.shared." for its encoder
-    # (always -- MultiStreamAutoencoder hard-requires exactly one
-    # shared encoder trunk, always stored under the "shared" key, so
-    # this part never varies) but its DECODER(s) under whichever keys
-    # decoder_for_stream actually maps to -- "decoders.shared." only
-    # when every stream shares one decoder; a stage-1b/2-derived
-    # checkpoint instead has SEPARATE per-stream decoders
-    # ("decoders.D0."/"decoders.D1.", see decoder_for_stream in
-    # model_cfg). This component extracts THE decoder for the RECON
-    # stream specifically (the one thing model_assembly.py's
-    # single-decoder reassembly path actually needs), looked up via
-    # decoder_for_stream[recon_stream_name] when that mapping exists,
-    # not just assumed to be "shared" -- an earlier version of this did
-    # assume "shared" unconditionally, which silently produced an EMPTY
-    # decoder component (no key starts with "decoders.shared." when
-    # they actually start with "decoders.D0.") for exactly this
-    # stage-1b/2-derived case, surfacing downstream as "every decoder
-    # key is missing" -- a confusing failure far from its actual cause.
-    is_multi_stream = any(k.startswith("encoders.shared.") for k in ae_state)
-    encoder_prefix = "encoders.shared" if is_multi_stream else "encoder"
-    if is_multi_stream:
-        decoder_for_stream = model_cfg.get("decoder_for_stream")
-        decoder_key = (decoder_for_stream.get(_resolved_recon_name, "shared")
-                        if decoder_for_stream is not None else "shared")
-        decoder_prefix = f"decoders.{decoder_key}"
-    else:
-        decoder_prefix = "decoder"
-
     components = {
         "encoder": ComponentCheckpoint(
-            state_dict=_strip_prefix(ae_state, encoder_prefix),
+            state_dict=_strip_encoder_or_decoder_prefix(ae_state, "encoder"),
             config=dict(ae_component_config),
             provenance=dict(shared_provenance),
         ),
         "decoder": ComponentCheckpoint(
-            state_dict=_strip_prefix(ae_state, decoder_prefix),
+            state_dict=_strip_decoder_prefix_for_stream(ae_state, model_cfg, _resolved_recon_name),
             config=dict(ae_component_config),
             provenance=dict(shared_provenance),
         ),
@@ -281,21 +331,46 @@ def load_joint_refinement_checkpoint(checkpoint_path: str | Path,
     _resolved_streams, _resolved_recon_name = cross_check_stream_configs_against_state_dict(
         _resolved_streams, _resolved_recon_name, ae_state,
     )
+    # condition_on_theta included explicitly -- omitting it here doesn't
+    # just drop a config field, it actively corrupts anything read back
+    # from this serialization: resolve_stream_configs_from_checkpoint_
+    # config's own deserialization does cfg.get("condition_on_theta",
+    # False), so a stream that's genuinely theta-conditioned (e.g.
+    # "deriv") silently comes back as condition_on_theta=False on the
+    # round trip through this dict -- which then makes
+    # build_models_from_components construct an Encoder with no
+    # theta_conditioners submodule at all for that stream, failing to
+    # load the real checkpoint's own theta_conditioners.deriv.* weights
+    # with an "unexpected keys" error that looks like a version
+    # mismatch but was actually caused right here.
     ae_component_config["stream_configs"] = {
-        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size, "mode": cfg.mode.value,
-               "condition_on_theta": cfg.condition_on_theta}
+        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
+               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
         for name, cfg in _resolved_streams.items()
     }
     ae_component_config["recon_stream_name"] = _resolved_recon_name
 
     components = {
         "encoder": ComponentCheckpoint(
-            state_dict=_strip_prefix(ae_state, "encoder"),
+            # "encoders.shared", NOT "encoder" -- ae_state here comes
+            # from MultiStreamAutoencoder.state_dict() (see
+            # train_refinement()'s own "ae_state": ae.state_dict() save
+            # call), whose self.encoders is an nn.ModuleDict keyed
+            # "shared" (build_models_from_components's own construction
+            # call: encoders={"shared": encoder}) -- so its actual keys
+            # are "encoders.shared.down_blocks...", never "encoder.*" at
+            # all. No fallback needed here the way
+            # _strip_encoder_or_decoder_prefix provides for
+            # load_ae_components above -- THIS function's own ae_state
+            # only ever comes from MultiStreamAutoencoder, never the
+            # plain Autoencoder Stage 1 uses, so there's only one real
+            # shape to handle.
+            state_dict=_strip_prefix(ae_state, "encoders.shared"),
             config=dict(ae_component_config),
             provenance=dict(shared_provenance),
         ),
         "decoder": ComponentCheckpoint(
-            state_dict=_strip_prefix(ae_state, "decoder"),
+            state_dict=_strip_prefix(ae_state, "decoders.shared"),
             config=dict(ae_component_config),
             provenance=dict(shared_provenance),
         ),
