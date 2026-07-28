@@ -1,7 +1,7 @@
 """
 Tests for training/model_assembly.py. Builds small, REAL Autoencoder/
 StatsHead/LatentDynamics instances, saves them through the same dict
-shapes train_ae.py/train_lds.py actually produce, runs them through the
+shapes train_stage1.py/train_stage2.py/train_lds.py actually produce, runs them through the
 checkpoint_components adapter, and checks build_models_from_components
 reconstructs models that are genuinely identical to the originals --
 not just the right shape.
@@ -26,7 +26,7 @@ STAT_NAMES = ["angle", "avg_phi", "stdev_phi"]
 def _save_ae_checkpoint(path, latent_channels=LATENT_CHANNELS, base_channels=4,
                          stats_hidden_dim=16, include_stats_head=True):
     """Builds and saves a REAL small autoencoder (+ optionally stats_head)
-    through the exact checkpoint shape train_ae.py's save calls use."""
+    through the exact checkpoint shape train_stage1.py's save calls use."""
     ae = Autoencoder(size=64, channels=1, base_channels=base_channels,
                       latent_channels=latent_channels)
     checkpoint = {

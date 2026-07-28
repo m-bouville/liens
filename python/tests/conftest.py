@@ -9,7 +9,7 @@ from pathlib import Path
 
 # Every module in this project (training/, models/, utils/) is meant to
 # be imported with python/ itself on sys.path -- true when running e.g.
-# `python -m training.train_ae` from python/, but NOT automatic for
+# `python -m training.train_stage1` from python/, but NOT automatic for
 # pytest, which by default only adds tests/'s own directory. Without
 # this, `from training.losses import RolloutLoss` fails with
 # ModuleNotFoundError regardless of which directory pytest is invoked
@@ -171,13 +171,14 @@ def isolated_project_root(tmp_path, monkeypatch):
     module-level constant derived from it at import time, which won't
     automatically follow a patched _PYTHON_ROOT on its own) to a fresh
     tmp_path instead, for the duration of one test. Covers every
-    module actually involved in a full stage 1->1b->2->3a->3b run
-    (train_ae.py/train_lds.py/train_refinement.py/orchestration.paths/
-    orchestration.pipeline) -- NOT the individual evaluation/*.py
-    scripts, which each have their own, separate _PYTHON_ROOT too, but
-    only ever use it for CLI argument defaults (argparse), never when
-    called programmatically with an explicit checkpoint_path/
-    output_path the way the pipeline itself always does internally.
+    module actually involved in a full stage 1->2->3a->3b run
+    (train_stage1.py/train_stage2.py/train_lds.py/train_refinement.py/
+    orchestration.paths/orchestration.pipeline) -- NOT the individual
+    evaluation/*.py scripts, which each have their own, separate
+    _PYTHON_ROOT too, but only ever use it for CLI argument defaults
+    (argparse), never when called programmatically with an explicit
+    checkpoint_path/output_path the way the pipeline itself always
+    does internally.
 
     orchestration.pipeline specifically imports _PYTHON_ROOT/
     _STAGE_DIRS via `from orchestration.paths import ...` -- a
@@ -201,13 +202,14 @@ def isolated_project_root(tmp_path, monkeypatch):
                   4: root / "checkpoints" / "stage4",
                   5: root / "checkpoints" / "stage5"}
 
-    import training.train_ae as train_ae
+    import training.train_stage1 as train_stage1
+    import training.train_stage2 as train_stage2
     import training.train_lds as train_lds
     import training.train_refinement as train_refinement
     import orchestration.paths as orch_paths
     import orchestration.pipeline as orch_pipeline
 
-    for module in (train_ae, train_lds, train_refinement, orch_paths, orch_pipeline):
+    for module in (train_stage1, train_stage2, train_lds, train_refinement, orch_paths, orch_pipeline):
         monkeypatch.setattr(module, "_PYTHON_ROOT", root, raising=True)
     for module in (orch_paths, orch_pipeline):
         monkeypatch.setattr(module, "_STAGE_DIRS", stage_dirs, raising=True)

@@ -3,7 +3,8 @@ import torch
 import pytest
 from pathlib import Path
 from utils import load_datasets as load
-from training.train_ae import train_autoencoder, train_stage2
+from training.train_stage1 import train_autoencoder
+from training.train_stage2 import train_stage2
 from training.train_lds import train_lds
 
 

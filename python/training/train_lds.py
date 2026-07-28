@@ -345,8 +345,9 @@ def train_lds(
                     f"condition_on_theta={condition_on_theta} was requested, but "
                     f"{ae_checkpoint_path}'s own '{deriv_stream_name}' stream has "
                     f"condition_on_theta={deriv_stream.condition_on_theta} -- this was decided when "
-                    f"the stream was CREATED (stage 1b), not something stage 3 can change by loading "
-                    f"a different value. Retrain from stage 1b with condition_on_theta="
+                    f"the stream was CREATED (in stage 2, see training/extend_encoder.py), not something "
+                    f"stage 3 can change by loading a different value. Rebuild the ancestor "
+                    f"from stage 2 with condition_on_theta="
                     f"{condition_on_theta} if you actually want a different ancestor, or drop this "
                     f"parameter here to match whatever {ae_checkpoint_path} already has."
                 )
@@ -853,7 +854,7 @@ def main():
                               "training/datasets.py")
     parser.add_argument("--condition-on-theta", action=argparse.BooleanOptionalAction, default=None,
                          help="VALIDATES against the loaded AE checkpoint's own deriv stream -- "
-                              "stage 3 cannot change this (decided at stage 1b); omit to skip "
+                              "stage 3 cannot change this (decided in stage 2); omit to skip "
                               "validation and trust whatever the checkpoint already has")
     parser.add_argument("--encode-batch-size", type=int, default=256)
     parser.add_argument("--val-ema-decay", type=float, default=0.7)

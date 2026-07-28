@@ -1,6 +1,6 @@
 """
 The actual pipeline orchestrator: run_from_params_file() runs stages
-1->1b->2->3(a/b)->4->5 as specified by one stage-parameters file. See
+1->2->3(a/b)->4->5 as specified by one stage-parameters file. See
 main.py's own module docstring for the file format, naming convention,
 and caching behavior -- this module is deliberately just the
 orchestration logic itself; main.py stays a thin CLI entry point
@@ -23,7 +23,8 @@ from orchestration.logging_utils import _log_to_file
 from orchestration.paths import _PYTHON_ROOT, _STAGE_DIRS
 from orchestration.stage_params import _prepare_stage_kwargs, _strip_unrecognized_params, parse_stage_params
 from training.checkpoint_components import split_joint_checkpoint_for_evaluation
-from training.train_ae import train_autoencoder, train_stage2
+from training.train_stage1 import train_autoencoder
+from training.train_stage2 import train_stage2
 from training.train_lds import train_lds
 from training.train_refinement import train_refinement
 
@@ -31,14 +32,16 @@ from training.train_refinement import train_refinement
 def run_from_params_file(params_path: Path, default_base: Path,
                           device: str | None = None) -> Path:
     """
-    Runs stages 1->1b->2->3(a/b)->4->5 as specified by a stage-parameters
+    Runs stages 1->2->3(a/b)->4->5 as specified by a stage-parameters
     file, stopping early and returning whichever checkpoint is the LAST
-    one actually produced (stage 1's own if no '# Stage 1b' section is
-    given -- stage 2 REQUIRES a multi-stream (deriv-stream) ancestor,
-    which only stage 1b produces, so stage 2 onward is skipped entirely
-    without it, same "stop early if not configured" convention already
-    used for stage 4/5 below; stage 3's if no '# Stage 4' section is
-    given, stage 4's if no '# Stage 5', stage 5's if both are present).
+    one actually produced (stage 1's own if no '# Stage 2' section is
+    given -- stage 2 is what builds the multi-stream (deriv-stream)
+    ancestor every later stage needs, directly from stage 1's own
+    checkpoint (see training/extend_encoder.py), so stage 2 onward is
+    skipped entirely without it, same "stop early if not configured"
+    convention already used for stage 4/5 below; stage 3's if no
+    '# Stage 4' section is given, stage 4's if no '# Stage 5', stage
+    5's if both are present).
     See the module docstring for the file format, naming convention, and
     caching behavior (own expected filename, then the parameter registry).
     """

@@ -919,8 +919,36 @@ class MicrostructureEvolutionDataset(Dataset):
         encoder_accepts_theta = (
             self.encoder_given and "theta" in inspect.signature(encoder.forward).parameters
         )
+        pending_meta, run_data_list, run_data_deriv_list = self._read_and_encode_all_runs(
+            run_dirs, good_steps, encoder, device, window_length, encode_batch_size,
+            read_workers, encoder_accepts_theta,
+        )
+        self._build_window_index(pending_meta, run_data_list, run_data_deriv_list)
+
+    def _read_and_encode_all_runs(
+        self, run_dirs: list[Path], good_steps: dict, encoder: torch.nn.Module | None,
+        device: str | torch.device, window_length: int, encode_batch_size: int,
+        read_workers: int, encoder_accepts_theta: bool,
+    ) -> tuple[list, list, list]:
+        """
+        Reads every kept snapshot for every run (via a shared
+        ThreadPoolExecutor -- see read_workers' own docstring in
+        __init__ for why), and, when self.encoder_given, encodes them
+        through a bounded-memory streaming buffer that batches across
+        run boundaries (see _flush_buffer's own docstring below for
+        the full rationale) rather than accumulating every run's raw
+        frames before encoding any of it. Extracted verbatim from
+        __init__'s own former body -- same logic, same order, just
+        named and callable on its own.
+
+        Returns (pending_meta, run_data_list, run_data_deriv_list):
+        pending_meta is (run_dir, metadata, kept_steps) for every run
+        that passed the length check, aligned index-for-index with
+        run_data_list (per-run "state" latents if self.encoder_given,
+        else raw frames) and run_data_deriv_list (per-run "deriv"
+        latents if self.encode_both_streams, else None per entry).
+        """
         n_windowless_runs = 0
-        n_degenerate_deriv_windows = 0
 
         pending_meta = []       # (run_dir, metadata, kept_steps), one per run that passed the length check
         run_data_list = []      # filled in incrementally, ends up aligned index-for-index with pending_meta
@@ -1089,6 +1117,28 @@ class MicrostructureEvolutionDataset(Dataset):
             # nvidia-smi output) needs to see that VRAM as free.
             torch.cuda.empty_cache()
 
+        if n_windowless_runs:
+            print(f"MicrostructureEvolutionDataset: {n_windowless_runs}/{len(run_dirs)} runs "
+                  f"had fewer than window_length={window_length} kept steps and were skipped "
+                  f"entirely (consider a shorter window_length or looser filtering if this "
+                  f"is a large fraction)")
+
+        return pending_meta, run_data_list, run_data_deriv_list
+
+
+    def _build_window_index(self, pending_meta: list, run_data_list: list, run_data_deriv_list: list) -> None:
+        """
+        Populates self._run_dirs/_run_steps/_run_data/_run_data_deriv/
+        _run_dt_scale/_run_theta (per-run bookkeeping) and self._index
+        (the actual (run_idx, window_start_position) pairs __getitem__
+        indexes into), applying stat_names' own NaN-guard and
+        min_std_deriv's own near-degenerate-derivative filter per
+        candidate window. Extracted verbatim from __init__'s own
+        former body -- same logic, same order, just named and callable
+        on its own.
+        """
+        n_degenerate_deriv_windows = 0
+
         for (run_dir, metadata, kept_steps), run_data, run_data_deriv in zip(
             pending_meta, run_data_list, run_data_deriv_list
         ):
@@ -1111,7 +1161,7 @@ class MicrostructureEvolutionDataset(Dataset):
                 torch.tensor([metadata.temperature - metadata.T0], dtype=torch.float32)
             )
 
-            for start in range(len(kept_steps) - window_length + 1):
+            for start in range(len(kept_steps) - self.window_length + 1):
                 if self.stat_names is not None:
                     start_step = kept_steps[start]
                     stats_df = self._stats_by_run[run_dir]
@@ -1132,11 +1182,7 @@ class MicrostructureEvolutionDataset(Dataset):
                   f"essentially stationary between those two specific steps (e.g. a straight, "
                   f"zero-curvature interface), not excluded by min_stdev_phi alone.")
 
-        if n_windowless_runs:
-            print(f"MicrostructureEvolutionDataset: {n_windowless_runs}/{len(run_dirs)} runs "
-                  f"had fewer than window_length={window_length} kept steps and were skipped "
-                  f"entirely (consider a shorter window_length or looser filtering if this "
-                  f"is a large fraction)")
+
 
     def __len__(self) -> int:
         n = len(self._index)

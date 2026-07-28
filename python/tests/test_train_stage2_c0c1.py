@@ -2,7 +2,8 @@ import torch
 import pytest
 from pathlib import Path
 from utils import load_datasets as load
-from training.train_ae import train_autoencoder, train_stage2
+from training.train_stage1 import train_autoencoder
+from training.train_stage2 import train_stage2
 
 
 def _build_run_dir_with_stats(base_dir, name, size=32):
@@ -71,10 +72,9 @@ def test_stage2_full_c0c1_loss_end_to_end(shared_stage1a_ancestor, tmp_path, iso
     """The redesigned stage 2, exercised end-to-end from a real stage 1a
     ancestor directly (no stage 1b pass at all -- see
     training/extend_encoder.py's own module docstring for why: D1 is
-    confirmed permanently unnecessary, so recon1_weight is left at its
-    default 0.0 here rather than exercised -- a nonzero value now
-    raises, since there's no decoder for 'deriv' to compute L_recon1
-    against at all). Confirms: the deriv stream built fresh (PURE_LATENT,
+    confirmed permanently unnecessary). recon1_weight/L_recon1 no
+    longer exist as a concept at all -- there's nothing left to set or
+    exercise for that term. Confirms: the deriv stream built fresh (PURE_LATENT,
     no D1), stats_head0/stats_head1 both loaded/built and frozen or
     available, the remaining four loss components (recon0, stats0,
     stats1, deriv) genuinely computed and contributing gradient,
@@ -140,15 +140,16 @@ def test_zero_weight_terms_omitted_from_console_output(shared_stage1a_ancestor, 
     "+0.0*stats1_diag" every single epoch for terms that structurally
     cannot contribute anything. Confirms zero-weight terms are omitted
     entirely, and that a nonzero one still shows correctly.
-    recon1_weight is not exercised here at all (see this file's own
-    test_stage2_full_c0c1_loss_end_to_end for why -- D1 is confirmed
-    permanently unnecessary, so it's left at its default 0.0)."""
+    recon1_weight/L_recon1 no longer exist as a concept at all (D1 is
+    confirmed permanently unnecessary -- see extend_encoder.py's own
+    module docstring), not just defaulted off, so there's nothing left
+    to exercise or omit for that term specifically."""
     base_path, stage1a_path = shared_stage1a_ancestor
 
     capsys.readouterr()  # clear stage 1's own output first
     train_stage2(
         base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
-        recon1_weight=0.0, stats1_weight=0.0, deriv_weight=0.02, deriv_weight_warmup_epochs=0,
+        stats1_weight=0.0, deriv_weight=0.02, deriv_weight_warmup_epochs=0,
         epochs=1, batch_size=4, num_workers=0,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage2_zero.pt", device="cpu", seed=0,
@@ -158,7 +159,6 @@ def test_zero_weight_terms_omitted_from_console_output(shared_stage1a_ancestor, 
     formula_line = next(line for line in output.splitlines() if line.startswith("/"))
     per_epoch_line = next(line for line in output.splitlines() if line.startswith("   1|"))
     assert formula_line == "/  1 train = recon0/1.0 +0.01*stats0/1.0 +0.02*deriv/1.0 | valid = ...  | ema"
-    assert "recon1" not in per_epoch_line
     assert per_epoch_line.count("+") == 4, "expected 2 '+' terms (stats0, deriv) on EACH of train/val"
 
     capsys.readouterr()  # clear again before the second call
@@ -208,10 +208,10 @@ def test_augment_is_actually_threaded_through_to_the_train_set_only(
     augment=True and val_set does NOT (val_loss must stay a clean
     measure of real, unaugmented performance), rather than just trusting
     that passing augment=True doesn't raise."""
-    import training.train_ae as train_ae_module
+    import training.train_stage2 as train_stage2_module
 
     base_path, stage1a_path = shared_stage1a_ancestor
-    real_dataset_cls = train_ae_module.MicrostructureEvolutionDataset
+    real_dataset_cls = train_stage2_module.MicrostructureEvolutionDataset
     recorded_augment_values = []
 
     class _RecordingDataset(real_dataset_cls):
@@ -219,7 +219,7 @@ def test_augment_is_actually_threaded_through_to_the_train_set_only(
             recorded_augment_values.append(augment)
             super().__init__(*args, augment=augment, **kwargs)
 
-    monkeypatch.setattr(train_ae_module, "MicrostructureEvolutionDataset", _RecordingDataset)
+    monkeypatch.setattr(train_stage2_module, "MicrostructureEvolutionDataset", _RecordingDataset)
 
     train_stage2(
         base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,

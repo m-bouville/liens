@@ -65,7 +65,7 @@ def _save_ae_checkpoint(path, run_dirs, size=64, base_channels=4, latent_channel
     """
     Builds and saves a REAL Autoencoder (or MultiStreamAutoencoder, for
     multi_stream) checkpoint -- real weights, real state_dict, exactly
-    what train_ae.py itself produces. multi_stream + stale_metadata
+    what train_stage1.py/train_stage2.py actually produce. multi_stream + stale_metadata
     together reproduces the exact "self_heals" scenario: config claims
     only one stream, but the encoder's actual weights have two.
     """

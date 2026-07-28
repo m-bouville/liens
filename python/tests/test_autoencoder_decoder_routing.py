@@ -16,9 +16,10 @@ def _build_stream_configs():
 
 def test_default_decoder_for_stream_preserves_existing_single_decoder_behavior():
     """decoder_for_stream=None (the default) must behave EXACTLY as
-    before this parameter existed -- every existing caller (train_ae.py,
-    model_assembly.py, every evaluation script) constructs with a
-    single decoder and no decoder_for_stream at all."""
+    before this parameter existed -- every existing caller
+    (train_stage1.py/train_stage2.py, model_assembly.py, every
+    evaluation script) constructs with a single decoder and no
+    decoder_for_stream at all."""
     torch.manual_seed(0)
     stream_configs = _build_stream_configs()
     encoder = Encoder(input_size=32, in_channels=1, base_channels=4, stream_configs=stream_configs)

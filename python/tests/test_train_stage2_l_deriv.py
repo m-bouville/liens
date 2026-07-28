@@ -1,7 +1,8 @@
 import torch
 from pathlib import Path
 from utils import load_datasets as load
-from training.train_ae import train_autoencoder, train_stage2
+from training.train_stage1 import train_autoencoder
+from training.train_stage2 import train_stage2
 import pytest
 
 
@@ -146,3 +147,66 @@ def test_stage2_accepts_single_stream_ancestor_and_builds_deriv(tmp_path, isolat
     assert "deriv" not in saved["config"]["decoder_for_stream"]
     assert not any(k.startswith("decoders.D1") for k in saved["model_state"])
     assert saved["stats_head1_state"] is not None
+
+
+def test_stats_head1_genuinely_trains_when_stats1_weight_nonzero(tmp_path, isolated_project_root):
+    """Regression test for a real, confirmed bug: stats_head1 is a
+    SEPARATE nn.Module from ae (not one of its submodules), left with
+    requires_grad=True in the Stage-1a-direct branch (deliberately, so
+    it gets its own first chance to learn something) -- but its own
+    parameters were never actually added to the optimizer anywhere,
+    so total.backward() genuinely computed gradients for it (the
+    printed stats1 loss term visibly decreases epoch over epoch) while
+    optimizer.step() never applied them. Confirmed directly: with the
+    bug present, stats_head1's true initial state_dict (captured via a
+    monkeypatch on extend_state_checkpoint_with_deriv_stream, since
+    it's constructed INSIDE train_stage2 -- a fresh, separately-built
+    comparison object would just be a different random draw, not the
+    actual initial state) was byte-identical to its state after 3 real
+    training epochs with stats1_weight=1.0, despite the loss
+    decreasing throughout (which came entirely from the shared trunk
+    moving via L_deriv/L_recon, not from stats_head1 itself)."""
+    import training.train_stage2 as train_stage2_module
+    from training.extend_encoder import extend_state_checkpoint_with_deriv_stream as real_extend
+
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1a_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
+    )
+
+    captured = {}
+
+    def _recording_extend(*args, **kwargs):
+        ext = real_extend(*args, **kwargs)
+        captured["stats_head1_initial"] = {k: v.clone() for k, v in ext.stats_head1.state_dict().items()}
+        return ext
+
+    monkeypatch_target = train_stage2_module.extend_state_checkpoint_with_deriv_stream
+    train_stage2_module.extend_state_checkpoint_with_deriv_stream = _recording_extend
+    try:
+        stage2_path = train_stage2_module.train_stage2(
+            base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
+            stats1_weight=1.0, deriv_weight=1.0,
+            epochs=3, batch_size=4, num_workers=0,
+            val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
+            log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
+        )
+    finally:
+        train_stage2_module.extend_state_checkpoint_with_deriv_stream = monkeypatch_target
+
+    saved = torch.load(stage2_path, map_location="cpu", weights_only=True)
+    sh1_after = saved["stats_head1_state"]
+    sh1_before = captured["stats_head1_initial"]
+
+    changed = any(not torch.equal(sh1_before[k], sh1_after[k]) for k in sh1_before)
+    assert changed, (
+        "stats_head1's weights are byte-identical to their true initial values after 3 real "
+        "training epochs with stats1_weight=1.0 -- its own parameters aren't reaching the "
+        "optimizer (check train_stage2's own `params = [...]` construction)"
+    )
