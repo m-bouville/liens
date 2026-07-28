@@ -234,13 +234,13 @@ def resolve_stream_configs_from_checkpoint_config(model_cfg: dict) -> tuple[dict
     (stream_configs, recon_stream_name) from a checkpoint's saved
     "config" dict -- the ONE shared place this resolution happens, used
     by every consumer that needs to rebuild a checkpoint's actual
-    architecture (train_ae.py's train_stage2, when resuming from a
+    architecture (train_stage2.py's train_stage2, when resuming from a
     stage 1 ancestor; evaluation/check_reconstruction.py, when
     visualizing any checkpoint), rather than each maintaining its own
     copy of the same fallback logic.
 
     "stream_configs"/"recon_stream_name" are NEW checkpoint fields (see
-    train_ae.py's train_autoencoder) -- checkpoints saved before they
+    train_stage1.py's train_autoencoder) -- checkpoints saved before they
     existed have neither, and fall back here to exactly the single
     "autoencoder"-mode stream they've always implicitly had, built from
     the flat latent_channels/latent_spatial_size keys those older

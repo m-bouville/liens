@@ -23,7 +23,7 @@ condition_on_theta= True
 
 
 
-# Stage 1a
+# Stage 1
 #   autoencoder
 
 latent_spatial_size= 8
@@ -67,17 +67,17 @@ ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
 
 use_dt_decade_weights = True  # was (de facto) False
 
-epochs 		  = 500
+epochs 		  =1000
 patience 	  =  50
 
 num_workers	  =   8   # was 8
-batches		  =65536
+batches		  = 4096
 
-lr 			  = 0.5e-3  # was 20e-6,  default: 0.001
+lr 			  = 0.2e-3  # was 20e-6,  default: 0.001
 z0_noise_scale=   0.175
-dt_cap		  = 400   # 500/0.05 = 10'000 time steps
+dt_cap		  = 125   # 125/0.05 = 2500 time steps
 
-force 	      = True
+# force 	      = True
 
 
 
@@ -86,17 +86,17 @@ force 	      = True
 n_rollout_steps= 2
 
 ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
-one_step_weight= 20000.
+one_step_weight= 0.5
 
 use_dt_decade_weights = True  # was (de facto) False
 
-epochs 		  = 500
+epochs 		  =1000
 patience 	  =  50
 
 num_workers	  = same
 batches		  = same
 
-lr 			  =   5e-6  # default: 0.001
+lr 			  =   0.2e-3  # default: 0.001
 z0_noise_scale=   0.1
 dt_cap		  = same
 

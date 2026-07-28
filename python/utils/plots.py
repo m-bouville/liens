@@ -19,10 +19,11 @@ def loss_curve(
     secondary_label: str = "1step",
 ) -> Path:
     """
-    Called from every stage's epoch loop (see train_ae.py/train_lds.py/
-    train_refinement.py) so the visualization and its y-axis-saturation
-    behavior stay in exactly one place rather than being reimplemented
-    slightly differently per stage.
+    Called from every stage's epoch loop (see train_stage1.py/
+    train_stage2.py/train_lds.py/train_refinement.py) so the
+    visualization and its y-axis-saturation behavior stay in exactly
+    one place rather than being reimplemented slightly differently per
+    stage.
 
     train_loss/val_loss/best_so_far: one value per epoch so far, in
     order -- best_so_far is the running minimum of val_loss's OWN

@@ -1612,6 +1612,24 @@ def _build_and_save_figures(
         results.dts, results.latent_losses_signed / results.dts, results.latent_losses / results.dts)
     dt_signed, dt_abs = dt_signed * _DT_PANEL_SCALE, dt_abs * _DT_PANEL_SCALE
 
+    # Trivial baseline: the "assume nothing changes" predictor,
+    # z0_pred(t+dt) = z0(t). Its error/dt is EXACTLY -dz0/dt (note the
+    # sign: error = z0_pred(t+dt) - z0_true(t+dt) = z0(t) - z0(t+dt) =
+    # -dz0, matching this panel's own error convention above), and its
+    # |error|/dt is EXACTLY |dz0/dt| = results.dz0dt_abs -- no new
+    # computation needed, dz0/dz0dt are already tracked per-window for
+    # dz0dt.png and the [0,1] panel below; this just reuses them here
+    # too, grouped the same way (_mean_curves_by_unique_value, by
+    # unique dt) as every other curve on these two panels. A genuine,
+    # exact baseline (not a rough guide) precisely because it needs no
+    # model at all -- either curve beating it is the real bar for
+    # "learned something dt-dependent worth having", not just "beat
+    # zero".
+    _, dt_trivial_signed, dt_trivial_abs, _ = _mean_curves_by_unique_value(
+        results.dts, results.dz0dt_signed, results.dz0dt_abs)
+    dt_trivial_signed = -dt_trivial_signed * _DT_PANEL_SCALE
+    dt_trivial_abs = dt_trivial_abs * _DT_PANEL_SCALE
+
     # [1,3] built HERE too (not at its former, separate location later
     # in this function) -- both panels need exactly the same already-
     # available data (results.dts, taylor_fit, results.euler_losses/_signed), and
@@ -1670,6 +1688,17 @@ def _build_and_save_figures(
     sizes = _size_by_count(dt_n)
 
     ax_signed.axhline(0, color="gray", linewidth=0.7, linestyle=":")
+    # Trivial baseline plotted FIRST (lower zorder, sits visually behind
+    # the two real curves) -- see its own data-prep comment above for
+    # why this is an exact, not approximate, reference: literally the
+    # error of never updating the prediction at all. Gray/square
+    # markers/dashed, deliberately distinct from euler-only's blue and
+    # full's orange -- this is a reference line, not a third model
+    # variant to compare against those two on equal footing.
+    ax_signed.plot(dt_x, dt_trivial_signed, "--", color="gray", linewidth=1, zorder=0)
+    ax_signed.scatter(dt_x, dt_trivial_signed, s=sizes, color="gray", zorder=0,
+                       marker="s", edgecolors="black", linewidths=0.3,
+                       label="trivial (no change)")
     ax_signed.plot(dt_x_13, dt_signed_13, "-", color="tab:blue", linewidth=1, zorder=1)
     ax_signed.scatter(dt_x_13, dt_signed_13, s=sizes, color="tab:blue", zorder=2,
                        edgecolors="black", linewidths=0.3, label="euler-only")
@@ -1679,9 +1708,17 @@ def _build_and_save_figures(
     # Lock the y-range from empirical data alone, BEFORE the regression
     # curves (below) are drawn -- same reasoning as before: the curves'
     # own 1/dt divergence near results.dts.min() would otherwise crush the
-    # actual data into a thin band.
+    # actual data into a thin band. The trivial baseline is real,
+    # non-diverging empirical data (unlike the regression curves below),
+    # so it's included in this lock deliberately -- if it's large enough
+    # to widen the range, that's the actual finding, not something to
+    # hide by locking the range before plotting it.
     ax_signed.set_ylim(ax_signed.get_ylim())
 
+    ax_abs.plot(dt_x, dt_trivial_abs, "--", color="gray", linewidth=1, zorder=0)
+    ax_abs.scatter(dt_x, dt_trivial_abs, s=sizes, color="gray", zorder=0,
+                    marker="s", edgecolors="black", linewidths=0.3,
+                    label="trivial (no change)")
     ax_abs.plot(dt_x_13, dt_abs_13, "-", color="tab:blue", linewidth=1, zorder=1)
     ax_abs.scatter(dt_x_13, dt_abs_13, s=sizes, color="tab:blue", zorder=2,
                     edgecolors="black", linewidths=0.3, label="euler-only")
