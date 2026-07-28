@@ -47,17 +47,78 @@ def _build_sweep(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
-def test_stage2_rejects_single_stream_ancestor(tmp_path):
-    """L_deriv has no meaning without a deriv stream -- must raise
-    clearly, not silently do something else. The two tests that used
-    to sit here (deriv-training-in-stage-2, freeze_outer_layers-with-
-    multi-stream) were superseded by test_train_stage2_c0c1.py's own,
-    more complete end-to-end test once stage 2 was redesigned for the
-    real stage 1a/1b split (separate D0/D1, both stats heads, all
-    five loss terms) -- removed here rather than kept skipped, since
-    resurrecting their old latent_names/latent_modes-based fixtures
-    would just duplicate what that file already covers more
-    thoroughly."""
+def test_stage2_rejects_ambiguous_multi_deriv_ancestor(tmp_path, isolated_project_root):
+    """L_deriv has no meaning without EXACTLY one deriv-role stream to
+    compare z0's own trajectory against -- must raise clearly, not
+    silently pick one. A single-stream (stage 1a) ancestor is no
+    longer the right example of an invalid one (see
+    test_stage2_accepts_single_stream_ancestor_and_builds_deriv below
+    -- train_stage2 now builds the deriv stream itself from exactly
+    that input, replacing what used to require a separate stage 1b
+    pass first). The genuinely-still-invalid case is an ancestor with
+    MORE than one non-recon stream -- built synthetically here
+    (matching test_checkpoint_components_multi_stream.py's own
+    approach), since no real training stage in this pipeline produces
+    a 3-stream checkpoint to resume from."""
+    from models.autoencoder import MultiStreamAutoencoder
+    from models.encoder import Encoder
+    from models.latent_streams import LatentStreamConfig, LatentStreamMode
+    from training.stats_head import StatsHead
+
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=4, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+        "deriv_a": LatentStreamConfig(name="deriv_a", channels=4, spatial_size=8,
+                                       mode=LatentStreamMode.PURE_LATENT),
+        "deriv_b": LatentStreamConfig(name="deriv_b", channels=4, spatial_size=8,
+                                       mode=LatentStreamMode.PURE_LATENT),
+    }
+    encoder = Encoder(input_size=32, in_channels=1, base_channels=4, stream_configs=stream_configs)
+    from models.decoder import Decoder
+    decoder = Decoder(output_size=32, out_channels=1, base_channels=4, latent_channels=4, latent_spatial_size=8)
+    model = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"D0": decoder},
+                                    stream_configs=stream_configs, decoder_for_stream={"state": "D0"})
+    stats_head = StatsHead(latent_channels=4, stat_names=["avg_phi"], latent_spatial=8)
+
+    checkpoint_path = tmp_path / "fake_ambiguous_multi_stream.pt"
+    torch.save({
+        "model_state": model.state_dict(),
+        "stats_head_state": stats_head.state_dict(),
+        "epoch": 1, "val_loss": 0.5,
+        "config": {
+            "size": 32, "base_channels": 4, "stats_weight": 0.01,
+            "stream_configs": {n: {"channels": c.channels, "spatial_size": c.spatial_size,
+                                    "mode": c.mode.value, "condition_on_theta": c.condition_on_theta}
+                                for n, c in stream_configs.items()},
+            "recon_stream_name": "state",
+            "decoder_for_stream": {"state": "D0"},
+        },
+        "stats_config": {"stat_names": ["avg_phi"], "stats_mean": torch.zeros(1), "stats_std": torch.ones(1)},
+    }, checkpoint_path)
+
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    with pytest.raises(ValueError, match="exactly one"):
+        train_stage2(
+            base_path=base_path, resume_from=checkpoint_path,
+            deriv_weight=1.0, stats0_weight=0.0,
+            epochs=1, batch_size=4, num_workers=0,
+            min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / "stage2_should_fail.pt", device="cpu",
+        )
+
+
+def test_stage2_accepts_single_stream_ancestor_and_builds_deriv(tmp_path, isolated_project_root):
+    """The new, intended behavior this test file's own removed test used
+    to explicitly forbid: train_stage2() now resumes DIRECTLY from a
+    stage 1a (single-stream) checkpoint, building the deriv stream
+    itself in memory -- see extend_encoder.py's own module docstring
+    for the full rationale (stage 1b's own training loop had been
+    inert since it started running at epochs=0; D1, the one thing
+    genuinely built only by that loop's own surrounding setup, is
+    confirmed permanently unnecessary). Checked here at train_stage2's
+    own integration level, not just extend_encoder.py's own isolated
+    unit tests -- confirms the two are actually wired together
+    correctly, end to end, including a real training epoch."""
     base_path = _build_sweep(tmp_path, n_runs=6, size=32)
 
     stage1_path = train_autoencoder(
@@ -69,11 +130,19 @@ def test_stage2_rejects_single_stream_ancestor(tmp_path):
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1.png",
     )
 
-    with pytest.raises(ValueError, match="exactly one"):
-        train_stage2(
-            base_path=base_path, resume_from=stage1_path,
-            deriv_weight=1.0, stats0_weight=0.0,
-            epochs=1, batch_size=4, num_workers=0,
-            min_step=0, min_stdev_phi=None,
-            checkpoint_path=tmp_path / "stage2_should_fail.pt", device="cpu",
-        )
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, stats0_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_from_1a.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
+    )
+    assert stage2_path.exists()
+
+    saved = torch.load(stage2_path, map_location="cpu", weights_only=True)
+    from models.latent_streams import LatentStreamMode
+    assert saved["config"]["stream_configs"]["deriv"]["mode"] == LatentStreamMode.PURE_LATENT.value
+    assert "deriv" not in saved["config"]["decoder_for_stream"]
+    assert not any(k.startswith("decoders.D1") for k in saved["model_state"])
+    assert saved["stats_head1_state"] is not None

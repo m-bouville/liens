@@ -96,9 +96,9 @@ def _strip_decoder_prefix_for_stream(state_dict: dict, model_cfg: dict, recon_st
     """
     Regression fix for a real, reported crash: build_models_from_
     components() failed with "missing keys: decoder.*" on a real stage
-    4 run resuming from a stage 2 checkpoint. Root cause: a stage 1b/2
+    4 run resuming from a stage 2 checkpoint. Root cause: a stage 2
     checkpoint doesn't necessarily have ONE shared decoder at all --
-    train_stage1b/train_stage2 construct SEPARATE per-stream decoders
+    train_stage2 can construct SEPARATE per-stream decoders
     (typically "D0" for the recon stream, "D1" for "deriv" -- see
     train_ae.py's own decoder_for_stream={state_name: "D0", "deriv":
     "D1"}), so "decoders.shared." matches nothing and

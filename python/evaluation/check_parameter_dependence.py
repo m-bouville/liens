@@ -21,6 +21,7 @@ being on sys.path):
 import argparse
 import re
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -738,53 +739,89 @@ def _local_widths(unique_x: np.ndarray, factor: float = 0.6) -> np.ndarray:
     return np.minimum(left_gap, right_gap) * factor
 
 
-def check_parameter_dependence(
-    lds_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
-    min_passing_steps: int | None = None,
-    base_path: Path | None = None, size: int | None = None,
-    ae_stats_weight: float | None = None, hidden_dim: int = 256, n_hidden_layers: int = 2,
-    condition_on_theta: bool | None = None,
-    euler_only: bool | None = None,
-    output_path: Path | None = None, dz0dt_output_path: Path | None = None,
-    dt_dependence_output_path: Path | None = None, decode: bool = False, device: str | None = None,
-) -> Path:
-    """Saves three figures: parameter_dependence.png (temperature, noise,
-    per-run scatter), dt_dependence.png (error/|error| vs dt, and,
-    when decode=True, pixel-space error vs dt), and dz0dt.png
-    (ground-truth dz0/dz0dt vs t and dt, independent of euler_only).
-    Returns parameter_dependence.png's own path (the other two are
-    still written to disk either way; see dt_dependence_output_path/
-    dz0dt_output_path to control where).
+@dataclass
+class _LoadedContext:
+    """Everything check_parameter_dependence()'s own setup phase (checkpoint
+    loading, model/dataset construction, output-path resolution) produces
+    that the rest of the pipeline (_evaluate_windows/_print_summary_statistics/
+    _build_and_save_figures) needs -- bundled rather than threaded through as
+    a long, individually-named parameter list on each of those, since the
+    full set is used piecemeal across all three."""
+    device: torch.device
+    euler_only: bool
+    output_path: Path
+    dz0dt_output_path: Path
+    dt_dependence_output_path: Path
+    lds_checkpoint_path: Path  # post ensure_lds_checkpoint conversion, NOT the caller's original
+    ae_config: dict
+    dataset: "MicrostructureEvolutionDataset"
+    ae_decoder: torch.nn.Module
+    f_theta: "LatentDynamics"
 
-    decode=False (default) skips pixel-space entirely -- no decoder
-    forward passes in the main evaluation loop, no pixel-space console
-    diagnostics (dt-decade table, temperature/noise/length_scale binned
-    summaries all drop their "mean pixel_loss" column), and
-    dt_dependence.png's own pixel-space panel isn't built at all. Set
-    True to include it, at the cost of the extra decoder calls.
 
-    lds_checkpoint_path may ALSO be a stage-1/1b/2 (AE-family)
-    checkpoint, not just a real stage-3 one -- see
-    checkpoint_identification.ensure_lds_checkpoint's own docstring for
-    the full mechanism (an ephemeral, UNTRAINED f_theta gets trained
-    against it for epochs=0). base_path/size are REQUIRED (and
-    otherwise unused) specifically for this AE-family-conversion path;
-    a real stage-3 checkpoint needs neither.
+@dataclass
+class _EvaluationResults:
+    """Every per-window array (plus the two running-sum scalars) produced by
+    _evaluate_windows()'s own pass over the dataset -- the shared input both
+    _print_summary_statistics() and _build_and_save_figures() read from,
+    after the euler_only substitution (see its own comment, preserved below)
+    has already been applied to latent_losses/pixel_losses/latent_losses_signed."""
+    dts: np.ndarray
+    temperatures: np.ndarray
+    noises: np.ndarray
+    length_scales: np.ndarray
+    run_dirs: list
+    latent_losses: np.ndarray
+    pixel_losses: np.ndarray
+    euler_losses: np.ndarray
+    euler_pixel_losses: np.ndarray
+    latent_losses_signed: np.ndarray
+    euler_losses_signed: np.ndarray
+    abs_steps: np.ndarray
+    dz0_signed: np.ndarray
+    dz0_abs: np.ndarray
+    dz0dt_signed: np.ndarray
+    dz0dt_abs: np.ndarray
+    signed_residual_sum: torch.Tensor
+    n_total: int
 
-    euler_only: None (default) auto-detects -- True whenever
-    lds_checkpoint_path actually got converted (an AE-family checkpoint
-    was given, so f_theta is untrained and "full" is meaningless), False
-    otherwise (a real stage-3 checkpoint, both euler-only and full shown
-    as usual). Every panel/fit/print that would otherwise report on
-    "full" (f_theta-corrected) numbers reports on euler-only ones
-    instead in this mode, and the full-vs-euler-only COMPARISONS
-    themselves (which have nothing to compare against here) are
-    skipped rather than printed as a meaningless ratio of 1.0. Force
-    True/False explicitly to override the auto-detection either way
-    (e.g. to see the euler-only-only report for a real stage-3
-    checkpoint too, for a same-scale comparison against an AE-family
-    run).
-    """
+
+@dataclass
+class _DerivedStats:
+    """A handful of values _print_summary_statistics() computes for its own
+    console output that _build_and_save_figures()'s panels ALSO need (panel
+    titles echo the same correlation percentages the console printed; the
+    bubble panel [0,2] plots the same per-(temperature,noise)-point
+    aggregation the runs-report is built alongside). Kept separate from
+    _EvaluationResults -- these are DERIVED from it by
+    _print_summary_statistics, not raw per-window data _evaluate_windows
+    itself produces. corr_dt_pixel is None whenever decode=False (see its
+    own assignment site below for why)."""
+    corr_dt_pixel: float | None
+    corr_noise_abs: float
+    corr_noise_signed: float
+    corr_temp_abs: float
+    corr_temp_signed: float
+    run_mean_loss: np.ndarray
+    run_n_windows: np.ndarray
+    run_noises: np.ndarray
+    run_temps: np.ndarray
+
+
+def _load_models_and_dataset(
+    lds_checkpoint_path: Path, min_step: int | None, min_stdev_phi: float | None,
+    min_passing_steps: int | None, base_path: Path | None, size: int | None,
+    ae_stats_weight: float | None, hidden_dim: int, n_hidden_layers: int,
+    condition_on_theta: bool | None, euler_only: bool | None,
+    output_path: Path | None, dz0dt_output_path: Path | None,
+    dt_dependence_output_path: Path | None, device: str | None,
+) -> _LoadedContext:
+    """check_parameter_dependence()'s own setup phase, extracted verbatim
+    (same order, same logic) -- resolves device/output paths, converts an
+    AE-family checkpoint via ensure_lds_checkpoint if needed, and builds the
+    ae/f_theta/dataset this whole evaluation runs against. See
+    check_parameter_dependence()'s own docstring for the parameters'
+    meaning; unchanged here."""
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if device.type == "cuda" and not torch.cuda.is_available():
         # See this function's own docstring on why this re-check exists,
@@ -943,6 +980,18 @@ def check_parameter_dependence(
         latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
         latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
+        # inf (exact no-op) for any checkpoint saved before dt_cap
+        # existed -- same .get()-with-fallback pattern as
+        # latent_spatial_size just above, and as model_assembly.py's
+        # own build_models_from_components uses for the SAME parameter.
+        # A real, reported bug otherwise: this is a SEPARATE LatentDynamics
+        # construction from that one (this whole function evaluates a
+        # raw Stage 3a/3b checkpoint directly, not via
+        # build_models_from_components at all), so fixing dt_cap there
+        # didn't fix it here -- a checkpoint saved with a real, finite
+        # dt_cap would silently evaluate as if dt_cap were still inf,
+        # with no error or warning anywhere to indicate the mismatch.
+        dt_cap=lds_config.get("dt_cap", float("inf")),
     ).to(device)
     f_theta.load_state_dict(lds_checkpoint["model_state"])
     f_theta.eval()
@@ -954,6 +1003,22 @@ def check_parameter_dependence(
     )
     print(f"Evaluating {len(dataset)} test windows...")
 
+    return _LoadedContext(
+        device=device, euler_only=euler_only, output_path=output_path,
+        dz0dt_output_path=dz0dt_output_path, dt_dependence_output_path=dt_dependence_output_path,
+        lds_checkpoint_path=lds_checkpoint_path, ae_config=ae_config, dataset=dataset,
+        ae_decoder=ae_decoder, f_theta=f_theta,
+    )
+
+
+def _evaluate_windows(dataset, f_theta, ae_decoder, device, decode: bool, euler_only: bool) -> _EvaluationResults:
+    """The main per-window evaluation loop, extracted verbatim -- iterates
+    every test window, computing the full/euler-only/pixel-space (if
+    decode=True) predictions and losses, plus the ground-truth dz0/dz0dt
+    tracking dz0dt.png needs. Ends with the euler_only substitution (see its
+    own comment below, preserved unchanged) so every downstream consumer of
+    latent_losses/pixel_losses/latent_losses_signed automatically reports on
+    euler-only data in that mode without needing to know euler_only exists."""
     # metadata.txt read once per run_dir, not once per window -- most
     # runs contribute several windows, and temperature/noise are
     # constant across all of them (unlike dt, which varies per window
@@ -1155,7 +1220,27 @@ def check_parameter_dependence(
         pixel_losses = euler_pixel_losses
         latent_losses_signed = euler_losses_signed
 
-    # Bias vs variance in z1's own error: euler_losses (E[|residual|],
+    return _EvaluationResults(
+        dts=dts, temperatures=temperatures, noises=noises, length_scales=length_scales,
+        run_dirs=run_dirs, latent_losses=latent_losses, pixel_losses=pixel_losses,
+        euler_losses=euler_losses, euler_pixel_losses=euler_pixel_losses,
+        latent_losses_signed=latent_losses_signed, euler_losses_signed=euler_losses_signed,
+        abs_steps=abs_steps, dz0_signed=dz0_signed, dz0_abs=dz0_abs,
+        dz0dt_signed=dz0dt_signed, dz0dt_abs=dz0dt_abs,
+        signed_residual_sum=signed_residual_sum, n_total=n_total,
+    )
+
+
+def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, decode: bool, euler_only: bool) -> _DerivedStats:
+    """Every console-only diagnostic that doesn't touch a figure object --
+    bias/variance, the dt power-law/saturating-exponential model comparison,
+    the euler-vs-full direct-magnitude comparison, the dt-decade table,
+    temperature/noise/length_scale correlations, and the top-10-runs-by-loss
+    listing. Extracted verbatim (see _DerivedStats' own docstring for the one
+    added line, a safe default for corr_dt_pixel, that this split required).
+    Mostly a side effect (print), but also returns the handful of computed
+    values _build_and_save_figures' own panels reuse -- see _DerivedStats."""
+    # Bias vs variance in z1's own error: results.euler_losses (E[|residual|],
     # mean ABSOLUTE error) can never distinguish "z1 is wrong by the
     # same amount, in the same direction, every time" (a bias -- in
     # principle correctable, e.g. by retraining z1 differently) from
@@ -1165,11 +1250,11 @@ def check_parameter_dependence(
     # residual's own norm, NOT mean of the norm) answers this directly:
     # random, cancelling errors average toward zero across many
     # windows; a genuine, consistent bias does not.
-    mean_signed_residual = signed_residual_sum / n_total  # (C, H, W), SIGN preserved
+    mean_signed_residual = results.signed_residual_sum / results.n_total  # (C, H, W), SIGN preserved
     bias_magnitude = mean_signed_residual.abs().mean().item()
-    total_magnitude = float(euler_losses.mean())
+    total_magnitude = float(results.euler_losses.mean())
     bias_fraction = bias_magnitude / total_magnitude if total_magnitude > 0 else float("nan")
-    print(f"\nz1's own euler-only error: bias vs variance (n={n_total} windows):")
+    print(f"\nz1's own euler-only error: bias vs variance (n={results.n_total} windows):")
     print(f"  E[|residual|]  (total error magnitude, already reported above as euler-only): "
           f"{total_magnitude:.6e}")
     print(f"  |E[residual]|  (the part that does NOT cancel across windows -- the bias): "
@@ -1185,13 +1270,23 @@ def check_parameter_dependence(
     # genuinely spans orders of magnitude within one sweep; temperature
     # and noise (below) typically don't, so they get linear treatment
     # instead rather than forcing the same log-space analysis on them.
-    log_dt = np.log10(dts)
-    log_latent = np.log10(np.clip(latent_losses, 1e-12, None))
+    log_dt = np.log10(results.dts)
+    log_latent = np.log10(np.clip(results.latent_losses, 1e-12, None))
     corr_dt_latent = np.corrcoef(log_dt, log_latent)[0, 1]
-    # corr_dt_pixel/log_pixel need pixel_losses, which is only populated
+    # corr_dt_pixel/log_pixel need results.pixel_losses, which is only populated
     # when decode=True (see the main loop's own decoder-skipping note).
+    # Defaulted to None here (a NEW line, not present in the original
+    # in-one-function version) so _DerivedStats' own return below always
+    # has a value to bundle regardless of decode -- the original code never
+    # needed this default, since a single function body never references a
+    # variable before its own conditional assignment; splitting the read
+    # (in _build_and_save_figures, itself also decode-gated identically) into
+    # a SEPARATE function from the write means Python can no longer see that
+    # the two conditionals are the same one, so the return statement itself
+    # needs corr_dt_pixel to unconditionally exist.
+    corr_dt_pixel = None
     if decode:
-        log_pixel = np.log10(np.clip(pixel_losses, 1e-12, None))
+        log_pixel = np.log10(np.clip(results.pixel_losses, 1e-12, None))
         corr_dt_pixel = np.corrcoef(log_dt, log_pixel)[0, 1]
         print(f"\ncorr w.r.t. log dt: log latent_loss {corr_dt_latent*100:.0f}%, "
               f"log pixel_loss {corr_dt_pixel*100:.0f}%")
@@ -1202,8 +1297,8 @@ def check_parameter_dependence(
 
     print(f"\nModel comparison ({'euler-only' if euler_only else 'latent_loss'} vs dt): "
           f"power law vs saturating exponential")
-    a, b, r2_log, sse_power, pred_power = fit_power_law(dts, latent_losses)
-    c, tau, r2_sat, sse_sat, pred_sat = fit_saturating_exponential(dts, latent_losses)
+    a, b, r2_log, sse_power, pred_power = fit_power_law(results.dts, results.latent_losses)
+    c, tau, r2_sat, sse_sat, pred_sat = fit_saturating_exponential(results.dts, results.latent_losses)
     print(f"  power law:     error ~ dt^{a:.3f}, SSE(real space)={sse_power:.6f}")
     print(f"  saturating exp: error -> {c:.4f} with timescale tau={tau:.1f}, "
           f"SSE(real space)={sse_sat:.6f}")
@@ -1211,16 +1306,16 @@ def check_parameter_dependence(
     print(f"  -> {better} fits better (lower SSE).")
 
     if euler_only:
-        # latent_losses IS euler_losses here (see the substitution
+        # results.latent_losses IS results.euler_losses here (see the substitution
         # above) -- a "euler-only vs full" comparison would just be
         # comparing that array against itself (ratio of means = 1.0,
         # "0.0% worse" every time), not a real finding. Skipped
         # entirely rather than printed as if it meant something.
         #
         # a_euler set to the ALREADY-computed a from the fit just
-        # above, not recomputed via a separate fit_power_law(dts,
-        # euler_losses) call -- that fit would be numerically IDENTICAL
-        # anyway (same data, latent_losses IS euler_losses here), just
+        # above, not recomputed via a separate fit_power_law(results.dts,
+        # results.euler_losses) call -- that fit would be numerically IDENTICAL
+        # anyway (same data, results.latent_losses IS results.euler_losses here), just
         # wastefully repeated. Still needed below regardless of this
         # mode: a_euler feeds the dt-decade table's own header. (The
         # power-law FIT CURVE itself, pred_power/pred_power_euler, is
@@ -1251,7 +1346,7 @@ def check_parameter_dependence(
         # well below every dt actually observed. The direct magnitude
         # comparison below is what actually answers "which one is smaller,
         # in practice, over the range that matters."
-        a_euler, _b_euler, _r2_log_euler, _sse_power_euler, _pred_power_euler = fit_power_law(dts, euler_losses)
+        a_euler, _b_euler, _r2_log_euler, _sse_power_euler, _pred_power_euler = fit_power_law(results.dts, results.euler_losses)
         print(f"\nEuler-only (z0+z1*dt, no f_theta) vs full (f_theta-corrected) prediction, "
               f"same windows/dt:")
         print(f"  euler-only:  error ~ dt^{a_euler:.3f}")
@@ -1260,11 +1355,11 @@ def check_parameter_dependence(
               f"see the direct magnitude comparison below for which is ACTUALLY smaller "
               f"over the observed dt range)")
 
-        ratio = np.array(latent_losses) / np.maximum(np.array(euler_losses), 1e-12)
+        ratio = np.array(results.latent_losses) / np.maximum(np.array(results.euler_losses), 1e-12)
         frac_full_worse = float((ratio > 1).mean())
         print(f"\nDirect magnitude comparison (full / euler-only), per window:")
-        print(f"  mean(full)={np.mean(latent_losses):.6f}  mean(euler-only)={np.mean(euler_losses):.6f}  "
-              f"ratio of means={np.mean(latent_losses) / np.mean(euler_losses):.4f}")
+        print(f"  mean(full)={np.mean(results.latent_losses):.6f}  mean(euler-only)={np.mean(results.euler_losses):.6f}  "
+              f"ratio of means={np.mean(results.latent_losses) / np.mean(results.euler_losses):.4f}")
         print(f"  mean(full/euler-only ratio)={ratio.mean():.4f}  median={np.median(ratio):.4f}")
         print(f"  full prediction is WORSE than euler-only on {frac_full_worse:.1%} of windows")
         if frac_full_worse > 0.5:
@@ -1280,13 +1375,13 @@ def check_parameter_dependence(
         mask = (log_dt >= lo) & (log_dt < lo + 1)
         if mask.sum() == 0:
             continue
-        row = f"1e{lo:.0f} - 1e{lo+1:.0f}   {mask.sum():4d}   {latent_losses[mask].mean():.6f}"
-        row += f"         {pixel_losses[mask].mean():.6f}" if decode else ""
+        row = f"1e{lo:.0f} - 1e{lo+1:.0f}   {mask.sum():4d}   {results.latent_losses[mask].mean():.6f}"
+        row += f"         {results.pixel_losses[mask].mean():.6f}" if decode else ""
         print(row)
 
     # ---- temperature and noise: linear-space correlation + binned summary
-    # Correlated against |error| and error DIRECTLY (latent_losses/
-    # latent_losses_signed), NOT log10(|error|) -- panels [1,0]/[1,1]
+    # Correlated against |error| and error DIRECTLY (results.latent_losses/
+    # results.latent_losses_signed), NOT log10(|error|) -- panels [1,0]/[1,1]
     # themselves are LINEAR-scale (mean(error)/mean|error| twin axes,
     # not a log-scale boxplot the way they used to be), so a log-based
     # correlation number doesn't actually describe what those panels
@@ -1295,14 +1390,14 @@ def check_parameter_dependence(
     # left, mean|error| on the right), so it's worth knowing whether
     # temperature/noise correlate with the DIRECTION of the bias too,
     # not just its magnitude.
-    corr_temp_abs = np.corrcoef(temperatures, latent_losses)[0, 1]
-    corr_temp_signed = np.corrcoef(temperatures, latent_losses_signed)[0, 1]
-    corr_noise_abs = np.corrcoef(noises, latent_losses)[0, 1]
-    corr_noise_signed = np.corrcoef(noises, latent_losses_signed)[0, 1]
+    corr_temp_abs = np.corrcoef(results.temperatures, results.latent_losses)[0, 1]
+    corr_temp_signed = np.corrcoef(results.temperatures, results.latent_losses_signed)[0, 1]
+    corr_noise_abs = np.corrcoef(results.noises, results.latent_losses)[0, 1]
+    corr_noise_signed = np.corrcoef(results.noises, results.latent_losses_signed)[0, 1]
     print(f"\ncorr w.r.t. temperature: error {corr_temp_signed * 100:.0f}%, |error| {corr_temp_abs * 100:.0f}%")
     print(f"corr w.r.t. noise: error {corr_noise_signed * 100:.0f}%, |error| {corr_noise_abs * 100:.0f}%")
-    _print_binned_summary("temperature", temperatures, latent_losses, pixel_losses if decode else None)
-    _print_binned_summary("noise", noises, latent_losses, pixel_losses if decode else None)
+    _print_binned_summary("temperature", results.temperatures, results.latent_losses, results.pixel_losses if decode else None)
+    _print_binned_summary("noise", results.noises, results.latent_losses, results.pixel_losses if decode else None)
 
     # ---- length scale (first peak in autocorrelation): DIAGNOSTIC for
     # whether error tracks the microstructure's own dominant length
@@ -1324,13 +1419,13 @@ def check_parameter_dependence(
     # Treated as N/A: excluded from the correlation, the binned summary,
     # BOTH fits, and the scatter -- not just visually hidden.
     max_dist = max_autocorr_dist(ae_config["size"], ae_config["size"])
-    saturated = length_scales >= max_dist
+    saturated = results.length_scales >= max_dist
     n_saturated = int(saturated.sum())
-    print(f"\n{n_saturated}/{len(length_scales)} windows have autocorr_length >= "
+    print(f"\n{n_saturated}/{len(results.length_scales)} windows have autocorr_length >= "
           f"{max_dist} (the C++ search cap) -- treated as N/A (not a real length "
           f"scale, just 'never decayed within range') and excluded below.")
-    length_scales_valid = length_scales[~saturated]
-    latent_losses_for_length = latent_losses[~saturated]
+    length_scales_valid = results.length_scales[~saturated]
+    latent_losses_for_length = results.latent_losses[~saturated]
     log_latent_for_length = log_latent[~saturated]
 
     corr_length_latent = np.corrcoef(length_scales_valid, log_latent_for_length)[0, 1]
@@ -1339,7 +1434,7 @@ def check_parameter_dependence(
     print("(if this is the dominant driver, error should track length_scale more "
           "cleanly than it tracks dt/temperature/noise individually above)")
     _print_binned_summary("length_scale", length_scales_valid, latent_losses_for_length,
-                           pixel_losses[~saturated] if decode else None)
+                           results.pixel_losses[~saturated] if decode else None)
 
     # UNLIKE dt (log-log panel, where fit_power_law's straight-line form
     # is the natural visual fit check), the length_scale panel is
@@ -1387,7 +1482,7 @@ def check_parameter_dependence(
     # round-trip through a text metadata file can turn one intended
     # sweep value into several bit-distinct floats.
     per_point: dict[tuple[float, float], dict] = {}
-    for t, n, ll in zip(temperatures, noises, latent_losses):
+    for t, n, ll in zip(results.temperatures, results.noises, results.latent_losses):
         key = (round(float(t), 6), round(float(n), 6))
         entry = per_point.setdefault(key, {"temperature": key[0], "noise": key[1], "losses": []})
         entry["losses"].append(ll)
@@ -1401,7 +1496,7 @@ def check_parameter_dependence(
     # below, which needs each seed identified individually, unlike
     # panel [0,2]'s own pooled-across-seeds view.
     per_run: dict[Path, dict] = {}
-    for run_dir, t, n, ll in zip(run_dirs, temperatures, noises, latent_losses):
+    for run_dir, t, n, ll in zip(results.run_dirs, results.temperatures, results.noises, results.latent_losses):
         entry = per_run.setdefault(run_dir, {"temperature": t, "noise": n, "losses": []})
         entry["losses"].append(ll)
     per_run_mean_loss = np.array([np.mean(v["losses"]) for v in per_run.values()])
@@ -1417,6 +1512,34 @@ def check_parameter_dependence(
         print(f"  {run_dir_list[i].name}: T={per_run_temps[i]:.3f}  noise={per_run_noises[i]:.4f}  "
               f"mean_loss={per_run_mean_loss[i]:.6f}  ({per_run_n_windows[i]} windows)")
 
+    return _DerivedStats(
+        corr_dt_pixel=corr_dt_pixel,
+        corr_noise_abs=corr_noise_abs,
+        corr_noise_signed=corr_noise_signed,
+        corr_temp_abs=corr_temp_abs,
+        corr_temp_signed=corr_temp_signed,
+        run_mean_loss=run_mean_loss,
+        run_n_windows=run_n_windows,
+        run_noises=run_noises,
+        run_temps=run_temps,
+    )
+
+
+def _build_and_save_figures(
+    results: _EvaluationResults, stats: _DerivedStats, lds_checkpoint_path: Path, output_path: Path,
+    dz0dt_output_path: Path, dt_dependence_output_path: Path, decode: bool, euler_only: bool,
+) -> None:
+    """Builds and saves all three output figures (parameter_dependence.png,
+    dt_dependence.png, dz0dt.png), extracted verbatim as ONE function rather
+    than split further -- the Taylor-residual decomposition (taylor_fit) is
+    computed once here, right after fig/fig_dt are created, and reused by
+    both the dt_dependence.png panels AND the later T<0.9/T>=0.9 console-only
+    refits deep inside this same block (see that computation's own comment,
+    preserved below, on why its position here is deliberate, not incidental)
+    -- genuinely interleaved with panel construction, not a separable
+    "compute all stats, then plot" sequence, so splitting it further would
+    require REORDERING logic, not just extracting it. Pure side effect
+    (writes three files), returns nothing."""
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
     # dt_dependence.png: the 4 panels whose x-axis is dt (error,
     # |error|, pixel-space, and the combined dz0/dz0dt panel), moved
@@ -1436,7 +1559,7 @@ def check_parameter_dependence(
     # (still nearby, just below) for why the T<0.9/T>=0.9 splits
     # themselves stay console-only and don't get their own variable
     # here: neither is plotted, only this ALL-DATA fit is.
-    taylor_fit = fit_taylor_residual_coefficients(dts, euler_losses_signed, latent_losses_signed,
+    taylor_fit = fit_taylor_residual_coefficients(results.dts, results.euler_losses_signed, results.latent_losses_signed,
                                                     label="ALL DATA", euler_only=euler_only)
 
     # Main title parsed from the checkpoint's own filename (e.g.
@@ -1465,8 +1588,8 @@ def check_parameter_dependence(
         # its own distinct red styling without forcing the whole main
         # title red too. Every panel not explicitly labeled otherwise
         # (temperature/noise curves, the per-run scatter) is ALSO
-        # showing euler-only data here (via the latent_losses/
-        # pixel_losses substitution above), even though their own
+        # showing euler-only data here (via the results.latent_losses/
+        # results.pixel_losses substitution above), even though their own
         # individual titles don't each say so -- this makes that fact
         # impossible to miss regardless of which panel someone looks at
         # first. Shown on BOTH figures now (fig and fig_dt), since the
@@ -1480,7 +1603,7 @@ def check_parameter_dependence(
 
     _euler_tag = " [euler-only]" if euler_only else ""
     # Moved to dt_dependence.png ([1,0] there), and now only built at
-    # all when decode=True -- both the panel AND the pixel_losses data
+    # all when decode=True -- both the panel AND the results.pixel_losses data
     # it needs (see the main loop's own decoder-skipping note) are
     # gated on the same flag, so there's nothing here to plot when it's
     # False.
@@ -1494,13 +1617,13 @@ def check_parameter_dependence(
         # the SAME residual, run through the decoder, not an independently
         # computed pixel-space quantity.
         ax = axes_dt[1, 1]
-        _boxplot_by_x(ax, dts, pixel_losses, log_x=True)
+        _boxplot_by_x(ax, results.dts, results.pixel_losses, log_x=True)
         ax.set_yscale("log")
         ax.set_xlabel("dt")
         ax.set_xlim(left=10)
         ax.set_ylabel(f"pixel-space{_euler_tag}: decode(z0(t+dt)): mean|pred - true|")
         ax.set_title(f"pixel-space (L1, decoded){_euler_tag}\n"
-                     f"corr w.r.t. log dt: log |error| {corr_dt_pixel * 100:.0f}%")
+                     f"corr w.r.t. log dt: log |error| {stats.corr_dt_pixel * 100:.0f}%")
     else:
         fig_dt.delaxes(axes_dt[1, 1])
 
@@ -1511,7 +1634,7 @@ def check_parameter_dependence(
     # of error directly -- and to [1,3] as well (see that panel's own
     # code, further below): both now share this exact style, [0,3]
     # showing whatever the current mode's quantity is (full when not
-    # euler_only, matching latent_losses' own substitution), [1,3]
+    # euler_only, matching results.latent_losses' own substitution), [1,3]
     # ALWAYS showing the euler-only quantity specifically, regardless of
     # mode, for a direct side-by-side comparison between the two.
     #
@@ -1535,27 +1658,27 @@ def check_parameter_dependence(
     # labeling the axis "[1e-3]" keeps the actual numbers readable.
     _DT_PANEL_SCALE = 1000
     dt_x, dt_signed, dt_abs, dt_n = _mean_curves_by_unique_value(
-        dts, latent_losses_signed / dts, latent_losses / dts)
+        results.dts, results.latent_losses_signed / results.dts, results.latent_losses / results.dts)
     dt_signed, dt_abs = dt_signed * _DT_PANEL_SCALE, dt_abs * _DT_PANEL_SCALE
 
     # [1,3] built HERE too (not at its former, separate location later
     # in this function) -- both panels need exactly the same already-
-    # available data (dts, taylor_fit, euler_losses/_signed), and
+    # available data (results.dts, taylor_fit, results.euler_losses/_signed), and
     # building them together is what makes the shared-axis alignment
     # below straightforward, rather than needing a second pass back
     # over [0,3] after [1,3] is built elsewhere.
     #
-    # [1,3] ALWAYS uses euler_losses/euler_losses_signed specifically
-    # (NOT the latent_losses/_signed substitution [0,3] and every other
+    # [1,3] ALWAYS uses results.euler_losses/results.euler_losses_signed specifically
+    # (NOT the results.latent_losses/_signed substitution [0,3] and every other
     # panel use) -- regardless of the overall euler_only mode, so it's
     # always a meaningful "euler-only" reference to compare [0,3]
     # against. Under euler_only=True, [0,3] and [1,3] end up showing
-    # the same thing (latent_losses IS euler_losses in that mode) --
+    # the same thing (results.latent_losses IS results.euler_losses in that mode) --
     # an expected, harmless redundancy in that specific mode, not a
     # bug, since [1,3]'s own point is to stay meaningful specifically
     # when [0,3] is NOT already euler-only.
     dt_x_13, dt_signed_13, dt_abs_13, dt_n_13 = _mean_curves_by_unique_value(
-        dts, euler_losses_signed / dts, euler_losses / dts)
+        results.dts, results.euler_losses_signed / results.dts, results.euler_losses / results.dts)
     dt_signed_13, dt_abs_13 = dt_signed_13 * _DT_PANEL_SCALE, dt_abs_13 * _DT_PANEL_SCALE
 
     # Regression curve overlay: eps/eps'/A are SHARED (the joint fit's
@@ -1573,7 +1696,7 @@ def check_parameter_dependence(
     eps, eps_prime, A = taylor_fit["eps"], taylor_fit["eps_prime"], taylor_fit["A"]
     C = taylor_fit["C"]
     D_or_C = C if euler_only else taylor_fit["D"]
-    dt_curve = np.geomspace(dts.min(), dts.max(), 400)
+    dt_curve = np.geomspace(results.dts.min(), results.dts.max(), 400)
 
     # Two panels now, one per QUANTITY (signed "error", absolute
     # "|error|"), each showing BOTH euler-only and full (mode-
@@ -1604,7 +1727,7 @@ def check_parameter_dependence(
                        edgecolors="black", linewidths=0.3, label="full")
     # Lock the y-range from empirical data alone, BEFORE the regression
     # curves (below) are drawn -- same reasoning as before: the curves'
-    # own 1/dt divergence near dts.min() would otherwise crush the
+    # own 1/dt divergence near results.dts.min() would otherwise crush the
     # actual data into a thin band.
     ax_signed.set_ylim(ax_signed.get_ylim())
 
@@ -1675,8 +1798,8 @@ def check_parameter_dependence(
     # s is marker AREA in matplotlib (points^2), and diameter ~ sqrt(s)
     # -- reducing diameter by a quarter (new = 0.75 * old) means scaling
     # area by 0.75^2 = 0.5625, not by 0.75 itself.
-    sc = axes[2].scatter(run_temps, run_noises, c=run_mean_loss,
-                          s=0.5625 * (30 + 10 * run_n_windows),
+    sc = axes[2].scatter(stats.run_temps, stats.run_noises, c=stats.run_mean_loss,
+                          s=0.5625 * (30 + 10 * stats.run_n_windows),
                           cmap="viridis", edgecolors="black", linewidths=0.3, alpha=0.7, vmin=0)
     axes[2].set_xlabel("temperature")
     axes[2].set_ylabel("noise")
@@ -1701,9 +1824,9 @@ def check_parameter_dependence(
     # sweep inputs, not a continuous range -- see
     # _mean_curves_by_unique_value's own docstring).
     temp_x, temp_signed, temp_abs, temp_n = _mean_curves_by_unique_value(
-        temperatures, latent_losses_signed, latent_losses)
+        results.temperatures, results.latent_losses_signed, results.latent_losses)
     noise_x, noise_signed, noise_abs, noise_n = _mean_curves_by_unique_value(
-        noises, latent_losses_signed, latent_losses)
+        results.noises, results.latent_losses_signed, results.latent_losses)
 
     # [1,2] (length_scale) REMOVED entirely -- its own values are
     # computed from only the non-saturated subset (windows where
@@ -1722,9 +1845,9 @@ def check_parameter_dependence(
     # above is UNCHANGED -- only this plotted panel is gone.
     panel_specs = [
         (axes[0], temp_x, temp_signed, temp_abs, temp_n, "temperature",
-         corr_temp_signed, corr_temp_abs),
+         stats.corr_temp_signed, stats.corr_temp_abs),
         (axes[1], noise_x, noise_signed, noise_abs, noise_n, "noise",
-         corr_noise_signed, corr_noise_abs),
+         stats.corr_noise_signed, stats.corr_noise_abs),
     ]
     twin_axes = []
     for ax, x, mean_signed, mean_abs, n_windows, xlabel, corr_s, corr_a in panel_specs:
@@ -1789,7 +1912,7 @@ def check_parameter_dependence(
     # restricting the plot's own data to a temperature subset would
     # need its own dedicated panel to be meaningful, not just swapped
     # into this one.
-    t_mask = temperatures < 0.9
+    t_mask = results.temperatures < 0.9
     if t_mask.sum() >= 2 and (~t_mask).sum() >= 2:
         # BOTH T<0.9 and T>=0.9 run, not just the former excluding the
         # latter -- isolating T>=0.9 directly (rather than only ever
@@ -1798,14 +1921,14 @@ def check_parameter_dependence(
         # has genuinely different, e.g. opposite-signed, coefficients"
         # -- two very different findings that look identical if you
         # only ever run the T<0.9 side.
-        fit_taylor_residual_coefficients(dts[t_mask], euler_losses_signed[t_mask],
-                                          latent_losses_signed[t_mask], label="T < 0.9 SUBSET",
+        fit_taylor_residual_coefficients(results.dts[t_mask], results.euler_losses_signed[t_mask],
+                                          results.latent_losses_signed[t_mask], label="T < 0.9 SUBSET",
                                           euler_only=euler_only)
-        fit_taylor_residual_coefficients(dts[~t_mask], euler_losses_signed[~t_mask],
-                                          latent_losses_signed[~t_mask], label="T >= 0.9 SUBSET",
+        fit_taylor_residual_coefficients(results.dts[~t_mask], results.euler_losses_signed[~t_mask],
+                                          results.latent_losses_signed[~t_mask], label="T >= 0.9 SUBSET",
                                           euler_only=euler_only)
     else:
-        print(f"\n  Skipping T-split regressions -- {t_mask.sum()} of {len(temperatures)} "
+        print(f"\n  Skipping T-split regressions -- {t_mask.sum()} of {len(results.temperatures)} "
               f"windows have T<0.9 (not enough on one side of the split to fit against).")
 
     # New 7th panel: the two ORANGE (mean|.|) curves from dz0dt.png's own
@@ -1819,8 +1942,8 @@ def check_parameter_dependence(
     # with dt, |dz0/dt| roughly doesn't, per this session's own earlier
     # finding), so one shared axis would flatten whichever has the
     # smaller range.
-    dt_x7, _, dz0_abs_by_dt, _ = _mean_curves_by_unique_value(dts, dz0_signed, dz0_abs)
-    _, _, dz0dt_abs_by_dt, _ = _mean_curves_by_unique_value(dts, dz0dt_signed, dz0dt_abs)
+    dt_x7, _, dz0_abs_by_dt, _ = _mean_curves_by_unique_value(results.dts, results.dz0_signed, results.dz0_abs)
+    _, _, dz0dt_abs_by_dt, _ = _mean_curves_by_unique_value(results.dts, results.dz0dt_signed, results.dz0dt_abs)
     dz0_abs_by_dt = dz0_abs_by_dt * _DT_PANEL_SCALE
     dz0dt_abs_by_dt = dz0dt_abs_by_dt * _DT_PANEL_SCALE
     ax7 = axes_dt[0, 1]
@@ -1880,12 +2003,12 @@ def check_parameter_dependence(
     fig2, axes2 = plt.subplots(2, 2, figsize=(12, 10))
 
     panel_rows = [
-        (dz0_signed, dz0_abs, "dz0", 0),
-        (dz0dt_signed, dz0dt_abs, "dz0/dt", 1),
+        (results.dz0_signed, results.dz0_abs, "dz0", 0),
+        (results.dz0dt_signed, results.dz0dt_abs, "dz0/dt", 1),
     ]
     for y_signed, y_abs, name, row in panel_rows:
-        t_x, t_signed_y, t_abs_y, _ = _mean_curves_by_unique_value(abs_steps, y_signed, y_abs)
-        dt_x, dt_signed_y, dt_abs_y, _ = _mean_curves_by_unique_value(dts, y_signed, y_abs)
+        t_x, t_signed_y, t_abs_y, _ = _mean_curves_by_unique_value(results.abs_steps, y_signed, y_abs)
+        dt_x, dt_signed_y, dt_abs_y, _ = _mean_curves_by_unique_value(results.dts, y_signed, y_abs)
         # x1000 for readability -- these values are naturally tiny,
         # matching the same reasoning/named-constant convention as
         # _DT_PANEL_SCALE in the main figure's own dt panels above.
@@ -1956,7 +2079,67 @@ def check_parameter_dependence(
     plt.close(fig2)
     print(f"Saved figure to {dz0dt_output_path}")
 
-    return output_path
+
+
+def check_parameter_dependence(
+    lds_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_passing_steps: int | None = None,
+    base_path: Path | None = None, size: int | None = None,
+    ae_stats_weight: float | None = None, hidden_dim: int = 256, n_hidden_layers: int = 2,
+    condition_on_theta: bool | None = None,
+    euler_only: bool | None = None,
+    output_path: Path | None = None, dz0dt_output_path: Path | None = None,
+    dt_dependence_output_path: Path | None = None, decode: bool = False, device: str | None = None,
+) -> Path:
+    """Saves three figures: parameter_dependence.png (temperature, noise,
+    per-run scatter), dt_dependence.png (error/|error| vs dt, and,
+    when decode=True, pixel-space error vs dt), and dz0dt.png
+    (ground-truth dz0/dz0dt vs t and dt, independent of euler_only).
+    Returns parameter_dependence.png's own path (the other two are
+    still written to disk either way; see dt_dependence_output_path/
+    dz0dt_output_path to control where).
+
+    decode=False (default) skips pixel-space entirely -- no decoder
+    forward passes in the main evaluation loop, no pixel-space console
+    diagnostics (dt-decade table, temperature/noise/length_scale binned
+    summaries all drop their "mean pixel_loss" column), and
+    dt_dependence.png's own pixel-space panel isn't built at all. Set
+    True to include it, at the cost of the extra decoder calls.
+
+    lds_checkpoint_path may ALSO be a stage-1/1b/2 (AE-family)
+    checkpoint, not just a real stage-3 one -- see
+    checkpoint_identification.ensure_lds_checkpoint's own docstring for
+    the full mechanism (an ephemeral, UNTRAINED f_theta gets trained
+    against it for epochs=0). base_path/size are REQUIRED (and
+    otherwise unused) specifically for this AE-family-conversion path;
+    a real stage-3 checkpoint needs neither.
+
+    euler_only: None (default) auto-detects -- True whenever
+    lds_checkpoint_path actually got converted (an AE-family checkpoint
+    was given, so f_theta is untrained and "full" is meaningless), False
+    otherwise (a real stage-3 checkpoint, both euler-only and full shown
+    as usual). Every panel/fit/print that would otherwise report on
+    "full" (f_theta-corrected) numbers reports on euler-only ones
+    instead in this mode, and the full-vs-euler-only COMPARISONS
+    themselves (which have nothing to compare against here) are
+    skipped rather than printed as a meaningless ratio of 1.0. Force
+    True/False explicitly to override the auto-detection either way
+    (e.g. to see the euler-only-only report for a real stage-3
+    checkpoint too, for a same-scale comparison against an AE-family
+    run).
+    """
+    ctx = _load_models_and_dataset(
+        lds_checkpoint_path, min_step, min_stdev_phi, min_passing_steps, base_path, size,
+        ae_stats_weight, hidden_dim, n_hidden_layers, condition_on_theta, euler_only,
+        output_path, dz0dt_output_path, dt_dependence_output_path, device,
+    )
+    results = _evaluate_windows(ctx.dataset, ctx.f_theta, ctx.ae_decoder, ctx.device,
+                                 decode, ctx.euler_only)
+    stats = _print_summary_statistics(results, ctx.ae_config, decode, ctx.euler_only)
+    _build_and_save_figures(results, stats, ctx.lds_checkpoint_path, ctx.output_path,
+                             ctx.dz0dt_output_path, ctx.dt_dependence_output_path,
+                             decode, ctx.euler_only)
+    return ctx.output_path
 
 
 def main():

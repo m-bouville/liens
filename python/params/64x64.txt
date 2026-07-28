@@ -6,7 +6,7 @@ Ny			  =  64
 
 min_step 	  = 3000       	# skip snapshots earlier than this step
 min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
-min_std_deriv = 0.00015		# skip time derivatives whose stdev is below this
+min_std_deriv = 0.15e-3		# skip time derivatives whose stdev is below this
 min_passing_steps= 12		# any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
 recon0_scale  = 0.1e-3
@@ -39,26 +39,10 @@ batches		  = 256
 
 
 
-# Stage 1b
-#   derivative decoder
-
-latent_channels = 8
-
-stats1_weight  =   1  # was 0.5     	# weight of L_stats1 relative to L_recon1
-
-epochs 		  =  0  # 50			# note: stage 1b is augmented
-patience 	  =   5        	# renamed to early_stopping_patience internally
-batches		  = 256
-
-freeze_encoder= True
-cos_weight	  = 2
-
-# force 	      = True
-
-
-
 # Stage 2
 #   latent-space structure: z1 approximates d z0 / dt
+
+latent_channels = 8
 
 stats0_weight   = 0.5     	# weight of L_stats0 relative to L_recon0
 deriv_weight    = 4.
@@ -86,12 +70,12 @@ use_dt_decade_weights = True  # was (de facto) False
 epochs 		  = 500
 patience 	  =  50
 
-num_workers	  =   8
-batches		  =8192
+num_workers	  =   8   # was 8
+batches		  =65536
 
-lr 			  = 100e-6  # was 20e-6,  default: 0.001
+lr 			  = 0.5e-3  # was 20e-6,  default: 0.001
 z0_noise_scale=   0.175
-dt_cap		  =   500
+dt_cap		  = 400   # 500/0.05 = 10'000 time steps
 
 force 	      = True
 
@@ -109,12 +93,12 @@ use_dt_decade_weights = True  # was (de facto) False
 epochs 		  = 500
 patience 	  =  50
 
-num_workers	  =   8
-batches		  =8192
+num_workers	  = same
+batches		  = same
 
 lr 			  =   5e-6  # default: 0.001
 z0_noise_scale=   0.1
-dt_cap		  =   same
+dt_cap		  = same
 
 force 	      = True
 

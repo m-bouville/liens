@@ -156,6 +156,22 @@ def test_strip_decoder_prefix_for_stream_falls_back_when_mapped_key_not_in_state
     assert _strip_decoder_prefix_for_stream(state, model_cfg, "state") == {"up_blocks.0.weight": "W_shared"}
 
 
+def test_strip_decoder_prefix_for_stream_single_entry_mapping_no_other_decoder_present():
+    """The exact shape training/extend_encoder.py's own
+    extend_state_checkpoint_with_deriv_stream() produces (D1 confirmed
+    permanently unnecessary -- see that module's own docstring):
+    decoder_for_stream has exactly ONE entry, and no other decoder key
+    (not "D1", not "shared") exists in the state_dict at all. Distinct
+    from the existing two-entry happy-path test above -- that one
+    doesn't confirm this still works when there's genuinely nothing
+    else around to fall back to or get confused by, which is exactly
+    what a real deriv=PURE_LATENT checkpoint's own state_dict looks
+    like now."""
+    state = {"decoders.D0.up_blocks.0.weight": "D0_W"}  # nothing else -- no D1, no shared
+    model_cfg = {"decoder_for_stream": {"state": "D0"}}
+    assert _strip_decoder_prefix_for_stream(state, model_cfg, "state") == {"up_blocks.0.weight": "D0_W"}
+
+
 def test_strip_decoder_prefix_for_stream_named_mapping_takes_priority_over_shared():
     """If BOTH a named (decoders.D0.*) and a generic shared
     (decoders.shared.*) prefix happen to be present in the same

@@ -131,9 +131,9 @@ def ensure_lds_checkpoint(
             f"one, or pass a real stage 3 checkpoint through directly."
         )
     # size, UNLIKE base_path, is already saved in every AE-family
-    # checkpoint's own config (see train_autoencoder/train_stage1b/
-    # train_stage2's own checkpoint-save calls) -- no reason to make
-    # the caller repeat it by hand when it's sitting right there. Only
+    # checkpoint's own config (see train_autoencoder/train_stage2's own
+    # checkpoint-save calls) -- no reason to make the caller repeat it
+    # by hand when it's sitting right there. Only
     # used as a FALLBACK (an explicitly-given size, even if it
     # happened to disagree, would be a strange thing for this function
     # to silently override) -- checked for a mismatch below instead.

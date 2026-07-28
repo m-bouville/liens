@@ -2,7 +2,7 @@ import torch
 import pytest
 from pathlib import Path
 from utils import load_datasets as load
-from training.train_ae import train_autoencoder, train_stage1b, train_stage2
+from training.train_ae import train_autoencoder, train_stage2
 
 
 def _build_run_dir_with_stats(base_dir, name, size=32):
@@ -46,8 +46,15 @@ def _build_sweep(tmp_path, n_runs=6, size=32):
 
 
 @pytest.fixture(scope="module")
-def shared_stage1ab_ancestor(tmp_path_factory):
-    root = tmp_path_factory.mktemp("shared_stage1ab")
+def shared_stage1a_ancestor(tmp_path_factory):
+    """No stage 1b pass at all -- train_stage2() now builds the deriv
+    stream itself, directly from stage 1's own checkpoint (see
+    training/extend_encoder.py's own module docstring for the full
+    rationale: stage 1b's own training loop had been inert since it
+    started running at epochs=0, and D1 -- the one thing genuinely
+    built only by that loop's own surrounding setup -- is confirmed
+    permanently unnecessary)."""
+    root = tmp_path_factory.mktemp("shared_stage1a")
     base_path = _build_sweep(root, n_runs=6, size=32)
     stage1a_path = train_autoencoder(
         size=32, base_path=base_path,
@@ -57,33 +64,31 @@ def shared_stage1ab_ancestor(tmp_path_factory):
         checkpoint_path=root / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=root / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=root / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=root / "curve1b.png",
-    )
-    return base_path, stage1b_path
+    return base_path, stage1a_path
 
 
-def test_stage2_full_c0c1_loss_end_to_end(shared_stage1ab_ancestor, tmp_path, isolated_project_root):
-    """THE actual redesigned stage 2, exercised end-to-end from a real
-    stage 1a -> 1b chain: separate D0/D1 correctly loaded (not the old
-    single-shared-decoder assumption that used to crash here), both
-    stats_head0/stats_head1 loaded and frozen, all five loss components
-    (recon0, recon1, stats0, stats1, deriv) genuinely computed and
-    contributing gradient, freeze_outer_layers correctly freezes BOTH
-    decoders' outer layers, and the saved checkpoint carries everything
-    (stats_head1_state, decoder_for_stream) needed to be a valid
-    ancestor for stage 3/4/5 and every evaluation script in turn."""
-    base_path, stage1b_path = shared_stage1ab_ancestor
-    stage1b_checkpoint = torch.load(stage1b_path, map_location="cpu", weights_only=True)
+def test_stage2_full_c0c1_loss_end_to_end(shared_stage1a_ancestor, tmp_path, isolated_project_root):
+    """The redesigned stage 2, exercised end-to-end from a real stage 1a
+    ancestor directly (no stage 1b pass at all -- see
+    training/extend_encoder.py's own module docstring for why: D1 is
+    confirmed permanently unnecessary, so recon1_weight is left at its
+    default 0.0 here rather than exercised -- a nonzero value now
+    raises, since there's no decoder for 'deriv' to compute L_recon1
+    against at all). Confirms: the deriv stream built fresh (PURE_LATENT,
+    no D1), stats_head0/stats_head1 both loaded/built and frozen or
+    available, the remaining four loss components (recon0, stats0,
+    stats1, deriv) genuinely computed and contributing gradient,
+    freeze_outer_layers correctly freezes D0's own outer layers, and the
+    saved checkpoint carries everything (stats_head1_state,
+    decoder_for_stream) needed to be a valid ancestor for stage 3/4/5
+    and every evaluation script in turn."""
+    base_path, stage1a_path = shared_stage1a_ancestor
+    stage1a_checkpoint = torch.load(stage1a_path, map_location="cpu", weights_only=True)
 
     stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1b_path,
+        base_path=base_path, resume_from=stage1a_path,
         deriv_weight=1.0, deriv_weight_warmup_epochs=0,
-        recon1_weight=0.5, stats0_weight=0.01, stats1_weight=0.02,
+        stats0_weight=0.01, stats1_weight=0.02,
         epochs=2, batch_size=4, num_workers=0,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         n_frozen_stages=1,
@@ -93,54 +98,56 @@ def test_stage2_full_c0c1_loss_end_to_end(shared_stage1ab_ancestor, tmp_path, is
     checkpoint = torch.load(stage2_path, map_location="cpu", weights_only=True)
     state = checkpoint["model_state"]
 
-    # 1. Separate D0/D1 correctly present (not the old, wrong, single "decoders.shared.*")
+    # 1. Single, named D0 decoder present -- no D1, no "decoders.shared.*"
     assert any(k.startswith("decoders.D0.") for k in state)
-    assert any(k.startswith("decoders.D1.") for k in state)
+    assert not any(k.startswith("decoders.D1.") for k in state)
     assert not any(k.startswith("decoders.shared.") for k in state)
-    print("Separate D0/D1 correctly loaded and saved")
+    print("Single, named D0 decoder correctly loaded and saved -- no D1")
 
-    # 2. Both stats heads present in the saved checkpoint.
+    # 2. Both stats heads present in the saved checkpoint (stats_head1
+    # kept available even though nothing here trains it via L_recon1
+    # -- see extend_encoder.py's own ExtendedStateCheckpoint docstring).
     assert checkpoint["stats_head_state"] is not None
     assert checkpoint["stats_head1_state"] is not None
     print("Both stats_head (SH0) and stats_head1 (SH1) present in checkpoint")
 
-    # 3. decoder_for_stream carried forward correctly.
-    assert checkpoint["config"]["decoder_for_stream"] == {"state": "D0", "deriv": "D1"}
-    print("decoder_for_stream correctly carried forward in config")
+    # 3. decoder_for_stream carried forward correctly -- no "deriv" entry
+    # at all (PURE_LATENT streams are never looked up there -- see
+    # MultiStreamAutoencoder's own pathway construction).
+    assert checkpoint["config"]["decoder_for_stream"] == {"state": "D0"}
+    assert checkpoint["config"]["stream_configs"]["deriv"]["mode"] == "pure_latent"
+    print("decoder_for_stream correctly carried forward, no 'deriv' entry")
 
-    # 4. n_frozen_stages=1 froze BOTH decoders' outer layers (not just one).
-    D0_output_conv_before = stage1b_checkpoint["model_state"]["decoders.D0.output_conv.weight"]
-    D1_output_conv_before = stage1b_checkpoint["model_state"]["decoders.D1.output_conv.weight"]
+    # 4. n_frozen_stages=1 froze D0's own outer layers.
+    D0_output_conv_before = stage1a_checkpoint["model_state"]["decoder.output_conv.weight"]
     D0_output_conv_after = state["decoders.D0.output_conv.weight"]
-    D1_output_conv_after = state["decoders.D1.output_conv.weight"]
     assert torch.equal(D0_output_conv_before, D0_output_conv_after), "D0's frozen output_conv moved"
-    assert torch.equal(D1_output_conv_before, D1_output_conv_after), "D1's frozen output_conv moved"
-    print("freeze_outer_layers correctly froze BOTH D0's and D1's output_conv")
+    print("freeze_outer_layers correctly froze D0's own output_conv")
 
     # 5. Inner layers (bottleneck-adjacent, NOT frozen by n_frozen_stages=1)
-    # genuinely trained -- confirms real gradient reached both pathways,
+    # genuinely trained -- confirms real gradient reached the pathway,
     # not just that construction succeeded.
-    D0_unbottleneck_before = stage1b_checkpoint["model_state"]["decoders.D0.unbottleneck.weight"]
-    D1_unbottleneck_before = stage1b_checkpoint["model_state"]["decoders.D1.unbottleneck.weight"]
+    D0_unbottleneck_before = stage1a_checkpoint["model_state"]["decoder.unbottleneck.weight"]
     D0_unbottleneck_after = state["decoders.D0.unbottleneck.weight"]
-    D1_unbottleneck_after = state["decoders.D1.unbottleneck.weight"]
     assert not torch.equal(D0_unbottleneck_before, D0_unbottleneck_after), "D0's unbottleneck did not train"
-    assert not torch.equal(D1_unbottleneck_before, D1_unbottleneck_after), "D1's unbottleneck did not train"
-    print("Both D0's and D1's own inner (unfrozen) layers genuinely trained")
+    print("D0's own inner (unfrozen) layers genuinely trained")
 
 
-def test_zero_weight_terms_omitted_from_console_output(shared_stage1ab_ancestor, tmp_path, isolated_project_root, capsys):
+def test_zero_weight_terms_omitted_from_console_output(shared_stage1a_ancestor, tmp_path, isolated_project_root, capsys):
     """Regression test for a real, reported clutter issue: with
-    recon1_weight=stats1_weight=0.0 (the new default -- pure L_deriv
-    training), the header/per-epoch breakdown used to still print
-    "+0.0*recon1 +0.0*stats1_diag" every single epoch for terms that
-    structurally cannot contribute anything. Confirms zero-weight terms
-    are omitted entirely, and that nonzero ones still show correctly."""
-    base_path, stage1b_path = shared_stage1ab_ancestor
+    stats1_weight=0.0 (the new default -- pure L_deriv training), the
+    header/per-epoch breakdown used to still print terms like
+    "+0.0*stats1_diag" every single epoch for terms that structurally
+    cannot contribute anything. Confirms zero-weight terms are omitted
+    entirely, and that a nonzero one still shows correctly.
+    recon1_weight is not exercised here at all (see this file's own
+    test_stage2_full_c0c1_loss_end_to_end for why -- D1 is confirmed
+    permanently unnecessary, so it's left at its default 0.0)."""
+    base_path, stage1a_path = shared_stage1a_ancestor
 
-    capsys.readouterr()  # clear stage 1a/1b's own output first
+    capsys.readouterr()  # clear stage 1's own output first
     train_stage2(
-        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
+        base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
         recon1_weight=0.0, stats1_weight=0.0, deriv_weight=0.02, deriv_weight_warmup_epochs=0,
         epochs=1, batch_size=4, num_workers=0,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
@@ -156,26 +163,26 @@ def test_zero_weight_terms_omitted_from_console_output(shared_stage1ab_ancestor,
 
     capsys.readouterr()  # clear again before the second call
     train_stage2(
-        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
-        recon1_weight=0.5, stats1_weight=0.02, deriv_weight=1.0, deriv_weight_warmup_epochs=0,
+        base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
+        stats1_weight=0.02, deriv_weight=1.0, deriv_weight_warmup_epochs=0,
         epochs=1, batch_size=4, num_workers=0,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage2_nonzero.pt", device="cpu", seed=0,
         log_every_epoch=True, loss_curve_path=tmp_path / "curve2_nonzero.png",
     )
     output = capsys.readouterr().out
-    assert "recon0/1.0 +0.5*recon1/1.0 +0.01*stats0/1.0 +0.02*stats1/1.0 +1.0*deriv/1.0" in output
+    assert "recon0/1.0 +0.01*stats0/1.0 +0.02*stats1/1.0 +1.0*deriv/1.0" in output
 
 
-def test_epochs_zero_actually_writes_a_checkpoint_stage2(shared_stage1ab_ancestor, tmp_path, isolated_project_root, capsys):
+def test_epochs_zero_actually_writes_a_checkpoint_stage2(shared_stage1a_ancestor, tmp_path, isolated_project_root, capsys):
     """Same regression test as Stage 1a/1b's own, for train_stage2."""
-    base_path, stage1b_path = shared_stage1ab_ancestor
+    base_path, stage1a_path = shared_stage1a_ancestor
 
     checkpoint_path = tmp_path / "stage2_ablation.pt"
     assert not checkpoint_path.exists()
 
     result = train_stage2(
-        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
+        base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
         epochs=0, batch_size=4, num_workers=0,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         checkpoint_path=checkpoint_path, device="cpu", seed=0,
@@ -191,7 +198,7 @@ def test_epochs_zero_actually_writes_a_checkpoint_stage2(shared_stage1ab_ancesto
 
 
 def test_augment_is_actually_threaded_through_to_the_train_set_only(
-    shared_stage1ab_ancestor, tmp_path, isolated_project_root, monkeypatch,
+    shared_stage1a_ancestor, tmp_path, isolated_project_root, monkeypatch,
 ):
     """Regression test for a real gap: augment was previously accepted by
     the params-file parsing layer but silently never passed to the
@@ -203,7 +210,7 @@ def test_augment_is_actually_threaded_through_to_the_train_set_only(
     that passing augment=True doesn't raise."""
     import training.train_ae as train_ae_module
 
-    base_path, stage1b_path = shared_stage1ab_ancestor
+    base_path, stage1a_path = shared_stage1a_ancestor
     real_dataset_cls = train_ae_module.MicrostructureEvolutionDataset
     recorded_augment_values = []
 
@@ -215,7 +222,7 @@ def test_augment_is_actually_threaded_through_to_the_train_set_only(
     monkeypatch.setattr(train_ae_module, "MicrostructureEvolutionDataset", _RecordingDataset)
 
     train_stage2(
-        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
+        base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
         epochs=1, batch_size=4, num_workers=0, augment=True,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage2_augment.pt", device="cpu", seed=0,
@@ -263,7 +270,7 @@ def test_gradient_scaling_trick_scales_gradient_exactly():
 
 
 def test_z0_from_deriv_weight_runs_end_to_end_across_its_range(
-    shared_stage1ab_ancestor, tmp_path, isolated_project_root,
+    shared_stage1a_ancestor, tmp_path, isolated_project_root,
 ):
     """End-to-end smoke test across z0_from_deriv_weight's own valid
     range, including the boundary values (0.0 -- today's original
@@ -281,12 +288,12 @@ def test_z0_from_deriv_weight_runs_end_to_end_across_its_range(
     differs with deriv_weight regardless of z0_from_deriv_weight --
     that isn't a bug, just a fact about this architecture that made an
     earlier, weight-identity version of this test provably wrong."""
-    base_path, stage1b_path = shared_stage1ab_ancestor
+    base_path, stage1a_path = shared_stage1a_ancestor
 
     for weight in [0.0, 0.1, 1.0]:
         ckpt_path = tmp_path / f"stage2_zfd_range_{weight}.pt"
         train_stage2(
-            base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
+            base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
             deriv_weight=1.0, deriv_weight_warmup_epochs=0, z0_from_deriv_weight=weight,
             epochs=1, batch_size=4, num_workers=0,
             val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,

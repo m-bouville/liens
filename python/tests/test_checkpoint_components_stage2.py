@@ -1,7 +1,7 @@
 import torch
 from pathlib import Path
 from utils import load_datasets as load
-from training.train_ae import train_autoencoder, train_stage1b, train_stage2
+from training.train_ae import train_autoencoder, train_stage2
 from training.checkpoint_components import load_ae_components, ComponentCheckpoint
 from training.model_assembly import build_models_from_components
 from models.latent_dynamics import LatentDynamics
@@ -54,12 +54,21 @@ def test_checkpoint_components_decoder_extraction_from_stage2(tmp_path, isolated
     decoder.*' on a real stage 4 run resuming from a stage 2
     checkpoint. Root cause: checkpoint_components.py's own
     _strip_prefix() only tried "decoder."/"decoders.shared." -- a
-    stage 1b/2-derived checkpoint has separate per-stream decoders
-    ("decoders.D0."/"decoders.D1."), so the decoder component was
-    silently extracted as an EMPTY dict, making every real decoder key
-    look "missing" downstream. Confirms the decoder component is
+    stage 2-derived checkpoint has a separate, NAMED per-stream decoder
+    ("decoders.D0.", not "decoders.shared."), so the decoder component
+    was silently extracted as an EMPTY dict, making every real decoder
+    key look "missing" downstream. Confirms the decoder component is
     non-empty AND that build_models_from_components can actually
-    reconstruct a working model from it."""
+    reconstruct a working model from it.
+
+    Stage 2 resumes directly from stage 1a here -- no stage 1b pass at
+    all (see training/extend_encoder.py's own module docstring for the
+    full rationale: D1 is confirmed permanently unnecessary). This is
+    actually the MORE relevant regression case going forward, not a
+    weaker one: the underlying bug was about a NAMED (non-"shared")
+    decoder key at all, not specifically about there being two of
+    them -- a single "decoders.D0." key exercises exactly the same
+    extraction path recon1_weight/D1's own former presence used to."""
     base_path = _build_sweep(tmp_path, n_runs=6, size=32)
     stage1a_path = train_autoencoder(
         size=32, base_path=base_path,
@@ -69,16 +78,9 @@ def test_checkpoint_components_decoder_extraction_from_stage2(tmp_path, isolated
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
-    )
     stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1b_path, stats0_weight=0.01,
-        recon1_weight=0.5, stats1_weight=0.02, deriv_weight=1.0, deriv_weight_warmup_epochs=0,
+        base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
+        stats1_weight=0.02, deriv_weight=1.0, deriv_weight_warmup_epochs=0,
         epochs=1, batch_size=4, num_workers=0,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
@@ -88,12 +90,12 @@ def test_checkpoint_components_decoder_extraction_from_stage2(tmp_path, isolated
     components = load_ae_components(stage2_path, device="cpu")
     assert len(components["decoder"].state_dict) > 0, (
         "decoder component is empty -- _strip_prefix failed to match stage 2's own "
-        "separate-decoder keys"
+        "named (non-'shared') decoder key"
     )
     # Explicit, not just implicit via "the rest of this test doesn't
     # crash": condition_on_theta was a real, separate regression (see
     # test_checkpoint_components.py's own unit tests for the isolated
-    # version) -- stage 1b/2's own "deriv" stream IS genuinely
+    # version) -- stage 2's own "deriv" stream IS genuinely
     # theta-conditioned by real training here, so this checkpoint is
     # exactly the right one to confirm that fact survives
     # load_ae_components' own serialization round trip, rather than
@@ -107,6 +109,12 @@ def test_checkpoint_components_decoder_extraction_from_stage2(tmp_path, isolated
         "'unexpected keys: theta_conditioners.deriv.*' error instead of failing here, "
         "directly, on the actual cause"
     )
+    # No D1 at all -- confirms this checkpoint genuinely has the single,
+    # named-decoder shape this test's own docstring claims, not
+    # incidentally still carrying a D1 that would make this a weaker
+    # regression check than intended.
+    stage2_state = torch.load(stage2_path, map_location="cpu", weights_only=True)["model_state"]
+    assert not any(k.startswith("decoders.D1") for k in stage2_state)
 
     latent_channels = components["encoder"].config["latent_channels"]
     latent_spatial = components["encoder"].config["latent_spatial_size"]

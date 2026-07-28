@@ -3,7 +3,7 @@ import torch
 import pytest
 from pathlib import Path
 from utils import load_datasets as load
-from training.train_ae import train_autoencoder, train_stage1b
+from training.train_ae import train_autoencoder, train_stage2
 from training.train_lds import train_lds
 
 
@@ -47,13 +47,21 @@ def _build_sweep(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
-def test_train_lds_loads_stage1b_checkpoint_correctly(tmp_path):
+def test_train_lds_loads_a_named_decoder_checkpoint_correctly(tmp_path, isolated_project_root):
     """Regression test for a real bug: train_lds (stage 3) had the exact
     same construction gap check_reconstruction.py did -- assumed a
-    single shared decoder, couldn't load stage 1b's separate-D0/D1
-    checkpoint at all. Only the encoder is ever actually USED here
-    (decoder weights are inert), but load_state_dict still needs the
-    right key structure to succeed in the first place."""
+    single shared decoder, couldn't load a checkpoint with a separate,
+    NAMED decoder key ("decoders.D0.", not "decoders.shared.") at all.
+    Only the encoder is ever actually USED here (decoder weights are
+    inert), but load_state_dict still needs the right key structure to
+    succeed in the first place.
+
+    Stage 2 resumes directly from stage 1a here -- no stage 1b pass at
+    all (see training/extend_encoder.py's own module docstring for the
+    full rationale). Still the right regression case: the original bug
+    was about a NAMED (non-"shared") decoder key existing at all, which
+    "decoders.D0." alone still is, not specifically about there being
+    two of them (D0 and D1 together)."""
     base_path = _build_sweep(tmp_path, n_runs=6, size=32)
     stage1a_path = train_autoencoder(
         size=32, base_path=base_path,
@@ -63,18 +71,22 @@ def test_train_lds_loads_stage1b_checkpoint_correctly(tmp_path):
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
+    )
+    saved = torch.load(stage2_path, map_location="cpu", weights_only=True)
+    assert saved["config"]["decoder_for_stream"] == {"state": "D0"}, (
+        "test's own premise broke -- expected a single, NAMED (non-'shared') decoder key"
     )
 
     # THE actual test: this must not raise the old "decoders.shared.*
     # missing" RuntimeError.
     lds_path = train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -83,10 +95,10 @@ def test_train_lds_loads_stage1b_checkpoint_correctly(tmp_path):
         log_every_epoch=False, loss_curve_path=tmp_path / "curve3.png",
     )
     assert lds_path.exists()
-    print("train_lds successfully loaded a stage 1b checkpoint and completed training")
+    print("train_lds successfully loaded a named-decoder checkpoint and completed training")
 
 
-def test_l_1step_display_uses_the_same_rollout_scale_as_the_main_loss(tmp_path, capsys):
+def test_l_1step_display_uses_the_same_rollout_scale_as_the_main_loss(tmp_path, capsys, isolated_project_root):
     """Regression test for a real, reported bug: l_1step (the "(1step)"
     figure shown alongside train_loss/val_loss every epoch, and the
     loss_curve.png secondary line) was returned RAW, never divided by
@@ -106,16 +118,16 @@ def test_l_1step_display_uses_the_same_rollout_scale_as_the_main_loss(tmp_path, 
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
     )
 
     train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path,
         ae_stats_weight=0.01,
         rollout_scale=0.0001,  # deliberately small, matching this session's own '_scale' convention
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
@@ -142,7 +154,7 @@ def test_l_1step_display_uses_the_same_rollout_scale_as_the_main_loss(tmp_path, 
     )
 
 
-def test_epochs_zero_actually_writes_a_checkpoint_stage3(tmp_path, capsys):
+def test_epochs_zero_actually_writes_a_checkpoint_stage3(tmp_path, capsys, isolated_project_root):
     """Same regression test as Stage 1a/1b/2's own, for train_lds."""
     base_path = _build_sweep(tmp_path, n_runs=6)
     stage1a_path = train_autoencoder(
@@ -152,19 +164,19 @@ def test_epochs_zero_actually_writes_a_checkpoint_stage3(tmp_path, capsys):
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
     )
 
     checkpoint_path = tmp_path / "stage3_ablation.pt"
     assert not checkpoint_path.exists()
 
     result = train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=0, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -186,7 +198,7 @@ def test_epochs_zero_actually_writes_a_checkpoint_stage3(tmp_path, capsys):
     assert "train_set: skipped" in output, "train_set must be skipped entirely at epochs=0"
 
 
-def test_use_dt_decade_weights_false_never_computes_or_calls_the_weights_fn(tmp_path, monkeypatch):
+def test_use_dt_decade_weights_false_never_computes_or_calls_the_weights_fn(tmp_path, monkeypatch, isolated_project_root):
     """Default (False) must leave today's behavior completely
     untouched: compute_dt_decade_weights should never even be CALLED,
     not just "called but ignored" -- confirmed by patching it to raise
@@ -208,16 +220,16 @@ def test_use_dt_decade_weights_false_never_computes_or_calls_the_weights_fn(tmp_
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b_off.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b_off.png",
+        checkpoint_path=tmp_path / "stage2_off.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_off.png",
     )
     # THE actual test: must complete without the patched function ever firing.
     lds_path = train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -229,7 +241,7 @@ def test_use_dt_decade_weights_false_never_computes_or_calls_the_weights_fn(tmp_
     assert lds_path.exists()
 
 
-def test_use_dt_decade_weights_true_is_computed_and_actually_used(tmp_path, monkeypatch):
+def test_use_dt_decade_weights_true_is_computed_and_actually_used(tmp_path, monkeypatch, isolated_project_root):
     """Confirms the full, genuine integration: compute_dt_decade_weights
     is called with BOTH the measured dt array AND the measured raw-loss
     array (see compute_euler_only_losses -- the corrected scheme needs
@@ -266,15 +278,15 @@ def test_use_dt_decade_weights_true_is_computed_and_actually_used(tmp_path, monk
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b_on.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b_on.png",
+        checkpoint_path=tmp_path / "stage2_on.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_on.png",
     )
     lds_path = train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -298,7 +310,7 @@ def test_use_dt_decade_weights_true_is_computed_and_actually_used(tmp_path, monk
     )
 
 
-def test_compute_euler_only_losses_matches_independent_manual_computation(tmp_path, monkeypatch):
+def test_compute_euler_only_losses_matches_independent_manual_computation(tmp_path, monkeypatch, isolated_project_root):
     """Directly verifies compute_euler_only_losses' own arithmetic
     against an INDEPENDENT computation over a real dataset -- not by
     calling compute_euler_only_losses again, but by iterating the same
@@ -362,15 +374,15 @@ def test_compute_euler_only_losses_matches_independent_manual_computation(tmp_pa
         checkpoint_path=tmp_path / "stage1a_euler.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a_euler.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b_euler.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b_euler.png",
+        checkpoint_path=tmp_path / "stage2_euler.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_euler.png",
     )
     lds_path = train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -388,7 +400,7 @@ def test_compute_euler_only_losses_matches_independent_manual_computation(tmp_pa
     np.testing.assert_allclose(captured["all_losses"], captured["manual_losses"], rtol=1e-5, atol=1e-8)
 
 
-def test_z0_noise_scale_perturbs_train_only_not_val(tmp_path, monkeypatch):
+def test_z0_noise_scale_perturbs_train_only_not_val(tmp_path, monkeypatch, isolated_project_root):
     """z0_noise_scale is meant to fix a specific, diagnosed failure mode
     (see train_lds()'s own docstring): re-running train_lds with the
     SAME seed, differing only in z0_noise_scale (0.0 vs 0.5), must
@@ -428,18 +440,18 @@ def test_z0_noise_scale_perturbs_train_only_not_val(tmp_path, monkeypatch):
         checkpoint_path=tmp_path / "stage1a_noise.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a_noise.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b_noise.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b_noise.png",
+        checkpoint_path=tmp_path / "stage2_noise.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_noise.png",
     )
 
     def _run(z0_noise_scale, suffix):
         calls.clear()
         train_lds(
-            size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+            size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
             epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
             val_fraction=0.34, test_fraction=0.17, num_workers=0,
             n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -497,7 +509,7 @@ def test_z0_noise_scale_perturbs_train_only_not_val(tmp_path, monkeypatch):
 # math work correctly) is already thoroughly covered in
 # test_latent_dynamics.py and not re-tested here.
 
-def test_rollout_loss_constructed_with_exponent_deriv_zero_and_dt_passed_at_call(tmp_path, monkeypatch):
+def test_rollout_loss_constructed_with_exponent_deriv_zero_and_dt_passed_at_call(tmp_path, monkeypatch, isolated_project_root):
     """The two-part fix, both parts required together: exponent_deriv=0.0
     at RolloutLoss's own construction does NOTHING on its own unless dt
     is also actually passed at the call site (RolloutLoss raises if
@@ -530,15 +542,15 @@ def test_rollout_loss_constructed_with_exponent_deriv_zero_and_dt_passed_at_call
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
     )
     lds_path = train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -557,7 +569,7 @@ def test_rollout_loss_constructed_with_exponent_deriv_zero_and_dt_passed_at_call
     )
 
 
-def test_dt_cap_default_round_trips_as_inf(tmp_path):
+def test_dt_cap_default_round_trips_as_inf(tmp_path, isolated_project_root):
     """Not specifying dt_cap at all must produce a saved checkpoint
     whose own config still explicitly records dt_cap=inf (not a
     missing key) -- so anything reading the checkpoint later gets an
@@ -572,15 +584,15 @@ def test_dt_cap_default_round_trips_as_inf(tmp_path):
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
     )
     lds_path = train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -593,7 +605,7 @@ def test_dt_cap_default_round_trips_as_inf(tmp_path):
     assert saved["config"]["dt_cap"] == float("inf")
 
 
-def test_dt_cap_finite_value_round_trips_and_is_actually_applied(tmp_path):
+def test_dt_cap_finite_value_round_trips_and_is_actually_applied(tmp_path, isolated_project_root):
     """The full, genuine chain: a finite dt_cap given to train_lds() must
     (1) be recorded in the saved checkpoint's own config, and (2) the
     RELOADED model (a fresh LatentDynamics, constructed from that saved
@@ -610,16 +622,16 @@ def test_dt_cap_finite_value_round_trips_and_is_actually_applied(tmp_path):
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
     )
     dt_cap_value = 50.0
     lds_path = train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -666,7 +678,7 @@ def test_dt_cap_finite_value_round_trips_and_is_actually_applied(tmp_path):
     )
 
 
-def test_dt_cap_mismatch_on_resume_raises_a_clear_error(tmp_path):
+def test_dt_cap_mismatch_on_resume_raises_a_clear_error(tmp_path, isolated_project_root):
     """dt_cap isn't a weight-shape mismatch load_state_dict would ever
     catch on its own (it's a plain float attribute, not a learnable
     parameter) -- resuming under a DIFFERENT dt_cap than the loaded
@@ -683,15 +695,15 @@ def test_dt_cap_mismatch_on_resume_raises_a_clear_error(tmp_path):
         checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
     )
-    stage1b_path = train_stage1b(
-        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1a_path,
         epochs=1, batch_size=4, num_workers=0, augment=False,
         val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
     )
     stage3a_path = train_lds(
-        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=1, min_step=0, min_stdev_phi=None,
@@ -703,7 +715,7 @@ def test_dt_cap_mismatch_on_resume_raises_a_clear_error(tmp_path):
     with pytest.raises(ValueError, match="dt_cap"):
         train_lds(
             size=32, base_path=base_path, resume_from=stage3a_path,
-            ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+            ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
             epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
             val_fraction=0.34, test_fraction=0.17, num_workers=0,
             n_rollout_steps=2, min_step=0, min_stdev_phi=None,

@@ -957,7 +957,7 @@ class MicrostructureEvolutionDataset(Dataset):
             encoder.eval() was already called above, BEFORE this: the
             encoder here DOES contain BatchNorm2d (see train_ae.py's own
             extensive freeze/eval-mode handling, and
-            test_train_stage1b.py's drift tests), but in eval() mode it
+            test_train_stage2_c0c1.py's own drift tests), but in eval() mode it
             normalizes using its saved running_mean/running_var, not
             live per-batch statistics -- so a given frame's own encoded
             output is unaffected by which OTHER frames happen to share

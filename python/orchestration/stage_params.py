@@ -26,9 +26,11 @@ def parse_stage_params(path: Path) -> tuple[dict[str, str], dict[int | str, dict
     genuinely distinct curriculum phases of stage 3), '1a' isn't a
     different phase of anything, it's just another, more consistent-
     looking name for stage 1 itself (matching the project's own
-    '1a'/'1b' pairing convention: stage 1a = single-stream autoencoder,
-    stage 1b = deriv stream decoder). '1b' is NOT touched by this --
-    it's a genuinely distinct stage (train_stage1b), not an alias.
+    '1a'/'1b' naming convention from when stage 1 and its former deriv-
+    stream-decoder extension were separate stages). '1b' is NOT touched
+    by this -- it's still a distinct, recognized section key (though
+    no longer used for anything -- see orchestration/pipeline.py's own
+    warning when one is present), not an alias.
     """
     global_params: dict[str, str] = {}
     stages: dict[int | str, dict[str, str]] = {}

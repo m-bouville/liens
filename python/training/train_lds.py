@@ -327,9 +327,11 @@ def train_lds(
 
     # condition_on_theta is NOT decided here -- deriv's theta-FiLM
     # conditioning is a structural property fixed once, when the stream
-    # is CREATED (stage 1b; see train_stage1b's own docstring). Stage 3
-    # only ever loads an already-built, FROZEN encoder, so there is
-    # nothing to set -- only something to VALIDATE, same rationale and
+    # is CREATED (see training/extend_encoder.py's own module docstring
+    # -- deriv is now built directly inside train_stage2(), no separate
+    # stage 1b pass). Stage 3 only ever loads an already-built, FROZEN
+    # encoder, so there is nothing to set -- only something to VALIDATE,
+    # same rationale and
     # same error as train_stage2's own identical check. None (default)
     # skips this entirely, trusting whatever the loaded checkpoint has.
     if condition_on_theta is not None:
