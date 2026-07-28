@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import pytest
 from pathlib import Path
 from utils import load_datasets as load
 from training.train_ae import train_autoencoder, train_stage1b
@@ -473,3 +474,241 @@ def test_z0_noise_scale_perturbs_train_only_not_val(tmp_path, monkeypatch):
                 "z0_noise_scale -- perturbation must never leak into val_loss"
             )
     assert saw_train and saw_val, "test must actually exercise both train and val calls"
+
+
+# ---- exponent_deriv / dt_cap ---------------------------------------------
+#
+# exponent_deriv's own mechanism (RolloutLoss's q-weighted reduction of
+# dt-dependence) already has thorough, dedicated unit coverage in
+# test_losses.py -- unchanged by this session's work. What's new and
+# untested here is specifically train_lds()'s OWN usage of it: this was
+# a real, previously-reported regression (a comment here used to
+# explicitly argue AGAINST using exponent_deriv at all, on reasoning
+# that turned out to be incomplete) -- confirms train_lds() actually
+# constructs RolloutLoss with exponent_deriv=0.0 (not left at the
+# class's own default of 1.0) and actually passes dt at the call site
+# (without which exponent_deriv would silently have no effect, per
+# RolloutLoss's own requirement that dt be given whenever
+# exponent_deriv != 1.0).
+#
+# dt_cap tests below similarly focus on train_lds()'s OWN plumbing
+# (construction, checkpoint round-trip, resume-time consistency
+# checking) -- LatentDynamics' own dt_cap behavior (does the forward()
+# math work correctly) is already thoroughly covered in
+# test_latent_dynamics.py and not re-tested here.
+
+def test_rollout_loss_constructed_with_exponent_deriv_zero_and_dt_passed_at_call(tmp_path, monkeypatch):
+    """The two-part fix, both parts required together: exponent_deriv=0.0
+    at RolloutLoss's own construction does NOTHING on its own unless dt
+    is also actually passed at the call site (RolloutLoss raises if
+    exponent_deriv != 1.0 and dt is None) -- confirms BOTH halves are
+    wired correctly, not just one."""
+    import training.train_lds as train_lds_module
+    from training.losses import RolloutLoss as RealRolloutLoss
+
+    calls = {"init_exponent_deriv": "NOT_CALLED", "call_count": 0, "any_call_missing_dt": False}
+
+    class _RecordingRolloutLoss(RealRolloutLoss):
+        def __init__(self, *args, **kwargs):
+            calls["init_exponent_deriv"] = kwargs.get("exponent_deriv")
+            super().__init__(*args, **kwargs)
+
+        def __call__(self, *args, **kwargs):
+            calls["call_count"] += 1
+            if kwargs.get("dt") is None:
+                calls["any_call_missing_dt"] = True
+            return super().__call__(*args, **kwargs)
+
+    monkeypatch.setattr(train_lds_module, "RolloutLoss", _RecordingRolloutLoss)
+
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1a_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
+    )
+    stage1b_path = train_stage1b(
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0, augment=False,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+    )
+    lds_path = train_lds(
+        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        n_rollout_steps=1, min_step=0, min_stdev_phi=None,
+        encode_batch_size=4, ema_warmup_epochs=0,
+        checkpoint_path=tmp_path / "stage3.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve3.png",
+    )
+    assert lds_path.exists()
+    assert calls["init_exponent_deriv"] == 0.0, (
+        f"RolloutLoss constructed with exponent_deriv={calls['init_exponent_deriv']!r}, expected 0.0"
+    )
+    assert calls["call_count"] > 0, "RolloutLoss must actually be called during training"
+    assert not calls["any_call_missing_dt"], (
+        "at least one RolloutLoss call was missing dt -- exponent_deriv=0.0 would silently "
+        "have no effect on that call, since RolloutLoss's own dt-weighting requires it"
+    )
+
+
+def test_dt_cap_default_round_trips_as_inf(tmp_path):
+    """Not specifying dt_cap at all must produce a saved checkpoint
+    whose own config still explicitly records dt_cap=inf (not a
+    missing key) -- so anything reading the checkpoint later gets an
+    unambiguous answer via direct key lookup, not needing to know a
+    separate, external default to interpret a missing key correctly."""
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1a_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
+    )
+    stage1b_path = train_stage1b(
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0, augment=False,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+    )
+    lds_path = train_lds(
+        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        n_rollout_steps=1, min_step=0, min_stdev_phi=None,
+        encode_batch_size=4, ema_warmup_epochs=0,
+        # dt_cap deliberately NOT passed -- confirms the default itself
+        checkpoint_path=tmp_path / "stage3.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve3.png",
+    )
+    saved = torch.load(lds_path, map_location="cpu", weights_only=False)
+    assert saved["config"]["dt_cap"] == float("inf")
+
+
+def test_dt_cap_finite_value_round_trips_and_is_actually_applied(tmp_path):
+    """The full, genuine chain: a finite dt_cap given to train_lds() must
+    (1) be recorded in the saved checkpoint's own config, and (2) the
+    RELOADED model (a fresh LatentDynamics, constructed from that saved
+    config exactly as model_assembly.py/check_parameter_dependence.py's
+    own loading paths do) must actually exhibit the capped forward()
+    behavior -- not just that the number made it into a dict somewhere,
+    but that it genuinely changes what the reloaded model computes."""
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1a_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
+    )
+    stage1b_path = train_stage1b(
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0, augment=False,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+    )
+    dt_cap_value = 50.0
+    lds_path = train_lds(
+        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        n_rollout_steps=1, min_step=0, min_stdev_phi=None,
+        encode_batch_size=4, ema_warmup_epochs=0, dt_cap=dt_cap_value,
+        checkpoint_path=tmp_path / "stage3.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve3.png",
+    )
+    saved = torch.load(lds_path, map_location="cpu", weights_only=False)
+    assert saved["config"]["dt_cap"] == dt_cap_value
+
+    from models.latent_dynamics import LatentDynamics
+    f_theta = LatentDynamics(latent_channels=saved["config"]["latent_channels"],
+                              n_theta=saved["config"]["n_theta"],
+                              latent_spatial=saved["config"]["latent_spatial_size"],
+                              hidden_dim=saved["config"]["hidden_dim"],
+                              n_hidden_layers=saved["config"]["n_hidden_layers"],
+                              dt_cap=saved["config"]["dt_cap"])
+    f_theta.load_state_dict(saved["model_state"])
+    with torch.no_grad():
+        f_theta.net[-1].bias.fill_(0.1)  # force a nonzero f, so capping has something to act on
+    torch.manual_seed(0)
+    z0 = torch.randn(2, saved["config"]["latent_channels"], saved["config"]["latent_spatial_size"],
+                      saved["config"]["latent_spatial_size"])
+    z1 = torch.randn_like(z0)
+    theta = torch.randn(2, saved["config"]["n_theta"])
+    f_val = f_theta.f(z0, z1, theta)
+
+    dt_below = torch.full((2,), dt_cap_value - 10)
+    dt_above = torch.full((2,), dt_cap_value + 500)
+    out_below = f_theta(z0, z1, dt_below, theta)
+    out_above = f_theta(z0, z1, dt_above, theta)
+
+    dt_below_r = dt_below.view(-1, 1, 1, 1)
+    dt_above_r = dt_above.view(-1, 1, 1, 1)
+    expected_below = z0 + z1 * dt_below_r + f_val * (dt_below_r ** 2 / 2)  # below cap: uncapped formula
+    expected_above_capped = z0 + z1 * dt_above_r + f_val * (dt_cap_value ** 2 / 2)  # above cap: frozen
+    expected_above_if_uncapped = z0 + z1 * dt_above_r + f_val * (dt_above_r ** 2 / 2)  # what it'd be WITHOUT capping
+
+    assert torch.allclose(out_below, expected_below, atol=1e-4)
+    assert torch.allclose(out_above, expected_above_capped, atol=1e-4)
+    assert not torch.allclose(out_above, expected_above_if_uncapped, atol=1e-2), (
+        "reloaded model's dt_cap has no actual effect on forward() -- round-tripped correctly "
+        "in the config dict, but not genuinely applied by the reconstructed model"
+    )
+
+
+def test_dt_cap_mismatch_on_resume_raises_a_clear_error(tmp_path):
+    """dt_cap isn't a weight-shape mismatch load_state_dict would ever
+    catch on its own (it's a plain float attribute, not a learnable
+    parameter) -- resuming under a DIFFERENT dt_cap than the loaded
+    weights were actually trained under is exactly the kind of silent,
+    dangerous inconsistency the existing architecture-mismatch check
+    exists to catch. Confirms dt_cap was actually added to that check,
+    not just to construction/saving."""
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1a_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
+    )
+    stage1b_path = train_stage1b(
+        base_path=base_path, resume_from=stage1a_path, stats1_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0, augment=False,
+        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage1b.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1b.png",
+    )
+    stage3a_path = train_lds(
+        size=32, base_path=base_path, ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+        epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        n_rollout_steps=1, min_step=0, min_stdev_phi=None,
+        encode_batch_size=4, ema_warmup_epochs=0, dt_cap=100.0,
+        checkpoint_path=tmp_path / "stage3a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve3a.png",
+    )
+
+    with pytest.raises(ValueError, match="dt_cap"):
+        train_lds(
+            size=32, base_path=base_path, resume_from=stage3a_path,
+            ae_checkpoint_path=stage1b_path, ae_stats_weight=0.01,
+            epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+            val_fraction=0.34, test_fraction=0.17, num_workers=0,
+            n_rollout_steps=2, min_step=0, min_stdev_phi=None,
+            encode_batch_size=4, ema_warmup_epochs=0,
+            dt_cap=200.0,  # DIFFERENT from stage3a's own 100.0
+            checkpoint_path=tmp_path / "stage3b.pt", device="cpu", seed=0,
+            log_every_epoch=False, loss_curve_path=tmp_path / "curve3b.png",
+        )

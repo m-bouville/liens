@@ -90,6 +90,23 @@ def test_checkpoint_components_decoder_extraction_from_stage2(tmp_path, isolated
         "decoder component is empty -- _strip_prefix failed to match stage 2's own "
         "separate-decoder keys"
     )
+    # Explicit, not just implicit via "the rest of this test doesn't
+    # crash": condition_on_theta was a real, separate regression (see
+    # test_checkpoint_components.py's own unit tests for the isolated
+    # version) -- stage 1b/2's own "deriv" stream IS genuinely
+    # theta-conditioned by real training here, so this checkpoint is
+    # exactly the right one to confirm that fact survives
+    # load_ae_components' own serialization round trip, rather than
+    # relying on build_models_from_components failing loudly below as
+    # the only signal something went wrong.
+    deriv_stream_cfg = components["encoder"].config["stream_configs"]["deriv"]
+    assert deriv_stream_cfg["condition_on_theta"] is True, (
+        "condition_on_theta was not preserved for the 'deriv' stream through "
+        "load_ae_components' own serialization -- would silently build an Encoder "
+        "with no theta_conditioners submodule, failing later with a confusing "
+        "'unexpected keys: theta_conditioners.deriv.*' error instead of failing here, "
+        "directly, on the actual cause"
+    )
 
     latent_channels = components["encoder"].config["latent_channels"]
     latent_spatial = components["encoder"].config["latent_spatial_size"]

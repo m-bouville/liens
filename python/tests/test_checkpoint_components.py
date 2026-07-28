@@ -16,6 +16,7 @@ from training.checkpoint_components import (
     ComponentCheckpoint, load_ae_components, load_lds_component,
     validate_component_compatibility, assemble_joint_checkpoint,
     split_joint_checkpoint_for_evaluation,
+    _strip_encoder_or_decoder_prefix, _strip_decoder_prefix_for_stream,
 )
 from models.constants import LATENT_SPATIAL_SIZE
 
@@ -67,6 +68,104 @@ def _make_lds_checkpoint(latent_channels=8):
         "data_config": {"min_step": 4000, "min_stdev_phi": 0.01,
                          "window_length": 2, "n_rollout_steps": 1},
     }
+
+
+# ---- _strip_encoder_or_decoder_prefix / _strip_decoder_prefix_for_stream ----
+#
+# Fast, isolated unit tests for the two prefix-resolution helpers,
+# complementing (not replacing) the slower, end-to-end integration tests
+# below that build real checkpoints through actual train_ae()/
+# train_stage2() calls. Those catch real regressions across the whole
+# pipeline; these isolate the prefix-matching logic itself, with plain
+# synthetic dicts, so edge cases (missing keys, wrong mappings, both
+# conventions present at once) can be checked directly and quickly
+# without a full training run for each one. Both were the direct fix
+# for a real, previously reported crash: build_models_from_components
+# failing with "missing keys: decoder.*"/"encoder.*" on a real stage 4
+# run, because _strip_prefix's own single, hardcoded prefix silently
+# returned an empty dict for checkpoint shapes it didn't anticipate.
+
+def test_strip_encoder_or_decoder_prefix_prefers_wrapped_convention():
+    """MultiStreamAutoencoder's own nn.ModuleDict-wrapped shape
+    ("encoders.shared.*"/"decoders.shared.*") is the newer, currently
+    more common of the two this project produces -- tried first."""
+    state = {"encoders.shared.down_blocks.0.weight": "W1",
+             "decoders.shared.up_blocks.0.weight": "W2"}
+    assert _strip_encoder_or_decoder_prefix(state, "encoder") == {"down_blocks.0.weight": "W1"}
+    assert _strip_encoder_or_decoder_prefix(state, "decoder") == {"up_blocks.0.weight": "W2"}
+
+
+def test_strip_encoder_or_decoder_prefix_falls_back_to_plain_convention():
+    """Stage 1's own plain Autoencoder (self.encoder/self.decoder
+    directly, no ModuleDict wrapping at all) has no 'encoders.shared.'
+    keys whatsoever -- must fall back to the plain 'encoder.'/'decoder.'
+    prefix rather than silently returning empty."""
+    state = {"encoder.down_blocks.0.weight": "W1", "decoder.up_blocks.0.weight": "W2"}
+    assert _strip_encoder_or_decoder_prefix(state, "encoder") == {"down_blocks.0.weight": "W1"}
+    assert _strip_encoder_or_decoder_prefix(state, "decoder") == {"up_blocks.0.weight": "W2"}
+
+
+def test_strip_encoder_or_decoder_prefix_neither_convention_present():
+    """If NEITHER prefix matches anything (a genuinely unrecognized
+    checkpoint shape), this returns an empty dict rather than raising --
+    matching _strip_prefix's own documented behavior. Callers are
+    responsible for detecting and reporting an empty result themselves
+    (see load_ae_components' own docstring/callers) -- this helper's
+    own job is just prefix resolution, not validation."""
+    state = {"something_else_entirely.weight": "W1"}
+    assert _strip_encoder_or_decoder_prefix(state, "encoder") == {}
+    assert _strip_encoder_or_decoder_prefix(state, "decoder") == {}
+
+
+def test_strip_decoder_prefix_for_stream_uses_decoder_for_stream_mapping():
+    """The precise, correct case: decoder_for_stream names exactly
+    which decoder key serves the recon stream (e.g. "state"->"D0") --
+    used directly, not guessed."""
+    state = {"decoders.D0.up_blocks.0.weight": "D0_W", "decoders.D1.up_blocks.0.weight": "D1_W"}
+    model_cfg = {"decoder_for_stream": {"state": "D0", "deriv": "D1"}}
+    assert _strip_decoder_prefix_for_stream(state, model_cfg, "state") == {"up_blocks.0.weight": "D0_W"}
+    assert _strip_decoder_prefix_for_stream(state, model_cfg, "deriv") == {"up_blocks.0.weight": "D1_W"}
+
+
+def test_strip_decoder_prefix_for_stream_falls_back_when_mapping_absent():
+    """An older checkpoint with no decoder_for_stream key at all (predates
+    the stage 1b/2 separate-decoder feature) should fall back to the
+    generic encoder-or-decoder-prefix resolution, not crash on a missing
+    key or silently return empty."""
+    state = {"decoders.shared.up_blocks.0.weight": "W_shared"}
+    assert _strip_decoder_prefix_for_stream(state, {}, "state") == {"up_blocks.0.weight": "W_shared"}
+
+
+def test_strip_decoder_prefix_for_stream_falls_back_when_stream_name_not_in_mapping():
+    """decoder_for_stream IS present, but doesn't happen to mention the
+    specific recon_stream_name being asked about -- falls back rather
+    than KeyError."""
+    state = {"decoders.shared.up_blocks.0.weight": "W_shared"}
+    model_cfg = {"decoder_for_stream": {"deriv": "D1"}}  # no "state" entry
+    assert _strip_decoder_prefix_for_stream(state, model_cfg, "state") == {"up_blocks.0.weight": "W_shared"}
+
+
+def test_strip_decoder_prefix_for_stream_falls_back_when_mapped_key_not_in_state_dict():
+    """decoder_for_stream POINTS at a key ("D0") that isn't actually
+    present in this particular state_dict (e.g. a stale/inconsistent
+    config) -- must fall back to the generic resolution rather than
+    silently returning an empty dict for a mapping that doesn't
+    actually match this checkpoint's own real keys."""
+    state = {"decoders.shared.up_blocks.0.weight": "W_shared"}  # NOT decoders.D0.*
+    model_cfg = {"decoder_for_stream": {"state": "D0"}}
+    assert _strip_decoder_prefix_for_stream(state, model_cfg, "state") == {"up_blocks.0.weight": "W_shared"}
+
+
+def test_strip_decoder_prefix_for_stream_named_mapping_takes_priority_over_shared():
+    """If BOTH a named (decoders.D0.*) and a generic shared
+    (decoders.shared.*) prefix happen to be present in the same
+    state_dict, the decoder_for_stream-directed lookup must win --
+    it's the precise, checkpoint-authoritative answer, not a guess the
+    generic fallback should be allowed to override."""
+    state = {"decoders.D0.up_blocks.0.weight": "D0_W",
+             "decoders.shared.up_blocks.0.weight": "SHOULD_NOT_BE_USED"}
+    model_cfg = {"decoder_for_stream": {"state": "D0"}}
+    assert _strip_decoder_prefix_for_stream(state, model_cfg, "state") == {"up_blocks.0.weight": "D0_W"}
 
 
 def test_load_ae_components_splits_encoder_and_decoder(tmp_path):
