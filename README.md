@@ -14,21 +14,25 @@ For details (equations, implementation), see `./docs/phase_field.md`.
 
 
 ## Neural surrogate
-The NN model will be trained on phase-field simulation results to predict the microstructure at $t + \Delta t$ based on the microstructure at $t$, i.e. it will learn a surrogate that approximates phase-field time evolution operators, without explicitly solving discretized PDEs.
+The NN model is trained on phase-field simulation results to predict the microstructure at $t + \Delta t$ based on the microstructure at $t$, i.e. it learns a surrogate that approximates phase-field time evolution operators, without explicitly solving discretized PDEs.
 
-The model will use an autoencoder (AE) based on convolutional neural networks (CNN). The encoder will compress the image of the microstructure, $x(t)$, as a latent representation, $z(t)$. From this the decoder will recover (approximately) the microstructure:
+The model uses an autoencoder (AE) based on convolutional neural networks (CNN). The encoder compresses the image of the microstructure, $x(t)$, as a latent representation, $z(t)$. From this the decoder recovers (approximately) the microstructure:
 - encode: $z = E(x)$,
 - decode: $x'= D(z)$, i.e. $D(E(x))$.
 
 The convolutional autoencoder has a symmetric encoder–decoder architecture. The latent representation retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. For details on the architecture of the autoencoder, see `./docs/neural_nets.md` and `./docs/NN-code_structure.md`.
 
 
-## Latent representation 
-The latent representation will also be used by a Latent Dynamics Surrogate (LDS) model to predict the microstructure at $t + \Delta t$: $z(t + \Delta t) = z(t) + f_\theta(z(t), \Delta t)$, with $\theta$ physical parameters (e.g. temperature). As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\Delta t$ a multiple of the phase-field time step).
+## Latent representation
+The latent representation is split into two streams: 
+- $z_0(t)$, the "state" (which the decoder can recover $x(t)$ from), 
+- $z_1(t)$, an approximation of $\dot{z}_0(t)$ that exists purely in latent space and is never decoded. 
 
-For sufficiently small time intervals, the evolution is approximately linear in the time increment: $f_\theta(z(t), \Delta t) \propto \Delta t$, so what we need to learn is the slope,
-$$g_\theta(z(t)) = \dfrac{z(t + \Delta t) - z(t)}{\Delta t}.$$ 
-Then, $z(t + \Delta t) = z(t) + g_\theta(z(t))\,\Delta t$.
+A Latent Dynamics Surrogate (LDS), $f_\theta$, predicts the next state from both:
+$$z_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t), \theta)\,\Delta t^2/2,$$
+with $\theta$ physical parameters (e.g. temperature). $z_1(t)\,\Delta t$ is the first-order (linear) term; $f_\theta$ predicts the second-order (curvature) correction on top of it. 
+
+As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\Delta t$ a multiple of the phase-field time step) — in practice the second-order term is capped for large $\Delta t$, to avoid a blow-up.
 
 Representing the microstructure in latent space rather than real space has two advantages:
 - it can be much smaller (even a smallish 256×256 image has 65'000 degrees of freedom),
@@ -39,6 +43,7 @@ The underlying hypothesis is two-fold. Phase-field evolution occurs on a smooth 
 
 For phase-field systems, the latent variables are expected to behave similarly to coordinates on a reduced thermodynamic manifold, dynamics should approximate gradient flow.
 
+See `./docs/neural_nets.md` for the full derivation, including the Taylor expansions.
 
 
 ## Process
@@ -46,6 +51,15 @@ The process is:
 $$x(t) \xrightarrow{E} z(t) \xrightarrow{f_\theta} z(t+\Delta t) \xrightarrow{D} x(t+\Delta t).$$
 In fact, the encoding occurs only once at the beginning and the decoding once at the end (plus when plots are needed):
 $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\theta} z(2 \Delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(T).$$
+
+
+## Process
+The process is:
+$$x(t) \xrightarrow{E} z(t) \xrightarrow{f_\theta} z(t+\Delta t) \xrightarrow{D} x(t+\Delta t).$$
+In fact, the encoding occurs only once at the beginning and the decoding once at the end (plus when plots are needed):
+$$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\theta} z(2 \Delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(T).$$
+
+(Writing $z$ loosely for the full latent state $(z_0,\ z_1)$; see `./docs/neural_nets.md` for the actual split-stream mechanics.)
 
 
 ```text
@@ -80,9 +94,9 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 
 
 ## Workflow
-0.	Generate hundreds of phase-field simulations. 
+0.	Generate over two thousand phase-field simulations. 
 1.	Train a CNN autoencoder on individual microstructures (no time evolution yet) to learn a latent representation that is reconstructive and physically descriptive.
-2.  Validate that the latent space behaves like a smooth, structured coordinate system (see `./docs/neural_nets.md` for more details).
+2.  Train a second latent stream, $z_1$, to represent $\dot{z}_0$ via a derivative loss (see `./docs/neural_nets.md` for more details).
 3.	Freeze the encoder and train the Latent Dynamics Surrogate (LDS) to predict future microstructures in latent space.
 4.	Fine-tune the encoder and the LDS for prediction, including a small input from reconstruction.
 5.	Fine-tune the latent representation and the LDS to both predict future microstructures and reconstruct the original microstructure.
@@ -116,8 +130,8 @@ For more details on the structure of the `python` directory, see `./docs/NN-code
 
 - [X] C++ phase-field solver
 - [X] Dataset generation
-- [X] 1. CNN autoencoder
-- [X] 2. Latent-space validation
+- [X] 1. CNN autoencoder (C$_0$)
+- [X] 2. Derivative (C$_1$)
 - [X] 3. Latent dynamics surrogate
 - [X] 4-5. End-to-end training
 - [ ] Obtaining satisfactory results

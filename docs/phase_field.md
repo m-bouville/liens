@@ -10,7 +10,7 @@ Its local free-energy density is given by a temperature-dependent Landau potenti
 $$f(\phi,T) = \frac{a(T)}{2}\phi^2 + \frac{b}{4}\phi^4\!,$$
 where $a(T)=a_0(T-T_0)$. Its derivative is $\frac{\partial f}{\partial\phi} = a(T)\phi + b\phi^3$. 
 
-Above the critical temperature $T_0$, the potential has a single minimum at $\phi=0$. Below $T_0$, it becomes a symmetric double well: minima at $\pm \sqrt{a_0(T_0-T)/b}$ and a maximum at 0.
+Above the critical temperature $T_0$, the potential has a single minimum at $\phi=0$. Below $T_0$, it becomes a symmetric double well: minima at $\pm \sqrt{a_0(T_0-T)/b}$ and a maximum at 0. The potential at the minima is $-a^2(T)/(4b)$.
 Dedimensionalization: $T_0$ and $b$ are typically set to 1 without loss of generality.
 
 A single non-conserved order parameter is evolved using the Allen–Cahn equation:

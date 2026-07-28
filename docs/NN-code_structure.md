@@ -16,10 +16,13 @@ python/
 ├── models/                [code]  Network architectures (no training logic)
 │   ├── blocks.py                  ConvBlock, DownBlock, UpBlock
 │   ├── encoder.py, decoder.py     Encoder/Decoder (composed by autoencoder.py)
-│   ├── autoencoder.py             Autoencoder = Encoder + Decoder
+│   ├── autoencoder.py             Autoencoder (single-stream) + MultiStreamAutoencoder
 │   └── latent_dynamics.py         Latent Dynamics Surrogate, LDS (f_theta)
 ├── training/              [code]  Training loops, losses, datasets, checkpoint plumbing
-│   ├── train_ae.py                Stages 1 (`train_autoencoder`) and 2 (`train_stage2`)
+│   ├── train_stage1.py            Stage 1 (`train_autoencoder`)
+│   ├── train_stage2.py            Stage 2 (`train_stage2`)
+│   ├── train_ae_common.py         Shared by stages 1/2 (`freeze_outer_layers` etc.)
+│   ├── extend_encoder.py          Builds stage 2's deriv stream from a stage-1 ancestor
 │   ├── train_lds.py               Stage 3
 │   ├── train_refinement.py        Stage 4 and 5
 │   └── ...
@@ -35,6 +38,30 @@ output/stage<N>/           [output]Diagnostic PNGs (reconstruction, rollout, los
 
 
 ## The pipeline: five training stages
+### Stages 1 and 2
+Stage 1 (`train_autoencoder`) trains a single-stream `Autoencoder` on individual frames
+(reconstruction + optional stats anchor). Stage 2 (`train_stage2`) always resumes from a
+stage-1 checkpoint and trains a second, "deriv" latent stream (`z1`) via `L_deriv`, a
+latent-space consistency loss comparing `z1(t)` against what `z0`'s own trajectory implies
+its rate of change should be — this is what stage 3's coupled integrator needs primed, and
+is genuinely different from `check_interpolation.py`'s diagnostic (see Evaluation below).
+
+There used to be a separate stage 1b between them, whose job was building this second
+stream. It's gone: `train_stage2()` now builds the deriv stream itself, in memory, directly
+from the stage-1 checkpoint, via `extend_encoder.py`'s
+`extend_state_checkpoint_with_deriv_stream()` — extending the encoder with a fresh
+bottleneck + theta-conditioner and transferring stage 1's own trained weights unchanged.
+The old stage 1b pass had gone inert (running at `epochs=0` in every configuration this
+project actually used) well before it was formally removed; the one thing it genuinely
+built — a per-stream *decoder* (`D1`) for the deriv stream — is confirmed permanently
+unnecessary and no longer exists at all. A checkpoint's `deriv` stream is `PURE_LATENT`
+now, not `DECODER`-mode. `train_stage2()` still accepts an already-multi-stream ancestor
+directly (resuming a prior stage-2 run, or a pre-removal checkpoint that still has a real
+`D1`) for backward compatibility — such a `D1`, if present, simply sits inert, never called.
+
+This is also why stage 2's model is a `MultiStreamAutoencoder`, not the plain `Autoencoder`
+stage 1 uses (see `models/` below).
+
 ### Stage 3
 Stages 3a and 3b are calls to the same `train_lds()`, with 3b resuming from 3a's checkpoint at a longer rollout horizon. A params file can instead use a single bare `# Stage 3` section: `main.py` enforces that 3a and 3b are either both present or both absent.
 
@@ -69,16 +96,31 @@ end.
 
 ### `models/` — architecture only, no training logic
 - **`Encoder`**: depth scales with input size so the spatial bottleneck is always 8×8 (3
-  stages for 64×64, 5 for 256×256). Can optionally return skip-connection features
-  (`use_skips=True`); this is not currently used.
-  (`neural_nets.md`'s skip-connection idea), currently dead weight.
+  stages for 64×64, 5 for 256×256). Built around `stream_configs` (a
+  `dict[str, LatentStreamConfig]`), not a single fixed output — one bottleneck per named
+  latent stream (e.g. today's `state`/`deriv` pair), each independently configurable
+  (channels, spatial size, whether it's theta-conditioned via a FiLM-style
+  `theta_conditioner`). A single-stream case is just `stream_configs` with one entry, not a
+  separate code path. Can optionally return skip-connection features (`use_skips=True`,
+  `neural_nets.md`'s skip-connection idea) — scaffolded, never enabled anywhere.
 - **`Decoder`**: mirrors the encoder; `UpBlock` uses `ConvTranspose2d(kernel_size=2,
   stride=2)` — a deliberately non-overlapping 2× expansion, chosen specifically to avoid
   the classic checkerboard-artifact failure mode of mismatched kernel/stride ratios.
   (A checkerboard artifact *did* appear during stage 4 development regardless — working on it.)
-- **`Autoencoder`**: composes Encoder + Decoder; `ae.encoder`/`ae.decoder` are the
-  attributes checkpoint-splitting code (below) relies on when stripping/re-adding
-  `"encoder."`/`"decoder."` prefixes from a combined `state_dict()`.
+- **`Autoencoder`**: composes a single Encoder + Decoder (one stream). `ae.encoder`/
+  `ae.decoder` are the attributes checkpoint-splitting code (below) relies on when
+  stripping/re-adding `"encoder."`/`"decoder."` prefixes from a combined `state_dict()`.
+  Stage 1 is the only stage that still builds this (single-stream) class directly.
+- **`MultiStreamAutoencoder`**: the class every other stage actually uses (stage 2 onward)
+  — one shared `Encoder` (multi-stream, as above) plus one or more named `Decoder`s
+  (`self.encoders["shared"]`/`self.decoders[...]`, not the flat `.encoder`/`.decoder`
+  attributes above). `decoder_for_stream` maps each stream to which decoder actually
+  decodes it — today's checkpoints map only the recon (`state`) stream to a decoder at all;
+  the `deriv` stream is `PURE_LATENT` (no decoder — see Stages 1 and 2 above), so
+  `self.pathways["deriv"]` has no `.decoder` to call. A stream's decoder mode
+  (`PURE_LATENT`/`DECODER`/`AUTOENCODER`) is a structural property fixed once, when the
+  stream is created, not something later stages can change by resuming with a different
+  value.
 - **`LatentDynamics`** (`f_theta`): predicts `dz` from `(z, dt, θ)`. `.rollout(z0, dts,
   theta)` chains multiple Euler steps (`z ← z + f_theta(z, dt, θ)`) given a *sequence* of
   per-transition `dt`s — this is the mechanism every multi-step rollout computation in the
@@ -93,24 +135,36 @@ end.
 #### Datasets (`datasets.py`)
 - `MicrostructureSnapshotDataset` — single frames, for stage 1. Supports D4×translation
   augmentation (32×) via `augment=True`.
-- `MicrostructureTripletDataset` — `(t1, t2, t3)` triples for stage 2's interpolation loss.
-- `MicrostructureEvolutionDataset` — the workhorse for stages 3, 4 and 5. Two modes selected by
-  whether `encoder` is given: with a frozen encoder, latents are cached once upfront
-  (stage 3's fast path); with `encoder=None`, raw pixel windows are returned and encoding
-  happens fresh every forward pass (stages 4 and 5, since `E` is trainable there — this is
-  *why* they are meaningfully more expensive per epoch than stage 3). Optionally also
-  returns `true_stats` (ground-truth statistics for the window's starting frame) when
-  `stat_names` is given, for stage 4/5's `L_stats` term.
+- `MicrostructureTripletDataset` — `(t1, t2, t3)` triples, built for an earlier
+  interpolation loss (`L_interp`) that predated the current C0/C1 (state/deriv) redesign.
+  That loss is gone from training entirely — `check_interpolation.py` now uses the same
+  underlying idea only as a diagnostic (see Evaluation below), not a loss function — and
+  this class isn't used anywhere in the current pipeline; kept for now, not actively
+  maintained against the current architecture.
+- `MicrostructureEvolutionDataset` — the workhorse for stages 2, 3, 4 and 5. Two modes
+  selected by whether `encoder` is given: with a frozen encoder, latents are cached once
+  upfront (stage 3's fast path); with `encoder=None`, raw pixel windows are returned and
+  encoding happens fresh every forward pass (stage 2, since `E` is still training there; 4
+  and 5, since `E` is trainable again there too — this is *why* these stages are
+  meaningfully more expensive per epoch than stage 3). `encode_both_streams=True` also
+  caches the `deriv` stream's own latent alongside `state`'s (stage 3's own ground-truth
+  target for `f_theta`). Optionally also returns `true_stats` (ground-truth statistics for
+  the window's starting frame) when `stat_names` is given, for stage 2's anchor term and
+  stage 4/5's `L_stats` term.
 - `build_good_steps()` — shared step-filtering logic (`min_step`, `min_stdev_phi`,
   missing/corrupt snapshot exclusion) used by all three dataset classes, so they agree on
   which steps are usable for the same `run_dirs`/filters.
-- Augmentation is currently not implemented for the raw-pixel mode (stages 4 and 5).
+- Augmentation is implemented for stage 1 and stage 2's raw-pixel mode (the same
+  (k, flip, shift) applied consistently across every frame in a window, so a window still
+  describes a physically meaningful evolution, not a scrambled one), but not yet for stage
+  4/5's raw-pixel mode.
 
 #### Losses (`losses.py`)
 - `ReconLoss`: reconstruction (comparing `D(E(x))` to `x`);
 - `StatsLoss`: per-stat normalized — raw statistics span ~800× different scales, e.g. `avg_phi` vs `energy` — the paper-level formula in `neural_nets.md` doesn't show this normalization;
 - `OneStepLoss`;
-- `RolloutLoss`: `return_per_step=True` exposes each chained step's own loss, `step_weights` can reweight individual steps (not currently used).
+- `RolloutLoss`: `return_per_step=True` exposes each chained step's own loss, `step_weights` can reweight individual steps (not currently used);
+- `DtDecadeWeights`: precomputed per-decade reweighting for `RolloutLoss`'s own `weights` parameter, built once from the training set's own dt distribution and raw per-transition loss — gives each dt *decade* equal total loss-mass contribution rather than each window equal weight, countering a real, measured imbalance (~7% of windows carrying ~68% of total loss). Not the same fix as weighting by window count alone, which was tried first and made things worse (see the class's own docstring for the measured numbers).
 
 #### Checkpoint criterion (`checkpoint_criterion.py`)
 `CheckpointCriterionTracker` is the shared "when should a checkpoint be saved" state machine (raw `val_loss` during an initial warmup, switching to an EMA afterward), used by all five training functions.
@@ -120,7 +174,7 @@ adapters between checkpoint *shapes*, needed only because stage 4/5 is the first
 - `load_ae_components()` / `load_lds_component()` — read a standalone stage-1/2 or stage-3
   checkpoint into a componentized `ComponentCheckpoint` (state_dict/config/provenance).
 - `assemble_joint_checkpoint()` — stage 4's entry point: merges two independent ancestors,
-  validating `latent_channels` agreement first.
+  validating `latent_channels` AND `latent_spatial_size` agreement first.
 - `load_joint_refinement_checkpoint()` — stage 5's entry point: same componentized output,
   but from a single prior *joint* (stage 4) checkpoint instead of two ancestors.
 - `split_joint_checkpoint_for_evaluation()` — the reverse direction: derives standalone-
@@ -142,8 +196,16 @@ forward pass — without this, `E` could trivially collapse to a constant with `
 learning to match it, since nothing else in the loss would catch it.
 
 #### Training loops
-- **`train_ae.py`**: `train_autoencoder()` (stage 1), `train_stage2()` (stage 2, includes
-  `freeze_outer_layers()`, a regularization knob).
+- **`train_stage1.py`**: `train_autoencoder()` (stage 1) plus this module's own CLI entry
+  point (`python -m training.train_stage1`) — the only training-loop module with one,
+  since every other stage always resumes from an ancestor and has no "from scratch" mode.
+- **`train_stage2.py`**: `train_stage2()` (stage 2) — see Stages 1 and 2 above for what
+  changed here recently.
+- **`train_ae_common.py`**: shared by the two above — `freeze_outer_layers()` (a
+  regularization knob) and `compute_weight_drift()` (its own diagnostic: per-block L2 drift
+  in parameters vs. buffers, since a frozen block's *parameters* should show exactly zero
+  drift but its BatchNorm *buffers* can still drift via forward-pass running stats unless
+  the frozen submodules are re-`.eval()`'d every epoch — see that function's own docstring).
 - **`train_lds.py`**: `train_lds()`, shared by stages 3a and 3b (`n_rollout_steps`
   distinguishes them; `resume_from` chains 3a→3b). Recently gained `one_step_weight`
   (adds `ε·L_1step` on top of `L_rollout`, hoping to regularize 3b's instability — tried
@@ -151,7 +213,7 @@ learning to match it, since nothing else in the loss would catch it.
   windows; not resolved as of this writing).
 - **`train_refinement.py`**: `train_refinement()`, shared by stages 4 and 5.
 
-All three training-loop modules follow the same shape: resolve ancestor checkpoint(s) →
+All four training-loop modules follow the same shape: resolve ancestor checkpoint(s) →
 build dataset(s) → epoch loop (train/val split, `CheckpointCriterionTracker`, loss-curve
 figure via `utils.plots.loss_curve`, early stopping) → save.
 
@@ -184,7 +246,8 @@ instead, split along natural seams:
   it, so a mismatched file is caught with a clear error instead of failing deep inside
   training with a confusing shape-mismatch. Recognizes `stage3_config` as well as
   `stage2_config` for stage 2, so a checkpoint trained before the stage-renumbering doesn't
-  need retraining just to be correctly identified.
+  need retraining just to be correctly identified. Still recognizes a legacy `stage1b_config`
+  too, for any pre-removal checkpoint that still exists on disk (see Stages 1 and 2 above).
 - **`logging_utils.py`**: `_log_to_file()`, tees stdout/stderr into a per-stage log file
   in addition to the console for the duration of a training call.
 - **`sweep_status.py`**: `check_sweep_status()` (`main.py --scan-only`), reports
@@ -199,7 +262,7 @@ Each has a real, importable function (not just CLI logic) so `main.py` can call 
 - **`check_reconstruction.py`**: AE reconstruction quality on held-out samples.
 - **`check_rollout.py`**: multi-step rollout comparison (`state(t)`, `real Δx`, `predicted Δx`, `error`, over the full window chain via `f_theta.rollout()`). Also has `_padded_bounds()` for predictable, comparable color scales across different checkpoints/runs — derived only from the *real* data, never from the prediction, so a bad prediction shows as visible saturation instead of stretching its own scale.
 - **`check_interpolation.py`** and **`check_perturbation.py`** are stage 2's two latent-space  diagnostics (the letter post-hoc only: not used as loss function).
-- **`check_parameter_dependence.py`** scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `main.py`'s stage 3 sanity checks alongside `check_rollout`.
+- **`check_parameter_dependence.py`** scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `pipeline.py`'s stage 3 sanity checks alongside `check_rollout`.
 - **`compare_integrators.py`** and **`compare_rollout_training.py`** are one-off exploratory   comparison scripts, not part of the maintained by-stage output/checkpoint conventions; treat as needing an explicit refactor-or-archive decision rather than assuming they stay current automatically.
 
 
@@ -223,10 +286,13 @@ oversight: `training/` modules have thorough unit + integration tests (dataset l
 checkpoint adapters, model assembly, loss mechanics — especially the collapse-prevention
 detach, criterion-tracker edge cases). `evaluation/` scripts have real but more recent
 coverage (`test_check_rollout.py`, `test_check_interpolation.py`,
-`test_check_perturbation.py`, `test_check_reconstruction.py`) — the last of these needed a
+`test_check_perturbation.py`, `test_check_reconstruction_stage4.py`) — the last of these needed a
 whole-function integration test rather than isolated-helper tests, since
 `check_reconstruction()` has no small torch-free piece to extract the way the other three
-do. `main.py`'s own orchestration logic has no dedicated test file.
+do. `orchestration.pipeline.run_from_params_file()` — the actual orchestration logic behind
+`main.py`'s thin CLI (see the `orchestration/` section above) — has its own dedicated
+integration coverage in `test_pipeline_stage2.py`, running the real 1→2 flow end-to-end
+against a synthetic sweep; `main.py` itself (argument parsing only) does not.
 
 
 

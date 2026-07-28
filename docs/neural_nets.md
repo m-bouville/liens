@@ -10,14 +10,7 @@ See `./docs/NN-code_structure.md` for more details on the structure of the code.
 The convolutional autoencoder has a symmetric encoder–decoder architecture. The encoder depth scales with the (square) system size so that the spatial bottleneck remains 8×8: three downsampling stages for 64×64 inputs (64→32→16→8), five for 256×256, and so on. Each resolution level consists of two 3×3 convolutions (circular padding to match periodic boundaries) with ReLU activations, followed by a stride-2 convolution for downsampling (mirrored by learned upsampling in the decoder), with BatchNorm/LayerNorm.
 
 The encoder terminates with a 1×1 convolution reducing the feature dimension to 16 channels, yielding an 8×8×16 latent representation. This bottleneck retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. Initial runs will use a larger latent space, to ensure that sufficient information is available for reconstruction, before shrinking it to find the lower bound for accuracy.
-
-
-### Using a U-Net?
-Using a U-Net instead of a pure AE would improve the decoding. But skip connections can weaken the usefulness of the latent representation used by the Latent Dynamics Surrogate (LDS). Since the decoder will have more information (latent representation + skips) than the LDS (only latent), the encoder-decoder pair may work even if the latent representation has little information (which would break the LDS). 
-
-To avoid this, skip connections will be added and trained only after freezing the encoder. Step 4 (or separate step just before or after) now includes: train skip connections and retrain decoder (encoder still frozen). Possible to alternate in step 4: train encoder + decoder (+ skips) and train encoder + LDS?
-
-
+ 
 
 ## Training Stages and loss functions
 
@@ -41,13 +34,12 @@ There are five losses, which can be mixed and matched at the different stages:
 
 | \#| Stage                  | Trained |Frozen|Unused| C$_0$/C$_1$|Space | Loss                            |
 |---|-------------------|--------------|------|------|-------|-------|---------------------------------|
-| 1 a| autoencoder       | E, D0, SH0|         | SH1, D1, f    | C$_0$ | real  | `L_recon0 + λ L_stats0`           |
-| 1 b| C1 decoder      | D1, SH1      | E    | SH0, D0, f    | C$_1$ | real  | `L_recon1 + λ L_stats1`           |
-| 2 | latent validation |E${}^*$, D$_0^*$, D$_1^*$| SH$_0$, SH$_1$ | f | C$_1^\dagger$ | both |`L_recon0+1 + λ L_stats0+1 + λ₁ L_deriv` |
-| 3a| LDS               | f       | E, SH$_{0+1}$ | D$_{0+1}$ | both | latent| `L_1step + λ₁ L_deriv`           |
-| 3b| LDS               | f       | E, SH$_{0+1}$ | D$_{0+1}$ | both | latent| `L_rollout + ε L_1step + λ₁ L_deriv` |
-| 4 | encoder refinement| E, f    | D$_{0+1}$, SH$_{0+1}$|   | both | lat + ε real|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
-| 5 | end-to-end        | E, f, D$_{0+1}$ | SH$_{0+1}$  |      | both | real  |`L_recon + λ L_stats + λ₂ L_rollout + λ₁ L_deriv` |
+| 1 a| autoencoder (C$_0$) | E, D$_0$, SH$_0$|         | f    | C$_0$ | real  | `L_recon0 + λ L_stats0`           |
+| 2 | derivative (C$_1$) |E${}^*$, D$_0^*$| SH$_0$ | f | C$_1^\dagger$ | both |`L_recon0 + λ L_stats0+1 + λ₁ L_deriv` |
+| 3a| LDS               | f       | E, SH$_0$ | D$_0$ | both | latent| `L_1step + λ₁ L_deriv`           |
+| 3b| LDS               | f       | E, SH$_0$ | D$_0$ | both | latent| `L_rollout + ε L_1step + λ₁ L_deriv` |
+| 4 | encoder refinement| E, f    | D$_0$, SH$_0$|   | both | lat + ε real|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
+| 5 | end-to-end        | E, f, D$_0$ | SH$_0$  |      | both | real  |`L_recon + λ L_stats + λ₂ L_rollout + λ₁ L_deriv` |
 
 Notes:
 - `L_recon` means reconstruction for both C$_0$ (on µstructure itself) and C$_1$ (on time derivative),
@@ -75,7 +67,7 @@ $$L_\mathrm{stats} = \sum_{i=1}^{N_s} w_i \left[g_i(z) - s_i(x)\right]^2.$$
 
 ### Derivative loss
 One compares $z_1(t)$ and $[z_0(t+\Delta t) - z_0(t)] / \Delta t$.
-See latent-space validation (step 2) below. Note: in stage 1 the small dense NN for the statistics is trained along the encoder and decoder, in 2 it is frozen.
+See latent-space derivative (step 2) below. Note: in stage 1 the small dense NN for the statistics is trained along the encoder and decoder, in 2 it is frozen.
 
 
 ### One-step latent prediction loss
@@ -148,16 +140,15 @@ One wants to get a latent representation which could reconstruct, while preservi
 
 A Taylor expansion of $z_0$ gives
 $$z_0(t + \Delta t) = z_0(t) + \dot{z}_0(t)\,\Delta t + \ddot{z}_0(t)\,(\Delta t^2/2) + o(\Delta t^2).$$
-Since $z_1(t) \approx \dot{z}_0(t)$ by training target, our prediction is
-$$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
+The idea is to replace $\dot{z}_0$ with $z_1$ by training in stage 2.
 
 
 ### Initial training
 - stage 1: C$_0$ trained through AE (`L_recon0 + λ L_stats0`)
-- stage 2?: improved latent representation of the link between C$_0$ and C$_1$: $z_1(t)$ learns $\frac{z_0(t+\Delta t) - z_0(t)}{\Delta t}$.
+- stage 2: improved latent representation of the link between C$_0$ and C$_1$: $z_1(t)$ learns $\frac{z_0(t+\Delta t) - z_0(t)}{\Delta t}$.
 - stage 3 starts from
-  - $C_0(t+\Delta t) = C_0(t) + \Delta t C_1(t)$,
-  - $C_1(t+\Delta t)$ from was it learned,
+  - $z_0(t+\Delta t) = z_0(t) + \Delta t z_1(t)$,
+  - $z_1(t+\Delta t)$ from was it learned,
   - 3a: `L_1step`, 3b: `L_rollout`
 
 The asymmetry between C$_0$ and C$_1$ in on the number of channels, not size, in the latent space (still true?).
@@ -167,21 +158,25 @@ The asymmetry between C$_0$ and C$_1$ in on the number of channels, not size, in
 Training the AE (stage 1) ensures that the initial state can be recovered. This proves that the latent representation $z$ somehow describes $x$, not that is a smooth and structured coordinate system. 
 Working directly in latent space is faster (it is smaller than real space), but _a priori_ we cannot do arithmetic. 
 
-The goal of stage 2 is to have a meaningful latent representation of the relationship between C$_0$ and C$_1$. Enforce $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can do $$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
+The goal of stage 2 is to have a meaningful latent representation of the relationship between C$_0$ and C$_1$, $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can do $$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
 
-This can be as simple as adding `L_deriv` to the loss function of stage 1.
+This involves adding `L_deriv` to the loss function of stage 1 (with a paired-window dataset for derivative calculation).
 
-In stage 2, we are changing the latent representation, so we need to change the encoder. And if the decoder did not change, it would no longer reconstruct properly, so we cannot freeze it either. Since neither E nor D is frozen, there could be a synchronized drift. We keep `stats0_head` (with frozen coefficients) to prevent this.
-We can also freeze the outter layers of both encoder and decoder (not those close to the latent space) for regularization.
+In stage 2, we are changing the latent representation, while maintaining the reconstruction of C$_0$. We can freeze the outter layers of both encoder and decoder (not those close to the latent space) for regularization.
 
 
 ### stage 3 (LDS)
 Provided with $z_0(t)$ and $z_1(t)$, one must learn $z_0(t+\Delta t)$ and $z_1(t+\Delta t)$.
 
 #### fθ and dz1 / dt
-$f_\theta$ does not need to be trained to the first-order term, it only needs to learn $\ddot{z}_0$ (curvature, a.k.a. $\dot{z}_1$), plus the gap between $z_1$ and $\dot{z}_0$. Then $f_\theta(z_0(t), z_1(t))$ should be trained against
+$f_\theta$ does not need to be trained to the first-order term, it only needs to learn $\ddot{z}_0$ (curvature, $\approx \dot{z}_1$), plus the gap between $z_1$ and $\dot{z}_0$. Then $f_\theta(z_0(t), z_1(t))$ should be trained against
 $$[z_0(t + \Delta t) - z_0(t) - z_1(t)\,\Delta t] / (\Delta t^2/2),$$
 with $\theta$ (currently just the temperature) as further input.
+Finally,
+$$z_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t)) \, (\Delta t^2/2) + o(\Delta t^2).$$
+
+In practice, the second order is restrained to $\Delta t \le \Delta t_\mathrm{cap}$, to avoid the risk of a blow-up at large $\Delta t$.
+
 
 #### gθ and d²z1 / dt²
 A similar Taylor expansion for $z_1$ gives
@@ -191,6 +186,7 @@ $$[z_1(t + \Delta t) - z_1(t) - f_\theta(z_0(t), z_1(t))\,\Delta t] / (\Delta t^
 again accounting for $\theta$.
 
 In stage 3a, we use only one step, `L_1step`. Stage 3b will involve several consecutive steps (`L_rollout`)​.
+
 
 
 ### Interpolation and perturbation
@@ -209,6 +205,6 @@ Interpolation and perturbation are currently used as _post-hoc_ diagnostic, not 
 
 
 ## Encoder refinement (step 4) and end-to-end (stage 5)
-In stage 1 the encoder was trained for reconstruction and stats-accuracy, and in stage 2 for generic interpolation-smoothness. Stage 3 trained `f` to predict dynamics, with D frozen. Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). 
+In stage 1 the autoencoder was trained for reconstruction and stats-accuracy of the state. Stage 2 focus on the relationship between $z_1$ and $z_0$ in latent space. Stage 3 trained `f` to predict dynamics, with E and D frozen. Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). 
 
 D is frozen, even though `L_recon` is in the loss function: this is what distinguishes stage 4 from stage 5. D is a tether keeping E's output compatible with the existing decoder. (Since the encoder is no longer frozen, the latent representation of each sample cannot be cached, unlike in stage 3.)
