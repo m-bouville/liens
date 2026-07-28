@@ -222,7 +222,20 @@ def train_refinement(
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
             optimizer.step()
-        return loss.item(), components["rollout"].item(), components["recon0"].item(), components["stats0"].item()
+        # Returned as GPU tensors, NOT .item()'d here -- .item() blocks
+        # the CPU until the GPU actually finishes and forces a full
+        # round trip EVERY batch. .detach() keeps each value a scalar
+        # GPU tensor, cheap to accumulate into a running sum on-device
+        # (see the epoch loop below, which now does exactly ONE
+        # .item() per metric per epoch, not one per metric per batch)
+        # -- while dropping the autograd graph, which backward() above
+        # has already consumed and which would otherwise be kept alive
+        # (and keep growing) for the rest of the epoch if left
+        # attached. Same fix as train_lds.py's/train_stage1.py's/
+        # train_stage2.py's own step() -- see any of those functions'
+        # own identical comment.
+        return (loss.detach(), components["rollout"].detach(),
+                components["recon0"].detach(), components["stats0"].detach())
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=ema_warmup_epochs,
                                           val_ema_decay=val_ema_decay)
@@ -244,20 +257,27 @@ def train_refinement(
         for m in frozen_modules:
             m.eval()
 
-        train_loss = train_rollout = train_recon0 = train_stats0 = 0.0
+        # GPU-resident accumulators, not Python floats -- see step()'s
+        # own docstring/comment: the ONLY host sync per phase (train/
+        # val) is the batch of four .item() calls after each loop
+        # ends, not four per batch.
+        train_loss_sum = torch.zeros((), device=device)
+        train_rollout_sum = torch.zeros((), device=device)
+        train_recon0_sum = torch.zeros((), device=device)
+        train_stats0_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
             for batch in train_loader:
                 bs = batch[0].size(0)
                 loss, rollout, recon0, stats0 = step(batch, train=True)
-                train_loss += loss * bs
-                train_rollout += rollout * bs
-                train_recon0 += recon0 * bs
-                train_stats0 += stats0 * bs
-            train_loss /= n_train
-            train_rollout /= n_train
-            train_recon0 /= n_train
-            train_stats0 /= n_train
+                train_loss_sum += loss * bs
+                train_rollout_sum += rollout * bs
+                train_recon0_sum += recon0 * bs
+                train_stats0_sum += stats0 * bs
+            train_loss = (train_loss_sum / n_train).item()
+            train_rollout = (train_rollout_sum / n_train).item()
+            train_recon0 = (train_recon0_sum / n_train).item()
+            train_stats0 = (train_stats0_sum / n_train).item()
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
@@ -266,20 +286,23 @@ def train_refinement(
 
         ae.eval()
         f_theta.eval()
-        val_loss = val_rollout = val_recon0 = val_stats0 = 0.0
+        val_loss_sum = torch.zeros((), device=device)
+        val_rollout_sum = torch.zeros((), device=device)
+        val_recon0_sum = torch.zeros((), device=device)
+        val_stats0_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0)
                 loss, rollout, recon0, stats0 = step(batch, train=False)
-                val_loss += loss * bs
-                val_rollout += rollout * bs
-                val_recon0 += recon0 * bs
-                val_stats0 += stats0 * bs
-        val_loss /= n_val
-        val_rollout /= n_val
-        val_recon0 /= n_val
-        val_stats0 /= n_val
+                val_loss_sum += loss * bs
+                val_rollout_sum += rollout * bs
+                val_recon0_sum += recon0 * bs
+                val_stats0_sum += stats0 * bs
+        val_loss = (val_loss_sum / n_val).item()
+        val_rollout = (val_rollout_sum / n_val).item()
+        val_recon0 = (val_recon0_sum / n_val).item()
+        val_stats0 = (val_stats0_sum / n_val).item()
 
         criterion, saved_this_epoch = tracker.update(epoch, val_loss)
 

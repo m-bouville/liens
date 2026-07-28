@@ -645,7 +645,16 @@ def train_stage2(
             stats_pred1 = stats_head1(z1_t)
             stats1_loss_val = stats_loss_fn(stats_pred1, true_stats)
         else:
-            stats1_loss_val = torch.tensor(0.0)
+            # device=device explicitly -- a bare torch.tensor(0.0)
+            # defaults to CPU regardless of what device training is
+            # actually running on. Harmless back when this got
+            # .item()'d immediately below (a plain Python float has no
+            # device), but step() now returns .detach()'d tensors for
+            # on-device accumulation (see the epoch loop's own
+            # comment) -- without this, a CUDA run would raise a
+            # device-mismatch error the moment this got added into a
+            # CUDA-resident running sum, every time stats_head1 is None.
+            stats1_loss_val = torch.tensor(0.0, device=device)
 
         # L_deriv: z1(t) (the deriv stream's OWN encode of x(t)) pulled
         # toward what z0's own latent trajectory implies its rate of
@@ -696,8 +705,19 @@ def train_stage2(
             total.backward()
             optimizer.step()
 
-        return (total.item(), recon.item(),
-                stats_loss_val.item(), stats1_loss_val.item(), deriv_loss.item())
+        # Returned as GPU tensors, NOT .item()'d here -- .item() blocks
+        # the CPU until the GPU actually finishes and forces a full
+        # round trip EVERY batch. .detach() keeps each value a scalar
+        # GPU tensor, cheap to accumulate into a running sum on-device
+        # (see the epoch loop below, which now does exactly ONE
+        # .item() per metric per epoch, not one per metric per batch)
+        # -- while dropping the autograd graph, which backward() above
+        # has already consumed and which would otherwise be kept alive
+        # (and keep growing) for the rest of the epoch if left
+        # attached. Same fix as train_lds.py's own step() -- see that
+        # function's own identical comment for the full rationale.
+        return (total.detach(), recon.detach(),
+                stats_loss_val.detach(), stats1_loss_val.detach(), deriv_loss.detach())
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
@@ -766,23 +786,33 @@ def train_stage2(
             # requires_grad_(False) correctly stops gradient updates --
             # see freeze_outer_layers()'s docstring.
             m.eval()
-        train_total = train_recon = train_stats = train_stats1 = train_deriv = 0.0
+        # GPU-resident accumulators, not Python floats -- see step()'s
+        # own docstring/comment: `x.detach() * bs` below stays a GPU
+        # tensor op (no sync), so the ONLY host sync per phase (train/
+        # val) is the batch of five .item() calls after each loop ends,
+        # not five per batch. Same fix as train_lds.py's own epoch
+        # loop -- see that function's own identical comment.
+        train_total_sum = torch.zeros((), device=device)
+        train_recon_sum = torch.zeros((), device=device)
+        train_stats_sum = torch.zeros((), device=device)
+        train_stats1_sum = torch.zeros((), device=device)
+        train_deriv_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
             for batch in train_loader:
                 bs = batch[0].size(0)
                 total, recon, stats, stats1, deriv = step(
                     batch, train=True, deriv_weight_used=effective_deriv_weight)
-                train_total += total * bs
-                train_recon += recon * bs
-                train_stats += stats * bs
-                train_stats1 += stats1 * bs
-                train_deriv += deriv * bs
-            train_total /= n_train
-            train_recon /= n_train
-            train_stats /= n_train
-            train_stats1 /= n_train
-            train_deriv /= n_train
+                train_total_sum += total * bs
+                train_recon_sum += recon * bs
+                train_stats_sum += stats * bs
+                train_stats1_sum += stats1 * bs
+                train_deriv_sum += deriv * bs
+            train_total = (train_total_sum / n_train).item()
+            train_recon = (train_recon_sum / n_train).item()
+            train_stats = (train_stats_sum / n_train).item()
+            train_stats1 = (train_stats1_sum / n_train).item()
+            train_deriv = (train_deriv_sum / n_train).item()
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
@@ -790,23 +820,27 @@ def train_stage2(
             train_total = train_recon = train_stats = train_stats1 = train_deriv = float("nan")
 
         ae.eval()
-        val_total = val_recon = val_stats = val_stats1 = val_deriv = 0.0
+        val_total_sum = torch.zeros((), device=device)
+        val_recon_sum = torch.zeros((), device=device)
+        val_stats_sum = torch.zeros((), device=device)
+        val_stats1_sum = torch.zeros((), device=device)
+        val_deriv_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0)
                 total, recon, stats, stats1, deriv = step(
                     batch, train=False, deriv_weight_used=val_deriv_weight)
-                val_total += total * bs
-                val_recon += recon * bs
-                val_stats += stats * bs
-                val_stats1 += stats1 * bs
-                val_deriv += deriv * bs
-        val_total /= n_val
-        val_recon /= n_val
-        val_stats /= n_val
-        val_stats1 /= n_val
-        val_deriv /= n_val
+                val_total_sum += total * bs
+                val_recon_sum += recon * bs
+                val_stats_sum += stats * bs
+                val_stats1_sum += stats1 * bs
+                val_deriv_sum += deriv * bs
+        val_total = (val_total_sum / n_val).item()
+        val_recon = (val_recon_sum / n_val).item()
+        val_stats = (val_stats_sum / n_val).item()
+        val_stats1 = (val_stats1_sum / n_val).item()
+        val_deriv = (val_deriv_sum / n_val).item()
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema

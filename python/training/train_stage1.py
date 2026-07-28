@@ -306,7 +306,17 @@ def train_autoencoder(
             stats0 = stats_loss_fn(stats_pred, stats_target)
             total = recon0 / recon0_scale + stats0_weight * stats0 / stats0_scale
         else:
-            stats0 = torch.tensor(0.0)
+            # device=device explicitly -- a bare torch.tensor(0.0)
+            # defaults to CPU regardless of what device training is
+            # actually running on. Harmless back when this got
+            # .item()'d immediately below (a plain Python float has no
+            # device), but step() now returns .detach()'d tensors for
+            # on-device accumulation (see the epoch loop's own
+            # comment) -- without this, a CUDA run would raise a
+            # device-mismatch error the moment this got added into a
+            # CUDA-resident running sum, every time include_stats is
+            # False.
+            stats0 = torch.tensor(0.0, device=device)
             total = recon0 / recon0_scale
 
         if train:
@@ -314,7 +324,18 @@ def train_autoencoder(
             total.backward()
             optimizer.step()
 
-        return total.item(), recon0.item(), stats0.item()
+        # Returned as GPU tensors, NOT .item()'d here -- .item() blocks
+        # the CPU until the GPU actually finishes and forces a full
+        # round trip EVERY batch. .detach() keeps each value a scalar
+        # GPU tensor, cheap to accumulate into a running sum on-device
+        # (see the epoch loop below, which now does exactly ONE
+        # .item() per metric per epoch, not one per metric per batch)
+        # -- while dropping the autograd graph, which backward() above
+        # has already consumed and which would otherwise be kept alive
+        # (and keep growing) for the rest of the epoch if left
+        # attached. Same fix as train_lds.py's/train_stage2.py's own
+        # step() -- see either function's own identical comment.
+        return total.detach(), recon0.detach(), stats0.detach()
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
@@ -340,19 +361,26 @@ def train_autoencoder(
         if stats_head is not None:
             stats_head.train()
 
-        train_total = train_recon0 = train_stats0 = 0.0
+        # GPU-resident accumulators, not Python floats -- see step()'s
+        # own docstring/comment: the ONLY host sync per phase (train/
+        # val) is the batch of three .item() calls after each loop
+        # ends, not three per batch. Same fix as train_lds.py's/
+        # train_stage2.py's own epoch loop.
+        train_total_sum = torch.zeros((), device=device)
+        train_recon0_sum = torch.zeros((), device=device)
+        train_stats0_sum = torch.zeros((), device=device)
         n_train = 0
         if epoch > 0:
             for batch in train_loader:
                 bs = batch[0].size(0) if include_stats else batch.size(0)
                 total, recon0, stats0 = step(batch, train=True)
-                train_total += total * bs
-                train_recon0 += recon0 * bs
-                train_stats0 += stats0 * bs
+                train_total_sum += total * bs
+                train_recon0_sum += recon0 * bs
+                train_stats0_sum += stats0 * bs
                 n_train += bs
-            train_total /= n_train
-            train_recon0 /= n_train
-            train_stats0 /= n_train
+            train_total = (train_total_sum / n_train).item()
+            train_recon0 = (train_recon0_sum / n_train).item()
+            train_stats0 = (train_stats0_sum / n_train).item()
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
@@ -363,18 +391,20 @@ def train_autoencoder(
         ae.eval()
         if stats_head is not None:
             stats_head.eval()
-        val_total = val_recon0 = val_stats0 = 0.0
+        val_total_sum = torch.zeros((), device=device)
+        val_recon0_sum = torch.zeros((), device=device)
+        val_stats0_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0) if include_stats else batch.size(0)
                 total, recon0, stats0 = step(batch, train=False)
-                val_total += total * bs
-                val_recon0 += recon0 * bs
-                val_stats0 += stats0 * bs
-        val_total /= n_val
-        val_recon0 /= n_val
-        val_stats0 /= n_val
+                val_total_sum += total * bs
+                val_recon0_sum += recon0 * bs
+                val_stats0_sum += stats0 * bs
+        val_total = (val_total_sum / n_val).item()
+        val_recon0 = (val_recon0_sum / n_val).item()
+        val_stats0 = (val_stats0_sum / n_val).item()
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema

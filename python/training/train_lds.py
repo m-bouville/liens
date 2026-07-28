@@ -129,6 +129,208 @@ def compute_euler_only_losses(
     return all_dts, all_losses
 
 
+def _load_frozen_encoder(
+    ae_checkpoint_path: Path | None, ae_latent_channels: int | None, ae_stats_weight: float,
+    size: int, condition_on_theta: bool | None, device: torch.device,
+) -> tuple[torch.nn.Module, dict, dict, Path]:
+    """
+    Loads a frozen, already-trained autoencoder's encoder from a stage-
+    1/2 checkpoint, validating condition_on_theta (if given) and the
+    requested size against what the checkpoint actually has. Extracted
+    verbatim from train_lds()'s own former body -- same logic, same
+    order, just named and callable on its own.
+
+    Accepts EITHER a single-stream (stage 1a) ancestor, OR an already-
+    multi-stream one -- the latter in either of two decoder shapes: no
+    decoder_for_stream at all (stage 2's own pre-stage-1b format, every
+    stream sharing one decoder), or a real decoder_for_stream mapping
+    (a legacy, stage-1b-derived checkpoint with separate per-stream
+    decoders still on disk). Only the encoder is ever actually used
+    here or by any caller downstream -- decoder weights, if loaded at
+    all, are inert (load_state_dict still needs the right key
+    structure to succeed in the first place).
+
+    Returns (encoder, ae_checkpoint, ae_config, ae_checkpoint_path) --
+    ae_checkpoint_path is returned too since it may be reconstructed
+    here (from ae_latent_channels) when not given directly, and the
+    caller needs the resolved path for its own printing and for the
+    "ae_checkpoint" field of whatever it goes on to save.
+    """
+    if ae_checkpoint_path is None:
+        if ae_latent_channels is None:
+            raise ValueError(
+                "Provide either ae_checkpoint_path directly, or ae_latent_channels "
+                "so the expected path can be reconstructed."
+            )
+        ae_name = ae_checkpoint_name(size, ae_latent_channels, ae_stats_weight)
+        ae_checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage2" / f"{ae_name}.pt"
+        print(f"Reconstructed AE checkpoint path: {ae_checkpoint_path}")
+
+    # Load the frozen autoencoder. Only .encoder is ever used below --
+    # the decoder is irrelevant to stage 3 training.
+    ae_checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
+    ae_config = ae_checkpoint["config"]
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, ae_checkpoint["model_state"],
+    )
+    recon_stream = stream_configs[recon_stream_name]
+
+    # condition_on_theta is NOT decided here -- deriv's theta-FiLM
+    # conditioning is a structural property fixed once, when the stream
+    # is CREATED (see training/extend_encoder.py's own module docstring
+    # -- deriv is now built directly inside train_stage2(), no separate
+    # stage 1b pass). Stage 3 only ever loads an already-built, FROZEN
+    # encoder, so there is nothing to set -- only something to VALIDATE,
+    # same rationale and
+    # same error as train_stage2's own identical check. None (default)
+    # skips this entirely, trusting whatever the loaded checkpoint has.
+    if condition_on_theta is not None:
+        deriv_candidates = [n for n, c in stream_configs.items()
+                             if n != recon_stream_name and c.mode != LatentStreamMode.PURE_LATENT]
+        if len(deriv_candidates) == 1:
+            deriv_stream_name = deriv_candidates[0]
+            deriv_stream = stream_configs[deriv_stream_name]
+            if deriv_stream.condition_on_theta != condition_on_theta:
+                raise ValueError(
+                    f"condition_on_theta={condition_on_theta} was requested, but "
+                    f"{ae_checkpoint_path}'s own '{deriv_stream_name}' stream has "
+                    f"condition_on_theta={deriv_stream.condition_on_theta} -- this was decided when "
+                    f"the stream was CREATED (in stage 2, see training/extend_encoder.py), not something "
+                    f"stage 3 can change by loading a different value. Rebuild the ancestor "
+                    f"from stage 2 with condition_on_theta="
+                    f"{condition_on_theta} if you actually want a different ancestor, or drop this "
+                    f"parameter here to match whatever {ae_checkpoint_path} already has."
+                )
+        # len(deriv_candidates) != 1 (0 or ambiguous): nothing meaningful
+        # to validate against -- silently skipped rather than raising a
+        # SECOND, less specific error here; whatever actually needs a
+        # deriv stream to exist (the dataset construction below) will
+        # raise its own clear error shortly regardless.
+
+    decoder_for_stream = ae_config.get("decoder_for_stream")
+    if len(stream_configs) == 1:
+        ae = Autoencoder(size=ae_config["size"], channels=1, base_channels=ae_config["base_channels"],
+                          latent_channels=recon_stream.channels,
+                          latent_spatial_size=recon_stream.spatial_size).to(device)
+    elif decoder_for_stream is None:
+        # Stage 2's own (pre-stage-1b) format: every stream shares ONE decoder.
+        _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
+                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs,
+                                   n_theta=1)
+        _decoder_module = Decoder(output_size=ae_config["size"], out_channels=1,
+                                   base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
+                                   latent_spatial_size=recon_stream.spatial_size)
+        ae = MultiStreamAutoencoder(encoders={"shared": _encoder_module}, decoders={"shared": _decoder_module},
+                                     stream_configs=stream_configs).to(device)
+    else:
+        # Stage 1b's own format: a SEPARATE decoder per stream (see
+        # autoencoder.py's MultiStreamAutoencoder). Only the encoder
+        # ever gets used below, but load_state_dict still needs a
+        # decoder object per unique decoder key for the checkpoint's
+        # own keys to match at all -- their actual weights are inert
+        # here, never read again after this load.
+        _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
+                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs,
+                                   n_theta=1)
+        _decoders = {}
+        for stream_name, decoder_key in decoder_for_stream.items():
+            stream_cfg = stream_configs[stream_name]
+            _decoders[decoder_key] = Decoder(
+                output_size=ae_config["size"], out_channels=1,
+                base_channels=ae_config["base_channels"], latent_channels=stream_cfg.channels,
+                latent_spatial_size=stream_cfg.spatial_size,
+            )
+        ae = MultiStreamAutoencoder(encoders={"shared": _encoder_module}, decoders=_decoders,
+                                     stream_configs=stream_configs,
+                                     decoder_for_stream=decoder_for_stream).to(device)
+    ae.load_state_dict(ae_checkpoint["model_state"])
+    encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+    encoder.eval()
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+    print(f"Loaded frozen encoder from {ae_checkpoint_path} "
+          f"(epoch {ae_checkpoint['epoch']}, val_loss={ae_checkpoint['val_loss']:.6f}, "
+          f"latent_channels={ae_config['latent_channels']})\n")
+
+    # Still a valuable sanity check -- just against the size YOU gave,
+    # not config.txt (which may describe an unrelated sweep entirely).
+    if size != ae_config["size"]:
+        raise ValueError(
+            f"size given ({size}) doesn't match the autoencoder checkpoint's own "
+            f"size ({ae_config['size']}) -- double check which checkpoint/size you meant."
+        )
+
+    return encoder, ae_checkpoint, ae_config, ae_checkpoint_path
+
+
+def _resume_f_theta_from_checkpoint(
+    f_theta: torch.nn.Module, resume_from: Path, ae_config: dict,
+    hidden_dim: int, n_hidden_layers: int, dt_cap: float, n_rollout_steps: int,
+    device: torch.device,
+) -> None:
+    """
+    Loads f_theta's weights from a prior LDS checkpoint (curriculum
+    rollout: train at n_rollout_steps=1 first, then resume here at the
+    target n_rollout_steps), validating the architecture matches
+    exactly first -- latent_channels, hidden_dim, n_hidden_layers,
+    dt_cap, and latent_spatial_size. Mutates f_theta in place via
+    load_state_dict, matching the idiom load_state_dict itself uses;
+    no return value. Extracted verbatim from train_lds()'s own former
+    body -- same logic, same order, just named and callable on its
+    own.
+    """
+    if resume_from is not None:
+        # Curriculum rollout: train with n_rollout_steps=1 first (stable,
+        # fast, avoids the epoch-1 loss blowup a from-scratch jump straight
+        # to multi-step rollout produced), then resume here with the
+        # target n_rollout_steps. Architecture must match exactly --
+        # loading into a differently-shaped f_theta would either error
+        # confusingly deep in load_state_dict or silently mismatch.
+        prev_lds = torch.load(resume_from, map_location=device, weights_only=True)
+        prev_config = prev_lds["config"]
+        prev_latent_spatial_size = prev_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
+        current_latent_spatial_size = ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
+        mismatch = [(k, prev_config[k], v) for k, v in
+                    [("latent_channels", ae_config["latent_channels"]),
+                     ("hidden_dim", hidden_dim), ("n_hidden_layers", n_hidden_layers)]
+                    if prev_config[k] != v]
+        # dt_cap checked separately, not folded into the list above --
+        # unlike the other three keys (always present, any checkpoint
+        # this project has produced), dt_cap may be absent from an older
+        # checkpoint's own saved config, and prev_config[k] direct
+        # indexing above would KeyError on those rather than falling
+        # back cleanly. Not a weight-shape mismatch load_state_dict
+        # would ever catch on its own (it's a plain float attribute,
+        # not a learnable parameter/buffer) -- but resuming under a
+        # DIFFERENT dt_cap than the loaded weights were actually trained
+        # under is exactly the kind of silent, dangerous inconsistency
+        # this whole check exists to catch. .get(..., inf) on the old
+        # side means resuming from a pre-dt_cap checkpoint against a
+        # new, also-default (inf) dt_cap doesn't spuriously flag a
+        # mismatch that was never really there.
+        prev_dt_cap = prev_config.get("dt_cap", float("inf"))
+        if prev_dt_cap != dt_cap:
+            mismatch.append(("dt_cap", prev_dt_cap, dt_cap))
+        if prev_latent_spatial_size != current_latent_spatial_size:
+            mismatch.append(("latent_spatial_size", prev_latent_spatial_size, current_latent_spatial_size))
+        if mismatch:
+            raise ValueError(f"{resume_from}'s architecture doesn't match the requested one: "
+                              + ", ".join(f"{k}={old} (checkpoint) vs {new} (requested)"
+                                          for k, old, new in mismatch))
+        f_theta.load_state_dict(prev_lds["model_state"])
+        prev_n_rollout = prev_lds.get("data_config", {}).get("n_rollout_steps")
+        print(f"Resumed f_theta from {resume_from} (epoch {prev_lds['epoch']}, "
+              f"val_loss={prev_lds['val_loss']:.6f}, trained at n_rollout_steps="
+              f"{prev_n_rollout if prev_n_rollout is not None else '?'})\n")
+        if prev_n_rollout is not None and n_rollout_steps <= prev_n_rollout:
+            print(f"WARNING: resuming from a checkpoint trained at n_rollout_steps="
+                  f"{prev_n_rollout}, but this run asks for n_rollout_steps="
+                  f"{n_rollout_steps} -- not larger, so this isn't the usual curriculum "
+                  f"direction (easy -> hard). Continuing anyway, but double-check this "
+                  f"is intentional.\n")
+
+
 def train_lds(
     size: int, base_path: Path,
     ae_checkpoint_path: Path | None = None,
@@ -305,110 +507,9 @@ def train_lds(
     print(f"grad_clip={grad_clip}  lr_warmup_steps={lr_warmup_steps}  z0_noise_scale={z0_noise_scale}")
     print(f"lr={lr}  seed={seed}")
 
-    if ae_checkpoint_path is None:
-        if ae_latent_channels is None:
-            raise ValueError(
-                "Provide either ae_checkpoint_path directly, or ae_latent_channels "
-                "so the expected path can be reconstructed."
-            )
-        ae_name = ae_checkpoint_name(size, ae_latent_channels, ae_stats_weight)
-        ae_checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage2" / f"{ae_name}.pt"
-        print(f"Reconstructed AE checkpoint path: {ae_checkpoint_path}")
-
-    # Load the frozen autoencoder. Only .encoder is ever used below --
-    # the decoder is irrelevant to stage 3 training.
-    ae_checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
-    ae_config = ae_checkpoint["config"]
-    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
-    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
-        stream_configs, recon_stream_name, ae_checkpoint["model_state"],
+    encoder, ae_checkpoint, ae_config, ae_checkpoint_path = _load_frozen_encoder(
+        ae_checkpoint_path, ae_latent_channels, ae_stats_weight, size, condition_on_theta, device,
     )
-    recon_stream = stream_configs[recon_stream_name]
-
-    # condition_on_theta is NOT decided here -- deriv's theta-FiLM
-    # conditioning is a structural property fixed once, when the stream
-    # is CREATED (see training/extend_encoder.py's own module docstring
-    # -- deriv is now built directly inside train_stage2(), no separate
-    # stage 1b pass). Stage 3 only ever loads an already-built, FROZEN
-    # encoder, so there is nothing to set -- only something to VALIDATE,
-    # same rationale and
-    # same error as train_stage2's own identical check. None (default)
-    # skips this entirely, trusting whatever the loaded checkpoint has.
-    if condition_on_theta is not None:
-        deriv_candidates = [n for n, c in stream_configs.items()
-                             if n != recon_stream_name and c.mode != LatentStreamMode.PURE_LATENT]
-        if len(deriv_candidates) == 1:
-            deriv_stream_name = deriv_candidates[0]
-            deriv_stream = stream_configs[deriv_stream_name]
-            if deriv_stream.condition_on_theta != condition_on_theta:
-                raise ValueError(
-                    f"condition_on_theta={condition_on_theta} was requested, but "
-                    f"{ae_checkpoint_path}'s own '{deriv_stream_name}' stream has "
-                    f"condition_on_theta={deriv_stream.condition_on_theta} -- this was decided when "
-                    f"the stream was CREATED (in stage 2, see training/extend_encoder.py), not something "
-                    f"stage 3 can change by loading a different value. Rebuild the ancestor "
-                    f"from stage 2 with condition_on_theta="
-                    f"{condition_on_theta} if you actually want a different ancestor, or drop this "
-                    f"parameter here to match whatever {ae_checkpoint_path} already has."
-                )
-        # len(deriv_candidates) != 1 (0 or ambiguous): nothing meaningful
-        # to validate against -- silently skipped rather than raising a
-        # SECOND, less specific error here; whatever actually needs a
-        # deriv stream to exist (the dataset construction below) will
-        # raise its own clear error shortly regardless.
-
-    decoder_for_stream = ae_config.get("decoder_for_stream")
-    if len(stream_configs) == 1:
-        ae = Autoencoder(size=ae_config["size"], channels=1, base_channels=ae_config["base_channels"],
-                          latent_channels=recon_stream.channels,
-                          latent_spatial_size=recon_stream.spatial_size).to(device)
-    elif decoder_for_stream is None:
-        # Stage 2's own (pre-stage-1b) format: every stream shares ONE decoder.
-        _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
-                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs,
-                                   n_theta=1)
-        _decoder_module = Decoder(output_size=ae_config["size"], out_channels=1,
-                                   base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
-                                   latent_spatial_size=recon_stream.spatial_size)
-        ae = MultiStreamAutoencoder(encoders={"shared": _encoder_module}, decoders={"shared": _decoder_module},
-                                     stream_configs=stream_configs).to(device)
-    else:
-        # Stage 1b's own format: a SEPARATE decoder per stream (see
-        # autoencoder.py's MultiStreamAutoencoder). Only the encoder
-        # ever gets used below, but load_state_dict still needs a
-        # decoder object per unique decoder key for the checkpoint's
-        # own keys to match at all -- their actual weights are inert
-        # here, never read again after this load.
-        _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
-                                   base_channels=ae_config["base_channels"], stream_configs=stream_configs,
-                                   n_theta=1)
-        _decoders = {}
-        for stream_name, decoder_key in decoder_for_stream.items():
-            stream_cfg = stream_configs[stream_name]
-            _decoders[decoder_key] = Decoder(
-                output_size=ae_config["size"], out_channels=1,
-                base_channels=ae_config["base_channels"], latent_channels=stream_cfg.channels,
-                latent_spatial_size=stream_cfg.spatial_size,
-            )
-        ae = MultiStreamAutoencoder(encoders={"shared": _encoder_module}, decoders=_decoders,
-                                     stream_configs=stream_configs,
-                                     decoder_for_stream=decoder_for_stream).to(device)
-    ae.load_state_dict(ae_checkpoint["model_state"])
-    encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
-    encoder.eval()
-    for p in encoder.parameters():
-        p.requires_grad_(False)
-    print(f"Loaded frozen encoder from {ae_checkpoint_path} "
-          f"(epoch {ae_checkpoint['epoch']}, val_loss={ae_checkpoint['val_loss']:.6f}, "
-          f"latent_channels={ae_config['latent_channels']})\n")
-
-    # Still a valuable sanity check -- just against the size YOU gave,
-    # not config.txt (which may describe an unrelated sweep entirely).
-    if size != ae_config["size"]:
-        raise ValueError(
-            f"size given ({size}) doesn't match the autoencoder checkpoint's own "
-            f"size ({ae_config['size']}) -- double check which checkpoint/size you meant."
-        )
 
     if checkpoint_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
@@ -507,55 +608,9 @@ def train_lds(
               f"distribution, weighted by each decade's own measured raw loss mass -- "
               f"{dict(sorted(dt_decade_weights_fn.decade_weight.items()))}\n")
 
-    if resume_from is not None:
-        # Curriculum rollout: train with n_rollout_steps=1 first (stable,
-        # fast, avoids the epoch-1 loss blowup a from-scratch jump straight
-        # to multi-step rollout produced), then resume here with the
-        # target n_rollout_steps. Architecture must match exactly --
-        # loading into a differently-shaped f_theta would either error
-        # confusingly deep in load_state_dict or silently mismatch.
-        prev_lds = torch.load(resume_from, map_location=device, weights_only=True)
-        prev_config = prev_lds["config"]
-        prev_latent_spatial_size = prev_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
-        current_latent_spatial_size = ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE)
-        mismatch = [(k, prev_config[k], v) for k, v in
-                    [("latent_channels", ae_config["latent_channels"]),
-                     ("hidden_dim", hidden_dim), ("n_hidden_layers", n_hidden_layers)]
-                    if prev_config[k] != v]
-        # dt_cap checked separately, not folded into the list above --
-        # unlike the other three keys (always present, any checkpoint
-        # this project has produced), dt_cap may be absent from an older
-        # checkpoint's own saved config, and prev_config[k] direct
-        # indexing above would KeyError on those rather than falling
-        # back cleanly. Not a weight-shape mismatch load_state_dict
-        # would ever catch on its own (it's a plain float attribute,
-        # not a learnable parameter/buffer) -- but resuming under a
-        # DIFFERENT dt_cap than the loaded weights were actually trained
-        # under is exactly the kind of silent, dangerous inconsistency
-        # this whole check exists to catch. .get(..., inf) on the old
-        # side means resuming from a pre-dt_cap checkpoint against a
-        # new, also-default (inf) dt_cap doesn't spuriously flag a
-        # mismatch that was never really there.
-        prev_dt_cap = prev_config.get("dt_cap", float("inf"))
-        if prev_dt_cap != dt_cap:
-            mismatch.append(("dt_cap", prev_dt_cap, dt_cap))
-        if prev_latent_spatial_size != current_latent_spatial_size:
-            mismatch.append(("latent_spatial_size", prev_latent_spatial_size, current_latent_spatial_size))
-        if mismatch:
-            raise ValueError(f"{resume_from}'s architecture doesn't match the requested one: "
-                              + ", ".join(f"{k}={old} (checkpoint) vs {new} (requested)"
-                                          for k, old, new in mismatch))
-        f_theta.load_state_dict(prev_lds["model_state"])
-        prev_n_rollout = prev_lds.get("data_config", {}).get("n_rollout_steps")
-        print(f"Resumed f_theta from {resume_from} (epoch {prev_lds['epoch']}, "
-              f"val_loss={prev_lds['val_loss']:.6f}, trained at n_rollout_steps="
-              f"{prev_n_rollout if prev_n_rollout is not None else '?'})\n")
-        if prev_n_rollout is not None and n_rollout_steps <= prev_n_rollout:
-            print(f"WARNING: resuming from a checkpoint trained at n_rollout_steps="
-                  f"{prev_n_rollout}, but this run asks for n_rollout_steps="
-                  f"{n_rollout_steps} -- not larger, so this isn't the usual curriculum "
-                  f"direction (easy -> hard). Continuing anyway, but double-check this "
-                  f"is intentional.\n")
+    _resume_f_theta_from_checkpoint(
+        f_theta, resume_from, ae_config, hidden_dim, n_hidden_layers, dt_cap, n_rollout_steps, device,
+    )
 
     step_weights_tensor = torch.tensor(step_weights, dtype=torch.float32, device=device) \
         if step_weights is not None else None
