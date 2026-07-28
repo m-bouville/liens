@@ -18,9 +18,13 @@ from pathlib import Path
 
 import torch
 
+from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.constants import LATENT_SPATIAL_SIZE
+from models.decoder import Decoder
+from models.encoder import Encoder
 from models.latent_streams import (
-    cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
+    LatentStreamConfig, cross_check_stream_configs_against_state_dict,
+    resolve_stream_configs_from_checkpoint_config,
 )
 
 
@@ -458,4 +462,110 @@ def split_joint_checkpoint_for_evaluation(
     torch.save(lds_view, lds_view_path)
 
     return ae_view_path, lds_view_path
+
+
+def build_ae_from_checkpoint(
+    checkpoint_path: str | Path, device: str | torch.device,
+) -> tuple[Autoencoder | EncoderDecoderPair | MultiStreamAutoencoder, torch.nn.Module,
+           dict, dict[str, LatentStreamConfig], str]:
+    """
+    Loads an AE checkpoint and reconstructs the matching LIVE model
+    (weights loaded, .eval() applied) -- not the componentized
+    ComponentCheckpoint shape the rest of this module deals in, which
+    stage 4/5's own assembly needs but a standalone diagnostic script
+    generally doesn't.
+
+    Handles every checkpoint shape this project has ever produced,
+    detected from the checkpoint's own saved keys/config, not assumed
+    from context:
+      - flat ("encoder."/"decoder."): stage 4/5's own EncoderDecoderPair
+        output (see model_assembly.py's build_models_from_components)
+      - single-stream: a plain stage-1 Autoencoder
+      - multi-stream, one shared decoder: stage 2's own format when
+        decoder_for_stream isn't present in the checkpoint's config
+      - multi-stream, separate decoder per stream: a legacy,
+        stage-1b-derived checkpoint (decoder_for_stream present) -- see
+        training/extend_encoder.py's own module docstring for why no
+        code path in this project produces this shape anymore, though
+        old checkpoints in this shape may still exist on disk
+
+    This was previously duplicated near-verbatim (same branches, same
+    order, same variable names) across check_deriv_temperature.py,
+    check_f_theta.py, check_interpolation.py, check_parameter_
+    dependence.py, check_perturbation.py, check_rollout.py, compare_
+    integrators.py, and compare_rollout_training.py -- consolidated
+    here rather than each independently re-detecting the same four
+    shapes. check_reconstruction.py and check_latent_channels.py have
+    enough additional, script-specific logic bundled into their own
+    versions (derivative-stream detection/notes, channel-ablation
+    bookkeeping) that migrating them was left for a separate, more
+    careful pass rather than folded in here.
+
+    Returns (ae, ae_encoder, checkpoint, stream_configs,
+    recon_stream_name). ae_encoder is ae.encoder if hasattr(ae,
+    "encoder") else ae.encoders["shared"] -- computed here since every
+    caller needs it and the hasattr check itself was ALSO duplicated
+    identically everywhere. checkpoint is the full, raw checkpoint
+    dict (not just its own "config") -- callers routinely also need
+    "epoch", "test_dirs", "stats_config", etc. stream_configs is
+    already cross-checked against the actual state_dict (see
+    cross_check_stream_configs_against_state_dict's own docstring for
+    the real failure mode this guards against), not just the
+    checkpoint's own possibly-stale config.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model_cfg = checkpoint["config"]
+
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, checkpoint["model_state"],
+    )
+    recon_stream = stream_configs[recon_stream_name]
+    decoder_for_stream = model_cfg.get("decoder_for_stream")
+    is_flat_checkpoint = any(k.startswith("encoder.") for k in checkpoint["model_state"])
+    if is_flat_checkpoint:
+        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
+        decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
+                           base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = EncoderDecoderPair(encoder, decoder, stream_name=recon_stream_name,
+                                 mode=recon_stream.mode).to(device)
+    elif len(stream_configs) == 1:
+        ae = Autoencoder(
+            size=model_cfg["size"], channels=1,
+            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
+            latent_spatial_size=recon_stream.spatial_size,
+        ).to(device)
+    elif decoder_for_stream is None:
+        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
+        decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
+                           base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
+                           latent_spatial_size=recon_stream.spatial_size)
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                     stream_configs=stream_configs).to(device)
+    else:
+        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
+                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
+                           n_theta=1)
+        decoders = {}
+        for stream_name, decoder_key in decoder_for_stream.items():
+            stream_cfg = stream_configs[stream_name]
+            decoders[decoder_key] = Decoder(
+                output_size=model_cfg["size"], out_channels=1,
+                base_channels=model_cfg["base_channels"], latent_channels=stream_cfg.channels,
+                latent_spatial_size=stream_cfg.spatial_size,
+            )
+        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
+                                     stream_configs=stream_configs,
+                                     decoder_for_stream=decoder_for_stream).to(device)
+    ae.load_state_dict(checkpoint["model_state"])
+    ae.eval()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+
+    return ae, ae_encoder, checkpoint, stream_configs, recon_stream_name
 

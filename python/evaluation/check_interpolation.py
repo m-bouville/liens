@@ -48,12 +48,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
-from models.decoder import Decoder
-from models.encoder import Encoder
-from models.latent_streams import (
-    cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
-)
+from training.checkpoint_components import build_ae_from_checkpoint
 from training.stats_head import StatsHead
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
@@ -129,64 +124,16 @@ def check_interpolation(
                        / f"{checkpoint_path.stem}.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    ae, ae_encoder, checkpoint, stream_configs, recon_stream_name = build_ae_from_checkpoint(
+        checkpoint_path, device,
+    )
     model_cfg = checkpoint["config"]
+    recon_stream = stream_configs[recon_stream_name]
     print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, config={model_cfg}")
 
     stats_config = checkpoint.get("stats_config")
     if stats_config is None:
         raise ValueError(f"{checkpoint_path} has no stats_head (trained with --stats-weight 0)")
-
-    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
-    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
-        stream_configs, recon_stream_name, checkpoint["model_state"],
-    )
-    recon_stream = stream_configs[recon_stream_name]
-    decoder_for_stream = model_cfg.get("decoder_for_stream")
-    is_flat_checkpoint = any(k.startswith("encoder.") for k in checkpoint["model_state"])
-    if is_flat_checkpoint:
-        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs)
-        decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
-                           base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
-                           latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder, stream_name=recon_stream_name,
-                                 mode=recon_stream.mode).to(device)
-    elif len(stream_configs) == 1:
-        ae = Autoencoder(
-            size=model_cfg["size"], channels=1,
-            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
-            latent_spatial_size=recon_stream.spatial_size,
-        ).to(device)
-    elif decoder_for_stream is None:
-        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
-                           n_theta=1)
-        decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
-                           base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
-                           latent_spatial_size=recon_stream.spatial_size)
-        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
-                                     stream_configs=stream_configs).to(device)
-    else:
-        # Stage 1b's own format: a SEPARATE decoder per stream (see
-        # autoencoder.py's MultiStreamAutoencoder).
-        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
-                           n_theta=1)
-        decoders = {}
-        for stream_name, decoder_key in decoder_for_stream.items():
-            stream_cfg = stream_configs[stream_name]
-            decoders[decoder_key] = Decoder(
-                output_size=model_cfg["size"], out_channels=1,
-                base_channels=model_cfg["base_channels"], latent_channels=stream_cfg.channels,
-                latent_spatial_size=stream_cfg.spatial_size,
-            )
-        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
-                                     stream_configs=stream_configs,
-                                     decoder_for_stream=decoder_for_stream).to(device)
-    ae.load_state_dict(checkpoint["model_state"])
-    ae.eval()
-    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
 
     stats_head = StatsHead(
         latent_channels=recon_stream.channels, stat_names=stats_config["stat_names"],

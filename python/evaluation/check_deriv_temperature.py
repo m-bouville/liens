@@ -40,12 +40,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
-from models.decoder import Decoder
-from models.encoder import Encoder
-from models.latent_streams import (
-    cross_check_stream_configs_against_state_dict, resolve_stream_configs_from_checkpoint_config,
-)
+from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
 from utils import load_datasets as load
 
@@ -95,76 +90,6 @@ def robust_polynomial_fit(x: np.ndarray, y: np.ndarray, basis_funcs: list,
     return coefs, coef_stderr
 
 
-def _load_encoder(checkpoint_path: Path, device: torch.device):
-    """
-    Mirrors check_interpolation.py's own checkpoint-format-detection
-    logic EXACTLY (same branches, same order) -- deliberately NOT
-    factored into a shared helper at this point in the project's own
-    history (that refactor belongs with check_interpolation.py itself,
-    not smuggled in as a side effect of this diagnostic), so this is a
-    direct copy, adapted only to return just the encoder submodule
-    (this script never needs a decoder or stats_head at all).
-    """
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model_cfg = checkpoint["config"]
-    print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, config={model_cfg}")
-
-    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
-    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
-        stream_configs, recon_stream_name, checkpoint["model_state"],
-    )
-    recon_stream = stream_configs[recon_stream_name]
-    decoder_for_stream = model_cfg.get("decoder_for_stream")
-    is_flat_checkpoint = any(k.startswith("encoder.") for k in checkpoint["model_state"])
-    if is_flat_checkpoint:
-        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs)
-        decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
-                           base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
-                           latent_spatial_size=recon_stream.spatial_size)
-        ae = EncoderDecoderPair(encoder, decoder, stream_name=recon_stream_name,
-                                 mode=recon_stream.mode).to(device)
-    elif len(stream_configs) == 1:
-        ae = Autoencoder(
-            size=model_cfg["size"], channels=1,
-            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
-            latent_spatial_size=recon_stream.spatial_size,
-        ).to(device)
-    elif decoder_for_stream is None:
-        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs)
-        decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
-                           base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
-                           latent_spatial_size=recon_stream.spatial_size)
-        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
-                                     stream_configs=stream_configs).to(device)
-    else:
-        encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
-                           base_channels=model_cfg["base_channels"], stream_configs=stream_configs)
-        decoders = {}
-        for stream_name, decoder_key in decoder_for_stream.items():
-            stream_cfg = stream_configs[stream_name]
-            decoders[decoder_key] = Decoder(
-                output_size=model_cfg["size"], out_channels=1,
-                base_channels=model_cfg["base_channels"], latent_channels=stream_cfg.channels,
-                latent_spatial_size=stream_cfg.spatial_size,
-            )
-        ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
-                                     stream_configs=stream_configs,
-                                     decoder_for_stream=decoder_for_stream).to(device)
-    ae.load_state_dict(checkpoint["model_state"])
-    ae.eval()
-    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
-
-    if "deriv" not in stream_configs:
-        raise ValueError(
-            f"{checkpoint_path} has no 'deriv' stream (stream_configs={list(stream_configs)}) -- "
-            f"this diagnostic needs z1 (the deriv stream) to exist at all, which means a checkpoint "
-            f"trained at or after stage 2, not stage 1/1b."
-        )
-    return ae_encoder, checkpoint.get("test_dirs")
-
-
 def check_deriv_temperature(
     stage2_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
     device: str | None = None,
@@ -176,7 +101,17 @@ def check_deriv_temperature(
     docstring) for ALL DATA, T<0.9, and T>=0.9 separately.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    encoder, test_dirs = _load_encoder(stage2_checkpoint_path, device)
+    ae, encoder, checkpoint, stream_configs, recon_stream_name = build_ae_from_checkpoint(
+        stage2_checkpoint_path, device,
+    )
+    print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, config={checkpoint['config']}")
+    if "deriv" not in stream_configs:
+        raise ValueError(
+            f"{stage2_checkpoint_path} has no 'deriv' stream (stream_configs={list(stream_configs)}) -- "
+            f"this diagnostic needs z1 (the deriv stream) to exist at all, which means a checkpoint "
+            f"trained at or after stage 2, not stage 1/1b."
+        )
+    test_dirs = checkpoint.get("test_dirs")
     if not test_dirs:
         raise ValueError(f"{stage2_checkpoint_path} has no saved test_dirs")
     test_dirs = [Path(d) for d in test_dirs]
