@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
-from training.checkpoint_criterion import CheckpointCriterionTracker
+from training.checkpoint_criterion import CheckpointCriterionTracker, atomic_torch_save
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import StatsLoss
 from training.model_assembly import build_models_from_components
@@ -327,7 +327,7 @@ def train_refinement(
 
         if saved_this_epoch:
             epochs_since_improvement = 0
-            torch.save({
+            atomic_torch_save({
                 "ae_state": ae.state_dict(),
                 "f_theta_state": f_theta.state_dict(),
                 "stats_head_state": stats_head.state_dict() if stats_head is not None else None,

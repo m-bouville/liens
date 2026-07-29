@@ -727,6 +727,7 @@ class MicrostructureEvolutionDataset(Dataset):
                  good_steps: dict[Path, list[int]] | None = None,
                  stat_names: list[str] | None = None, augment: bool = False,
                  min_std_deriv: float | None = None, encode_both_streams: bool = False,
+                 stats_frame_index: int = 0,
                  read_workers: int = 16):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
@@ -883,12 +884,32 @@ class MicrostructureEvolutionDataset(Dataset):
                 "Pass a real encoder (cached-latent, stage-3 mode) if you want both streams."
             )
 
+        if not 0 <= stats_frame_index < window_length:
+            raise ValueError(
+                f"stats_frame_index={stats_frame_index} is out of range for "
+                f"window_length={window_length} -- must be a valid index INTO the window "
+                f"(0 = the window's own first frame, the long-standing default; "
+                f"window_length-1 = its last)."
+            )
+
         self.window_length = window_length
         self.encoder_given = encoder is not None  # which mode __getitem__ operates in
         self.encode_both_streams = encode_both_streams
         self.stat_names = stat_names
         self.augment = augment
         self.min_std_deriv = min_std_deriv
+        # Which frame IN the window true_stats (and its own NaN guard)
+        # refers to. 0 (default) is the long-standing behavior every
+        # existing caller relies on: window[0], the window's own
+        # starting frame. train_stage2.py's deriv_target_centered mode
+        # needs 1 instead, since there the frame actually encoded (and
+        # thus the frame stats_head/stats_head1 are asked to predict
+        # statistics FOR) is the window's MIDDLE frame, not its first
+        # -- leaving this at 0 in that mode silently trains both stats
+        # anchors against a DIFFERENT frame's statistics than the one
+        # they're predicting from, which is a real (measured, not
+        # hypothetical) misalignment, not a rounding-level detail.
+        self.stats_frame_index = stats_frame_index
         self._run_dirs: list[Path] = []         # run_dir per run_idx, for tracing samples back
         self._run_steps: list[list[int]] = []   # kept step numbers per run, in order
         self._run_data: list[torch.Tensor] = []  # per run, on CPU: "state" latents (n_kept,C,8,8) if
@@ -1163,7 +1184,7 @@ class MicrostructureEvolutionDataset(Dataset):
 
             for start in range(len(kept_steps) - self.window_length + 1):
                 if self.stat_names is not None:
-                    start_step = kept_steps[start]
+                    start_step = kept_steps[start + self.stats_frame_index]
                     stats_df = self._stats_by_run[run_dir]
                     if start_step not in stats_df.index or stats_df.loc[start_step, self.stat_names].isna().any():
                         continue  # same NaN-guard rationale as MicrostructureTripletDataset
@@ -1259,9 +1280,12 @@ class MicrostructureEvolutionDataset(Dataset):
             return window, dt_window, theta
 
         run_dir = self._run_dirs[run_idx]
-        start_step = steps[0]  # window[0] is the real starting frame -- true_stats is always FOR it
+        # steps[stats_frame_index], not steps[0] -- see stats_frame_index's
+        # own comment in __init__. Default 0 keeps the long-standing
+        # "window[0] is the real starting frame" behavior exactly.
+        stats_step = steps[self.stats_frame_index]
         true_stats = torch.tensor(
-            self._stats_by_run[run_dir].loc[start_step, self.stat_names].to_numpy(dtype=float),
+            self._stats_by_run[run_dir].loc[stats_step, self.stat_names].to_numpy(dtype=float),
             dtype=torch.float32,
         )
         if aug_idx is not None and "angle" in self.stat_names:

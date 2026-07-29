@@ -149,6 +149,87 @@ def test_stage2_accepts_single_stream_ancestor_and_builds_deriv(tmp_path, isolat
     assert saved["stats_head1_state"] is not None
 
 
+def test_epoch0_reference_does_not_perturb_training_rng(tmp_path, isolated_project_root, monkeypatch):
+    """
+    REGRESSION: the epoch-0 reference row (a pure diagnostic, printed
+    for comparison against epoch 1 onward) must not change the actual
+    training outcome. Caught directly via a real A/B run before this
+    fix existed: the reference block's own forward passes shifted
+    torch's global RNG state, which changed train_loader's own shuffle
+    order (shuffle=True) at epoch 1, silently producing a DIFFERENT
+    final model_state depending on whether this purely-informational
+    row was present at all.
+
+    Verified here directly against the actual mechanism (RNG state
+    save/restore around the reference block) via monkeypatching, not
+    by comparing two full training runs against each other -- since
+    both runs would trigger the reference block identically, any RNG
+    shift it causes would be the SAME shift both times, making a
+    plain two-run comparison unable to detect this class of bug at
+    all (confirmed directly: removing the real fix and rerunning that
+    kind of comparison still passed). Instead, directly confirms
+    torch.set_rng_state is called with EXACTLY the state
+    torch.get_rng_state returned right before the reference block's
+    own forward passes ran -- the real property that matters,
+    independent of whether any particular seed/architecture happens
+    to expose it as a visible training difference.
+    """
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+
+    stage1_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1_epoch0ref.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_epoch0ref.png",
+    )
+
+    import torch as torch_module
+    real_get_rng_state = torch_module.get_rng_state
+    real_set_rng_state = torch_module.set_rng_state
+    calls = []
+
+    def _tracking_get_rng_state():
+        state = real_get_rng_state()
+        calls.append(("get", state.clone()))
+        return state
+
+    def _tracking_set_rng_state(state):
+        calls.append(("set", state.clone()))
+        return real_set_rng_state(state)
+
+    monkeypatch.setattr(torch_module, "get_rng_state", _tracking_get_rng_state)
+    monkeypatch.setattr(torch_module, "set_rng_state", _tracking_set_rng_state)
+
+    torch.manual_seed(0)
+    train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, stats0_weight=0.01, stats1_weight=1.0,
+        epochs=2, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_epoch0ref.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_epoch0ref.png",
+        deriv_target_centered=True,
+    )
+
+    get_calls = [state for kind, state in calls if kind == "get"]
+    set_calls = [state for kind, state in calls if kind == "set"]
+    assert len(get_calls) >= 1 and len(set_calls) >= 1, (
+        "expected the epoch-0 reference block to call both torch.get_rng_state and "
+        "torch.set_rng_state at least once (epochs=2 > 0, so the block must have run)"
+    )
+    # The FIRST get must be matched by an EQUAL later set -- the actual
+    # save-before/restore-after property, not just "these functions
+    # got called at some point for some unrelated reason".
+    first_get = get_calls[0]
+    assert any(torch.equal(first_get, s) for s in set_calls), (
+        "the RNG state captured before the reference block's own forward passes was "
+        "never restored via an equal torch.set_rng_state call -- the reference block's "
+        "own randomness can leak into the real training that follows it"
+    )
+
+
 def test_stats_head1_genuinely_trains_when_stats1_weight_nonzero(tmp_path, isolated_project_root):
     """Regression test for a real, confirmed bug: stats_head1 is a
     SEPARATE nn.Module from ae (not one of its submodules), left with
@@ -209,4 +290,99 @@ def test_stats_head1_genuinely_trains_when_stats1_weight_nonzero(tmp_path, isola
         "stats_head1's weights are byte-identical to their true initial values after 3 real "
         "training epochs with stats1_weight=1.0 -- its own parameters aren't reaching the "
         "optimizer (check train_stage2's own `params = [...]` construction)"
+    )
+
+
+def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_project_root):
+    """deriv_target_centered's own epoch schedule is conflated with
+    deriv_weight_warmup_epochs deliberately -- not a separate knob (see
+    train_stage2's own docstring for the full rationale). A fresh run
+    with deriv_weight_warmup_epochs=2 should spend epochs 1-2 in the
+    cheap (window_length=3 dataset, but only 2 frames actually encoded)
+    phase, then switch to the full three-frame centered target at
+    epoch 3 -- checked here via the checkpoint's own saved
+    stage2_config, not by parsing printed output."""
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+
+    stage1_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1_centered.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_centered.png",
+    )
+
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
+        epochs=4, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_centered_fresh.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_centered_fresh.png",
+        deriv_target_centered=True,
+    )
+
+    saved = torch.load(stage2_path, map_location="cpu", weights_only=True)
+    cfg = saved["stage2_config"]
+    assert cfg["deriv_target_centered"] is True
+    assert cfg["deriv_switch_epoch"] == 2
+    # Saved checkpoint is from the run's LAST (best) epoch, which is
+    # past the switch point (epoch 2 of 4) -- so the checkpoint that
+    # ends up saved should reflect the centered phase already active.
+    assert cfg["use_centered_at_save"] is True
+
+
+def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_project_root):
+    """REGRESSION: resuming a stage-2 checkpoint that's already well
+    past deriv_weight_warmup_epochs must start the NEW run directly in
+    the centered phase, at full deriv_weight, from ITS OWN epoch 1 --
+    not re-ramp the weight or waste epochs in the cheaper phase again.
+    Uses the checkpoint's own saved "epoch" to detect this (see
+    prior_stage2_epochs in train_stage2's own docstring).
+
+    This is the scenario an already-fully-trained stage-2 checkpoint
+    (trained with deriv_target_centered=False, no relation to THIS
+    run's own deriv_weight_warmup_epochs at all) needs to resume
+    smoothly into deriv_target_centered=True without wasting the prior
+    run's own computation."""
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+
+    stage1_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1_resume.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_resume.png",
+    )
+    # A "fully trained" ancestor, well past any reasonable warmup --
+    # trained WITHOUT deriv_target_centered at all, matching a real
+    # pre-existing checkpoint from before this feature existed.
+    stage2_ancestor_path = train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, stats0_weight=0.01,
+        epochs=5, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_ancestor.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_ancestor.png",
+    )
+    ancestor_epoch = torch.load(stage2_ancestor_path, map_location="cpu",
+                                 weights_only=True)["epoch"]
+    assert ancestor_epoch >= 3, "fixture assumption: ancestor must be past a small warmup"
+
+    stage2_resumed_path = train_stage2(
+        base_path=base_path, resume_from=stage2_ancestor_path,
+        deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_resumed.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_resumed.png",
+        deriv_target_centered=True,
+    )
+
+    saved = torch.load(stage2_resumed_path, map_location="cpu", weights_only=True)
+    assert saved["stage2_config"]["use_centered_at_save"] is True, (
+        "resuming a stage-2 checkpoint already well past deriv_weight_warmup_epochs "
+        "must be centered from this run's own epoch 1, not stuck re-running the cheap phase"
     )

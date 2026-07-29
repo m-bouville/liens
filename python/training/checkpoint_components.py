@@ -4,8 +4,9 @@ point in this pipeline where checkpoints from different lineages need
 to be combined: stage 2's (E, D, stats_head) and stage 3's (f), merged
 into one model, then carried forward together. Stages 1->2->3 are a
 strict linear chain -- one ancestor each, never a merge -- so their
-existing, monolithic checkpoint dicts (see train_ae.py/train_lds.py)
-have been fine as-is and are NOT changed here.
+existing, monolithic checkpoint dicts (see train_stage1.py/
+train_stage2.py/train_lds.py) have been fine as-is and are NOT changed
+here.
 
 This module is an ADAPTER, not a new save format: it reads checkpoints
 in their existing, unchanged shapes and produces a componentized VIEW
@@ -26,6 +27,7 @@ from models.latent_streams import (
     LatentStreamConfig, cross_check_stream_configs_against_state_dict,
     resolve_stream_configs_from_checkpoint_config,
 )
+from training.checkpoint_criterion import atomic_torch_save
 
 
 @dataclass
@@ -440,7 +442,7 @@ def split_joint_checkpoint_for_evaluation(
     if checkpoint.get("stats_head_state") is not None and checkpoint.get("stats_config") is not None:
         ae_view["stats_head_state"] = checkpoint["stats_head_state"]
         ae_view["stats_config"] = checkpoint["stats_config"]
-    torch.save(ae_view, ae_view_path)
+    atomic_torch_save(ae_view, ae_view_path)
 
     data_config = checkpoint.get("data_config", {})
     lds_view_path = output_dir / f"{joint_checkpoint_path.stem}-lds_view.pt"
@@ -459,7 +461,7 @@ def split_joint_checkpoint_for_evaluation(
             "n_rollout_steps": data_config.get("n_rollout_steps", 1),
         },
     }
-    torch.save(lds_view, lds_view_path)
+    atomic_torch_save(lds_view, lds_view_path)
 
     return ae_view_path, lds_view_path
 

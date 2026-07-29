@@ -204,3 +204,282 @@ stats0_weight = 0.0
         f"pipeline should have stopped at stage 1 without a '# Stage 2' section, got {identity}"
     )
     print("Correctly stopped after stage 1 -- stage 2 was NOT attempted")
+
+
+def test_pipeline_ignores_global_resume_from_for_pipeline_managed_stages(tmp_path, isolated_project_root, capsys):
+    """
+    REGRESSION: a global 'resume_from' (e.g. left over from testing a
+    stage-2 deriv_target_centered curriculum, or intended for some
+    OTHER stage entirely) must not leak into stage 1 or stage 2's own
+    kwargs at all. Real crash reproduced directly against the ORIGINAL
+    code for stage 2 specifically: 'TypeError: training.train_stage2.
+    train_stage2() got multiple values for keyword argument
+    'resume_from''; stage 1 (which doesn't hardcode its own resume_from
+    at all) would instead have SILENTLY tried to resume from the bogus
+    global path and failed with a confusing FileNotFoundError, or
+    worse, silently succeeded against the WRONG checkpoint if a path
+    happened to exist.
+
+    resume_from's own MEANING is always stage-specific (see
+    _NEVER_GLOBAL_DEFAULT_KEYS's own comment in stage_params.py), so
+    it's excluded from the global-default merge entirely -- no warning
+    needed here, since this is now expected, documented behavior, not
+    an error condition being caught after the fact.
+    """
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    params_text = f"""
+Nx = 32
+Ny = 32
+base = {base_path}
+min_step = 0
+num_workers = 0
+val_fraction = 0.34
+test_fraction = 0.17
+augment = false
+resume_from = {tmp_path / "not_a_real_checkpoint.pt"}
+
+# Stage 1
+epochs = 1
+batch_size = 4
+base_channels = 4
+latent_channels = 4
+stats0_weight = 0.01
+stat_names = avg_phi
+
+# Stage 2
+epochs = 0
+"""
+    params_path = tmp_path / "test_pipeline_global_resume_from.txt"
+    params_path.write_text(params_text)
+
+    # run_from_params_file itself always attempts stage 3 onward too
+    # (see test_pipeline_runs_1_then_2_directly's own identical
+    # comment) -- irrelevant to what THIS test verifies.
+    try:
+        run_from_params_file(params_path, default_base=base_path, device="cpu")
+    except ValueError as e:
+        if "train_lds()" not in str(e):
+            raise
+
+    from orchestration.paths import _STAGE_DIRS
+    stage2_files = list(_STAGE_DIRS[2].glob("test_pipeline_global_resume_from-stage2.pt"))
+    assert len(stage2_files) == 1, "stage 2's own checkpoint file was not created"
+    checkpoint = torch.load(stage2_files[0], map_location="cpu", weights_only=True)
+    identity = identify_checkpoint_stage(checkpoint)
+    assert identity == "stage 2 (latent-space validation)", (
+        f"pipeline should have completed stage 2 normally (built from stage 1, not the bogus "
+        f"global resume_from path), got {identity}"
+    )
+
+
+def test_pipeline_honors_stage2_specific_resume_from_override(tmp_path, isolated_project_root, capsys):
+    """
+    A DIFFERENT case from the global one above: resume_from set
+    EXPLICITLY under '# Stage 2' itself, pointing at a REAL, prior
+    stage-2 checkpoint -- not a leftover global value, and not a
+    mistake either: this is exactly what train_stage2's own
+    deriv_target_centered curriculum is BUILT around (see its own
+    docstring) -- continuing an already-trained stage-2 checkpoint
+    with a different set of Stage-2 params, rather than restarting
+    from stage 1. This must be HONORED (used INSTEAD of the pipeline's
+    own default, stage 1's checkpoint), not stripped -- an earlier,
+    overly-broad version of this fix stripped it unconditionally,
+    which would have silently defeated this exact curriculum feature.
+    """
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    params_text = f"""
+Nx = 32
+Ny = 32
+base = {base_path}
+min_step = 0
+num_workers = 0
+val_fraction = 0.34
+test_fraction = 0.17
+augment = false
+
+# Stage 1
+epochs = 1
+batch_size = 4
+base_channels = 4
+latent_channels = 4
+stats0_weight = 0.01
+stat_names = avg_phi
+
+# Stage 2
+epochs = 1
+batch_size = 4
+deriv_weight = 1.0
+stats0_weight = 0.01
+force = true
+"""
+    params_path = tmp_path / "test_pipeline_stage2_ancestor.txt"
+    params_path.write_text(params_text)
+
+    # First pass: builds a real stage-1 -> stage-2 checkpoint pair, the
+    # PRIOR checkpoint this test will explicitly resume from below --
+    # exactly the "12 hours already spent" scenario this feature exists
+    # for, just with a trivially cheap fixture instead of a real run.
+    try:
+        run_from_params_file(params_path, default_base=base_path, device="cpu")
+    except ValueError as e:
+        if "train_lds()" not in str(e):
+            raise
+
+    from orchestration.paths import _STAGE_DIRS
+    prior_stage2_files = list(_STAGE_DIRS[2].glob("test_pipeline_stage2_ancestor-stage2.pt"))
+    assert len(prior_stage2_files) == 1
+    prior_stage2_checkpoint = prior_stage2_files[0]
+
+    # Second pass: a DIFFERENT params file, whose own '# Stage 2'
+    # section explicitly resumes from the FIRST pass's own stage-2
+    # checkpoint -- not stage 1's.
+    params_text2 = f"""
+Nx = 32
+Ny = 32
+base = {base_path}
+min_step = 0
+num_workers = 0
+val_fraction = 0.34
+test_fraction = 0.17
+augment = false
+
+# Stage 1
+epochs = 1
+batch_size = 4
+base_channels = 4
+latent_channels = 4
+stats0_weight = 0.01
+stat_names = avg_phi
+
+# Stage 2
+epochs = 1
+batch_size = 4
+deriv_weight = 1.0
+stats0_weight = 0.01
+resume_from = {prior_stage2_checkpoint}
+force = true
+"""
+    params_path2 = tmp_path / "test_pipeline_stage2_resumed.txt"
+    params_path2.write_text(params_text2)
+
+    try:
+        run_from_params_file(params_path2, default_base=base_path, device="cpu")
+    except ValueError as e:
+        if "train_lds()" not in str(e):
+            raise
+
+    captured = capsys.readouterr()
+    assert "resume_from" in captured.out and str(prior_stage2_checkpoint) in captured.out, (
+        "expected a clear NOTE that Stage 2's own explicit resume_from override was used, got none"
+    )
+
+    stage2_files = list(_STAGE_DIRS[2].glob("test_pipeline_stage2_resumed-stage2.pt"))
+    assert len(stage2_files) == 1, "stage 2's own checkpoint file was not created"
+    checkpoint = torch.load(stage2_files[0], map_location="cpu", weights_only=True)
+    assert checkpoint["stage2_config"]["resumed_from"] == str(prior_stage2_checkpoint), (
+        "the resulting stage-2 checkpoint doesn't record the EXPLICIT override as its own ancestor "
+        "-- it should have resumed from the prior stage-2 checkpoint, not stage 1's"
+    )
+
+
+def test_pipeline_backs_up_before_self_resume_overwrite(tmp_path, isolated_project_root, capsys):
+    """
+    REGRESSION: the actual scenario resume_from's own backup exists
+    for -- the SAME params file (hence the SAME stage_output_path)
+    used both to build the original stage-2 checkpoint AND, on a
+    second run, with an explicit 'resume_from' pointing at THAT SAME
+    checkpoint (continuing its own deriv_target_centered curriculum in
+    place, per train_stage2's own docstring). force=True (needed for
+    resolve_checkpoint to even attempt a rerun against an existing
+    checkpoint) would otherwise overwrite BOTH the .pt AND, per
+    _log_to_file's own open(log_path, "w"), the .log -- silently, with
+    nothing left of either if the second run failed partway through.
+
+    Deliberately does NOT check the normal stage1->stage2 flow here:
+    that's covered implicitly by every OTHER test in this file never
+    producing a spurious backup file, since none of them set an
+    explicit resume_from at all.
+    """
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    params_text = f"""
+Nx = 32
+Ny = 32
+base = {base_path}
+min_step = 0
+num_workers = 0
+val_fraction = 0.34
+test_fraction = 0.17
+augment = false
+force = true
+
+# Stage 1
+epochs = 1
+batch_size = 4
+base_channels = 4
+latent_channels = 4
+stats0_weight = 0.01
+stat_names = avg_phi
+
+# Stage 2
+epochs = 1
+batch_size = 4
+deriv_weight = 1.0
+stats0_weight = 0.01
+"""
+    params_path = tmp_path / "test_pipeline_self_resume.txt"
+    params_path.write_text(params_text)
+
+    # First pass: produces the original stage-2 checkpoint AND its log,
+    # both at the SAME path a second run of this SAME params file would
+    # also write to.
+    try:
+        run_from_params_file(params_path, default_base=base_path, device="cpu")
+    except ValueError as e:
+        if "train_lds()" not in str(e):
+            raise
+
+    from orchestration.paths import _STAGE_DIRS
+    stage2_pt = _STAGE_DIRS[2] / "test_pipeline_self_resume-stage2.pt"
+    stage2_log = _STAGE_DIRS[2] / "test_pipeline_self_resume-stage2.log"
+    assert stage2_pt.exists() and stage2_log.exists(), "fixture assumption: first pass must produce both files"
+    original_pt_bytes = stage2_pt.read_bytes()
+    original_log_bytes = stage2_log.read_bytes()
+
+    def _backup_glob(suffix):
+        return list(_STAGE_DIRS[2].glob(f"test_pipeline_self_resume-stage2-*{suffix}"))
+
+    assert not _backup_glob(".pt") and not _backup_glob(".log"), (
+        "the normal stage1->stage2 flow must never produce a backup file -- "
+        "found one after the FIRST pass, before any resume_from override was even used"
+    )
+
+    # Second pass: the SAME params file, now with an explicit
+    # resume_from pointing at the SAME checkpoint the first pass just
+    # produced -- the actual self-resume scenario.
+    params_text_resumed = params_text.replace(
+        "# Stage 2\nepochs = 1",
+        f"# Stage 2\nresume_from = {stage2_pt}\nepochs = 1",
+    )
+    params_path.write_text(params_text_resumed)
+
+    try:
+        run_from_params_file(params_path, default_base=base_path, device="cpu")
+    except ValueError as e:
+        if "train_lds()" not in str(e):
+            raise
+
+    backup_pts = _backup_glob(".pt")
+    backup_logs = _backup_glob(".log")
+    assert len(backup_pts) == 1, f"expected exactly one .pt backup, got {backup_pts}"
+    assert len(backup_logs) == 1, f"expected exactly one .log backup, got {backup_logs}"
+    assert backup_pts[0].read_bytes() == original_pt_bytes, (
+        "the backed-up .pt doesn't match the ORIGINAL checkpoint's own bytes -- "
+        "backup must happen BEFORE the overwrite, not after"
+    )
+    assert backup_logs[0].read_bytes() == original_log_bytes, (
+        "the backed-up .log doesn't match the ORIGINAL log's own bytes -- "
+        "backup must happen BEFORE _log_to_file's own truncating open(..., 'w')"
+    )
+
+    captured = capsys.readouterr()
+    assert "backed up" in captured.out, "expected a clear NOTE that a backup was made, got none"

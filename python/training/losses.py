@@ -33,6 +33,94 @@ class ReconLoss(nn.Module):
         return self.loss_fn(x_recon, x)
 
 
+def centered_deriv_target(z0_before: torch.Tensor, z0_t: torch.Tensor, z0_after: torch.Tensor,
+                           dt_minus: torch.Tensor, dt_plus: torch.Tensor) -> torch.Tensor:
+    """
+    L_deriv's target, built from a WINDOW_LENGTH=3 window (t-dt_minus,
+    t, t+dt_plus) instead of today's default two-frame, one-sided
+    (t, t+dt) window. The one-sided target, (z0(t+dt)-z0(t))/dt, is
+    only first-order accurate: Taylor-expanding z0(t+dt) shows its
+    error is z0_ddot(t)*dt/2 + O(dt^2) -- a real, systematic bias that
+    check_deriv_temperature.py's own eps' term is the signature of.
+
+    This is the standard non-uniform three-point central-difference
+    formula, second-order accurate (the z0_ddot*dt^2/2 terms in the
+    forward and backward Taylor expansions carry the SAME sign, since
+    dt^2 is even in dt, and cancel exactly on subtraction -- leaving
+    O(dt^3) error, not O(dt)):
+
+        z0_dot(t) ~= [dt_minus^2 * z0_after - dt_plus^2 * z0_before
+                      + (dt_plus^2 - dt_minus^2) * z0_t]
+                     / [dt_minus * dt_plus * (dt_minus + dt_plus)]
+
+    Reduces exactly to the familiar symmetric form
+    (z0_after-z0_before)/(dt_minus+dt_plus) when dt_minus == dt_plus,
+    but does NOT assume equal spacing -- save_steps schedules in this
+    project are not uniform (dt spans multiple decades; see
+    dz0dt.png's own "vs t" panels), so assuming symmetric spacing here
+    would silently reintroduce a bias of the same kind this is meant
+    to remove.
+
+    Only defined for INTERIOR kept steps (both a before- and
+    after-neighbor exist) -- MicrostructureEvolutionDataset's own
+    window-index construction already only yields window_length=3
+    windows where this holds (see its own window-building loop), so
+    no separate edge-case filtering is needed here.
+    """
+    return (dt_minus.pow(2) * z0_after - dt_plus.pow(2) * z0_before
+            + (dt_plus.pow(2) - dt_minus.pow(2)) * z0_t) / (dt_minus * dt_plus * (dt_minus + dt_plus))
+
+
+def dt_weighted_deriv_loss(recon_loss_module: ReconLoss, z1_pred: torch.Tensor,
+                            target_deriv: torch.Tensor, dt: torch.Tensor,
+                            exponent: float) -> torch.Tensor:
+    """
+    L_deriv's own dt-reweighting, motivated by check_deriv_temperature.py's
+    own direct measurement: z1(t) - target_deriv(t) = eps/dt + eps',
+    a real, highly significant (>30 sigma on real 64x64 data) eps/dt
+    term.
+
+    CORRECTION to this function's own original motivation: it was
+    first added believing z1, having no dt input, was forced to
+    compromise across many different dt values seen by the SAME frame.
+    That's wrong -- MicrostructureEvolutionDataset's own sliding-window
+    construction gives each frame exactly one window and hence one dt,
+    so there's no such per-frame conflict, and this reweighting's own
+    ability to fix the eps/dt term is accordingly less certain than
+    originally claimed here. Left available as an orthogonal knob (see
+    centered_deriv_target above for the mechanism with a verified,
+    real justification -- the eps' term's O(dt) truncation bias), but
+    treat a nonzero exponent as exploratory, not as a settled fix.
+
+    exponent=0.0 (default): returns recon_loss_module(z1_pred,
+    target_deriv) EXACTLY -- the plain, historical, uniform-weight
+    L_deriv, not merely a numerically-close reproduction of it (weight
+    below would work out to a constant 1.0 per window at exponent=0
+    too, but computing it that way would do needless per-element work
+    AND depend on floating-point pow(dt, -0.0) behaving as exactly
+    1.0, rather than just calling the existing, already-trusted
+    ReconLoss instance directly).
+
+    exponent=1.0: weight_i = (1/dt_i) / mean(1/dt), i.e. a plain
+    inverse-dt weight, RENORMALIZED to have mean 1 across the batch so
+    L_deriv's own overall scale stays comparable to the unweighted
+    case -- changing which windows matter most, not the loss's own
+    magnitude (which deriv_weight/deriv_scale are already tuned
+    against). Larger exponent values push the effective target harder
+    toward dt -> 0; not yet validated at any specific nonzero value.
+    """
+    if exponent == 0.0:
+        return recon_loss_module(z1_pred, target_deriv)
+
+    weight = dt.pow(-exponent)
+    weight = weight / weight.mean()
+    if recon_loss_module.kind == "l1":
+        per_element = (z1_pred - target_deriv).abs()
+    else:
+        per_element = (z1_pred - target_deriv) ** 2
+    return (weight * per_element).mean()
+
+
 class StatsLoss(nn.Module):
     """
     Auxiliary loss: MSE between StatsHead's predictions (from the latent

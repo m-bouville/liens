@@ -9,8 +9,11 @@ from pathlib import Path
 
 import pytest
 
+import os
+import time
+
 from orchestration.stage_params import (
-    _prepare_stage_kwargs, _resolve_same, parse_stage_params,
+    _backup_before_overwrite, _prepare_stage_kwargs, _resolve_same, parse_stage_params,
 )
 
 
@@ -195,3 +198,85 @@ def test_stage_1_and_1a_headers_are_interchangeable(tmp_path):
     _, stages_bare = parse_stage_params(path_bare)
     _, stages_1a = parse_stage_params(path_1a)
     assert stages_bare[1]["stats_weight"] == stages_1a[1]["stats_weight"] == "0.05"
+
+
+def test_backup_before_overwrite_names_by_source_mtime_not_now(tmp_path, capsys):
+    """
+    REGRESSION: the backup's own timestamp must reflect when the
+    SOURCE file was last modified, not when the backup happened to run
+    -- those can genuinely differ (the pipeline sitting queued, or
+    simply this function being called some time after the file it's
+    backing up was actually produced). Set the source's own mtime
+    explicitly, in the past, and confirm the backup's name reflects
+    THAT time, not time.time() at call time.
+    """
+    src = tmp_path / "64x64-stage2.pt"
+    src.write_bytes(b"original checkpoint bytes")
+    past = time.mktime((2026, 7, 29, 15, 53, 0, 0, 0, -1))
+    os.utime(src, (past, past))
+
+    _backup_before_overwrite(src)
+
+    from datetime import datetime
+    expected_name = f"64x64-stage2-{datetime.fromtimestamp(past).strftime('%Y%m%d_%Hh%M')}.pt"
+    backup = tmp_path / expected_name
+    assert backup.exists(), (
+        f"expected a backup named after the SOURCE's own mtime ({expected_name}), "
+        f"found instead: {[p.name for p in tmp_path.iterdir()]}"
+    )
+    assert backup.read_bytes() == b"original checkpoint bytes"
+
+
+def test_backup_before_overwrite_skips_duplicate_for_unchanged_source(tmp_path, capsys):
+    """
+    REGRESSION: calling this twice on the SAME, unchanged source file
+    (e.g. the pipeline invoked again before this stage would even
+    rerun) must produce exactly ONE backup, not a growing pile of
+    byte-identical copies at different (archival-time) names -- this
+    is a direct consequence of naming by the source's own mtime (see
+    test_backup_before_overwrite_names_by_source_mtime_not_now), which
+    makes the backup path deterministic for unchanged content.
+    """
+    src = tmp_path / "64x64-stage2.pt"
+    src.write_bytes(b"original checkpoint bytes")
+
+    _backup_before_overwrite(src)
+    _backup_before_overwrite(src)
+    _backup_before_overwrite(src)
+
+    backups = list(tmp_path.glob("64x64-stage2-*.pt"))
+    assert len(backups) == 1, f"expected exactly one backup after 3 calls, got {backups}"
+
+    captured = capsys.readouterr()
+    assert captured.out.count("backed up") == 1, (
+        "expected exactly one real copy across 3 calls, with the other 2 explicitly "
+        "noting they were skipped as already archived"
+    )
+    assert "already archived" in captured.out
+
+
+def test_backup_before_overwrite_creates_new_backup_for_genuinely_changed_source(tmp_path):
+    """A DIFFERENT mtime (a genuinely new version of the file, e.g. a
+    later training run's own output) must produce a SEPARATE backup,
+    not be skipped as if it were the same content."""
+    src = tmp_path / "64x64-stage2.pt"
+    src.write_bytes(b"version one")
+    t1 = time.mktime((2026, 7, 29, 15, 53, 0, 0, 0, -1))
+    os.utime(src, (t1, t1))
+    _backup_before_overwrite(src)
+
+    src.write_bytes(b"version two")
+    t2 = time.mktime((2026, 7, 29, 16, 10, 0, 0, 0, -1))
+    os.utime(src, (t2, t2))
+    _backup_before_overwrite(src)
+
+    backups = list(tmp_path.glob("64x64-stage2-*.pt"))
+    assert len(backups) == 2, f"expected two distinct backups for two distinct mtimes, got {backups}"
+
+
+def test_backup_before_overwrite_noop_when_source_missing(tmp_path, capsys):
+    """No source file at all -- e.g. this stage has never run before --
+    must be a silent no-op, not an error."""
+    _backup_before_overwrite(tmp_path / "does_not_exist-stage2.pt")
+    assert list(tmp_path.iterdir()) == []
+    assert capsys.readouterr().out == ""

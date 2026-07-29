@@ -10,7 +10,7 @@ at z1's error itself, not f_theta, as the more likely root cause).
 That earlier finding was INFERRED algebraically, through f_theta's own
 downstream residual (see check_parameter_dependence.py's own module
 docstring for the full derivation). This script instead measures z1's
-error DIRECTLY: train_stage2's own L_deriv target (see train_ae.py) is
+error DIRECTLY: train_stage2.py's own L_deriv target is
 
     target_deriv(t) = (z0(t+dt) - z0(t)) / dt
 
@@ -42,6 +42,7 @@ from torch.utils.data import DataLoader
 
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
+from training.losses import centered_deriv_target
 from utils import load_datasets as load
 
 # Same anchor rationale as check_interpolation.py/check_parameter_dependence.py's
@@ -92,13 +93,27 @@ def robust_polynomial_fit(x: np.ndarray, y: np.ndarray, basis_funcs: list,
 
 def check_deriv_temperature(
     stage2_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_passing_steps: int | None = None, deriv_target_centered: bool = False,
     device: str | None = None,
 ) -> dict:
     """
-    Measures z1(t) - target_deriv(t), target_deriv = (z0(t+dt)-z0(t))/dt
-    -- EXACTLY train_stage2's own L_deriv target (see train_ae.py) --
-    per window, then fits eps/dt + eps' (see this module's own
-    docstring) for ALL DATA, T<0.9, and T>=0.9 separately.
+    Measures z1(t) - target_deriv(t), per window, then fits eps/dt +
+    eps' (see this module's own docstring) for ALL DATA, T<0.9, and
+    T>=0.9 separately.
+
+    deriv_target_centered (default False): target_deriv(t) =
+    (z0(t+dt)-z0(t))/dt -- EXACTLY train_stage2.py's own one-sided
+    L_deriv target when this stage-2 checkpoint was trained without
+    its own deriv_target_centered=True. If True instead, uses the
+    second-order-accurate centered target from a (t-dt_minus, t,
+    t+dt_plus) window -- see centered_deriv_target's own docstring
+    (losses.py) for the derivation. Comparing eps/eps' between the two
+    modes on the SAME checkpoint is a direct attribution test: eps'
+    (the dt-independent term) collapsing under the centered target
+    would confirm it was mostly z0's O(dt) truncation bias, not a
+    genuine z1 modelling limitation; eps (the 1/dt term) is not
+    expected to move much either way, since the centered target isn't
+    designed to address it.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     ae, encoder, checkpoint, stream_configs, recon_stream_name = build_ae_from_checkpoint(
@@ -120,11 +135,18 @@ def check_deriv_temperature(
     # pass, with the SAME bounded-memory streaming/parallel-read
     # machinery MicrostructureEvolutionDataset already has (see its own
     # docstring) -- reused here rather than a bespoke encode loop.
+    # window_length=3 (not 2) under deriv_target_centered -- same
+    # reasoning as train_stage2.py's own switch: gives (before, middle,
+    # after) triples, and MicrostructureEvolutionDataset's own window
+    # index construction already only yields these for interior kept
+    # steps, no separate edge-case filtering needed here either.
     dataset = MicrostructureEvolutionDataset(
-        test_dirs, encoder=encoder, device=device, window_length=2,
-        min_step=min_step or 0, min_stdev_phi=min_stdev_phi, encode_both_streams=True,
+        test_dirs, encoder=encoder, device=device, window_length=3 if deriv_target_centered else 2,
+        min_step=min_step or 0, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+        encode_both_streams=True,
     )
-    print(f"Evaluating {len(dataset)} (t, t+dt) windows...")
+    print(f"Evaluating {len(dataset)} "
+          f"{'(t-dt_minus, t, t+dt_plus)' if deriv_target_centered else '(t, t+dt)'} windows...")
 
     loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=0)
     dts, temperatures, residuals_signed = [], [], []
@@ -138,15 +160,33 @@ def check_deriv_temperature(
             window_deriv = window_deriv.to(device)
             dt_window = dt_window.to(device)
 
-            z0_t = window[:, 0]
-            z0_next = window[:, 1]
-            z1_t = window_deriv[:, 0]
-            dt = dt_window[:, 0]
+            if deriv_target_centered:
+                z0_before, z0_t, z0_after = window[:, 0], window[:, 1], window[:, 2]
+                # z1's own frame is the MIDDLE one here (window_deriv[:,1]),
+                # not window_deriv[:,0] -- z1(t) is compared against a
+                # target built AROUND t, so it must be z1 evaluated AT t,
+                # matching train_stage2.py's own step() (there too, z1_t
+                # comes from x_t = the middle frame under this same mode).
+                z1_t = window_deriv[:, 1]
+                dt_minus = dt_window[:, 0]
+                dt_plus = dt_window[:, 1]
+                target_deriv = centered_deriv_target(
+                    z0_before, z0_t, z0_after,
+                    dt_minus.view(-1, 1, 1, 1), dt_plus.view(-1, 1, 1, 1),
+                )
+                # dt_minus+dt_plus (the TOTAL span this target draws on)
+                # for the eps/dt fit below -- same convention as
+                # train_stage2.py's own dt_for_weighting.
+                dt = dt_minus + dt_plus
+            else:
+                z0_t = window[:, 0]
+                z0_next = window[:, 1]
+                z1_t = window_deriv[:, 0]
+                dt = dt_window[:, 0]
+                # EXACT match to train_stage2's own one-sided L_deriv
+                # target -- see this module's own docstring.
+                target_deriv = (z0_next - z0_t) / dt.view(-1, 1, 1, 1)
 
-            # EXACT match to train_stage2's own L_deriv target -- see
-            # this module's own docstring.
-            dt_r = dt.view(-1, 1, 1, 1)
-            target_deriv = (z0_next - z0_t) / dt_r
             residual = (z1_t - target_deriv).flatten(start_dim=1).mean(dim=1)  # (B,) signed, per-window
 
             residuals_signed.extend(residual.cpu().tolist())
@@ -197,13 +237,19 @@ def main():
     parser.add_argument("--stage2-checkpoint", type=Path, required=True)
     parser.add_argument("--min-step", type=int, default=None)
     parser.add_argument("--min-stdev-phi", type=float, default=None)
+    parser.add_argument("--min-passing-steps", type=int, default=None)
+    parser.add_argument("--deriv-target-centered", action="store_true",
+                         help="Use the second-order-accurate centered L_deriv target "
+                              "instead of the default one-sided one -- see this module's "
+                              "own docstring and check_deriv_temperature's own docstring.")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     check_deriv_temperature(
         stage2_checkpoint_path=args.stage2_checkpoint, min_step=args.min_step,
-        min_stdev_phi=args.min_stdev_phi, device=args.device,
+        min_stdev_phi=args.min_stdev_phi, min_passing_steps=args.min_passing_steps,
+        deriv_target_centered=args.deriv_target_centered, device=args.device,
     )
 
 

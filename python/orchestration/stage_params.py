@@ -5,6 +5,8 @@ main.py during its split into orchestration/.
 """
 import inspect
 import re
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 
@@ -116,6 +118,20 @@ def _convert_value(value: str):
 # different reason.
 _LIST_VALUED_KEYS = {"stat_names"}
 
+# Keys that must NEVER be picked up as a global default, even though
+# _prepare_stage_kwargs's own merge is otherwise deliberately
+# unscoped (see its own docstring for that general rationale).
+# resume_from's own MEANING is always stage-specific -- train_stage1's
+# own resume_from means "restart this exact stage from a crash";
+# train_stage2's own means "which ancestor to extend"; train_lds's own
+# means "which prior stage-3 curriculum phase to continue" -- so a
+# single global value is never actually "the same ancestry" for a
+# different stage, unlike e.g. num_workers/device/seed, which
+# genuinely mean the same thing everywhere. A STAGE'S OWN section
+# setting resume_from directly is unaffected by this and still works
+# exactly as documented -- this only blocks the GLOBAL-default path.
+_NEVER_GLOBAL_DEFAULT_KEYS = {"resume_from"}
+
 
 def _prepare_stage_kwargs(raw_params: dict[str, str], global_params: dict[str, str] | None = None) -> dict:
     """
@@ -134,9 +150,14 @@ def _prepare_stage_kwargs(raw_params: dict[str, str], global_params: dict[str, s
     plain dict merge, not scoped to any particular set of keys: any
     global key applies to any stage that happens to accept a parameter
     by that name (see _strip_unrecognized_params for what happens to
-    ones that don't).
+    ones that don't) -- EXCEPT _NEVER_GLOBAL_DEFAULT_KEYS (see its own
+    comment above), which are dropped from global_params before the
+    merge, regardless of whether this specific stage would otherwise
+    have accepted them.
     """
-    merged = {**(global_params or {}), **raw_params}
+    global_params = {k: v for k, v in (global_params or {}).items()
+                      if k not in _NEVER_GLOBAL_DEFAULT_KEYS}
+    merged = {**global_params, **raw_params}
     kwargs = {}
     for key, value in merged.items():
         renamed_key = _KEY_RENAMES.get(key, key)
@@ -162,3 +183,104 @@ def _strip_unrecognized_params(func, kwargs: dict, label: str) -> dict:
         print(f"WARNING: {label} has parameter(s) not recognized by its training "
               f"function -- IGNORED, not used: {sorted(unrecognized)}")
     return {k: v for k, v in kwargs.items() if k in accepted}
+
+
+def _resolve_stage_specific_ancestor(kwargs: dict, default, label: str,
+                                      key: str = "resume_from"):
+    """
+    Returns (kwargs_without_key, resolved_value, was_overridden):
+    `default` (the pipeline's own, normally-correct ancestor for this
+    stage) unless `key` is present in kwargs, in which case THAT value
+    overrides it, with a clear print explaining the override.
+    was_overridden distinguishes the two cases explicitly (rather than
+    a caller comparing resolved_value != default itself, which would
+    misfire in the unlikely case an override happens to equal the
+    default) -- used by callers that need to back up an about-to-be-
+    overwritten file ONLY in the explicit-override case (see
+    _backup_before_overwrite's own docstring), never for the normal,
+    automatic stage-chaining case, where the output path and the
+    ancestor are two different files by construction.
+
+    A value here did NOT come from a typo (that's
+    _strip_unrecognized_params's own job) or a global-section leak
+    (that's already excluded before this point -- see
+    _NEVER_GLOBAL_DEFAULT_KEYS and _prepare_stage_kwargs's own
+    docstring): reaching here means it was set explicitly, under THIS
+    stage's own section. That's a legitimate, intentional choice to
+    honor, not discard -- e.g. train_stage2's own deriv_target_centered
+    curriculum is BUILT around resuming from an already-trained stage-2
+    checkpoint (see train_stage2's own docstring), which requires
+    exactly this: a stage-2-section resume_from pointing at a prior
+    stage-2 checkpoint instead of the pipeline's own default (stage 1's
+    checkpoint).
+
+    Exists as a named function (not inlined at each call site) because
+    train_stage2/train_lds/train_refinement all happen to share this
+    SAME parameter name for DIFFERENT roles (train_stage2's own
+    resume_from means "which ancestor to extend"; train_lds's own means
+    "which PRIOR stage-3 curriculum phase to continue") -- each call
+    site already passes its own correct default explicitly; this only
+    ever substitutes an explicit, same-stage override for that default,
+    never invents a value the underlying function wouldn't otherwise
+    have been given.
+    """
+    if key not in kwargs:
+        return kwargs, default, False
+    override = Path(kwargs[key])
+    print(f"NOTE: {label} has its own '{key}' set explicitly -- using it "
+          f"({override}) INSTEAD of the pipeline's own default ancestor for this stage.")
+    return {k: v for k, v in kwargs.items() if k != key}, override, True
+
+
+def _backup_before_overwrite(path: Path) -> None:
+    """
+    If `path` already exists, copies it to `<stem>-<timestamp><suffix>`
+    in the same directory, before whatever runs next overwrites it in
+    place. Timestamp format matches this project's own snapshot/log
+    naming convention elsewhere: YYYYMMDD_HHhMM -- taken from `path`'s
+    own last-modified time, NOT the current time: this name is meant
+    to answer "when was THIS checkpoint/log actually produced", not
+    "when did we happen to archive it" (those can easily differ by
+    hours if the pipeline sits queued, or differ across the .pt and
+    its own .log if one gets written slightly after the other).
+
+    Using the source's own mtime (rather than "now") also means the
+    resulting backup path is DETERMINISTIC for an unchanged source
+    file -- so if `path` hasn't actually changed since the last backup
+    (e.g. the pipeline is invoked again before this stage would even
+    rerun, or resolve_checkpoint finds a cache hit on a LATER stage
+    but this one's own backup already ran earlier in the same
+    invocation), the backup already exists at that exact name, and
+    this returns without copying again rather than leaving redundant,
+    byte-identical archives at different timestamps.
+
+    Only meant to be called when resume_from is an EXPLICIT, stage-
+    specific override (see _resolve_stage_specific_ancestor's own
+    was_overridden return value) -- NOT for the normal, automatic
+    stage-chaining resume_from (stage 1 -> stage 2, 3a -> 3b, etc.),
+    where the output path and the ancestor are two DIFFERENT files by
+    construction, so there is no overwrite risk to protect against in
+    the first place; backing up on every ordinary run would just leave
+    a growing pile of redundant copies nobody asked for.
+
+    The real risk this protects against: resuming a checkpoint at the
+    SAME path this run's own output (or its .log) will be written to
+    -- e.g. continuing an already-trained stage-2 checkpoint's own
+    deriv_target_centered curriculum in place, which force=True would
+    otherwise silently overwrite mid-run, with NOTHING left of the
+    original if anything goes wrong partway through -- the log file
+    especially, since _log_to_file's own open(log_path, "w") truncates
+    it immediately, before training even starts, regardless of whether
+    the run succeeds.
+    """
+    if not path.exists():
+        return
+    timestamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y%m%d_%Hh%M")
+    backup_path = path.with_name(f"{path.stem}-{timestamp}{path.suffix}")
+    if backup_path.exists():
+        print(f"NOTE: {path} is already archived at {backup_path} (unchanged since -- "
+              f"same mtime) -- not re-copying.")
+        return
+    shutil.copy2(path, backup_path)
+    print(f"NOTE: backed up {path} -> {backup_path} before this run's own output "
+          f"(force=True) overwrites it in place.")

@@ -32,7 +32,7 @@ from models.latent_streams import (
     LatentStreamMode, cross_check_stream_configs_against_state_dict,
     resolve_stream_configs_from_checkpoint_config,
 )
-from training.checkpoint_criterion import CheckpointCriterionTracker
+from training.checkpoint_criterion import CheckpointCriterionTracker, atomic_torch_save
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss, compute_dt_decade_weights
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
@@ -837,7 +837,7 @@ def train_lds(
 
         if saved_this_epoch:
             epochs_since_improvement = 0
-            torch.save({
+            atomic_torch_save({
                 "model_state": f_theta.state_dict(),
                 "epoch": epoch,
                 "val_loss": val_loss,

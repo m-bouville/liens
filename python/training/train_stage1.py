@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from models.autoencoder import Autoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_streams import DEFAULT_STREAM_NAME, LatentStreamMode
-from training.checkpoint_criterion import CheckpointCriterionTracker
+from training.checkpoint_criterion import CheckpointCriterionTracker, atomic_torch_save
 from training.datasets import MicrostructureSnapshotDataset, complete_run_dirs, split_run_dirs
 from training.losses import ReconLoss, StatsLoss
 from training.stats_head import StatsHead
@@ -471,7 +471,7 @@ def train_autoencoder(
                     "stats_std": stats_loss_fn.std.cpu() if stats_loss_fn is not None else None,
                 } if include_stats else None,
             }
-            torch.save(checkpoint, checkpoint_path)
+            atomic_torch_save(checkpoint, checkpoint_path)
             msg += "  -> saved"
             if on_checkpoint_saved is not None:
                 on_checkpoint_saved(checkpoint_path, epoch)

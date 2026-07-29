@@ -23,10 +23,10 @@ from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import cross_check_stream_configs_against_state_dict, \
                                    resolve_stream_configs_from_checkpoint_config
-from training.checkpoint_criterion import CheckpointCriterionTracker
+from training.checkpoint_criterion import CheckpointCriterionTracker, atomic_torch_save
 from training.extend_encoder import extend_state_checkpoint_with_deriv_stream
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
-from training.losses import ReconLoss, StatsLoss
+from training.losses import ReconLoss, StatsLoss, centered_deriv_target, dt_weighted_deriv_loss
 from training.stats_head import StatsHead
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
@@ -49,6 +49,7 @@ def train_stage2(
     base_path: Path, resume_from: Path,
     deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats0_weight: float = 0.0,
     stats1_weight: float = 0.0, z0_from_deriv_weight: float = 0.0,
+    deriv_dt_weight_exponent: float = 0.0, deriv_target_centered: bool = False,
     recon0_scale: float = 1.0,
     stats0_scale: float = 1.0, stats1_scale: float = 1.0, deriv_scale: float = 1.0,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
@@ -249,6 +250,46 @@ def train_stage2(
     shock could genuinely destabilize a z0 that Stage 1's own training
     already spent real time getting right.
 
+    deriv_dt_weight_exponent (default 0.0): see dt_weighted_deriv_loss's
+    own docstring (losses.py) for the mechanism. 0.0 (default)
+    reproduces today's plain, uniform-weight L_deriv exactly.
+
+    CORRECTION to this parameter's own original motivation: it was
+    first added believing z1, having no dt input, was forced to
+    compromise across MANY different dt values seen by the SAME frame.
+    That's wrong -- MicrostructureEvolutionDataset's own sliding-window
+    construction gives each frame exactly ONE window and hence ONE dt,
+    so there is no such per-frame conflict. What IS real, and worth
+    testing instead: L_deriv's one-sided target has an O(dt) truncation
+    bias (see deriv_target_centered below, which fixes this directly
+    and is likely the better lever) and dt varies systematically with
+    a frame's OWN coarsening state across the dataset (see dz0dt.png's
+    "vs t" panels), which is a real, if different, dt-correlated
+    effect. Left in place as an orthogonal knob, but the evidence
+    motivating it needs re-establishing before trusting a nonzero
+    value here -- see check_deriv_temperature.py's own eps/eps' split
+    for how to check what's actually driving any given dt-dependence
+    before reaching for this parameter specifically.
+
+    deriv_target_centered (default False): builds L_deriv's own target
+    from a THREE-frame (t-dt_minus, t, t+dt_plus) window instead of
+    today's two-frame, one-sided (t, t+dt) one -- see
+    centered_deriv_target's own docstring (losses.py) for the full
+    derivation. This is the FIX for the O(dt) truncation bias just
+    described: the one-sided target is only first-order accurate in
+    dt, and check_deriv_temperature.py's own eps' term (a real,
+    dt-independent bias, not just noise -- see its own >40 sigma
+    significance on real 64x64 data) is exactly what that bias looks
+    like once measured. The centered target is second-order accurate
+    instead, WITHOUT assuming even spacing (this project's own
+    save_steps schedules are not uniform). Changes window_length from
+    2 to 3 for both train_set and val_set -- a strictly larger, not
+    filtered-differently, set of interior windows (a run's own first
+    and last kept step still can't have both neighbors, so those
+    windows drop out, same as MicrostructureTripletDataset's own,
+    already-existing window_length=3-equivalent construction already
+    does for check_interpolation.py).
+
     on_checkpoint_saved: see train_autoencoder(). log_every_epoch: see
     train_autoencoder() -- same behavior here.
 
@@ -300,6 +341,16 @@ def train_stage2(
     stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
         stream_configs, recon_stream_name, prev["model_state"],
     )
+
+    # Captured BEFORE the branch below (which reassigns stream_configs
+    # in both cases, so by the time either branch finishes this can no
+    # longer be told apart from stream_configs alone) -- needed by
+    # deriv_target_centered's own epoch-scheduling logic further down,
+    # to tell a genuinely-fresh stage-1a ancestor (whose own "epoch" is
+    # STAGE 1's, unrelated to any stage-2 progress at all) apart from
+    # resuming a PRIOR stage-2 run (whose own "epoch" says exactly how
+    # far that prior run got).
+    resumed_from_stage2 = len(stream_configs) > 1
 
     if len(stream_configs) == 1:
         # A Stage 1a (single-stream, state-only) ancestor -- the deriv
@@ -501,6 +552,40 @@ def train_stage2(
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
 
+    # deriv_target_centered's own epoch schedule: conflated with
+    # deriv_weight_warmup_epochs deliberately, not a separate knob --
+    # while L_deriv's own gradient is still ramping up (a transient
+    # shock to the shared trunk is exactly what the ramp exists to
+    # avoid), there's little reason to also pay for the more accurate,
+    # more expensive target; once the ramp completes and L_deriv is at
+    # full strength, that's exactly when using the better target
+    # starts to matter. deriv_switch_epoch mirrors
+    # effective_deriv_weight's own ramp-completion point EXACTLY (see
+    # that formula below): deriv_weight_warmup_epochs itself if
+    # positive, else 1 (immediately, matching "no ramp" meaning "full
+    # weight from epoch 1" there too).
+    #
+    # prior_stage2_epochs: 0 for a fresh run OR one resuming a stage-1a
+    # ancestor (see resumed_from_stage2 above); a PRIOR stage-2 run's
+    # own saved epoch otherwise -- this is what lets resuming an
+    # already-fully-trained stage-2 checkpoint (e.g. one trained for
+    # 226 epochs, deriv_target_centered=False throughout) start
+    # DIRECTLY in the centered phase from this run's own epoch 1,
+    # rather than re-running a now-pointless warmup: 226 +
+    # (whatever this run's own epoch 1 is) is already far past any
+    # reasonable deriv_weight_warmup_epochs.
+    deriv_switch_epoch = (
+        (deriv_weight_warmup_epochs if deriv_weight_warmup_epochs > 0 else 1)
+        if deriv_target_centered else None
+    )
+    prior_stage2_epochs = prev["epoch"] if resumed_from_stage2 else 0
+    if deriv_target_centered:
+        already_past_switch = prior_stage2_epochs + 1 >= deriv_switch_epoch
+        print(f"deriv_target_centered=True: switching to the centered L_deriv target at "
+              f"epoch {deriv_switch_epoch} of this run's own numbering "
+              f"(prior_stage2_epochs={prior_stage2_epochs}, so this run "
+              f"{'starts already past that point -- centered from epoch 1' if already_past_switch else f'spends its first {min(deriv_switch_epoch - prior_stage2_epochs - 1, epochs)} epoch(s) in the cheaper, one-sided phase'}).")
+
     run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
         raise ValueError(f"No complete runs found under {base_path}/{size}x{size} -- "
@@ -514,23 +599,31 @@ def train_stage2(
         # below), so train_set/train_loader would never be touched --
         # skipped entirely, same rationale as Stage 1a/1b's own fix.
         train_set = train_loader = None
-        val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None, window_length=2,
+        val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None,
+                                                  window_length=3 if deriv_target_centered else 2,
+                                                  stats_frame_index=1 if deriv_target_centered else 0,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
                                                   min_passing_steps=min_passing_steps)
         print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
-              f"{len(val_set)} val consecutive-pair windows")
+              f"{len(val_set)} val "
+              f"{'centered (t-dt_minus, t, t+dt_plus)' if deriv_target_centered else 'consecutive-pair'} windows")
     else:
-        train_set = MicrostructureEvolutionDataset(train_dirs, encoder=None, window_length=2,
+        train_set = MicrostructureEvolutionDataset(train_dirs, encoder=None,
+                                                    window_length=3 if deriv_target_centered else 2,
+                                                    stats_frame_index=1 if deriv_target_centered else 0,
                                                     stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                     min_step=min_step, min_stdev_phi=min_stdev_phi,
                                                     min_passing_steps=min_passing_steps,
                                                     augment=augment)
-        val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None, window_length=2,
+        val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None,
+                                                  window_length=3 if deriv_target_centered else 2,
+                                                  stats_frame_index=1 if deriv_target_centered else 0,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
                                                   min_passing_steps=min_passing_steps)
-        print(f"{len(train_set)} train / {len(val_set)} val consecutive-pair windows")
+        print(f"{len(train_set)} train / {len(val_set)} val "
+              f"{'centered (t-dt_minus, t, t+dt_plus)' if deriv_target_centered else 'consecutive-pair'} windows")
         train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
                                    persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
@@ -585,16 +678,44 @@ def train_stage2(
         params += [p for p in stats_head1.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(params, lr=lr)
 
-    def step(batch, train: bool, deriv_weight_used: float):
+    def step(batch, train: bool, deriv_weight_used: float, use_centered: bool = False):
         window, dt_window, theta, true_stats = batch
         window = window.to(device, non_blocking=True)
         dt_window = dt_window.to(device, non_blocking=True)
         theta = theta.to(device, non_blocking=True)
         true_stats = true_stats.to(device, non_blocking=True)
 
-        x_t = window[:, 0]
-        x_next = window[:, 1]
-        dt = dt_window[:, 0].view(-1, 1, 1, 1)
+        if deriv_target_centered and use_centered:
+            # window_length=3: (t-dt_minus, t, t+dt_plus). z1 -- and
+            # everything else in this step (recon, stats, stats1) --
+            # is still evaluated at the SAME frame as the other cases
+            # below: the one z1 itself encodes. Here that's the MIDDLE
+            # frame, not window[:, 0] -- x_before/x_after exist ONLY to
+            # build target_deriv below, and contribute no gradient of
+            # their own to recon/stats/stats1 at all.
+            x_before, x_t, x_after = window[:, 0], window[:, 1], window[:, 2]
+            dt_minus = dt_window[:, 0].view(-1, 1, 1, 1)
+            dt_plus = dt_window[:, 1].view(-1, 1, 1, 1)
+        elif deriv_target_centered:
+            # Cheap phase (use_centered=False, only possible when
+            # deriv_target_centered=True -- see deriv_switch_epoch's
+            # own comment above): the SAME window_length=3 dataset as
+            # the centered case, but x_before/dt_minus are simply never
+            # touched -- 2 encodes here (x_t, x_after), not 3, exactly
+            # matching the OLD one-sided cost. x_t is STILL window[:,1]
+            # (the middle frame), NOT window[:,0] -- deliberately kept
+            # identical to the centered case above, so stats_frame_index=1
+            # (see the dataset construction above) stays correct
+            # regardless of which phase is active THIS epoch, rather
+            # than needing two different dataset configurations for one
+            # run.
+            x_t = window[:, 1]
+            x_next = window[:, 2]
+            dt = dt_window[:, 1].view(-1, 1, 1, 1)
+        else:
+            x_t = window[:, 0]
+            x_next = window[:, 1]
+            dt = dt_window[:, 0].view(-1, 1, 1, 1)
 
         # theta (temperature, centered at T0) now actually used -- see
         # Encoder's own docstring for why the deriv stream specifically
@@ -677,23 +798,56 @@ def train_stage2(
         # but its gradient w.r.t. x is exactly `weight`, not the full
         # 1.0 an un-detached x would give -- a genuinely controllable
         # dial, not just an on/off switch.
-        if z0_from_deriv_weight > 0:
+        if deriv_target_centered and use_centered:
+            if z0_from_deriv_weight > 0:
+                z0_before = ae.encoders["shared"](x_before, theta=theta)[recon_stream_name]
+                z0_after = ae.encoders["shared"](x_after, theta=theta)[recon_stream_name]
+                z0_before_for_deriv = z0_before.detach() + z0_from_deriv_weight * (z0_before - z0_before.detach())
+                z0_after_for_deriv = z0_after.detach() + z0_from_deriv_weight * (z0_after - z0_after.detach())
+                z0_t_for_deriv = z0_t.detach() + z0_from_deriv_weight * (z0_t - z0_t.detach())
+            else:
+                with torch.no_grad():
+                    z0_before = ae.encoders["shared"](x_before, theta=theta)[recon_stream_name]
+                    z0_after = ae.encoders["shared"](x_after, theta=theta)[recon_stream_name]
+                z0_before_for_deriv = z0_before
+                z0_after_for_deriv = z0_after
+                z0_t_for_deriv = z0_t.detach()
+            # See centered_deriv_target's own docstring (losses.py) for
+            # the full derivation -- second-order accurate even under
+            # the UNEVEN spacing this project's own save_steps
+            # schedules actually have, unlike a plain symmetric
+            # (z0_after-z0_before)/(dt_minus+dt_plus) which silently
+            # assumes dt_minus == dt_plus.
+            target_deriv = centered_deriv_target(z0_before_for_deriv, z0_t_for_deriv, z0_after_for_deriv,
+                                                  dt_minus, dt_plus)
+            # dt_minus+dt_plus (the TOTAL span this target draws on),
+            # not either half alone -- dt_weighted_deriv_loss's own
+            # weighting is about how much a WINDOW should count
+            # relative to others, and this window's real extent in
+            # time is the full span, matching how the non-centered
+            # path's own dt already means exactly that (there, the
+            # window's only span IS the one gap).
+            dt_for_weighting = dt_minus + dt_plus
+        else:
             # theta passed even though only the state stream's output is
             # kept below -- Encoder.forward computes EVERY stream in one
             # pass internally (see its own docstring), so it still needs
             # theta if ANY of its streams (deriv, here) requires it,
             # regardless of which single stream this particular call
             # site goes on to use.
-            z0_next = ae.encoders["shared"](x_next, theta=theta)[recon_stream_name]
-            z0_next_for_deriv = z0_next.detach() + z0_from_deriv_weight * (z0_next - z0_next.detach())
-            z0_t_for_deriv = z0_t.detach() + z0_from_deriv_weight * (z0_t - z0_t.detach())
-        else:
-            with torch.no_grad():
+            if z0_from_deriv_weight > 0:
                 z0_next = ae.encoders["shared"](x_next, theta=theta)[recon_stream_name]
-            z0_next_for_deriv = z0_next
-            z0_t_for_deriv = z0_t.detach()
-        target_deriv = (z0_next_for_deriv - z0_t_for_deriv) / dt
-        deriv_loss = recon_loss(z1_t, target_deriv)
+                z0_next_for_deriv = z0_next.detach() + z0_from_deriv_weight * (z0_next - z0_next.detach())
+                z0_t_for_deriv = z0_t.detach() + z0_from_deriv_weight * (z0_t - z0_t.detach())
+            else:
+                with torch.no_grad():
+                    z0_next = ae.encoders["shared"](x_next, theta=theta)[recon_stream_name]
+                z0_next_for_deriv = z0_next
+                z0_t_for_deriv = z0_t.detach()
+            target_deriv = (z0_next_for_deriv - z0_t_for_deriv) / dt
+            dt_for_weighting = dt
+        deriv_loss = dt_weighted_deriv_loss(recon_loss, z1_t, target_deriv, dt_for_weighting,
+                                             deriv_dt_weight_exponent)
 
         total = (recon / recon0_scale
                  + stats0_weight * stats_loss_val / stats0_scale
@@ -744,9 +898,91 @@ def train_stage2(
           f"{' (anchor active)' if stats_head1 is not None and stats1_weight > 0 else ' (inactive)'}"
           f", augment={augment}"
           f", z0_from_deriv_weight={z0_from_deriv_weight}"
-          f"{' (WARNING: nonzero -- z0 can now be shaped by L_deriv, not just L_recon)' if z0_from_deriv_weight > 0 else ''}")
+          f"{' (WARNING: nonzero -- z0 can now be shaped by L_deriv, not just L_recon)' if z0_from_deriv_weight > 0 else ''}"
+          f", deriv_dt_weight_exponent={deriv_dt_weight_exponent}"
+          f"{' (favoring small-dt windows in L_deriv)' if deriv_dt_weight_exponent > 0 else ''}"
+          f", deriv_target_centered={deriv_target_centered}"
+          f"{' (second-order accurate L_deriv target, window_length=3)' if deriv_target_centered else ''}")
     formula = " ".join(f"+{w}*{lbl}/{s}" for w, lbl, s in active_terms)
     print(f"/{epochs:3d} train = recon0/{recon0_scale} {formula} | valid = ...  | ema")
+
+    _prev_use_centered = False  # see just_switched's own comment inside the loop below
+
+    if epochs > 0:
+        # RNG state saved/restored around this ENTIRE block -- confirmed
+        # directly (via a real A/B run) that without this, the reference
+        # evaluation's own forward passes shift torch's global RNG state
+        # enough to change train_loader's own shuffle order at epoch 1
+        # (shuffle=True), silently changing the actual training
+        # trajectory depending on whether this purely-diagnostic
+        # reference row is present at all -- exactly the kind of
+        # behavior-changing side effect a "just for reference, printed
+        # only" feature must never have.
+        _rng_state = torch.get_rng_state()
+        _cuda_rng_state = torch.cuda.get_rng_state() if device.type == "cuda" else None
+        # epoch-0 reference: how does the model resume_from actually
+        # loaded perform, BEFORE this run's own training touches it at
+        # all -- printed for comparison against epoch 1 onward, same
+        # format, but deliberately NOT a real epoch: never calls
+        # tracker.update, never saves a checkpoint, never touches
+        # epoch_history/the loss curve. If it DID participate in any
+        # of those, it would ALWAYS "win" the very first save (nothing
+        # beats CheckpointCriterionTracker's own starting
+        # best_val_loss=inf), silently saving a checkpoint labeled
+        # "epoch 0" before any real training happened -- and a LATER
+        # resume's own prior_stage2_epochs logic (see
+        # _resolve_stage_specific_ancestor's own docstring) would then
+        # misread that as "this model has had zero epochs of training
+        # since this checkpoint's own ancestor", even if real training
+        # this run then failed to beat it.
+        #
+        # use_centered computed as epoch 1 itself would (not epoch 0)
+        # -- this reference is only a fair "before" snapshot if it's
+        # evaluated under the SAME target definition epoch 1 is about
+        # to optimize against, not whichever phase would apply at
+        # epoch 0 specifically (which can genuinely differ right at a
+        # deriv_target_centered switch boundary).
+        reference_use_centered = bool(deriv_target_centered) and (
+            prior_stage2_epochs + 1 >= deriv_switch_epoch)
+        ae.eval()
+        ref_total_sum = torch.zeros((), device=device)
+        ref_recon_sum = torch.zeros((), device=device)
+        ref_stats_sum = torch.zeros((), device=device)
+        ref_stats1_sum = torch.zeros((), device=device)
+        ref_deriv_sum = torch.zeros((), device=device)
+        n_val = len(val_set)
+        with torch.no_grad():
+            for batch in val_loader:
+                bs = batch[0].size(0)
+                total, recon, stats, stats1, deriv = step(
+                    batch, train=False, deriv_weight_used=deriv_weight,
+                    use_centered=reference_use_centered)
+                ref_total_sum += total * bs
+                ref_recon_sum += recon * bs
+                ref_stats_sum += stats * bs
+                ref_stats1_sum += stats1 * bs
+                ref_deriv_sum += deriv * bs
+        ref_total = (ref_total_sum / n_val).item()
+        ref_recon = (ref_recon_sum / n_val).item()
+        ref_stats = (ref_stats_sum / n_val).item()
+        ref_stats1 = (ref_stats1_sum / n_val).item()
+        ref_deriv = (ref_deriv_sum / n_val).item()
+        ref_term_values = {
+            stats_label: (stats0_weight, stats0_scale, ref_stats),
+            stats1_label: (stats1_weight, stats1_scale, ref_stats1),
+            "deriv": (deriv_weight, deriv_scale, ref_deriv),
+        }
+        ref_terms = " ".join(f"+{w*v/s:7.4f}" for lbl, (w, s, v) in ref_term_values.items()
+                              if any(lbl == l for _, l, _ in active_terms))
+        nan_terms = " ".join(f"+{float('nan'):7.4f}" for lbl, (_, _, _) in ref_term_values.items()
+                              if any(lbl == l for _, l, _ in active_terms))
+        print(f"{'ref':>4}|"
+              f"{float('nan'):7.4f} ={float('nan'):7.4f} {nan_terms} |"
+              f"{ref_total:7.4f} ={ref_recon/recon0_scale:7.4f} {ref_terms} |"
+              f"{'(before this run)':>9}")
+        torch.set_rng_state(_rng_state)
+        if _cuda_rng_state is not None:
+            torch.cuda.set_rng_state(_cuda_rng_state)
 
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         # Linear ramp: 0 at epoch 0 (never reached, epochs are 1-indexed)
@@ -754,9 +990,23 @@ def train_stage2(
         # beyond. deriv_weight_warmup_epochs=0 (opt-out) skips this
         # entirely -- full weight from epoch 1, byte-identical to before
         # this parameter existed.
+        #
+        # ramp_epoch: epoch itself when deriv_target_centered=False --
+        # EVERY existing resume_from use case (unrelated to this
+        # feature) keeps its own long-standing behavior exactly,
+        # including the ramp restarting on resume, unchanged. Only
+        # when deriv_target_centered=True does this become
+        # prior_stage2_epochs-aware, so the weight ramp and
+        # use_centered_this_epoch's own switch (below) move together --
+        # a run resuming a stage-2 ancestor already well past
+        # deriv_weight_warmup_epochs starts at BOTH full deriv_weight
+        # AND the centered target from its own epoch 1, rather than
+        # re-ramping the weight while use_centered has already jumped
+        # ahead of it.
+        ramp_epoch = (prior_stage2_epochs + epoch) if deriv_target_centered else epoch
         effective_deriv_weight = (
             deriv_weight if deriv_weight_warmup_epochs <= 0
-            else deriv_weight * min(1.0, epoch / deriv_weight_warmup_epochs)
+            else deriv_weight * min(1.0, ramp_epoch / deriv_weight_warmup_epochs)
         )
         # val_deriv_weight is NEVER ramped, unlike effective_deriv_weight
         # above -- the ramp's own purpose (see deriv_weight_warmup_epochs'
@@ -774,6 +1024,30 @@ def train_stage2(
         # which this avoids by never letting the comparison target drift
         # in the first place.
         val_deriv_weight = deriv_weight
+
+        # use_centered_this_epoch: see deriv_switch_epoch's own comment
+        # above for the full schedule. False for every epoch when
+        # deriv_target_centered=False (step()'s own "and use_centered"
+        # checks then never matter, but keeping this explicit rather
+        # than None avoids a separate falsy-vs-None branch everywhere
+        # else below).
+        use_centered_this_epoch = bool(deriv_target_centered) and (
+            prior_stage2_epochs + epoch >= deriv_switch_epoch)
+        # just_switched: True on the FIRST epoch this run itself
+        # transitions from the cheap to the centered phase (not true
+        # for a run that starts ALREADY past the switch point --
+        # tracker.best_val_loss already starts at its own fresh
+        # float("inf") every call, per CheckpointCriterionTracker's own
+        # construction below, so a run that's centered from epoch 1 has
+        # nothing stale to reset in the first place).
+        just_switched = use_centered_this_epoch and not _prev_use_centered
+        _prev_use_centered = use_centered_this_epoch
+        if just_switched:
+            print(f"  [epoch {epoch}: switching to the centered L_deriv target now -- "
+                  f"resetting best_val_loss/EMA, since val_loss computed under the OLD "
+                  f"target isn't a fair bar for the NEW target's own val_loss to clear]")
+            tracker.best_val_loss = float("inf")
+            tracker.val_ema = None
 
         ae.train()
         # stats_head stays in eval mode always -- frozen, never trained
@@ -802,7 +1076,8 @@ def train_stage2(
             for batch in train_loader:
                 bs = batch[0].size(0)
                 total, recon, stats, stats1, deriv = step(
-                    batch, train=True, deriv_weight_used=effective_deriv_weight)
+                    batch, train=True, deriv_weight_used=effective_deriv_weight,
+                    use_centered=use_centered_this_epoch)
                 train_total_sum += total * bs
                 train_recon_sum += recon * bs
                 train_stats_sum += stats * bs
@@ -830,7 +1105,8 @@ def train_stage2(
             for batch in val_loader:
                 bs = batch[0].size(0)
                 total, recon, stats, stats1, deriv = step(
-                    batch, train=False, deriv_weight_used=val_deriv_weight)
+                    batch, train=False, deriv_weight_used=val_deriv_weight,
+                    use_centered=use_centered_this_epoch)
                 val_total_sum += total * bs
                 val_recon_sum += recon * bs
                 val_stats_sum += stats * bs
@@ -886,7 +1162,7 @@ def train_stage2(
 
         if saved_this_epoch:
             epochs_since_improvement = 0
-            torch.save({
+            atomic_torch_save({
                 "model_state": ae.state_dict(),
                 "stats_head_state": stats_head.state_dict(),
                 "stats_head1_state": stats_head1.state_dict() if stats_head1 is not None else None,
@@ -910,6 +1186,10 @@ def train_stage2(
                 "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
                 "stage2_config": {"deriv_weight": deriv_weight,
                                    "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
+                                   "deriv_dt_weight_exponent": deriv_dt_weight_exponent,
+                                   "deriv_target_centered": deriv_target_centered,
+                                   "deriv_switch_epoch": deriv_switch_epoch,
+                                   "use_centered_at_save": use_centered_this_epoch,
                                    "stats0_weight": stats0_weight, "stats1_weight": stats1_weight,
                                    "n_frozen_stages": n_frozen_stages, "resumed_from": str(resume_from)},
             }, checkpoint_path)

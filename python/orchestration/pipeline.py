@@ -21,7 +21,10 @@ from orchestration.checkpoint_registry import (
 )
 from orchestration.logging_utils import _log_to_file
 from orchestration.paths import _PYTHON_ROOT, _STAGE_DIRS
-from orchestration.stage_params import _prepare_stage_kwargs, _strip_unrecognized_params, parse_stage_params
+from orchestration.stage_params import (
+    _backup_before_overwrite, _prepare_stage_kwargs, _resolve_stage_specific_ancestor,
+    _strip_unrecognized_params, parse_stage_params,
+)
 from training.checkpoint_components import split_joint_checkpoint_for_evaluation
 from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2
@@ -184,13 +187,20 @@ def run_from_params_file(params_path: Path, default_base: Path,
     stage2_kwargs = _prepare_stage_kwargs(stages.get(2, {}), global_params)
     force2 = stage2_kwargs.pop("force", False)
     stage2_kwargs = _strip_unrecognized_params(train_stage2, stage2_kwargs, "Stage 2")
+    stage2_kwargs, stage2_resume_from, stage2_overridden = _resolve_stage_specific_ancestor(
+        stage2_kwargs, stage1_checkpoint, "Stage 2")
     # Naming note: registries use a consistent "stageN_checkpoint" ancestry
     # convention across ALL stages, independent of whatever the underlying
     # function calls its own parameter (train_stage2 calls it resume_from,
     # train_lds calls it ae_checkpoint_path) -- so "stage1_checkpoint" means
     # the same thing everywhere you look, in any registry. Stage 2's direct
     # ancestor is stage 1 now (train_stage2 builds the deriv stream itself),
-    # so the signature reflects THAT ancestry.
+    # so the signature reflects THAT ancestry -- UNLESS overridden above (an
+    # explicit Stage-2-section resume_from, e.g. continuing an already-
+    # trained stage-2 checkpoint's own deriv_target_centered curriculum),
+    # in which case the signature reflects the REAL ancestor actually used,
+    # not the pipeline's own unused default -- otherwise two runs built from
+    # genuinely different ancestors could collide on the same cache key.
     #
     # No more "epochs==0: skip, reuse stage 1b's output" special case --
     # that existed because stage 1b, not stage 2, used to be where the
@@ -203,16 +213,30 @@ def run_from_params_file(params_path: Path, default_base: Path,
     # not a no-op.
     signature2 = {"base_path": str(base_path),
                    "stage1_checkpoint": str(stage1_checkpoint),
+                   **({"resumed_from": str(stage2_resume_from)} if stage2_overridden else {}),
                    **extra_signature, **_signature_kwargs(stage2_kwargs)}
     stage2_checkpoint = resolve_checkpoint(2, force2, signature2, stage2_kwargs.get("epochs"))
     if stage2_checkpoint is None:
+        if stage2_overridden:
+            # Only here, not for the ordinary stage1->stage2 default
+            # above -- THAT default is always a different file from
+            # this stage's own output, so nothing is ever at risk of
+            # being silently overwritten in the normal, automatic
+            # flow. An explicit override, though, commonly points at
+            # THIS SAME stage's own prior output (that's the whole
+            # point of deriv_target_centered's own curriculum), which
+            # force=True is about to overwrite in place -- see
+            # _backup_before_overwrite's own docstring for why the
+            # .log file matters here just as much as the .pt one.
+            _backup_before_overwrite(stage_output_path(2))
+            _backup_before_overwrite(stage_output_path(2).with_suffix(".log"))
         with _log_to_file(stage_output_path(2).with_suffix(".log")):
             print("=" * 70)
             print("STAGE 2: latent-space validation (L_deriv fine-tuning)")
             print("=" * 70)
             registry2_path = _STAGE_DIRS[2] / "registry-stage2.csv"
             stage2_checkpoint = train_stage2(
-                base_path=base_path, resume_from=stage1_checkpoint,
+                base_path=base_path, resume_from=stage2_resume_from,
                 checkpoint_path=stage_output_path(2), device=device,
                 loss_curve_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage_output_path(2).stem}-loss_curve.png",
                 on_checkpoint_saved=_make_checkpoint_callback(registry2_path, signature2),
@@ -302,6 +326,8 @@ def run_from_params_file(params_path: Path, default_base: Path,
         kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}), global_params)
         force = kwargs.pop("force", False)
         kwargs = _strip_unrecognized_params(train_lds, kwargs, f"Stage {stage_key}")
+        kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
+            kwargs, resume_from, f"Stage {stage_key}")
         # Default to quiet (only print on save/early-stop), not train_lds()'s
         # own default of every-epoch -- stage 3 commonly runs hundreds of
         # epochs, and setdefault respects an explicit log_every_epoch in
@@ -324,6 +350,14 @@ def run_from_params_file(params_path: Path, default_base: Path,
         checkpoint = resolve_checkpoint(stage_key, force, signature, kwargs.get("epochs"))
         freshly_trained = checkpoint is None
         if checkpoint is None:
+            if overridden:
+                # Only for an EXPLICIT, same-stage override -- not the
+                # normal 3b-resumes-from-3a case (resume_from is not
+                # None there too, but that's always a DIFFERENT file,
+                # 3a's own checkpoint, from 3b's own output, so nothing
+                # is ever at risk of being silently overwritten there).
+                _backup_before_overwrite(stage_output_path(stage_key))
+                _backup_before_overwrite(stage_output_path(stage_key).with_suffix(".log"))
             with _log_to_file(stage_output_path(stage_key).with_suffix(".log")):
                 print("=" * 70)
                 resume_note = f" (resuming from {resume_from})" if resume_from is not None else ""
@@ -454,6 +488,8 @@ def run_from_params_file(params_path: Path, default_base: Path,
         kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}), global_params)
         force = kwargs.pop("force", False)
         kwargs = _strip_unrecognized_params(train_refinement, kwargs, f"Stage {stage_key}")
+        kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
+            kwargs, resume_from, f"Stage {stage_key}")
         if resume_from is not None:
             signature = {"base_path": str(base_path), "resumed_from": str(resume_from),
                           **extra_signature, **_signature_kwargs(kwargs)}
@@ -468,6 +504,13 @@ def run_from_params_file(params_path: Path, default_base: Path,
                           **extra_signature, **_signature_kwargs(kwargs)}
         checkpoint = resolve_checkpoint(stage_key, force, signature, kwargs.get("epochs"))
         if checkpoint is None:
+            if overridden:
+                # Only for an EXPLICIT, same-stage override -- not the
+                # normal stage-5-resumes-from-stage-4 case (resume_from
+                # is not None there too, but that's always stage 4's
+                # own, different checkpoint, not stage 5's own output).
+                _backup_before_overwrite(stage_output_path(stage_key))
+                _backup_before_overwrite(stage_output_path(stage_key).with_suffix(".log"))
             with _log_to_file(stage_output_path(stage_key).with_suffix(".log")):
                 print("=" * 70)
                 label = "encoder refinement" if freeze_decoder else "end-to-end refinement"

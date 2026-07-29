@@ -220,6 +220,54 @@ def test_stat_names_given_returns_4tuple_with_correct_true_stats(tmp_run_dir_wit
         )
 
 
+def test_stats_frame_index_selects_the_right_frame(tmp_run_dir_with_stats):
+    """
+    REGRESSION: true_stats must describe the frame the caller actually
+    ENCODES, which is not always window[0].
+
+    train_stage2.py's deriv_target_centered mode uses window_length=3
+    and encodes the MIDDLE frame (x_t = window[:, 1]) -- x_before/
+    x_after exist only to build L_deriv's own centered target. With the
+    long-standing hardcoded steps[0] lookup, both stats anchors
+    (L_stats0 on z0_t, L_stats1 on z1_t) were silently trained against
+    a DIFFERENT frame's statistics than the frame they predict from --
+    measured, not hypothetical: fixing it improved stats0 ~6x and
+    stats1 ~3x on a real 3-epoch run.
+
+    Checked against the fixture's own distinctive per-step values
+    (stat value = step/1000), so a misalignment by even one frame
+    fails loudly rather than merely looking plausible.
+    """
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+    for frame_index in (0, 1, 2):
+        ds = MicrostructureEvolutionDataset(
+            [run_dir], encoder=None, window_length=3, min_step=0, min_stdev_phi=None,
+            stat_names=stat_names, stats_frame_index=frame_index,
+        )
+        assert len(ds) > 0, "fixture produced no window_length=3 windows to check"
+        for idx in range(len(ds)):
+            _, _, _, true_stats = ds[idx]
+            _, window_steps = ds.window_info(idx)
+            expected_step = window_steps[frame_index]
+            expected = torch.tensor([expected_step / 1000.0] * len(stat_names), dtype=torch.float32)
+            assert torch.allclose(true_stats, expected), (
+                f"stats_frame_index={frame_index}, idx {idx}: true_stats {true_stats} "
+                f"doesn't match frame {frame_index} (step {expected_step}) expected {expected}"
+            )
+
+
+def test_stats_frame_index_out_of_range_raises(tmp_run_dir_with_stats):
+    """An index outside the window is a caller mistake -- caught at
+    construction rather than silently producing an off-by-N target or
+    an obscure IndexError deep inside __getitem__."""
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+    with pytest.raises(ValueError, match="stats_frame_index"):
+        MicrostructureEvolutionDataset(
+            [run_dir], encoder=None, window_length=2, min_step=0, min_stdev_phi=None,
+            stat_names=stat_names, stats_frame_index=2,
+        )
+
+
 def test_stat_names_with_real_encoder_raises(tmp_run_dir_with_stats, fake_encoder):
     """stat_names + a real encoder (cached-latent, stage-3 mode) is
     treated as a caller mistake -- stage 3 never uses L_stats -- and

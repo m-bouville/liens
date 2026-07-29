@@ -9,7 +9,12 @@ warmup-era val_loss could permanently block every future save) that a
 fast, automated test would have caught immediately, but was only found
 via a confusing symptom after a real, hours-long training run.
 """
+import os
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
+
+import torch
 
 
 @dataclass
@@ -60,3 +65,48 @@ class CheckpointCriterionTracker:
         if should_save:
             self.best_val_loss = criterion
         return criterion, should_save
+
+
+def atomic_torch_save(obj, path: Path) -> None:
+    """
+    torch.save(obj, path), but ATOMIC: any process reading `path`
+    concurrently (e.g. a check_*.py diagnostic run against a
+    checkpoint while training is still writing new "best" versions of
+    it, hours into a long run) either sees the complete, PRIOR version
+    of the file, or the complete, NEW version -- never a partially-
+    written one.
+
+    Real failure mode this fixes, reproduced directly (not
+    hypothetical): torch.save's own default behavior writes its zip-
+    format archive progressively, IN PLACE, at the destination path --
+    a concurrent torch.load() landing mid-write sees a truncated
+    archive and raises "PytorchStreamReader failed reading file
+    data/N: file read failed", intermittently, depending on exactly
+    when the read happens to land. Confirmed by directly racing a slow
+    save against a concurrent read in a loop: this reproduces the
+    identical error class within a handful of attempts.
+
+    Achieved by writing to a temp file FIRST, in the SAME DIRECTORY as
+    the real destination (critical: a rename across filesystems is a
+    real copy, not atomic; same-directory guarantees same filesystem),
+    then os.replace()-ing it into place -- os.replace (not os.rename)
+    specifically, since only os.replace is documented as atomic AND
+    guaranteed to overwrite an existing destination on BOTH POSIX and
+    Windows (os.rename's own overwrite behavior on Windows is
+    unspecified/can raise).
+
+    On any failure before the replace completes, the temp file is
+    cleaned up rather than left behind as accumulating garbage in the
+    checkpoints directory -- the ORIGINAL file at `path`, if any, is
+    never touched at all until the very last, atomic step.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        os.close(fd)  # torch.save opens its own handle on the path; the mkstemp one was only to claim a unique name
+        torch.save(obj, tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
