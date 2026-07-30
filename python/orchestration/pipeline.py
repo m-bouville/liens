@@ -34,8 +34,20 @@ from training.train_refinement import train_refinement
 
 
 def run_from_params_file(params_path: Path, default_base: Path,
-                          device: str | None = None) -> Path:
+                          device: str | None = None,
+                          run_sanity_checks: bool = True) -> Path:
     """
+    run_sanity_checks (default True): when False, skips the purely
+    diagnostic post-stage checks (reconstruction, latent-channel
+    activations, interpolation consistency, perturbation response) and
+    the figures they write. They are read-only reporting -- nothing
+    downstream consumes their results -- but on a SHORT pipeline run
+    they dominate the wall time, since each renders matplotlib figures
+    that cost far more than the tiny amount of training being checked.
+    Used by the pipeline tests, which exercise parameter plumbing and
+    stage sequencing rather than model quality. Left True by default so
+    a real run keeps reporting everything it always has.
+
     Runs stages 1->2->3(a/b)->4->5 as specified by a stage-parameters
     file, stopping early and returning whichever checkpoint is the LAST
     one actually produced (stage 1's own if no '# Stage 2' section is
@@ -275,45 +287,51 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print(f"\nStage 2 complete: {stage2_checkpoint}\n")
             _upsert_registry(registry2_path, stage2_checkpoint, signature2)
 
-            print("=" * 70)
-            print("Sanity check: reconstruction quality (stage 2 checkpoint)")
-            print("=" * 70)
-            check_reconstruction(
-                checkpoint_path=stage2_checkpoint, device=device,
-                min_step=stage2_kwargs.get("min_step", 0),
-                min_stdev_phi=stage2_kwargs.get("min_stdev_phi"),
-                output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-reconstruction.png",
-            )
-            print()
+            # All four stage-2 diagnostics gated together: they are pure
+            # read-only reporting (three figures plus console), never feed
+            # anything downstream, and dominate the cost of a short
+            # pipeline run -- see run_sanity_checks in this function's own
+            # docstring.
+            if run_sanity_checks:
+                print("=" * 70)
+                print("Sanity check: reconstruction quality (stage 2 checkpoint)")
+                print("=" * 70)
+                check_reconstruction(
+                    checkpoint_path=stage2_checkpoint, device=device,
+                    min_step=stage2_kwargs.get("min_step", 0),
+                    min_stdev_phi=stage2_kwargs.get("min_stdev_phi"),
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-reconstruction.png",
+                )
+                print()
 
-            print("=" * 70)
-            print("Sanity check: latent channel activations (stage 2 checkpoint)")
-            print("=" * 70)
-            check_latent_channels(
-                ae_checkpoint_path=stage2_checkpoint, device=device,
-                min_step=stage2_kwargs.get("min_step", 0),
-                min_stdev_phi=stage2_kwargs.get("min_stdev_phi"),
-                output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-latent_channels.png",
-            )
-            print()
+                print("=" * 70)
+                print("Sanity check: latent channel activations (stage 2 checkpoint)")
+                print("=" * 70)
+                check_latent_channels(
+                    ae_checkpoint_path=stage2_checkpoint, device=device,
+                    min_step=stage2_kwargs.get("min_step", 0),
+                    min_stdev_phi=stage2_kwargs.get("min_stdev_phi"),
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-latent_channels.png",
+                )
+                print()
 
-            print("=" * 70)
-            print("Sanity check: interpolation consistency (stage 2 checkpoint)")
-            print("=" * 70)
-            check_interpolation(
-                checkpoint_path=stage2_checkpoint, device=device,
-                output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-interpolation.png",
-            )
-            print()
+                print("=" * 70)
+                print("Sanity check: interpolation consistency (stage 2 checkpoint)")
+                print("=" * 70)
+                check_interpolation(
+                    checkpoint_path=stage2_checkpoint, device=device,
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-interpolation.png",
+                )
+                print()
 
-            print("=" * 70)
-            print("Sanity check: perturbation response (stage 2 checkpoint)")
-            print("=" * 70)
-            check_perturbation(
-                checkpoint_path=stage2_checkpoint, device=device,
-                output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-perturbation.png",
-            )
-            print()
+                print("=" * 70)
+                print("Sanity check: perturbation response (stage 2 checkpoint)")
+                print("=" * 70)
+                check_perturbation(
+                    checkpoint_path=stage2_checkpoint, device=device,
+                    output_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage2_checkpoint.stem}-perturbation.png",
+                )
+                print()
 
 
     # ---- Stage 3: LDS -- either single-phase ('# Stage 3') or a

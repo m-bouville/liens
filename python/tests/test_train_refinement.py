@@ -21,6 +21,8 @@ import pandas as pd
 import torch
 import pytest
 
+from conftest import cached_sweep
+
 from models.autoencoder import MultiStreamAutoencoder
 from models.encoder import Encoder
 from models.decoder import Decoder
@@ -68,7 +70,7 @@ def _build_run_dir(sweep_dir: Path, name: str, temperature: float, seed: int) ->
     return run_dir
 
 
-def _build_sweep(tmp_path: Path, n_runs: int = 6) -> Path:
+def _build_sweep_uncached(tmp_path: Path, n_runs: int = 6) -> Path:
     """base_path such that base_path/64x64/ holds n_runs real run
     directories plus the sweep-level metadata.txt complete_run_dirs()
     needs (see utils.load_datasets.read_sweep_metadata)."""
@@ -317,3 +319,18 @@ def test_epochs_zero_actually_writes_a_checkpoint_stage4(tmp_path, isolated_proj
     assert saved["epoch"] == 0
     output = capsys.readouterr().out
     assert "train_set: skipped" in output, "train_set must be skipped entirely at epochs=0"
+
+
+def _build_sweep(tmp_path, *args, **kwargs):
+    """
+    Memoized wrapper around this module's own _build_sweep_uncached --
+    see conftest.cached_sweep for the full rationale and the read-only
+    justification. tmp_path is accepted for call-site compatibility and
+    deliberately IGNORED: the sweep lives in a shared, longer-lived
+    directory so repeated calls with the same arguments reuse one build
+    instead of rewriting the same synthetic snapshots per test. Anything
+    a test WRITES (checkpoints, figures, logs) still goes to its own
+    tmp_path, which this never touches.
+    """
+    return cached_sweep((__name__, args, tuple(sorted(kwargs.items()))),
+                        lambda d: _build_sweep_uncached(d, *args, **kwargs))

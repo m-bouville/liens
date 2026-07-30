@@ -113,3 +113,68 @@ def test_scripts_that_define_output_paths_have_the_anchor():
         "these files reference checkpoints/output paths but never define or "
         "import _PYTHON_ROOT:\n  " + "\n  ".join(missing)
     )
+
+
+def test_cached_sweeps_live_under_pytest_basetemp_not_an_uncleaned_tempdir(tmp_path):
+    """
+    REGRESSION: conftest.cached_sweep originally built each shared sweep
+    into a bare tempfile.mkdtemp(), which NOTHING ever cleans up -- one
+    leaked directory per distinct sweep per test run, permanently (154
+    orphaned sweep_* directories had accumulated before this was
+    caught). Anchoring them under pytest's own tmp_path_factory root
+    instead keeps the cache's whole purpose (a sweep must outlive any
+    single test's own tmp_path so it can be shared) while restoring
+    pytest's normal retention/pruning.
+
+    Asserts the sweep root is inside pytest's own basetemp, which is
+    what makes it subject to that pruning.
+    """
+    import conftest
+
+    assert conftest._SWEEP_ROOT is not None, (
+        "the session-scoped _sweep_cache_root fixture did not run -- cached_sweep would "
+        "fall back to an UNCLEANED tempfile.mkdtemp()"
+    )
+
+    # Exercise cached_sweep FOR REAL and check where it actually put the
+    # directory. Asserting on _SWEEP_ROOT alone would be vacuous: that
+    # stays correctly set even if cached_sweep ignores it and calls
+    # tempfile.mkdtemp() anyway -- which is exactly the bug, and exactly
+    # what an earlier version of this test failed to catch.
+    key = ("test_path_policy_leak_probe", (), ())
+    try:
+        base = conftest.cached_sweep(key, lambda d: d)
+    finally:
+        conftest._SWEEP_CACHE.pop(key, None)
+
+    # tmp_path and the sweep root are both under pytest's own per-session
+    # basetemp (tmp_path is <basetemp>/<test name>N, the sweep root is
+    # <basetemp>/cached_sweepsN), so a correctly-placed sweep sits
+    # somewhere beneath that same basetemp.
+    basetemp = tmp_path.parent
+    assert base.is_relative_to(basetemp), (
+        f"cached_sweep built into {base}, outside pytest's basetemp ({basetemp}) -- "
+        f"nothing will ever prune it"
+    )
+
+
+def test_cached_sweep_reuses_one_build_per_key():
+    """The cache's actual purpose -- one build per distinct key, not one
+    per call. Guards against a future change that silently rebuilds every
+    time (correct, but re-introduces the ~21s the cache exists to save)."""
+    import conftest
+
+    builds = []
+
+    def builder(base):
+        builds.append(base)
+        return base
+
+    key = ("test_path_policy_probe", (), ())
+    try:
+        first = conftest.cached_sweep(key, builder)
+        second = conftest.cached_sweep(key, builder)
+        assert first == second
+        assert len(builds) == 1, f"builder ran {len(builds)}x for one key -- cache not working"
+    finally:
+        conftest._SWEEP_CACHE.pop(key, None)

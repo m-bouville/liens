@@ -19,6 +19,8 @@ matches byte-for-byte, and the freshly-initialized parts exist with
 the right shape/location and nothing else.
 """
 import pytest
+
+from conftest import cached_sweep
 import torch
 import pandas as pd
 
@@ -52,7 +54,7 @@ def _build_run_dir(base_dir, name, size=32):
     return run_dir
 
 
-def _build_sweep(tmp_path, n_runs=6, size=32):
+def _build_sweep_uncached(tmp_path, n_runs=6, size=32):
     base_dir = tmp_path / f"{size}x{size}"
     run_names = [f"T800_n010_s{i}" for i in range(n_runs)]
     for name in run_names:
@@ -213,3 +215,18 @@ def test_raises_clearly_when_ancestor_has_no_stats_head(tmp_path):
     )
     with pytest.raises(ValueError, match="stats_head"):
         extend_state_checkpoint_with_deriv_stream(resume_from=stage1a_no_stats, device="cpu")
+
+
+def _build_sweep(tmp_path, *args, **kwargs):
+    """
+    Memoized wrapper around this module's own _build_sweep_uncached --
+    see conftest.cached_sweep for the full rationale and the read-only
+    justification. tmp_path is accepted for call-site compatibility and
+    deliberately IGNORED: the sweep lives in a shared, longer-lived
+    directory so repeated calls with the same arguments reuse one build
+    instead of rewriting the same synthetic snapshots per test. Anything
+    a test WRITES (checkpoints, figures, logs) still goes to its own
+    tmp_path, which this never touches.
+    """
+    return cached_sweep((__name__, args, tuple(sorted(kwargs.items()))),
+                        lambda d: _build_sweep_uncached(d, *args, **kwargs))

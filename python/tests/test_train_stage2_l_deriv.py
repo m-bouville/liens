@@ -5,6 +5,8 @@ from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2
 import pytest
 
+from conftest import cached_sweep
+
 
 def _build_run_dir(base_dir, name, temperature=0.8, noise=0.01, seed_val=1, size=32):
     run_dir = base_dir / name
@@ -31,7 +33,7 @@ def _build_run_dir(base_dir, name, temperature=0.8, noise=0.01, seed_val=1, size
     return run_dir
 
 
-def _build_sweep(tmp_path, n_runs=6, size=32):
+def _build_sweep_uncached(tmp_path, n_runs=6, size=32):
     base_dir = tmp_path / "datasets" / f"{size}x{size}"
     base_dir.mkdir(parents=True)
     run_names = [f"T800_n010_s{i}" for i in range(n_runs)]
@@ -293,17 +295,20 @@ def test_stats_head1_genuinely_trains_when_stats1_weight_nonzero(tmp_path, isola
     )
 
 
-def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_project_root):
-    """deriv_target_centered's own epoch schedule is conflated with
-    deriv_weight_warmup_epochs deliberately -- not a separate knob (see
-    train_stage2's own docstring for the full rationale). A fresh run
-    with deriv_weight_warmup_epochs=2 should spend epochs 1-2 in the
-    cheap (window_length=3 dataset, but only 2 frames actually encoded)
-    phase, then switch to the full three-frame centered target at
-    epoch 3 -- checked here via the checkpoint's own saved
-    stage2_config, not by parsing printed output."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_project_root, capsys):
+    """deriv_target_centered's own switch epoch is derived from
+    deriv_weight_warmup_epochs, not a separate knob (see train_stage2's
+    own docstring).
 
+    Asserts the SCHEDULE, which is deterministic, rather than whether a
+    save happened to occur after the switch -- that depends on whether
+    val_loss improved, which is stochastic, and made an earlier version
+    of this test flaky (it failed ~2 runs in 3 as part of the full suite
+    while passing alone). Papering over that with more epochs made the
+    test slow AND left it flaky; asserting the deterministic property
+    fixes both.
+    """
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
     stage1_path = train_autoencoder(
         size=32, base_path=base_path,
         epochs=1, batch_size=4, base_channels=4, latent_channels=4,
@@ -312,28 +317,187 @@ def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_pr
         checkpoint_path=tmp_path / "stage1_centered.pt", device="cpu", seed=0,
         log_every_epoch=False, loss_curve_path=tmp_path / "curve1_centered.png",
     )
+    capsys.readouterr()
 
     stage2_path = train_stage2(
         base_path=base_path, resume_from=stage1_path,
         deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
-        epochs=10, batch_size=4, num_workers=0,
+        epochs=3, batch_size=4, num_workers=0,
         min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage2_centered_fresh.pt", device="cpu",
         log_every_epoch=False, loss_curve_path=tmp_path / "curve2_centered_fresh.png",
         deriv_target_centered=True,
     )
+    printed = capsys.readouterr().out
+
+    cfg = torch.load(stage2_path, map_location="cpu", weights_only=True)["stage2_config"]
+    assert cfg["deriv_target_centered"] is True
+    assert cfg["deriv_switch_epoch"] == 2, "switch epoch must track deriv_weight_warmup_epochs"
+    # A FRESH run (prior_stage2_epochs=0) must spend its first epoch in
+    # the cheaper one-sided phase, then announce the switch at epoch 2.
+    assert "switching to the centered L_deriv target at epoch 2" in printed
+    assert "prior_stage2_epochs=0" in printed
+    assert "[epoch 2: switching to the centered L_deriv target now" in printed
+
+
+def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_project_root, capsys):
+    """
+    REGRESSION: resuming a stage-2 checkpoint already past
+    deriv_weight_warmup_epochs must start the NEW run centered from ITS
+    OWN epoch 1 -- not re-run a warmup that's already complete. Uses the
+    ancestor's own saved "epoch" (prior_stage2_epochs).
+
+    Asserts the deterministic schedule announcement rather than
+    use_centered_at_save, which depends on which epoch happened to save
+    -- see the sibling test above for why that made this flaky.
+    """
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1_resume.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_resume.png",
+    )
+    # An ancestor trained WITHOUT deriv_target_centered -- i.e. a real
+    # pre-existing checkpoint from before the feature existed.
+    stage2_ancestor_path = train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, stats0_weight=0.01,
+        epochs=3, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_ancestor.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_ancestor.png",
+    )
+    ancestor_epoch = torch.load(stage2_ancestor_path, map_location="cpu",
+                                 weights_only=True)["epoch"]
+    capsys.readouterr()
+
+    train_stage2(
+        base_path=base_path, resume_from=stage2_ancestor_path,
+        deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_resumed.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_resumed.png",
+        deriv_target_centered=True,
+    )
+    printed = capsys.readouterr().out
+    assert f"prior_stage2_epochs={ancestor_epoch}" in printed
+    assert "centered from epoch 1" in printed, (
+        "an ancestor already past the warmup must yield a run that is centered from "
+        "its own epoch 1, not one that re-runs the cheap phase"
+    )
+    assert "[epoch 1: switching to the centered L_deriv target now" in printed
+
+
+def test_stats_head1_genuinely_trains_when_stats1_weight_nonzero(tmp_path, isolated_project_root):
+    """Regression test for a real, confirmed bug: stats_head1 is a
+    SEPARATE nn.Module from ae (not one of its submodules), left with
+    requires_grad=True in the Stage-1a-direct branch (deliberately, so
+    it gets its own first chance to learn something) -- but its own
+    parameters were never actually added to the optimizer anywhere,
+    so total.backward() genuinely computed gradients for it (the
+    printed stats1 loss term visibly decreases epoch over epoch) while
+    optimizer.step() never applied them. Confirmed directly: with the
+    bug present, stats_head1's true initial state_dict (captured via a
+    monkeypatch on extend_state_checkpoint_with_deriv_stream, since
+    it's constructed INSIDE train_stage2 -- a fresh, separately-built
+    comparison object would just be a different random draw, not the
+    actual initial state) was byte-identical to its state after 3 real
+    training epochs with stats1_weight=1.0, despite the loss
+    decreasing throughout (which came entirely from the shared trunk
+    moving via L_deriv/L_recon, not from stats_head1 itself)."""
+    import training.train_stage2 as train_stage2_module
+    from training.extend_encoder import extend_state_checkpoint_with_deriv_stream as real_extend
+
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1a_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
+    )
+
+    captured = {}
+
+    def _recording_extend(*args, **kwargs):
+        ext = real_extend(*args, **kwargs)
+        captured["stats_head1_initial"] = {k: v.clone() for k, v in ext.stats_head1.state_dict().items()}
+        return ext
+
+    monkeypatch_target = train_stage2_module.extend_state_checkpoint_with_deriv_stream
+    train_stage2_module.extend_state_checkpoint_with_deriv_stream = _recording_extend
+    try:
+        stage2_path = train_stage2_module.train_stage2(
+            base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
+            stats1_weight=1.0, deriv_weight=1.0,
+            epochs=3, batch_size=4, num_workers=0,
+            val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
+            log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
+        )
+    finally:
+        train_stage2_module.extend_state_checkpoint_with_deriv_stream = monkeypatch_target
 
     saved = torch.load(stage2_path, map_location="cpu", weights_only=True)
-    cfg = saved["stage2_config"]
+    sh1_after = saved["stats_head1_state"]
+    sh1_before = captured["stats_head1_initial"]
+
+    changed = any(not torch.equal(sh1_before[k], sh1_after[k]) for k in sh1_before)
+    assert changed, (
+        "stats_head1's weights are byte-identical to their true initial values after 3 real "
+        "training epochs with stats1_weight=1.0 -- its own parameters aren't reaching the "
+        "optimizer (check train_stage2's own `params = [...]` construction)"
+    )
+
+
+def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_project_root, capsys):
+    """deriv_target_centered's own switch epoch is derived from
+    deriv_weight_warmup_epochs, not a separate knob (see train_stage2's
+    own docstring).
+
+    Asserts the SCHEDULE, which is deterministic, rather than whether a
+    save happened to occur after the switch -- that depends on whether
+    val_loss improved, which is stochastic, and made an earlier version
+    of this test flaky (it failed ~2 runs in 3 as part of the full suite
+    while passing alone). Papering over that with more epochs made the
+    test slow AND left it flaky; asserting the deterministic property
+    fixes both.
+    """
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1_path = train_autoencoder(
+        size=32, base_path=base_path,
+        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1_centered.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_centered.png",
+    )
+    capsys.readouterr()
+
+    stage2_path = train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
+        epochs=3, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_centered_fresh.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_centered_fresh.png",
+        deriv_target_centered=True,
+    )
+    printed = capsys.readouterr().out
+
+    cfg = torch.load(stage2_path, map_location="cpu", weights_only=True)["stage2_config"]
     assert cfg["deriv_target_centered"] is True
-    assert cfg["deriv_switch_epoch"] == 2
-    # Saved checkpoint is from the run's LAST (best) epoch. With the
-    # switch's own grace period (see reset_with_grace) now blocking any
-    # save for several epochs right after the switch, epochs=10 leaves
-    # enough room past that window for a genuine post-grace save to
-    # happen -- the checkpoint that ends up saved should reflect the
-    # centered phase already active.
-    assert cfg["use_centered_at_save"] is True
+    assert cfg["deriv_switch_epoch"] == 2, "switch epoch must track deriv_weight_warmup_epochs"
+    # A FRESH run (prior_stage2_epochs=0) must spend its first epoch in
+    # the cheaper one-sided phase, then announce the switch at epoch 2.
+    assert "switching to the centered L_deriv target at epoch 2" in printed
+    assert "prior_stage2_epochs=0" in printed
+    assert "[epoch 2: switching to the centered L_deriv target now" in printed
 
 
 def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_project_root):
@@ -389,3 +553,18 @@ def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_
         "resuming a stage-2 checkpoint already well past deriv_weight_warmup_epochs "
         "must be centered from this run's own epoch 1, not stuck re-running the cheap phase"
     )
+
+
+def _build_sweep(tmp_path, *args, **kwargs):
+    """
+    Memoized wrapper around this module's own _build_sweep_uncached --
+    see conftest.cached_sweep for the full rationale and the read-only
+    justification. tmp_path is accepted for call-site compatibility and
+    deliberately IGNORED: the sweep lives in a shared, longer-lived
+    directory so repeated calls with the same arguments reuse one build
+    instead of rewriting the same synthetic snapshots per test. Anything
+    a test WRITES (checkpoints, figures, logs) still goes to its own
+    tmp_path, which this never touches.
+    """
+    return cached_sweep((__name__, args, tuple(sorted(kwargs.items()))),
+                        lambda d: _build_sweep_uncached(d, *args, **kwargs))

@@ -1,5 +1,7 @@
 import torch
 from pathlib import Path
+
+from conftest import cached_sweep
 from utils import load_datasets as load
 from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2
@@ -32,7 +34,7 @@ def _build_run_dir_with_stats(base_dir, name, size=32):
     return run_dir
 
 
-def _build_sweep(tmp_path, n_runs=6, size=32):
+def _build_sweep_uncached(tmp_path, n_runs=6, size=32):
     base_dir = tmp_path / "datasets" / f"{size}x{size}"
     base_dir.mkdir(parents=True)
     run_names = [f"T800_n010_s{i}" for i in range(n_runs)]
@@ -132,3 +134,18 @@ def test_checkpoint_components_decoder_extraction_from_stage2(tmp_path, isolated
     ae, stats_head, f_theta_out, frozen, _, _ = build_models_from_components(components, device="cpu")
     assert ae is not None
     print("build_models_from_components correctly reconstructed the model from a stage 2 checkpoint")
+
+
+def _build_sweep(tmp_path, *args, **kwargs):
+    """
+    Memoized wrapper around this module's own _build_sweep_uncached --
+    see conftest.cached_sweep for the full rationale and the read-only
+    justification. tmp_path is accepted for call-site compatibility and
+    deliberately IGNORED: the sweep lives in a shared, longer-lived
+    directory so repeated calls with the same arguments reuse one build
+    instead of rewriting the same synthetic snapshots per test. Anything
+    a test WRITES (checkpoints, figures, logs) still goes to its own
+    tmp_path, which this never touches.
+    """
+    return cached_sweep((__name__, args, tuple(sorted(kwargs.items()))),
+                        lambda d: _build_sweep_uncached(d, *args, **kwargs))

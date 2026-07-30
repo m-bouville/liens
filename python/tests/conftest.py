@@ -21,6 +21,9 @@ if str(_PYTHON_ROOT) not in sys.path:
 
 import torch
 import torch.nn as nn
+import itertools
+import tempfile
+
 import pytest
 
 from models.constants import LATENT_SPATIAL_SIZE
@@ -58,6 +61,84 @@ class FakeEncoder(nn.Module):
 
     def forward(self, x):
         return {DEFAULT_STREAM_NAME: self.conv(x)}
+
+
+# ---------------------------------------------------------------------
+# Shared, memoized synthetic sweeps.
+#
+# Seven test modules each define their own _build_sweep(), and between
+# them they call it ~45 times. Each call writes a full set of synthetic
+# run directories (snapshots + metadata + statistics.csv) and costs
+# ~0.5s -- about 21s of a ~150s suite spent rebuilding data that is
+# then only ever READ.
+#
+# Verified read-only before adding this: every write into a sweep
+# happens inside the _build_* helpers themselves; no test mutates a
+# sweep after receiving it (checkpoints and outputs go to the test's own
+# tmp_path, which is untouched by this). So one build per distinct
+# argument set can be shared across every test that asks for it.
+#
+# The modules' builders are NOT interchangeable -- they disagree on
+# directory layout, on _build_run_dir's signature, and on what they
+# return -- so this caches per (module, args) rather than trying to
+# unify them. Unifying is a separate refactor; this is just the cost fix.
+#
+# Deliberately a module-level dict rather than a session-scoped fixture:
+# the builders are called as plain functions from inside test bodies
+# (_build_sweep(tmp_path, ...)), so a fixture would mean touching all
+# ~45 call sites and their signatures.
+_SWEEP_CACHE: dict = {}
+_SWEEP_ROOT: Path | None = None
+# MONOTONIC, deliberately -- NOT len(_SWEEP_CACHE). Using the dict's own
+# length as the directory name collides the moment any entry is removed
+# (two different keys then compute the same name, and mkdir fails with
+# FileExistsError). Real runs never remove entries, so this only showed
+# up once a test popped its own probe key -- but a counter that can go
+# backwards is fragile regardless of who currently triggers it.
+_SWEEP_SEQ = itertools.count()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _sweep_cache_root(tmp_path_factory):
+    """
+    Anchors every cached sweep under pytest's OWN session temp root, so
+    pytest's normal retention policy (keep the last few sessions, prune
+    older ones) applies to them.
+
+    A first version of this used a bare tempfile.mkdtemp() instead --
+    which nothing ever cleans up. That leaked one directory per distinct
+    sweep per test run, permanently: 154 orphaned sweep_* directories had
+    accumulated in /tmp before this was caught. Using tmp_path_factory
+    keeps the whole point of the cache (a sweep must OUTLIVE any single
+    test's own tmp_path, so it can be shared across tests) while putting
+    cleanup back under pytest's control.
+
+    autouse + session scope so it is guaranteed to have run before any
+    test body calls cached_sweep().
+    """
+    global _SWEEP_ROOT
+    _SWEEP_ROOT = tmp_path_factory.mktemp("cached_sweeps")
+    yield
+    _SWEEP_CACHE.clear()
+
+
+def cached_sweep(key, builder):
+    """Builds once per distinct `key`, into a directory that OUTLIVES
+    any single test's own tmp_path (see _sweep_cache_root for where it
+    actually lives, and why that matters for cleanup), and returns
+    whatever `builder` returned. Safe only because sweeps are read-only
+    -- verified before this was introduced; see the block comment above."""
+    if key not in _SWEEP_CACHE:
+        if _SWEEP_ROOT is None:
+            # Only reachable if cached_sweep is called outside a pytest
+            # session entirely (e.g. an ad-hoc import). Fall back rather
+            # than crash, but this path does NOT get pytest's cleanup.
+            base = Path(tempfile.mkdtemp(prefix="sweep_uncleaned_"))
+        else:
+            base = _SWEEP_ROOT / f"sweep_{next(_SWEEP_SEQ):03d}"
+            base.mkdir(parents=True, exist_ok=False)
+        _SWEEP_CACHE[key] = builder(base)
+    return _SWEEP_CACHE[key]
 
 
 @pytest.fixture

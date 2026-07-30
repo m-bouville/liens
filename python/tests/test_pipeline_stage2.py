@@ -1,5 +1,7 @@
 import torch
 from pathlib import Path
+
+from conftest import cached_sweep
 from utils import load_datasets as load
 from orchestration.pipeline import run_from_params_file
 from orchestration.checkpoint_identification import identify_checkpoint_stage
@@ -29,7 +31,7 @@ def _build_run_dir_with_stats(base_dir, name, size=32):
     return run_dir
 
 
-def _build_sweep(tmp_path, n_runs=6, size=32):
+def _build_sweep_uncached(tmp_path, n_runs=6, size=32):
     base_dir = tmp_path / "datasets" / f"{size}x{size}"
     base_dir.mkdir(parents=True)
     run_names = [f"T800_n010_s{i}" for i in range(n_runs)]
@@ -84,7 +86,8 @@ epochs = 0
     params_path.write_text(params_text)
 
     try:
-        run_from_params_file(params_path, default_base=base_path, device="cpu")
+        run_from_params_file(params_path, default_base=base_path, device="cpu",
+                                             run_sanity_checks=False)
     except ValueError as e:
         if "train_lds()" not in str(e):
             raise
@@ -155,7 +158,8 @@ stats0_weight = 0.01
     # checkpoint, checked directly from disk below regardless of what
     # happens after that.
     try:
-        run_from_params_file(params_path, default_base=base_path, device="cpu")
+        run_from_params_file(params_path, default_base=base_path, device="cpu",
+                                             run_sanity_checks=False)
     except ValueError as e:
         if "train_lds()" not in str(e):
             raise
@@ -202,7 +206,8 @@ stats0_weight = 0.0
     params_path = tmp_path / "test_pipeline_no_stage2.txt"
     params_path.write_text(params_text)
 
-    final_checkpoint = run_from_params_file(params_path, default_base=base_path, device="cpu")
+    final_checkpoint = run_from_params_file(params_path, default_base=base_path, device="cpu",
+                                             run_sanity_checks=False)
     checkpoint = torch.load(final_checkpoint, map_location="cpu", weights_only=True)
     identity = identify_checkpoint_stage(checkpoint)
     print(f"Final checkpoint (no '# Stage 2' given): {identity}")
@@ -262,7 +267,8 @@ epochs = 0
     # (see test_pipeline_runs_1_then_2_directly's own identical
     # comment) -- irrelevant to what THIS test verifies.
     try:
-        run_from_params_file(params_path, default_base=base_path, device="cpu")
+        run_from_params_file(params_path, default_base=base_path, device="cpu",
+                                             run_sanity_checks=False)
     except ValueError as e:
         if "train_lds()" not in str(e):
             raise
@@ -326,7 +332,8 @@ force = true
     # exactly the "12 hours already spent" scenario this feature exists
     # for, just with a trivially cheap fixture instead of a real run.
     try:
-        run_from_params_file(params_path, default_base=base_path, device="cpu")
+        run_from_params_file(params_path, default_base=base_path, device="cpu",
+                                             run_sanity_checks=False)
     except ValueError as e:
         if "train_lds()" not in str(e):
             raise
@@ -369,7 +376,8 @@ force = true
     params_path2.write_text(params_text2)
 
     try:
-        run_from_params_file(params_path2, default_base=base_path, device="cpu")
+        run_from_params_file(params_path2, default_base=base_path, device="cpu",
+                                             run_sanity_checks=False)
     except ValueError as e:
         if "train_lds()" not in str(e):
             raise
@@ -439,7 +447,8 @@ stats0_weight = 0.01
     # both at the SAME path a second run of this SAME params file would
     # also write to.
     try:
-        run_from_params_file(params_path, default_base=base_path, device="cpu")
+        run_from_params_file(params_path, default_base=base_path, device="cpu",
+                                             run_sanity_checks=False)
     except ValueError as e:
         if "train_lds()" not in str(e):
             raise
@@ -469,7 +478,8 @@ stats0_weight = 0.01
     params_path.write_text(params_text_resumed)
 
     try:
-        run_from_params_file(params_path, default_base=base_path, device="cpu")
+        run_from_params_file(params_path, default_base=base_path, device="cpu",
+                                             run_sanity_checks=False)
     except ValueError as e:
         if "train_lds()" not in str(e):
             raise
@@ -489,3 +499,87 @@ stats0_weight = 0.01
 
     captured = capsys.readouterr()
     assert "backed up" in captured.out, "expected a clear NOTE that a backup was made, got none"
+
+
+def _build_sweep(tmp_path, *args, **kwargs):
+    """
+    Memoized wrapper around this module's own _build_sweep_uncached --
+    see conftest.cached_sweep for the full rationale and the read-only
+    justification. tmp_path is accepted for call-site compatibility and
+    deliberately IGNORED: the sweep lives in a shared, longer-lived
+    directory so repeated calls with the same arguments reuse one build
+    instead of rewriting the same synthetic snapshots per test. Anything
+    a test WRITES (checkpoints, figures, logs) still goes to its own
+    tmp_path, which this never touches.
+    """
+    return cached_sweep((__name__, args, tuple(sorted(kwargs.items()))),
+                        lambda d: _build_sweep_uncached(d, *args, **kwargs))
+
+
+def test_pipeline_sanity_checks_actually_run_at_the_DEFAULT(tmp_path, isolated_project_root, capsys):
+    """
+    REGRESSION: every other pipeline test in this file passes
+    run_sanity_checks=False (they exercise parameter plumbing and stage
+    sequencing, and the four diagnostics plus their matplotlib figures
+    dominate the wall time of such a short run). That left the
+    diagnostics block itself -- check_reconstruction,
+    check_latent_channels, check_interpolation, check_perturbation, as
+    wired into run_from_params_file -- with NO test coverage at all, so
+    broken wiring there would go unnoticed.
+
+    This test deliberately does NOT pass run_sanity_checks, exercising
+    the production DEFAULT (True), and asserts all four actually ran.
+    """
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    params_text = f"""
+Nx = 32
+Ny = 32
+base = {base_path}
+min_step = 0
+num_workers = 0
+val_fraction = 0.34
+test_fraction = 0.17
+augment = false
+force = true
+
+# Stage 1
+epochs = 1
+batch_size = 4
+base_channels = 4
+latent_channels = 4
+stats0_weight = 0.01
+stat_names = avg_phi
+
+# Stage 2
+epochs = 1
+batch_size = 4
+deriv_weight = 1.0
+stats0_weight = 0.01
+"""
+    params_path = tmp_path / "test_pipeline_sanity_default.txt"
+    params_path.write_text(params_text)
+
+    # NOTE: run_sanity_checks deliberately NOT passed -- the whole point
+    # is to exercise its production default.
+    #
+    # The trailing stage-3 config error is expected and irrelevant here,
+    # for the same reason documented in
+    # test_pipeline_runs_1_then_2_directly: run_from_params_file always
+    # attempts stage 3 onward, so a params file with no "# Stage 3"
+    # section fails there. The stage-2 diagnostics this test is about
+    # run BEFORE that point, so they're already captured either way.
+    try:
+        run_from_params_file(params_path, default_base=base_path, device="cpu")
+    except ValueError as e:
+        if "train_lds()" not in str(e):
+            raise
+
+    printed = capsys.readouterr().out
+    for expected in ("Sanity check: reconstruction quality",
+                      "Sanity check: latent channel activations",
+                      "Sanity check: interpolation consistency",
+                      "Sanity check: perturbation response"):
+        assert expected in printed, (
+            f"'{expected}' never ran -- the pipeline's own diagnostics block is not wired up, "
+            f"and every OTHER pipeline test disables it, so nothing else would catch this"
+        )
