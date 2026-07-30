@@ -19,6 +19,7 @@ import pytest
 from utils import load_datasets as load
 
 from evaluation.check_rollout import _padded_bounds, _error_bounds, parse_fixed_window, _correlation_pct, _format_small
+from models.latent_dynamics import LatentDynamics
 from models.latent_streams import DEFAULT_STREAM_NAME
 
 
@@ -345,3 +346,56 @@ def test_error_bounds_keeps_the_floor_for_a_genuinely_small_error():
 
     assert vmin == pytest.approx(floor_vmin)
     assert vmax == pytest.approx(floor_vmax)
+
+
+def test_check_rollout_threads_dt_cap_from_the_saved_checkpoint(monkeypatch, tmp_path):
+    """
+    REGRESSION: check_rollout()'s own LatentDynamics reconstruction is
+    SEPARATE from model_assembly.py's own build_models_from_components
+    and from evaluation._latent_eval.py's own copy, both of which
+    already had this fix -- fixing dt_cap in either of THOSE did not
+    fix it here. A checkpoint saved with a real, finite dt_cap used to
+    silently evaluate as if dt_cap were still inf.
+
+    Intercepts LatentDynamics.__init__ itself to capture the dt_cap
+    kwarg actually passed, then lets the rest of check_rollout() fail
+    past that point (no real dataset/AE fixture needed) -- the capture
+    already happened before the failure, which is all this test needs.
+    """
+    from types import SimpleNamespace
+    import torch
+    import evaluation.check_rollout as cr
+
+    captured = {}
+    real_init = LatentDynamics.__init__
+
+    def capturing_init(self, *args, **kwargs):
+        captured["dt_cap"] = kwargs.get("dt_cap")
+        real_init(self, *args, **kwargs)
+        raise RuntimeError("stop here -- dt_cap already captured")
+
+    monkeypatch.setattr(LatentDynamics, "__init__", capturing_init)
+    # build_ae_from_checkpoint runs BEFORE the LatentDynamics construction
+    # this test cares about -- must SUCCEED (not raise) with minimal,
+    # good-enough fake values so execution actually reaches that line.
+    fake_ae_checkpoint = {"config": {"size": 32}}
+    monkeypatch.setattr(
+        cr, "build_ae_from_checkpoint",
+        lambda path, device: (None, None, fake_ae_checkpoint, {}, "state"),
+    )
+
+    checkpoint_path = tmp_path / "fake-stage3.pt"
+    torch.save({
+        "epoch": 1, "val_loss": 0.05,
+        "ae_checkpoint": "does-not-need-to-exist.pt",
+        "config": {"latent_channels": 4, "n_theta": 1, "hidden_dim": 8,
+                   "n_hidden_layers": 1, "dt_cap": 125.0},
+    }, checkpoint_path)
+
+    try:
+        cr.check_rollout(checkpoint_path, device="cpu", output_path=tmp_path / "out.png")
+    except Exception:
+        pass  # expected -- fails past the point this test cares about
+
+    assert "dt_cap" in captured, "LatentDynamics was never constructed at all"
+    assert captured["dt_cap"] == 125.0

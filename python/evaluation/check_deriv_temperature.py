@@ -40,55 +40,29 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from evaluation._fits import robust_polynomial_fit
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import centered_deriv_target
 from utils import load_datasets as load
 
+# _latent_eval.py's own _load_models_and_dataset is NOT reused here,
+# deliberately: it is coupled to the LDS/stage-3 conversion path
+# (ensure_lds_checkpoint, f_theta, LatentDynamics) that check_parameter_
+# dependence.py needs but this script never touches -- this diagnostic
+# loads a stage-2 AE checkpoint directly, nothing else. Pulling that
+# function in would reintroduce exactly the "heavier LDS-checkpoint-
+# loading machinery" this module's own docstring already explains it
+# was built to avoid. Only the numeric fitter (robust_polynomial_fit,
+# _fits.py -- numpy-only, no torch/checkpoint dependency at all) is
+# shared; see its own module docstring for why sharing IT specifically
+# matters (it fixes a real eps/eps'-naming inconsistency between this
+# script and check_parameter_dependence.py).
+
 # Same anchor rationale as check_interpolation.py/check_parameter_dependence.py's
 # own _PYTHON_ROOT (see either's docstring) -- never a bare relative path.
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/
 
-
-def robust_polynomial_fit(x: np.ndarray, y: np.ndarray, basis_funcs: list,
-                           n_iter: int = 10, huber_delta_scale: float = 1.345):
-    """
-    Identical to check_parameter_dependence.py's own function of the
-    same name -- duplicated here (not imported) specifically so this
-    script has no import-time dependency on that module's own, much
-    heavier LDS-checkpoint-loading machinery, which this diagnostic
-    never needs (it only ever loads a stage-2 AE checkpoint). See that
-    module's own docstring for the full IRLS/Huber mechanism.
-    """
-    X = np.column_stack([f(x) for f in basis_funcs])
-    n, p = X.shape
-    weights = np.ones(n)
-
-    def _weighted_lstsq(w):
-        sqrt_w = np.sqrt(w)
-        coefs, *_ = np.linalg.lstsq(X * sqrt_w[:, None], y * sqrt_w, rcond=None)
-        return coefs
-
-    coefs = _weighted_lstsq(weights)
-    for _ in range(n_iter):
-        residuals = y - X @ coefs
-        mad = np.median(np.abs(residuals - np.median(residuals)))
-        scale = 1.4826 * mad if mad > 0 else np.std(residuals) + 1e-12
-        huber_delta = huber_delta_scale * scale
-        abs_resid = np.abs(residuals)
-        weights = np.where(abs_resid <= huber_delta, 1.0, huber_delta / np.maximum(abs_resid, 1e-12))
-        coefs = _weighted_lstsq(weights)
-
-    residuals = y - X @ coefs
-    XtWX = X.T @ (weights[:, None] * X)
-    dof = max(n - p, 1)
-    sigma2 = np.sum(weights * residuals ** 2) / dof
-    try:
-        cov = sigma2 * np.linalg.inv(XtWX)
-        coef_stderr = np.sqrt(np.diag(cov))
-    except np.linalg.LinAlgError:
-        coef_stderr = np.full(p, np.nan)
-    return coefs, coef_stderr
 
 
 def check_deriv_temperature(

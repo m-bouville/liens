@@ -41,8 +41,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from training.checkpoint_components import build_ae_from_checkpoint
-from training.stats_head import StatsHead
+from evaluation._ae_stats_eval import load_ae_and_stats_head
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
 
@@ -76,33 +75,15 @@ def check_perturbation(
     output_path: Path | None = None, device: str | None = None,
 ) -> Path:
     """Saves the perturbation-response plot and returns its path."""
-    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     eps_values = np.array(eps_values or [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4])
 
-    if output_path is None:
-        output_path = (_PYTHON_ROOT.parent / "output" / "perturbation_check_png"
-                       / f"{checkpoint_path.stem}.png")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    ae, ae_encoder, checkpoint, stream_configs, recon_stream_name = build_ae_from_checkpoint(
-        checkpoint_path, device,
+    ctx = load_ae_and_stats_head(
+        checkpoint_path, "perturbation_check_png", output_path, device,
+        no_stats_head_context="-- this check is built entirely around stats_head.",
     )
-    model_cfg = checkpoint["config"]
-    recon_stream = stream_configs[recon_stream_name]
-    print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, config={model_cfg}")
-
-    stats_config = checkpoint.get("stats_config")
-    if stats_config is None:
-        raise ValueError(f"{checkpoint_path} has no stats_head (trained with --stats-weight 0) "
-                          f"-- this check is built entirely around stats_head.")
-
-    stats_head = StatsHead(
-        latent_channels=recon_stream.channels, stat_names=stats_config["stat_names"],
-        latent_spatial=recon_stream.spatial_size,
-    ).to(device)
-    stats_head.load_state_dict(checkpoint["stats_head_state"])
-    stats_head.eval()
-    print(f"stats_head covers: {stats_config['stat_names']}")
+    device, output_path = ctx.device, ctx.output_path
+    ae_encoder, checkpoint, recon_stream_name = ctx.ae_encoder, ctx.checkpoint, ctx.recon_stream_name
+    model_cfg, stats_head = ctx.model_cfg, ctx.stats_head
 
     test_dirs = checkpoint.get("test_dirs") or []
     if not test_dirs:

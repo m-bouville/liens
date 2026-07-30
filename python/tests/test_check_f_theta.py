@@ -2,12 +2,96 @@
 Tests for evaluation/check_f_theta.py.
 """
 
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
-from evaluation.check_f_theta import _log_corr, compute_f_diagnostics
+from conftest import cached_sweep
+
+from evaluation.check_f_theta import _log_corr, check_f_theta, compute_f_diagnostics
+from models.autoencoder import MultiStreamAutoencoder
+from models.decoder import Decoder
+from models.encoder import Encoder
 from models.latent_dynamics import LatentDynamics
+from models.latent_streams import LatentStreamConfig, LatentStreamMode
+from utils import load_datasets as load
+
+
+SIZE = 32
+LATENT_CHANNELS = 4
+STEPS = [0, 1000, 2000, 3000, 4000]
+
+
+def _build_run_dir_uncached(tmp_path, name="T800_n010_s0", temperature=0.8, seed=0):
+    run_dir = tmp_path / name
+    run_dir.mkdir()
+    metadata_text = "\n".join([
+        f"directory = {name}", "code version = test", "status = complete",
+        f"Nx = {SIZE}", f"Ny = {SIZE}", "dt = 0.05", "steps = 4000",
+        f"save_steps = {' '.join(str(s) for s in STEPS)}",
+        "a0 = 1.0", "b = 1.0", "T0 = 1.0", f"temperature = {temperature}",
+        "kappa = 0.2", "mobility = 0.05", "phi0 = 0.0", "noise = 0.01",
+        f"seed = {seed}", "equation = allen_cahn", "solver = explicit", "",
+    ])
+    (run_dir / "metadata.txt").write_text(metadata_text)
+    for step in STEPS:
+        arr = np.full((SIZE, SIZE), step / 10000.0, dtype="<f2")
+        arr.tofile(run_dir / load.snapshot_filename(step))
+    pd.DataFrame([{"step": s, "avg_phi": s / 1000.0} for s in STEPS]).to_csv(
+        run_dir / "statistics.csv", index=False)
+    (run_dir / "COMPLETE").touch()
+    return run_dir
+
+
+def _build_run_dir(tmp_path, *args, **kwargs):
+    return cached_sweep(
+        (__name__, args, tuple(sorted(kwargs.items()))),
+        lambda d: _build_run_dir_uncached(d, *args, **kwargs),
+    )
+
+
+def _build_ae_checkpoint(path: Path):
+    stream_configs = {
+        "state": LatentStreamConfig(name="state", channels=LATENT_CHANNELS, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+        "deriv": LatentStreamConfig(name="deriv", channels=LATENT_CHANNELS, spatial_size=8,
+                                     mode=LatentStreamMode.DECODER, condition_on_theta=True),
+    }
+    encoder = Encoder(input_size=SIZE, in_channels=1, base_channels=4, stream_configs=stream_configs)
+    decoder = Decoder(output_size=SIZE, out_channels=1, base_channels=4,
+                       latent_channels=LATENT_CHANNELS, latent_spatial_size=8)
+    ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
+                                 stream_configs=stream_configs)
+    checkpoint = {
+        "model_state": ae.state_dict(), "epoch": 1, "val_loss": 0.01,
+        "val_loss_ema": 0.01, "test_dirs": [],
+        "config": {"size": SIZE, "base_channels": 4, "latent_channels": LATENT_CHANNELS,
+                   "latent_spatial_size": 8, "stats_weight": 0.0,
+                   "stream_configs": {
+                       "state": {"channels": LATENT_CHANNELS, "spatial_size": 8, "mode": "autoencoder"},
+                       "deriv": {"channels": LATENT_CHANNELS, "spatial_size": 8, "mode": "decoder",
+                                 "condition_on_theta": True},
+                   },
+                   "recon_stream_name": "state"},
+    }
+    torch.save(checkpoint, path)
+
+
+def _build_lds_checkpoint(path: Path, ae_checkpoint_path: Path, run_dirs, dt_cap: float = float("inf")):
+    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=1, hidden_dim=8, n_hidden_layers=1,
+                              dt_cap=dt_cap)
+    checkpoint = {
+        "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05,
+        "val_loss_ema": 0.05, "ae_checkpoint": str(ae_checkpoint_path),
+        "test_dirs": [str(d) for d in run_dirs],
+        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": 1, "hidden_dim": 8,
+                   "n_hidden_layers": 1, "dt_cap": dt_cap},
+        "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2},
+    }
+    torch.save(checkpoint, path)
 
 
 def test_log_corr_returns_none_for_float32_round_tripped_constant_values():
@@ -360,3 +444,158 @@ def test_print_binned_by_dt2_uses_correct_decade_boundaries_and_medians(capsys):
     assert "1e3-1e4" in output
     assert "n=    3" in output
     assert "median=    8.0000e+00" in output  # median of [5, 8, 1_000_000] == 8, not dragged toward the outlier
+
+
+def test_check_f_theta_threads_dt_cap_from_the_saved_checkpoint(monkeypatch, tmp_path):
+    """
+    REGRESSION: check_f_theta()'s own LatentDynamics reconstruction is
+    SEPARATE from model_assembly.py's own build_models_from_components
+    and from evaluation._latent_eval.py's own copy, both of which
+    already had this fix -- fixing dt_cap in either of THOSE did not
+    fix it here. A checkpoint saved with a real, finite dt_cap used to
+    silently evaluate as if dt_cap were still inf.
+
+    Intercepts LatentDynamics.__init__ to capture the dt_cap kwarg
+    actually passed, then lets the rest of check_f_theta() fail past
+    that point -- no real dataset/AE fixture needed, the capture
+    already happened before the failure. ensure_lds_checkpoint is
+    monkeypatched at ITS OWN source module (orchestration.
+    checkpoint_identification), not on check_f_theta's own namespace --
+    it's imported LOCALLY inside check_f_theta(), so patching it there
+    wouldn't be picked up.
+    """
+    import orchestration.checkpoint_identification as ci
+
+    captured = {}
+    real_init = LatentDynamics.__init__
+
+    def capturing_init(self, *args, **kwargs):
+        captured["dt_cap"] = kwargs.get("dt_cap")
+        real_init(self, *args, **kwargs)
+        raise RuntimeError("stop here -- dt_cap already captured")
+
+    monkeypatch.setattr(LatentDynamics, "__init__", capturing_init)
+    monkeypatch.setattr(ci, "ensure_lds_checkpoint", lambda path, **kw: path)
+
+    import evaluation._latent_eval as latent_eval
+    from types import SimpleNamespace
+    fake_ae_checkpoint = {"config": {"size": 32}}
+    fake_ae = SimpleNamespace(decoder=object())  # ae_decoder is read BEFORE LatentDynamics
+    monkeypatch.setattr(
+        latent_eval, "build_ae_from_checkpoint",
+        lambda path, device: (fake_ae, None, fake_ae_checkpoint, {}, "state"),
+    )
+
+    checkpoint_path = tmp_path / "fake-stage3.pt"
+    torch.save({
+        "epoch": 1, "val_loss": 0.05, "test_dirs": ["fake_run_dir"],
+        "ae_checkpoint": "does-not-need-to-exist.pt",
+        "config": {"latent_channels": 4, "n_theta": 1, "hidden_dim": 8,
+                   "n_hidden_layers": 1, "dt_cap": 125.0},
+        "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 3},
+    }, checkpoint_path)
+
+    from evaluation.check_f_theta import check_f_theta
+    try:
+        check_f_theta(checkpoint_path, device="cpu", output_path=tmp_path / "out.png")
+    except Exception:
+        pass  # expected -- fails past the point this test cares about
+
+    assert "dt_cap" in captured, "LatentDynamics was never constructed at all"
+    assert captured["dt_cap"] == 125.0
+
+
+def test_check_f_theta_runs_end_to_end(tmp_path, isolated_project_root):
+    """
+    Real, on-disk fixture -- an actual encoder/decoder/f_theta and a
+    genuine run directory -- exercising check_f_theta() through its
+    ACTUAL call path (not a mocked build_ae_from_checkpoint/
+    ensure_lds_checkpoint), specifically because this function's own
+    setup phase was just rewritten to share
+    evaluation._latent_eval._load_ae_f_theta_and_dataset rather than
+    duplicating it. The dt_cap-focused test above verifies the
+    parameter threads through correctly via mocks; this one verifies
+    the real, unmocked integration still produces a saved figure.
+    """
+    run_dir = _build_run_dir(tmp_path)
+    ae_checkpoint_path = tmp_path / "fake-stage2.pt"
+    _build_ae_checkpoint(ae_checkpoint_path)
+    lds_checkpoint_path = tmp_path / "fake-stage3.pt"
+    _build_lds_checkpoint(lds_checkpoint_path, ae_checkpoint_path, [run_dir])
+
+    output_path = tmp_path / "f_theta_diag.png"
+    result_path = check_f_theta(
+        lds_checkpoint_path=lds_checkpoint_path, min_step=0, device="cpu",
+        output_path=output_path,
+    )
+    assert result_path == output_path
+    assert output_path.exists()
+
+
+def test_check_f_theta_default_output_path_uses_the_real_stage_folder(
+    tmp_path, isolated_project_root,
+):
+    """
+    REGRESSION: check_f_theta()'s own default output_path used to be
+    hardcoded to output/stage3/ regardless of whether the checkpoint
+    was actually stage3a or stage3b -- the exact same bug already fixed
+    once in evaluation._latent_eval.py's own
+    _stage_folder_from_checkpoint_stem, now shared here too rather than
+    recurring a third time. A stage-3a and a stage-3b checkpoint's own
+    figures must land in DIFFERENT folders, not silently overwrite each
+    other in a shared output/stage3/.
+    """
+    run_dir = _build_run_dir(tmp_path)
+    ae_checkpoint_path = tmp_path / "fake-stage2-b.pt"
+    _build_ae_checkpoint(ae_checkpoint_path)
+    lds_checkpoint_path = tmp_path / "64x64-stage3b.pt"
+    _build_lds_checkpoint(lds_checkpoint_path, ae_checkpoint_path, [run_dir])
+
+    result_path = check_f_theta(
+        lds_checkpoint_path=lds_checkpoint_path, min_step=0, device="cpu",
+    )
+    assert result_path.parent.name == "stage3b", (
+        f"expected output under a 'stage3b' folder, got '{result_path.parent.name}' -- "
+        f"the stage-folder-from-stem logic isn't being used"
+    )
+
+
+def test_untrained_f_theta_does_not_produce_broken_log_scaled_panels(recwarn, tmp_path,
+                                                                     isolated_project_root):
+    """
+    REGRESSION: LatentDynamics zero-initializes its own final layer, so
+    f_theta is EXACTLY zero everywhere until trained -- which is
+    precisely what ensure_lds_checkpoint produces when this script is
+    pointed at an AE-family (stage-1/1b/2) checkpoint, a mode
+    check_f_theta()'s own docstring documents as supported. Every
+    ||f||-derived quantity is then identically 0, and three panels used
+    to be set to a log scale regardless, rendering unusable with only a
+    matplotlib UserWarning to indicate it.
+
+    Asserts NO "cannot be log-scaled" warning is emitted -- i.e. the
+    panels genuinely fall back to linear rather than silently breaking.
+    """
+    run_dir = _build_run_dir(tmp_path)
+    ae_checkpoint_path = tmp_path / "fake-stage2-untrained.pt"
+    _build_ae_checkpoint(ae_checkpoint_path)
+    lds_checkpoint_path = tmp_path / "fake-stage3-untrained.pt"
+    _build_lds_checkpoint(lds_checkpoint_path, ae_checkpoint_path, [run_dir])
+
+    # Confirm the premise: this checkpoint's own f_theta really is
+    # all-zero, so the all-zero code path is genuinely being exercised.
+    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=1,
+                              hidden_dim=8, n_hidden_layers=1)
+    assert f_theta.f(torch.randn(2, LATENT_CHANNELS, 8, 8),
+                     torch.randn(2, LATENT_CHANNELS, 8, 8),
+                     torch.randn(2, 1)).abs().max().item() == 0.0
+
+    check_f_theta(
+        lds_checkpoint_path=lds_checkpoint_path, min_step=0, device="cpu",
+        output_path=tmp_path / "untrained.png",
+    )
+
+    log_warnings = [w for w in recwarn if "cannot be log-scaled" in str(w.message)]
+    assert not log_warnings, (
+        f"{len(log_warnings)} panel(s) were log-scaled against all-zero data and render "
+        f"broken -- _log_scale_if_positive should have fallen back to linear"
+    )

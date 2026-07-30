@@ -46,9 +46,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_dynamics import LatentDynamics
-from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
 
 # GENERAL POLICY (matches training/train_refinement.py's own
@@ -289,6 +287,38 @@ def _print_summary(name: str, values: np.ndarray) -> None:
           f"max={values.max():14.4e}  p90={np.percentile(values, 90):14.4e}")
 
 
+def _log_scale_if_positive(ax, *value_arrays, axis: str = "y") -> bool:
+    """
+    Sets a log scale ONLY if the data actually has positive values;
+    returns whether it did.
+
+    A log axis needs at least one positive value -- otherwise matplotlib
+    emits "Data has no positive values, and therefore cannot be
+    log-scaled" and silently leaves the panel unusable. That is not a
+    hypothetical here: LatentDynamics zero-initializes its own final
+    layer (see its own docstring), so f_theta is EXACTLY zero
+    everywhere until trained -- which is precisely the state
+    ensure_lds_checkpoint produces when this script is pointed at an
+    AE-family (stage-1/1b/2) checkpoint, a mode check_f_theta()'s own
+    docstring explicitly documents as supported. Every ||f||-derived
+    quantity is then identically 0, so three panels of this figure used
+    to render broken, with only a warning to indicate it.
+
+    Falls back to a LINEAR scale and annotates the panel in that case,
+    rather than leaving a reader to assume an axis is log-scaled when
+    it isn't.
+    """
+    combined = np.concatenate([np.asarray(v, dtype=float).ravel() for v in value_arrays]) \
+        if value_arrays else np.array([])
+    if combined.size and np.any(combined > 0):
+        (ax.set_xscale if axis == "x" else ax.set_yscale)("log")
+        return True
+    ax.text(0.5, 0.5, f"all-zero data\n({axis}-axis left LINEAR, not log)",
+            transform=ax.transAxes, ha="center", va="center",
+            fontsize=8, color="tab:red", alpha=0.7)
+    return False
+
+
 def _print_binned_by_dt2(name: str, dt2: np.ndarray, values: np.ndarray) -> None:
     """Median of `values` within each dt2 decade -- median (not mean),
     deliberately: this is specifically about separating a genuine,
@@ -337,70 +367,41 @@ def check_f_theta(
     this AE-family-conversion path; a real stage-3 checkpoint needs
     neither.
     """
-    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    from evaluation._latent_eval import (
+        _load_ae_f_theta_and_dataset, _stage_folder_from_checkpoint_stem,
+    )
 
     if output_path is None:
-        output_path = (_PYTHON_ROOT.parent / "output" / "stage3"
+        output_path = (_PYTHON_ROOT.parent / "output"
+                        / _stage_folder_from_checkpoint_stem(lds_checkpoint_path)
                         / f"{lds_checkpoint_path.stem}-f_theta_diagnostic.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    from orchestration.checkpoint_identification import ensure_lds_checkpoint
-    lds_checkpoint_path = ensure_lds_checkpoint(
-        lds_checkpoint_path, base_path=base_path, size=size, device=device,
-        min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
-        ae_stats_weight=ae_stats_weight, hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
-        condition_on_theta=condition_on_theta,
+    # window_length_override=3 regardless of what THIS checkpoint was
+    # trained at (e.g. even a stage-3a, n_rollout_steps=1 checkpoint's
+    # own f_theta can be probed this way) -- the diagnostic needs step 1
+    # AND step 2's own real transition, not however many steps training
+    # used. See _load_ae_f_theta_and_dataset's own docstring.
+    # announce_euler_only=False: this script has NO full-vs-euler-only
+    # distinction to begin with (it reports f_theta's own behavior
+    # directly), so that banner would actively misdescribe what runs
+    # here. ensure_lds_checkpoint's own NOTE, printed unconditionally
+    # just above, already covers the untrained-f_theta caveat
+    # accurately -- and this function's own docstring spells out
+    # exactly which numbers go uninformative in that mode.
+    # ae_config/ae_decoder are deliberately discarded: unlike
+    # check_parameter_dependence.py, nothing below decodes back to
+    # pixel space or reads the AE's own config.
+    (device, _euler_only, lds_checkpoint_path, _ae_config, dataset, _ae_decoder, f_theta) = (
+        _load_ae_f_theta_and_dataset(
+            lds_checkpoint_path, min_step, min_stdev_phi, min_passing_steps, base_path, size,
+            ae_stats_weight, hidden_dim, n_hidden_layers, condition_on_theta,
+            euler_only=None, device=device, window_length_override=3,
+            announce_euler_only=False,
+        )
     )
-
-    lds_checkpoint = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
-    lds_config = lds_checkpoint["config"]
-
-    data_config = lds_checkpoint.get("data_config")
-    if data_config is None:
-        print("WARNING: checkpoint has no saved data_config -- falling back to "
-              "min_step=0, min_stdev_phi=None, min_passing_steps=None, window_length=3 "
-              "(may not match training).")
-        data_config = {"min_step": 0, "min_stdev_phi": None, "window_length": 3}
-    min_step = min_step if min_step is not None else data_config["min_step"]
-    min_stdev_phi = min_stdev_phi if min_stdev_phi is not None else data_config["min_stdev_phi"]
-    # .get(), not [...]: a checkpoint trained before min_passing_steps
-    # existed at all has no such key in its saved data_config -- None
-    # (its own default, "no whole-run filtering") is the correct
-    # fallback, not a KeyError.
-    min_passing_steps = (min_passing_steps if min_passing_steps is not None
-                          else data_config.get("min_passing_steps"))
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps} "
-          f"(from checkpoint's own data_config unless overridden above)")
-    # window_length=3 regardless of what THIS checkpoint was trained at
-    # (e.g. even a stage-3a, n_rollout_steps=1 checkpoint's own f_theta
-    # can be probed this way) -- the diagnostic needs step 1 AND step
-    # 2's own real transition, not however many steps training used.
-    window_length = 3
-
-    test_dirs = lds_checkpoint.get("test_dirs") or []
-    if not test_dirs:
-        raise ValueError(f"{lds_checkpoint_path} has no saved test_dirs")
-    test_dirs = [Path(d) for d in test_dirs]
-
-    ae_checkpoint_path = Path(lds_checkpoint["ae_checkpoint"])
-    ae, ae_encoder, ae_checkpoint, stream_configs, recon_stream_name = build_ae_from_checkpoint(
-        ae_checkpoint_path, device,
-    )
-
-    f_theta = LatentDynamics(
-        latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
-        latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
-        hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
-    ).to(device)
-    f_theta.load_state_dict(lds_checkpoint["model_state"])
-    f_theta.eval()
-
-    dataset = MicrostructureEvolutionDataset(
-        test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
-        min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
-        encode_both_streams=True,
-    )
-    print(f"Evaluating {len(dataset)} test windows (window_length={window_length})...")
+    print(f"(window_length=3, overridden regardless of this checkpoint's own trained "
+          f"n_rollout_steps -- see this function's own docstring)")
 
     d = compute_f_diagnostics(dataset, f_theta, device)
 
@@ -491,15 +492,15 @@ def check_f_theta(
     axes[0, 1].scatter(d["dt2"], d["f2_real_norm"], s=8, alpha=0.4, label="f2_real")
     axes[0, 1].scatter(d["dt2"], d["f2_chained_norm"], s=8, alpha=0.4, label="f2_chained")
     axes[0, 1].set_xscale("log")
-    axes[0, 1].set_yscale("log")
+    _log_scale_if_positive(axes[0, 1], d["f2_real_norm"], d["f2_chained_norm"])
     axes[0, 1].set_xlabel("dt2")
     axes[0, 1].set_ylabel("||f||")
     axes[0, 1].set_title("||f|| vs dt2, real vs chained z0")
     axes[0, 1].legend()
 
     axes[0, 2].scatter(d["z0_step1_error"], d["f2_chained_norm"], s=8, alpha=0.4)
-    axes[0, 2].set_xscale("log")
-    axes[0, 2].set_yscale("log")
+    _log_scale_if_positive(axes[0, 2], d["z0_step1_error"], axis="x")
+    _log_scale_if_positive(axes[0, 2], d["f2_chained_norm"])
     axes[0, 2].set_xlabel("||z0_hat(t1) - z0(t1)|| (step-1 error)")
     axes[0, 2].set_ylabel("||f2_chained||")
     axes[0, 2].set_title("||f2_chained|| vs how off-distribution z0 is")
@@ -544,7 +545,7 @@ def check_f_theta(
     ax_ratio.scatter(d["dt2"], d["ratio_real"], s=8, alpha=0.4, color="tab:blue")
     ax_cos.scatter(d["dt2"], d["cos_sim_real"], s=8, alpha=0.4, color="tab:orange")
     ax_ratio.set_xscale("log")
-    ax_ratio.set_yscale("log")
+    _log_scale_if_positive(ax_ratio, d["ratio_real"])
     ax_ratio.set_xlabel("dt2")
     ax_ratio.set_ylabel("ratio_real", color="tab:blue")
     ax_cos.set_ylabel("cos_sim_real", color="tab:orange")

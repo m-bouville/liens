@@ -13,9 +13,8 @@ check_latent_channels.py already have full, direct end-to-end tests of
 this (see test_check_reconstruction_stage4.py); this file exercises
 the identical construction pattern in the remaining scripts that also
 had it (check_interpolation.py, check_perturbation.py, check_rollout.py,
-check_parameter_dependence.py, compare_integrators.py,
-compare_rollout_training.py), which all share the exact same
-is_flat_checkpoint logic.
+check_parameter_dependence.py, compare_rollout_training.py), which all
+share the exact same is_flat_checkpoint logic.
 """
 import torch
 from models.autoencoder import EncoderDecoderPair

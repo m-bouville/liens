@@ -55,6 +55,7 @@ import torch
 from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_dynamics import LatentDynamics
 from models.latent_streams import resolve_stream_configs_from_checkpoint_config
+from evaluation._window_parsing import parse_fixed_window
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
@@ -73,42 +74,6 @@ from utils.naming import lds_checkpoint_name
 # regardless of how/from-where the process was launched.
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/
 
-
-def _is_int(s: str) -> bool:
-    try:
-        int(s)
-        return True
-    except ValueError:
-        return False
-
-
-def parse_fixed_window(s: str) -> tuple[Path, list[int]]:
-    """
-    'run_dir:step0:step1:...:stepN' -> (Path(run_dir), [step0, ..., stepN]).
-
-    NOT a naive split(':') -- run_dir itself can contain a colon (e.g. a
-    Windows path like 'D:\\work\\...\\T950_n020_s79'), which would
-    otherwise be sliced apart from the rest of the path and misread as
-    if it were a step number. Instead, split on ':' and then scan from
-    the RIGHT, greedily taking trailing parts that parse as int (the
-    step numbers); everything before that point is the run_dir, rejoined
-    with ':'. This relies on run directory names in this project never
-    being purely numeric themselves (they're always 'T<temp>_n<noise>_
-    s<seed>'-shaped) -- a directory literally named e.g. '12345' would
-    be misparsed as an extra step instead, but that never occurs here.
-    """
-    parts = s.split(":")
-    split_idx = len(parts)
-    for i in range(len(parts) - 1, -1, -1):
-        if _is_int(parts[i]):
-            split_idx = i
-        else:
-            break
-    path_parts, step_strs = parts[:split_idx], parts[split_idx:]
-    if len(step_strs) < 2 or not path_parts:
-        raise ValueError(f"--fixed-windows entry must be 'run_dir:step0:step1:...:stepN' "
-                          f"(a run_dir followed by at least 2 step numbers), got '{s}'")
-    return Path(":".join(path_parts)), [int(x) for x in step_strs]
 
 
 def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
@@ -353,6 +318,18 @@ def check_rollout(
         latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
         latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
+        # inf (exact no-op) for any checkpoint saved before dt_cap
+        # existed -- same .get()-with-fallback pattern as
+        # latent_spatial_size just above. A real, reported bug
+        # otherwise: this LatentDynamics reconstruction is SEPARATE
+        # from model_assembly.py's own build_models_from_components
+        # (which already has this fix) and from
+        # evaluation._latent_eval.py's own copy (ditto) -- fixing
+        # dt_cap in either of those did NOT fix it here. A checkpoint
+        # saved with a real, finite dt_cap would silently evaluate as
+        # if dt_cap were still inf, with no error or warning anywhere
+        # to indicate the mismatch.
+        dt_cap=lds_config.get("dt_cap", float("inf")),
     ).to(device)
     f_theta.load_state_dict(lds_checkpoint["model_state"])
     f_theta.eval()

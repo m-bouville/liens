@@ -48,8 +48,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from training.checkpoint_components import build_ae_from_checkpoint
-from training.stats_head import StatsHead
+from evaluation._ae_stats_eval import load_ae_and_stats_head
+from evaluation._window_parsing import _is_int
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
 
@@ -64,14 +64,6 @@ from utils.naming import ae_checkpoint_name
 # is anchored to THIS FILE's own on-disk location instead, which is
 # invariant regardless of how/from-where the process was launched.
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/check_interpolation.py -> python/
-
-
-def _is_int(s: str) -> bool:
-    try:
-        int(s)
-        return True
-    except ValueError:
-        return False
 
 
 def parse_fixed_triple(s: str) -> tuple[Path, int, int, int]:
@@ -117,31 +109,10 @@ def check_interpolation(
     output_path: Path | None = None, device: str | None = None,
 ) -> Path:
     """Saves the interpolation-consistency histogram and returns its path."""
-    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-
-    if output_path is None:
-        output_path = (_PYTHON_ROOT.parent / "output" / "interpolation_check_png"
-                       / f"{checkpoint_path.stem}.png")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    ae, ae_encoder, checkpoint, stream_configs, recon_stream_name = build_ae_from_checkpoint(
-        checkpoint_path, device,
-    )
-    model_cfg = checkpoint["config"]
-    recon_stream = stream_configs[recon_stream_name]
-    print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, config={model_cfg}")
-
-    stats_config = checkpoint.get("stats_config")
-    if stats_config is None:
-        raise ValueError(f"{checkpoint_path} has no stats_head (trained with --stats-weight 0)")
-
-    stats_head = StatsHead(
-        latent_channels=recon_stream.channels, stat_names=stats_config["stat_names"],
-        latent_spatial=recon_stream.spatial_size,
-    ).to(device)
-    stats_head.load_state_dict(checkpoint["stats_head_state"])
-    stats_head.eval()
-    print(f"stats_head covers: {stats_config['stat_names']}")
+    ctx = load_ae_and_stats_head(checkpoint_path, "interpolation_check_png", output_path, device)
+    device, output_path = ctx.device, ctx.output_path
+    ae_encoder, checkpoint, recon_stream_name = ctx.ae_encoder, ctx.checkpoint, ctx.recon_stream_name
+    model_cfg, stats_head = ctx.model_cfg, ctx.stats_head
 
     if fixed_triples:
         triples = [parse_fixed_triple(s) for s in fixed_triples]
