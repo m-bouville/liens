@@ -13,7 +13,9 @@ import os
 import time
 
 from orchestration.stage_params import (
-    _backup_before_overwrite, _prepare_stage_kwargs, _resolve_same, parse_stage_params,
+    _backup_before_overwrite, _prepare_stage_kwargs, _resolve_same,
+    _strip_unrecognized_params, parse_stage_params, renamed_keys,
+    report_unrecognized_global_params,
 )
 
 
@@ -280,3 +282,75 @@ def test_backup_before_overwrite_noop_when_source_missing(tmp_path, capsys):
     _backup_before_overwrite(tmp_path / "does_not_exist-stage2.pt")
     assert list(tmp_path.iterdir()) == []
     assert capsys.readouterr().out == ""
+
+
+def _f_alpha(alpha: int = 0, shared: int = 0, epochs: int = 0):
+    pass
+
+
+def _f_beta(beta: int = 0, shared: int = 0, epochs: int = 0):
+    pass
+
+
+def test_global_param_valid_for_ANY_stage_is_not_reported(capsys):
+    """
+    The whole point of the two-tier split: a global param is offered to
+    EVERY stage as a default, so one that only some stages accept is
+    normal, not an error. It must be reported nowhere -- not globally
+    (some stage accepts it) and not per-stage (it didn't come from that
+    stage's own section).
+    """
+    unknown = report_unrecognized_global_params({"alpha": "1"}, (_f_alpha, _f_beta))
+    assert unknown == []
+    assert capsys.readouterr().out == ""
+
+    # ...and the stage that CAN'T use it must strip it silently
+    merged = {"alpha": 1, "beta": 2}
+    out = _strip_unrecognized_params(_f_beta, merged, "Stage X",
+                                     own_keys=renamed_keys({"beta": "2"}))
+    assert out == {"beta": 2}
+    assert capsys.readouterr().out == ""
+
+
+def test_global_param_valid_for_NO_stage_is_reported_once(capsys):
+    unknown = report_unrecognized_global_params({"gamma": "1"}, (_f_alpha, _f_beta))
+    assert unknown == ["gamma"]
+    out = capsys.readouterr().out
+    assert "gamma" in out and "NO stage" in out
+
+
+def test_pipeline_consumed_globals_are_never_reported(capsys):
+    """base/Nx/Ny/force are consumed by the pipeline itself, not forwarded
+    to any training function -- legitimate, so they must not warn."""
+    unknown = report_unrecognized_global_params(
+        {"base": "d", "Nx": "64", "Ny": "64", "force": "true"}, (_f_alpha, _f_beta))
+    assert unknown == []
+    assert capsys.readouterr().out == ""
+
+
+def test_stage_own_section_typo_IS_reported(capsys):
+    merged = {"epochs": 5, "alphaa": 9}
+    out = _strip_unrecognized_params(_f_alpha, merged, "Stage 1",
+                                     own_keys=renamed_keys({"epochs": "5", "alphaa": "9"}))
+    assert out == {"epochs": 5}          # stripped either way
+    printed = capsys.readouterr().out
+    assert "alphaa" in printed and "OWN section" in printed
+
+
+def test_report_respects_key_renames(capsys):
+    """renamed_keys must map through _KEY_RENAMES, or a legitimate alias
+    (patience -> early_stopping_patience) would be flagged as a typo."""
+    assert renamed_keys({"patience": "1", "batches": "2"}) == {
+        "early_stopping_patience", "batch_size"}
+
+    def _f(early_stopping_patience: int = 0, batch_size: int = 0):
+        pass
+    assert report_unrecognized_global_params({"patience": "1", "batches": "2"}, (_f,)) == []
+    assert capsys.readouterr().out == ""
+
+
+def test_strip_without_own_keys_warns_about_everything(capsys):
+    """Omitting own_keys is the right behavior for a caller with no
+    globals to inherit from -- everything unrecognized is its own."""
+    _strip_unrecognized_params(_f_alpha, {"epochs": 1, "nope": 2}, "Standalone")
+    assert "nope" in capsys.readouterr().out

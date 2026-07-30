@@ -24,21 +24,38 @@ def _signature_kwargs(kwargs: dict) -> dict:
     match for this configuration."""
     return {k: v for k, v in kwargs.items() if k not in _NON_SIGNATURE_KEYS}
 
+# A reused checkpoint saved at or above this fraction of its target
+# epoch count gets reported as a plain FACT, with no advisory. Below it,
+# the advisory ("possibly killed early, consider retraining") is worth
+# printing. 2/3 chosen because normal early stopping routinely lands in
+# the top third -- so the old, UNCONDITIONAL advisory fired on healthy
+# runs too, including the degenerate "saved at epoch 60/60 -- if this
+# looks very low..." where the run demonstrably went the full distance.
+# A warning that fires when nothing is wrong teaches the reader to skip
+# it, which costs exactly the cases it exists for.
+_EPOCH_ADVISORY_FRACTION = 2 / 3
+
+
 def _report_checkpoint_epoch(path: Path, target_epochs: int | None, device: str | None) -> None:
     """Prints the epoch a reused checkpoint was actually saved at,
     against the target upper bound -- e.g. 40/50 is normal early
     stopping, 4/50 suggests the process was killed shortly after it
-    started and this checkpoint is likely worth deleting by hand."""
+    started and this checkpoint is likely worth deleting by hand. The
+    advisory is only attached when the saved epoch is genuinely low
+    (see _EPOCH_ADVISORY_FRACTION)."""
     checkpoint = torch.load(path, map_location=device or "cpu", weights_only=True)
     saved_epoch = checkpoint.get("epoch")
     if saved_epoch is None:
         return
-    if target_epochs is not None:
-        print(f"  (saved at epoch {saved_epoch}/{target_epochs} -- if this looks very "
-              f"low relative to the target, the run may have been killed shortly after "
-              f"starting; consider deleting this checkpoint and retraining)")
-    else:
+    if target_epochs is None:
         print(f"  (saved at epoch {saved_epoch})")
+    elif saved_epoch >= _EPOCH_ADVISORY_FRACTION * target_epochs:
+        print(f"  (saved at epoch {saved_epoch}/{target_epochs})")
+    else:
+        print(f"  (saved at epoch {saved_epoch}/{target_epochs} -- well short of the "
+              f"target; the run may have been killed shortly after starting, or stopped "
+              f"early on a noisy criterion. Consider deleting this checkpoint and "
+              f"retraining)")
 
 
 def _in_progress_signature(final_signature: dict, epoch: int) -> dict:

@@ -167,7 +167,53 @@ def _prepare_stage_kwargs(raw_params: dict[str, str], global_params: dict[str, s
             kwargs[renamed_key] = _convert_value(value)
     return kwargs
 
-def _strip_unrecognized_params(func, kwargs: dict, label: str) -> dict:
+# Params the PIPELINE itself consumes rather than forwarding to any
+# training function (see run_from_params_file's own preamble, which pops
+# them). Legitimate in a params file, so they must not be reported as
+# unrecognized -- they're simply not training-function parameters.
+_PIPELINE_CONSUMED_KEYS = frozenset({"base", "Nx", "Ny", "force"})
+
+
+def renamed_keys(raw_params: dict) -> set[str]:
+    """
+    The parameter names raw_params will actually CARRY once
+    _prepare_stage_kwargs has applied _KEY_RENAMES -- so a caller can
+    ask "which of these keys came from this stage's OWN section?"
+    against the post-rename names the kwargs dict is keyed by.
+    """
+    return {_KEY_RENAMES.get(k, k) for k in raw_params}
+
+
+def report_unrecognized_global_params(global_params: dict, funcs) -> list[str]:
+    """
+    Warns ONCE, in the preamble, about global-section params that no
+    stage's training function accepts at all -- i.e. genuine typos or
+    leftovers, dead everywhere rather than merely inapplicable here.
+
+    Split out from the per-stage check deliberately. A global param is
+    by design offered to EVERY stage as a default (see
+    _prepare_stage_kwargs), so most globals are legitimately unusable by
+    most stages -- e.g. a global `latent_channels` is meaningful to
+    stage 1 and meaningless to stage 3. Reporting those per-stage
+    produced a spurious warning in every stage that couldn't use them,
+    which is noise that trains the reader to ignore the warning
+    entirely; the one case that IS a real mistake (a key no stage
+    accepts) then hides among them. So: globals are checked once here,
+    against the UNION of every training function's parameters, and the
+    per-stage check below only reports keys from a stage's OWN section.
+    """
+    accepted = set(_PIPELINE_CONSUMED_KEYS)
+    for f in funcs:
+        accepted |= set(inspect.signature(f).parameters)
+    unknown = sorted(renamed_keys(global_params) - accepted)
+    if unknown:
+        print(f"WARNING: global/preamble parameter(s) accepted by NO stage's training "
+              f"function -- IGNORED everywhere, likely a typo or a leftover: {unknown}")
+    return unknown
+
+
+def _strip_unrecognized_params(func, kwargs: dict, label: str,
+                                own_keys: set[str] | None = None) -> dict:
     """
     Returns a copy of kwargs with any key that isn't an actual parameter
     of `func` REMOVED (not just warned about -- a warning that leaves
@@ -176,12 +222,22 @@ def _strip_unrecognized_params(func, kwargs: dict, label: str) -> dict:
     parameter (e.g. Nx/Ny left over in a stage section after the
     config.txt-validation logic that used to consume them was removed)
     before it reaches the actual training call.
+
+    own_keys: if given, only keys in this set are WARNED about -- the
+    rest are still stripped, silently. Pass renamed_keys(<this stage's
+    own raw section>) so that inherited global defaults that simply
+    don't apply to this stage are dropped without comment (they're
+    reported once, globally, by report_unrecognized_global_params
+    instead -- see its own docstring for why the split matters). Omit it
+    to warn about everything, which is the right behavior for a caller
+    that has no globals to inherit from.
     """
     accepted = set(inspect.signature(func).parameters)
     unrecognized = set(kwargs) - accepted
-    if unrecognized:
-        print(f"WARNING: {label} has parameter(s) not recognized by its training "
-              f"function -- IGNORED, not used: {sorted(unrecognized)}")
+    to_warn = sorted(unrecognized if own_keys is None else (unrecognized & own_keys))
+    if to_warn:
+        print(f"WARNING: {label}'s OWN section has parameter(s) not recognized by its "
+              f"training function -- IGNORED, not used: {to_warn}")
     return {k: v for k, v in kwargs.items() if k in accepted}
 
 

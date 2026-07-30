@@ -207,11 +207,23 @@ def isolated_project_root(tmp_path, monkeypatch):
     import training.train_refinement as train_refinement
     import orchestration.paths as orch_paths
     import orchestration.pipeline as orch_pipeline
+    # checkpoint_registry does `from orchestration.paths import
+    # _CHECKPOINTS_ROOT, _STAGE_DIRS`, binding its OWN module-level names
+    # at import time -- so patching orch_paths alone never reaches them,
+    # and its _resolve_checkpoint_field would resolve relative registry
+    # paths against the REAL checkpoints tree during tests. Read-only, so
+    # nothing is written there, but a cache hit/miss test could then pass
+    # or fail against real-tree paths instead of the isolated ones.
+    # Exactly the per-module-copy problem this fixture's own docstring
+    # describes, and the same shape as train_stage1/train_stage2's own
+    # _PYTHON_ROOT copies already handled below.
+    import orchestration.checkpoint_registry as orch_registry
 
     for module in (train_stage1, train_stage2, train_lds, train_refinement, orch_paths, orch_pipeline):
         monkeypatch.setattr(module, "_PYTHON_ROOT", root, raising=True)
-    for module in (orch_paths, orch_pipeline):
+    for module in (orch_paths, orch_pipeline, orch_registry):
         monkeypatch.setattr(module, "_STAGE_DIRS", stage_dirs, raising=True)
-    monkeypatch.setattr(orch_paths, "_CHECKPOINTS_ROOT", root / "checkpoints", raising=True)
+    for module in (orch_paths, orch_registry):
+        monkeypatch.setattr(module, "_CHECKPOINTS_ROOT", root / "checkpoints", raising=True)
 
     return root

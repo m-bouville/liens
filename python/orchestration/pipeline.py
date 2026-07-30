@@ -23,7 +23,8 @@ from orchestration.logging_utils import _log_to_file
 from orchestration.paths import _PYTHON_ROOT, _STAGE_DIRS
 from orchestration.stage_params import (
     _backup_before_overwrite, _prepare_stage_kwargs, _resolve_stage_specific_ancestor,
-    _strip_unrecognized_params, parse_stage_params,
+    _strip_unrecognized_params, parse_stage_params, renamed_keys,
+    report_unrecognized_global_params,
 )
 from training.checkpoint_components import split_joint_checkpoint_for_evaluation
 from training.train_stage1 import train_autoencoder
@@ -88,6 +89,14 @@ def run_from_params_file(params_path: Path, default_base: Path,
     size = nx
     extra_signature = {"Nx": nx, "Ny": ny}
 
+    # One global check, here, against the UNION of every stage's training
+    # function -- see report_unrecognized_global_params' own docstring for
+    # why globals must NOT be reported per-stage (a global is offered to
+    # every stage by design, so most are legitimately unusable by most
+    # stages). Runs after base/Nx/Ny are popped above, so those don't warn.
+    report_unrecognized_global_params(
+        global_params, (train_autoencoder, train_stage2, train_lds, train_refinement))
+
     stem = params_path.stem
 
     def stage_dir(stage_num: int | str) -> Path:
@@ -147,7 +156,8 @@ def run_from_params_file(params_path: Path, default_base: Path,
     # ---- Stage 1: autoencoder ----
     stage1_kwargs = _prepare_stage_kwargs(stages.get(1, {}), global_params)
     force1 = stage1_kwargs.pop("force", False)
-    stage1_kwargs = _strip_unrecognized_params(train_autoencoder, stage1_kwargs, "Stage 1")
+    stage1_kwargs = _strip_unrecognized_params(train_autoencoder, stage1_kwargs, "Stage 1",
+                                            own_keys=renamed_keys(stages.get(1, {})))
     signature1 = {"base_path": str(base_path),
                   **extra_signature, **_signature_kwargs(stage1_kwargs)}
     stage1_checkpoint = resolve_checkpoint(1, force1, signature1, stage1_kwargs.get("epochs"))
@@ -205,7 +215,8 @@ def run_from_params_file(params_path: Path, default_base: Path,
 
     stage2_kwargs = _prepare_stage_kwargs(stages.get(2, {}), global_params)
     force2 = stage2_kwargs.pop("force", False)
-    stage2_kwargs = _strip_unrecognized_params(train_stage2, stage2_kwargs, "Stage 2")
+    stage2_kwargs = _strip_unrecognized_params(train_stage2, stage2_kwargs, "Stage 2",
+                                            own_keys=renamed_keys(stages.get(2, {})))
     stage2_kwargs, stage2_resume_from, stage2_overridden = _resolve_stage_specific_ancestor(
         stage2_kwargs, stage1_checkpoint, "Stage 2")
     # Naming note: registries use a consistent "stageN_checkpoint" ancestry
@@ -344,7 +355,8 @@ def run_from_params_file(params_path: Path, default_base: Path,
         already reused from the registry, not retrained this run."""
         kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}), global_params)
         force = kwargs.pop("force", False)
-        kwargs = _strip_unrecognized_params(train_lds, kwargs, f"Stage {stage_key}")
+        kwargs = _strip_unrecognized_params(train_lds, kwargs, f"Stage {stage_key}",
+                                            own_keys=renamed_keys(stages.get(stage_key, {})))
         kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
             kwargs, resume_from, f"Stage {stage_key}")
         # Default to quiet (only print on save/early-stop), not train_lds()'s
@@ -506,7 +518,8 @@ def run_from_params_file(params_path: Path, default_base: Path,
         freeze_decoder = (stage_key == 4)
         kwargs = _prepare_stage_kwargs(stages.get(stage_key, {}), global_params)
         force = kwargs.pop("force", False)
-        kwargs = _strip_unrecognized_params(train_refinement, kwargs, f"Stage {stage_key}")
+        kwargs = _strip_unrecognized_params(train_refinement, kwargs, f"Stage {stage_key}",
+                                            own_keys=renamed_keys(stages.get(stage_key, {})))
         kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
             kwargs, resume_from, f"Stage {stage_key}")
         if resume_from is not None:

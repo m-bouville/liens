@@ -293,3 +293,37 @@ def test_clamped_midrun_reset_still_permits_a_save():
     tracker.reset_with_grace(clamp_grace_epochs(5, total_epochs - switch_epoch + 1))
     saves = [tracker.update(e, v)[1] for e, v in [(2, 0.9), (3, 0.8)]]
     assert any(saves), "a short run must still be able to save at least once after a switch"
+
+
+def test_epoch_advisory_only_fires_when_genuinely_short(tmp_path, capsys):
+    """
+    REGRESSION: the advisory used to be UNCONDITIONAL, producing the
+    self-contradicting "saved at epoch 60/60 -- if this looks very low
+    relative to the target..." on a run that demonstrably went the full
+    distance. A warning that fires when nothing is wrong teaches the
+    reader to skip it, costing exactly the cases it exists for.
+    """
+    import torch
+    from orchestration.checkpoint_registry import _report_checkpoint_epoch
+
+    def report(saved, target):
+        p = tmp_path / f"ck_{saved}_{target}.pt"
+        torch.save({"epoch": saved}, p)
+        _report_checkpoint_epoch(p, target, "cpu")
+        return capsys.readouterr().out
+
+    for saved, target in [(60, 60), (42, 60), (40, 60), (226, 250)]:
+        out = report(saved, target)
+        assert f"{saved}/{target}" in out
+        assert "may have been killed" not in out, (
+            f"{saved}/{target} is >= 2/3 of target -- must be a plain fact, no advisory")
+
+    for saved, target in [(39, 60), (4, 60), (1, 100)]:
+        out = report(saved, target)
+        assert f"{saved}/{target}" in out
+        assert "may have been killed" in out, (
+            f"{saved}/{target} is well short -- the advisory IS warranted here")
+
+    # no target -> bare fact, never an advisory
+    out = report(17, None)
+    assert "17" in out and "may have been killed" not in out
