@@ -21,7 +21,7 @@ from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs,
 from training.losses import StatsLoss
 from training.model_assembly import build_models_from_components
 from training.refinement_loss import compute_stage45_loss
-from utils.plots import loss_component_scatter, loss_curve
+from utils.plots import loss_component_scatter, loss_curve, should_write_loss_figure
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
 
@@ -321,10 +321,11 @@ def train_refinement(
         train_loss_history.append(train_loss)
         val_loss_history.append(val_loss)
         best_so_far_history.append(tracker.best_val_loss)
-        loss_curve(
-            epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-            loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
-        )
+        if should_write_loss_figure(epoch, log_every_epoch):
+            loss_curve(
+                epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+                loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
+            )
 
         current_val_components = {
             "rollout": rollout_weight * val_rollout / rollout_scale,
@@ -341,10 +342,11 @@ def train_refinement(
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
             component_histories[name]["best_so_far"].append(best_components[name])
-        loss_component_scatter(
-            epoch_history, component_histories, loss_components_path,
-            title=f"Stage {'4' if freeze_decoder else '5'} loss components",
-        )
+        if should_write_loss_figure(epoch, log_every_epoch):
+            loss_component_scatter(
+                epoch_history, component_histories, loss_components_path,
+                title=f"Stage {'4' if freeze_decoder else '5'} loss components",
+            )
 
         ema_str = f"{tracker.val_ema:7.4f}" if tracker.val_ema is not None else "  (warmup)"
         msg = (f"{epoch:4d}|"
@@ -405,5 +407,20 @@ def train_refinement(
             print(f"Early stopping at epoch {epoch}: no improvement for "
                   f"{early_stopping_patience} epochs")
             break
+
+    # Unconditional final write: the in-loop calls are throttled (see
+    # should_write_loss_figure), and a run can end on an epoch that was
+    # skipped -- via early stopping, or simply because the last epoch
+    # wasn't a multiple of the interval. Without this the figures left on
+    # disk could be up to `every` epochs stale, which is exactly the
+    # state a finished run gets judged from.
+    loss_curve(
+        epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+        loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
+    )
+    loss_component_scatter(
+        epoch_history, component_histories, loss_components_path,
+        title=f"Stage {'4' if freeze_decoder else '5'} loss components",
+    )
 
     return checkpoint_path

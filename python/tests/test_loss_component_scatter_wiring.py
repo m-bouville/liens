@@ -15,8 +15,11 @@ instead, alongside that stage's other tests.
 Run from python/ (imports rely on that root being on sys.path):
     pytest tests/test_loss_component_scatter_wiring.py -v
 """
+import re
 import struct
 from pathlib import Path
+
+import pytest
 
 from test_train_stage2_l_deriv import _build_sweep
 from test_train_refinement import (
@@ -181,7 +184,113 @@ def test_refinement_component_values_reconstruct_train_total(tmp_path, isolated_
     for i, epoch in enumerate(captured["epoch_history"]):
         reconstructed = sum(captured["component_histories"][c]["train"][i]
                             for c in captured["component_histories"])
-        assert f"{epoch:4d}|{reconstructed:7.4f}" in printed, (
-            f"epoch {epoch}: reconstructed train total {reconstructed:.4f} doesn't match "
-            f"what the console actually printed"
+        m = re.search(rf"^\s*{epoch}\|\s*([\d.]+)\s*=", printed, re.MULTILINE)
+        assert m, f"epoch {epoch}: no console line found to compare against"
+        printed_total = float(m.group(1))
+        assert reconstructed == pytest.approx(printed_total, abs=5e-4), (
+            f"epoch {epoch}: reconstructed train total {reconstructed:.4f} doesn't match the "
+            f"console's own {printed_total:.4f} (tolerance 5e-4, matching the console's own "
+            f"4-decimal rounding -- these are two independently computed, mathematically equal "
+            f"sums, not required to be bit-identical; a real Windows run failed here by exactly "
+            f"1e-4, right at the .4f rounding boundary, from BLAS/platform summation-order "
+            f"differences)"
         )
+
+
+def test_figures_are_throttled_but_ALWAYS_flushed_at_the_end(tmp_path, isolated_project_root,
+                                                              monkeypatch):
+    """
+    The per-epoch figure writes are throttled (see
+    utils.plots.should_write_loss_figure -- they cost ~0.7s/epoch and
+    only the last one is ever looked at). Two things must hold:
+
+      1. Throttling actually happens (far fewer writes than epochs).
+      2. The FINAL state is never stale. This is the subtle one: a run
+         can end on an epoch the throttle skipped -- via early stopping,
+         or simply a final epoch that isn't a multiple of the interval
+         -- so each stage must write once unconditionally AFTER its
+         loop. Without that, a finished run would be judged from
+         figures up to `every` epochs out of date.
+
+    Uses 12 epochs against an interval of 10, so the last in-loop write
+    is epoch 10 and epochs 11-12 are skipped -- the final flush is the
+    only thing that can make the figure reflect all 12.
+    """
+    import training.train_stage1 as t1
+    from utils.plots import LOSS_FIGURE_EVERY
+
+    epochs = 12
+    assert epochs % LOSS_FIGURE_EVERY != 0, (
+        "fixture assumption: the final epoch must NOT be a write epoch, or this test "
+        "cannot distinguish a real final flush from an in-loop write"
+    )
+
+    seen_epoch_counts = []
+    real = t1.loss_curve
+
+    def spy(epoch_history, *args, **kwargs):
+        seen_epoch_counts.append(len(epoch_history))
+        return real(epoch_history, *args, **kwargs)
+
+    monkeypatch.setattr(t1, "loss_curve", spy)
+
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    t1.train_autoencoder(
+        size=32, base_path=base_path, epochs=epochs, batch_size=4, base_channels=4,
+        latent_channels=4, val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        augment=False, min_step=0, min_stdev_phi=None, stats0_weight=0.01,
+        stat_names=["avg_phi"], checkpoint_path=tmp_path / "s1_thr.pt", device="cpu",
+        seed=0, log_every_epoch=False, loss_curve_path=tmp_path / "c_thr.png",
+    )
+
+    assert len(seen_epoch_counts) < epochs, (
+        f"no throttling: loss_curve ran {len(seen_epoch_counts)}x for {epochs} epochs"
+    )
+    assert seen_epoch_counts[-1] == epochs, (
+        f"the LAST write saw only {seen_epoch_counts[-1]} epochs, not all {epochs} -- "
+        f"the post-loop final flush is missing, so a finished run's figures are stale"
+    )
+
+
+def test_log_every_epoch_true_writes_every_epoch_not_throttled(tmp_path, isolated_project_root,
+                                                                monkeypatch):
+    """
+    REGRESSION-shaped, for the OTHER half of should_write_loss_figure:
+    log_every_epoch=True means a closely-watched run (its whole point is
+    a console line every epoch), typically also a SLOW one -- a real
+    stage-1 epoch can take ~20 minutes, against which the ~0.7s these
+    figures cost is ~0.06%, negligible. Throttling that case would only
+    make the plot someone is actively watching go stale, for savings
+    that don't matter at that timescale -- so it must NOT be throttled,
+    unlike the log_every_epoch=False (quiet/automated) case covered by
+    the sibling test above.
+    """
+    import training.train_stage1 as t1
+
+    epochs = 12
+    seen_epoch_counts = []
+    real = t1.loss_curve
+
+    def spy(epoch_history, *args, **kwargs):
+        seen_epoch_counts.append(len(epoch_history))
+        return real(epoch_history, *args, **kwargs)
+
+    monkeypatch.setattr(t1, "loss_curve", spy)
+
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    t1.train_autoencoder(
+        size=32, base_path=base_path, epochs=epochs, batch_size=4, base_channels=4,
+        latent_channels=4, val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        augment=False, min_step=0, min_stdev_phi=None, stats0_weight=0.01,
+        stat_names=["avg_phi"], checkpoint_path=tmp_path / "s1_watched.pt", device="cpu",
+        seed=0, log_every_epoch=True, loss_curve_path=tmp_path / "c_watched.png",
+    )
+
+    # >= epochs, not == : the unconditional post-loop flush fires as a
+    # (harmless) extra call even when every epoch already wrote -- see
+    # should_write_loss_figure's own docstring.
+    assert len(seen_epoch_counts) >= epochs, (
+        f"log_every_epoch=True was throttled ({len(seen_epoch_counts)} writes for {epochs} "
+        f"epochs) -- a closely-watched run must see every epoch's own update"
+    )
+    assert seen_epoch_counts[-1] == epochs

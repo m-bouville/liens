@@ -32,7 +32,7 @@ from training.losses import ReconLoss, StatsLoss, centered_deriv_target, dt_weig
 from training.stats_head import StatsHead
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
-from utils.plots import loss_component_scatter, loss_curve
+from utils.plots import loss_component_scatter, loss_curve, should_write_loss_figure
 from evaluation.check_interpolation import check_interpolation
 from evaluation.check_perturbation import check_perturbation
 
@@ -1225,10 +1225,11 @@ def train_stage2(
         train_loss_history.append(train_total)
         val_loss_history.append(val_total)
         best_so_far_history.append(tracker.best_val_loss)
-        loss_curve(
-            epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-            loss_curve_path, title="Stage 2 loss",
-        )
+        if should_write_loss_figure(epoch, log_every_epoch):
+            loss_curve(
+                epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+                loss_curve_path, title="Stage 2 loss",
+            )
 
         # loss_component_scatter: recon0 (always present, weight 1) plus
         # whichever of stats0/stats1/deriv are actually active this run
@@ -1245,9 +1246,11 @@ def train_stage2(
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
             component_histories[name]["best_so_far"].append(best_components[name])
-        loss_component_scatter(
-            epoch_history, component_histories, loss_components_path, title="Stage 2 loss components",
-        )
+        if should_write_loss_figure(epoch, log_every_epoch):
+            loss_component_scatter(
+                epoch_history, component_histories, loss_components_path,
+                title="Stage 2 loss components",
+            )
 
         train_terms = " ".join(f"+{tw*tv/s:7.4f}" for lbl, (tw, _, s, tv, _) in term_values.items()
                                 if any(lbl == l for _, l, _ in active_terms))
@@ -1282,6 +1285,40 @@ def train_stage2(
                     "decoder_for_stream": decoder_for_stream,
                 },
                 "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
+                # Mirrors train_lds's own data_config, and exists for the
+                # same reason: a diagnostic reading this checkpoint has
+                # no other way to reproduce the window set it was
+                # actually trained on, and its own CLI defaults
+                # (min_step=None -> 0, min_stdev_phi=None) mean NO
+                # filtering at all -- silently a different, much larger
+                # population than training ever saw.
+                #
+                # min_std_deriv especially: it is applied ONLY here, in
+                # stage 2, and on real 64x64 data discards tens of
+                # thousands of windows (33683 train / 13090 val in one
+                # real run). Until this was saved it appeared in no
+                # checkpoint at all, so every stage-2 evaluation
+                # SILENTLY ran against windows training had deliberately
+                # excluded.
+                #
+                # Saving it made that difference REPORTABLE, not
+                # reproducible -- an important distinction. The filter
+                # is raw-pixel-only (it thresholds the spatial std of
+                # the pixel-space derivative), and
+                # MicrostructureEvolutionDataset rejects it outright in
+                # cached-latent mode, where it has no defined meaning.
+                # train_stage2 can apply it only because it trains E/D
+                # and therefore runs in raw-pixel mode; every stage-2
+                # DIAGNOSTIC uses a frozen encoder instead. So
+                # check_deriv_temperature reads this value and prints an
+                # explicit NOTE that its window population differs from
+                # training's -- it does not, and cannot, match it.
+                "data_config": {
+                    "min_step": min_step, "min_stdev_phi": min_stdev_phi,
+                    "min_passing_steps": min_passing_steps, "min_std_deriv": min_std_deriv,
+                    "window_length": 3 if deriv_target_centered else 2,
+                    "augment": augment,
+                },
                 "stage2_config": {"deriv_weight": deriv_weight,
                                    "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
                                    "deriv_dt_weight_exponent": deriv_dt_weight_exponent,
@@ -1322,6 +1359,21 @@ def train_stage2(
     final_buffers = {k: final_state[k] for k in initial_buffers}
     param_drift, buffer_drift = compute_weight_drift(
         initial_params, initial_buffers, final_params, final_buffers)
+
+    # Unconditional final write: the in-loop calls are throttled (see
+    # should_write_loss_figure), and a run can end on an epoch that was
+    # skipped -- via early stopping, or simply because the last epoch
+    # wasn't a multiple of the interval. Without this the figures left on
+    # disk could be up to `every` epochs stale, which is exactly the
+    # state a finished run gets judged from.
+    loss_curve(
+        epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+        loss_curve_path, title="Stage 2 loss",
+    )
+    loss_component_scatter(
+        epoch_history, component_histories, loss_components_path,
+        title="Stage 2 loss components",
+    )
 
     print("\nPer-block PARAMETER drift (L2 norm of change from stage-1 starting point):")
     frozen_groups = {group for group, value in param_drift.items() if value == 0.0}

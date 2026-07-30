@@ -12,6 +12,46 @@ import numpy as np
 from . import load_datasets as load
 
 
+LOSS_FIGURE_EVERY = 10
+
+
+def should_write_loss_figure(epoch: int, log_every_epoch: bool, every: int = LOSS_FIGURE_EVERY) -> bool:
+    """
+    Whether to regenerate the per-epoch loss figures THIS epoch.
+
+    Keyed off log_every_epoch -- the SAME flag each stage already uses to
+    decide whether to print every epoch's own console line or only the
+    epochs a checkpoint was saved on (see e.g. train_stage1's own "if
+    log_every_epoch or saved_this_epoch"). Reused here rather than a
+    second, independent flag, since it already encodes exactly the
+    distinction that matters: is this run being watched closely enough
+    that a stale plot is a real cost?
+
+    log_every_epoch=True: write EVERY epoch. Measured cost is real in
+    absolute terms (~300 ms for loss_curve plus ~390 ms for
+    loss_component_scatter, ~0.7 s/epoch -- see fig.savefig()/
+    tight_layout() being the dominant cost, not the plotting itself:
+    8 ms to build a figure, 87 ms to build AND save it) but log_every_epoch
+    is what a user watching a SLOW, closely-monitored run sets (e.g. a
+    real stage-1 epoch taking ~20 minutes, where 0.7s is ~0.06% overhead)
+    -- throttling there would only make the plot they're actively
+    watching stale, for savings too small to matter at that timescale.
+
+    log_every_epoch=False: throttle to every `every` epochs. This is the
+    quiet/automated case (short ablations, batch runs, tests) where
+    nobody is watching each epoch's own plot update, and where epochs
+    are often fast enough that 0.7s IS a proportionally real cost
+    (measured directly: 12 unthrottled writes took ~6.8s vs ~3.1s
+    throttled on a 12-epoch synthetic run).
+
+    epoch=0 always writes regardless of log_every_epoch, so train_*()'s
+    own epochs=0 ablation (which runs the loop body exactly once, at
+    epoch 0) still produces its figures either way.
+    """
+    return log_every_epoch or epoch % every == 0
+    return epoch % every == 0
+
+
 def loss_curve(
     epochs: list[int], train_loss: list[float], val_loss: list[float],
     best_so_far: list[float], output_path: Path, title: str = "",

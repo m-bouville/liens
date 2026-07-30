@@ -38,7 +38,7 @@ from training.checkpoint_criterion import (
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss, compute_dt_decade_weights
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
-from utils.plots import loss_curve
+from utils.plots import loss_curve, should_write_loss_figure
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -847,13 +847,14 @@ def train_lds(
         if show_1step:
             train_1step_history.append(train_1step)
             val_1step_history.append(val_1step)
-        loss_curve(
-            epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-            loss_curve_path, title="Stage 3 loss",
-            secondary_train=train_1step_history if show_1step else None,
-            secondary_val=val_1step_history if show_1step else None,
-            secondary_label="1step",
-        )
+        if should_write_loss_figure(epoch, log_every_epoch):
+            loss_curve(
+                epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+                loss_curve_path, title="Stage 3 loss",
+                secondary_train=train_1step_history if show_1step else None,
+                secondary_val=val_1step_history if show_1step else None,
+                secondary_label="1step",
+            )
 
         ema_str = f"{tracker.val_ema:.6f}" if tracker.val_ema is not None else "  (warmup)"
         if show_1step:
@@ -902,6 +903,20 @@ def train_lds(
             print(f"Early stopping at epoch {epoch}: no improvement for "
                   f"{early_stopping_patience} epochs")
             break
+
+    # Unconditional final write: the in-loop calls are throttled (see
+    # should_write_loss_figure), and a run can end on an epoch that was
+    # skipped -- via early stopping, or simply because the last epoch
+    # wasn't a multiple of the interval. Without this the figures left on
+    # disk could be up to `every` epochs stale, which is exactly the
+    # state a finished run gets judged from.
+    loss_curve(
+        epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+        loss_curve_path, title="Stage 3 loss",
+        secondary_train=train_1step_history if show_1step else None,
+        secondary_val=val_1step_history if show_1step else None,
+        secondary_label="1step",
+    )
 
     return checkpoint_path
 

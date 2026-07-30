@@ -72,16 +72,16 @@ See latent-space derivative (step 2) below. Note: in stage 1 the small dense NN 
 
 ### One-step latent prediction loss
 Compare the prediction to the ground truth in latent space:
-$$L_\mathrm{1step} = \left\| [z(t) + f_\theta(z(t), \Delta t)] - z(t+\Delta t) \right\|_2^2.$$
+$$L_\mathrm{1step} = \left\| z_1(t) - [z_0(t+\Delta t) - z_0(t)] / \Delta t \right\|_2^2.$$
 Doing so in latent space avoids reliance on the decoder, cleanly separating decoder loss and prediction loss.
 
 
 ### Multi-step rollout loss
 By having several predictions in a row, we let error accumulate:
-$$z(t_{k}) \xrightarrow{f} \hat{z}(t_{k+1}) \xrightarrow{f} \hat{z}(t_{k+2}) \xrightarrow{f} \hat{z}(t_{k+3}) \xrightarrow{f} \ldots.$$
+$$z_0(t_{k}) \xrightarrow{f} \hat{z}_0(t_{k+1}) \xrightarrow{f} \hat{z}_0(t_{k+2}) \xrightarrow{f} \hat{z}_0(t_{k+3}) \xrightarrow{f} \ldots.$$
 When starting from the snapshot at time $t_k$, the rollout loss is:
-$$L_\mathrm{rollout} = \sum_{i=1}^{N_r} \left\| \hat{z}(t_{k+i}) - z(t_{k+i}) \right\|_2^2,$$
-where $\hat{z}(t_{k+i+1}) = \hat{z}(t_{k+i}) + f_\theta(\hat{z}(t_{k+i}), \Delta t_i)$ and $\Delta t_i = t_{k+i+1} - t_{k+i}$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
+$$L_\mathrm{rollout} = \sum_{i=1}^{N_r} \left\| \hat{z}_0(t_{k+i}) - z_0(t_{k+i}) \right\|_2^2,$$
+where $\hat{z}_0(t_{k+i+1}) = \hat{z}_0(t_{k+i}) + z_1(t_{k+i})\,\Delta t_i$ and $\Delta t_i = t_{k+i+1} - t_{k+i}$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
 
 
 
@@ -155,14 +155,22 @@ The asymmetry between C$_0$ and C$_1$ in on the number of channels, not size, in
 
 
 ### stage 2
-Training the AE (stage 1) ensures that the initial state can be recovered. This proves that the latent representation $z$ somehow describes $x$, not that is a smooth and structured coordinate system. 
-Working directly in latent space is faster (it is smaller than real space), but _a priori_ we cannot do arithmetic. 
+Working directly in latent space is faster (it is smaller than real space), but _a priori_ we cannot do arithmetic in it. 
 
-The goal of stage 2 is to have a meaningful latent representation of the relationship between C$_0$ and C$_1$, $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can do $$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
+Training the AE (stage 1) ensures that the microstructure (the state) can be reconstructed in real space. This means that the latent representation $z_0$ somehow describes $x$, not that is a smooth and structured coordinate system. 
+
+The goal of stage 2 is to have a meaningful latent representation of the relationship between C$_0$ and C$_1$, $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ (*) directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can have the prediction $$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
 
 This involves adding `L_deriv` to the loss function of stage 1 (with a paired-window dataset for derivative calculation).
 
 In stage 2, we are changing the latent representation, while maintaining the reconstruction of C$_0$. We can freeze the outter layers of both encoder and decoder (not those close to the latent space) for regularization.
+
+#### (*) Calculating the derivative
+In fact, we use a symmetric, second-order discretization. We expand $z_0(t+\Delta t_+)$ and $z_0(t-\Delta t_-)$. The weighted sum, $z_0(t+\Delta t_+) / {\Delta t_+}^{\!2} - z_0(t-\Delta t_-) / {\Delta t_-}^{\!2}$, removes the second-order term, and one finally obtains 
+$$\dot{z}_0(t)  =
+{} \frac{z_0(t+\Delta t_+) \, {\Delta t_-}^{\!2} - z_0(t-\Delta t_-) \, {\Delta t_+}^{\!2} - z_0(t) ( {\Delta t_-}^{\!2} - {\Delta t_+}^{\!2}) }{(\Delta t_+ + \Delta t_-)\Delta t_+ \, \Delta t_- }
+{} + o(\Delta t_+) + o(\Delta t_-).$$
+$z_1(t)$ is trained against this.
 
 
 ### stage 3 (LDS)
@@ -175,7 +183,7 @@ with $\theta$ (currently just the temperature) as further input.
 Finally,
 $$z_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t)) \, (\Delta t^2/2) + o(\Delta t^2).$$
 
-In practice, the second order is restrained to $\Delta t \le \Delta t_\mathrm{cap}$, to avoid the risk of a blow-up at large $\Delta t$.
+In practice, the second order is not multiplied by $\Delta t ^2$ but by  $\min(\Delta t, \Delta t_\mathrm{cap})^2$, to avoid the risk of a blow-up at large $\Delta t$.
 
 
 #### gθ and d²z1 / dt²
@@ -187,6 +195,107 @@ again accounting for $\theta$.
 
 In stage 3a, we use only one step, `L_1step`. Stage 3b will involve several consecutive steps (`L_rollout`)​.
 
+
+### Residuals
+We have that
+$$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t))\,(\Delta t^2/2)$$
+approximates
+$$z_0(t + \Delta t) = z_0(t) + \dot{z}_0(t)\,\Delta t + \ddot{z}_0(t)\,(\Delta t^2/2) + A\,\Delta t^3.$$
+
+So, the residual is
+$$\frac{\tilde{z}_0(t + \Delta t) - z_0(t + \Delta t)}{\Delta t} = [z_1(t) - \dot{z}_0(t)] + \frac{1}{2}\left[f_\theta(z_0(t), z_1(t)) - \ddot{z}_0(t)\right]\Delta t - A \Delta t^2.$$
+The leading order is the error on $z_1$ and the next that on $f_\theta$.
+
+At stage 2 (before $f_\theta$ is available),
+$$\frac{[z_0(t) + z_1(t)\,\Delta t] - z_0(t + \Delta t)}{\Delta t} = [z_1(t) - \dot{z}_0(t)] - \frac{1}{2} \ddot{z}_0(t)\,\Delta t.$$
+
+
+#### The structure of residuals
+$z_1$ approximates $\dot{z}_0$:
+$$z_1(t) = \frac{z_0(t + \Delta t) - z_0(t) + \varepsilon_1}{\Delta t} + \varepsilon_1'.$$ 
+Hence, $$z_1(t) - \dot{z}_0(t) = \frac{\varepsilon_1}{\Delta t} + \varepsilon_1',$$ so that 
+$$\frac{[z_0(t) + z_1(t)\,\Delta t] - z_0(t + \Delta t)}{\Delta t} = \frac{\varepsilon_1}{\Delta t} + \varepsilon_1' - \frac{1}{2} \ddot{z}_0(t)\,\Delta t,$$
+and
+$$\frac{\tilde{z}_0(t + \Delta t) - z_0(t + \Delta t)}{\Delta t} = \frac{\varepsilon_1}{\Delta t} + \varepsilon_1' + \frac{1}{2}\left[f_\theta(z_0(t), z_1(t)) - \ddot{z}_0(t)\right]\Delta t - A \Delta t^2.$$
+
+$f_\theta$ approximates $\ddot{z}_0$, $f_\theta(z_0(t), z_1(t)) = \ddot{z}_0(t) + \varepsilon_{\!f} / \Delta t + \varepsilon_{\!f}'$,
+where $\varepsilon_{\!f}$ and $\varepsilon_{\!f}'$ may depend on $\varepsilon_1$ and $\varepsilon_1'$.
+This yields
+$$\frac{\tilde{z}_0(t + \Delta t) - z_0(t + \Delta t)}{\Delta t} = \frac{\varepsilon_1}{\Delta t} + \left(\varepsilon_1' + \frac{\varepsilon_{\!f}}{2}\right) + \frac{\varepsilon_{\!f}'}{2} \, \Delta t - A \Delta t^2.$$
+
+
+### t + 2 Dt
+
+Just like
+
+$$z_0(t + \Delta t) = z_0(t) + \dot{z}_0(t)\,\Delta t + \ddot{z}_0(t)\,(\Delta t^2/2) + A\,\Delta t^3,$$
+
+we have
+
+$$z_0(t + 2\Delta t) = z_0(t + \Delta t) + \dot{z}_0(t + \Delta t)\,\Delta t + \ddot{z}_0(t + \Delta t)\,(\Delta t^2/2) + A\,\Delta t^3.$$
+
+
+$$z_0(t + 2\Delta t) = 
+z_0(t) 
+{} + [\dot{z}_0(t) + \dot{z}_0(t + \Delta t)]\,\Delta t
+{} + [\ddot{z}_0(t) + \ddot{z}_0(t + \Delta t)]\,(\Delta t^2/2)
+{} + 2\,A\,\Delta t^3.$$
+
+
+
+We also know that
+<!-- $$z_1(t + \Delta t) = \dot{z}_0(t + \Delta t) + \frac{\varepsilon_1}{\Delta t} + \varepsilon_1',$$-->
+$$z_1(t) + z_1(t + \Delta t) = \dot{z}_0(t) + \dot{z}_0(t + \Delta t) + 2 \frac{\varepsilon_1}{\Delta t} + 2 \varepsilon_1',$$
+
+and
+<!--$$f_\theta(z_0(t + \Delta t), z_1(t + \Delta t)) = \ddot{z}_0(t + \Delta t) + \varepsilon_{\!f} / \Delta t + \varepsilon_{\!f}',$$-->
+$$f_\theta(z_0(t), z_1(t)) + f_\theta(z_0(t + \Delta t), z_1(t + \Delta t)) = \ddot{z}_0(t) + \ddot{z}_0(t + \Delta t) + 2\varepsilon_{\!f} / \Delta t + 2\varepsilon_{\!f}',$$
+
+yielding
+<!--$$z_0(t + 2\Delta t) = 
+z_0(t) 
+{} + [z_1(t) + z_1(t + \Delta t) - 2 \frac{\varepsilon_1}{\Delta t} - 2 \varepsilon_1']\,\Delta t
+{} + [f_\theta(z_0(t), z_1(t)) + f_\theta(z_0(t + \Delta t), z_1(t + \Delta t)) - 2\varepsilon_{\!f} / \Delta t - 2\varepsilon_{\!f}']\,(\Delta t^2/2)
+{} + 2\,A\,\Delta t^3.$$-->
+
+<!--$$z_0(t + 2\Delta t) = 
+z_0(t) 
+{} + [z_1(t) + z_1(t + \Delta t)] \,\Delta t - 2 \varepsilon_1 - 2 \varepsilon_1'\,\Delta t
+{} + [f_\theta(z_0(t), z_1(t)) + f_\theta(z_0(t + \Delta t), z_1(t + \Delta t))]\,(\Delta t^2/2) - \varepsilon_{\!f} \, \Delta t - \varepsilon_{\!f}'\,\Delta t^2
+{} + 2\,A\,\Delta t^3.$$-->
+
+<!--$$z_0(t + 2\Delta t) = 
+z_0(t) 
+{} + [z_1(t) + z_1(t + \Delta t)] \,\Delta t
+{} + [f_\theta(z_0(t), z_1(t)) + f_\theta(z_0(t + \Delta t), z_1(t + \Delta t))]\,(\Delta t^2/2) 
+{} - 2 \varepsilon_1 - (2 \varepsilon_1' + \varepsilon_{\!f}) \, \Delta t - \varepsilon_{\!f}'\,\Delta t^2
+{} + 2\,A\,\Delta t^3.$$-->
+
+<!--Or, more simply,-->
+$$z_0(t + 2\Delta t) = 
+z_0(t) 
+{} + [z_1(t) + z_1(t + \Delta t)] \,\Delta t
+{} + [f_\theta(t) + f_\theta(t + \Delta t)]\,(\Delta t^2/2) 
+{} - 2 \varepsilon_1 - (2 \varepsilon_1' + \varepsilon_{\!f}) \, \Delta t - \varepsilon_{\!f}'\,\Delta t^2
+{} + 2\,A\,\Delta t^3.$$
+
+
+By training of $$g_\theta$$,
+<!--$$z_1(t + \Delta t) \approx z_1(t) + f_\theta(z_0(t), z_1(t))\,\Delta t + g_\theta(z_0(t), z_1(t)) \, (\Delta t^2/2) - \varepsilon_{\!g} / \Delta t - \varepsilon_{\!g}'.$$-->
+$$z_1(t + \Delta t) \approx z_1(t) + f_\theta(t)\,\Delta t + g_\theta(t) \, (\Delta t^2/2) - \varepsilon_{\!g} / \Delta t - \varepsilon_{\!g}'.$$
+
+
+Finally,
+
+$$z_0(t + 2\Delta t) = 
+z_0(t) 
+{} + 2 z_1(t) \, \Delta t 
+{} + [3f_\theta(t) + f_\theta(t + \Delta t)]\,(\Delta t^2/2) 
+{} - 2 \varepsilon_1 - \varepsilon_{\!g}  - (2 \varepsilon_1' + \varepsilon_{\!f} + \varepsilon_{\!g}') \, \Delta t - \varepsilon_{\!f}'\,\Delta t^2
+{}  + [g_\theta(t)/2 + 2\,A] \, \Delta t^3.$$
+
+
+---------------------------------
 
 
 ### Interpolation and perturbation

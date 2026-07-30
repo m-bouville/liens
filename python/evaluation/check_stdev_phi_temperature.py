@@ -9,16 +9,25 @@ consistently across the whole sweep?
 Motivation: evaluation/check_deriv_temperature.py and
 check_parameter_dependence.py both found z1's own error changing sign
 and magnitude specifically around T>=0.9 (T0=1 in this project's own
-sweep) -- and neither the encoder nor ANY stage-2 loss term is ever
-given temperature as an input (confirmed directly: Encoder.forward(x)
-and Autoencoder.forward(x) take no theta argument at all; train_stage2
-unpacks theta from its batch but never uses it again). If the natural
-scale of genuine structure shrinks toward the SAME noise floor a fixed
-min_stdev_phi threshold was calibrated against elsewhere in the sweep,
-that's a direct, physically-motivated candidate explanation for why the
-data (and therefore z1's training signal) could look qualitatively
-different near T0 -- independent of anything the encoder itself does
-wrong.
+sweep). If the natural scale of genuine structure shrinks toward the
+SAME noise floor a fixed min_stdev_phi threshold was calibrated against
+elsewhere in the sweep, that's a direct, physically-motivated candidate
+explanation for why the data (and therefore z1's training signal) could
+look qualitatively different near T0 -- independent of anything the
+model itself does wrong. That question is what this diagnostic answers,
+and it is worth answering regardless of the model's architecture, since
+it is about the DATA alone.
+
+UPDATED: this docstring used to add "and neither the encoder nor ANY
+stage-2 loss term is ever given temperature as an input (confirmed
+directly: Encoder.forward(x) and Autoencoder.forward(x) take no theta
+argument at all)". That was true when written and is now FALSE --
+Encoder.forward(x, theta) FiLM-conditions every stream whose own
+LatentStreamConfig sets condition_on_theta=True, which the "deriv"
+stream (z1) does. So temperature IS available to z1 now. The
+data-side question above stands on its own either way; only the
+"the model cannot possibly know T, so it must be the data" half of the
+old reasoning is gone.
 
 Reads statistics.csv directly across an entire sweep -- no model,
 checkpoint, or GPU needed at all.
@@ -158,9 +167,28 @@ def check_stdev_phi_temperature(
           f"{n_runs_skipped_no_stats} missing statistics.csv/stdev_phi, skipped), "
           f"{len(temperatures)} (step, temperature) samples")
 
-    corr = np.corrcoef(theoretical_amplitudes, stdevs)[0, 1]
-    print(f"\ncorr(theoretical equilibrium amplitude, actual stdev_phi) = {corr:.3f} "
-          f"(close to 1 -> stdev_phi tracks the Landau-predicted critical scaling closely)")
+    # corr(theoretical_amplitude, stdev_phi) is genuinely UNDEFINED, not
+    # just numerically awkward, whenever either side has zero variance
+    # across every sample -- most commonly a single-temperature sweep,
+    # since theoretical_amplitude depends only on temperature (and each
+    # run's fixed a0/b/T0). np.corrcoef divides by each side's own
+    # stddev internally, so a zero-variance side raises a raw
+    # RuntimeWarning and silently returns NaN -- exactly the failure
+    # mode this diagnostic's own question ("does the amplitude track
+    # temperature?") cannot even be POSED against in that case. Checked
+    # explicitly and reported in plain language instead.
+    if np.ptp(theoretical_amplitudes) == 0 or np.ptp(stdevs) == 0:
+        n_distinct_T = len(set(np.round(temperatures, 6)))
+        corr = float("nan")
+        print(f"\ncorr(theoretical equilibrium amplitude, actual stdev_phi): UNDEFINED -- "
+              f"{'only one distinct temperature' if n_distinct_T <= 1 else 'stdev_phi is identical across every sample'} "
+              f"in this data, so there is no variation for a correlation to describe. "
+              f"This diagnostic's own question (does the natural amplitude track temperature?) "
+              f"needs a sweep spanning multiple temperatures to answer at all.")
+    else:
+        corr = np.corrcoef(theoretical_amplitudes, stdevs)[0, 1]
+        print(f"\ncorr(theoretical equilibrium amplitude, actual stdev_phi) = {corr:.3f} "
+              f"(close to 1 -> stdev_phi tracks the Landau-predicted critical scaling closely)")
 
     # Binned view: median stdev_phi (and the SAME percentile of
     # theoretical amplitude, for a fair overlay) per temperature bin --

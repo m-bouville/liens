@@ -114,9 +114,53 @@ def check_deriv_temperature(
     # after) triples, and MicrostructureEvolutionDataset's own window
     # index construction already only yields these for interior kept
     # steps, no separate edge-case filtering needed here either.
+    # Filtering defaults to the checkpoint's OWN saved data_config, so
+    # this evaluates the same window population training actually used;
+    # an explicitly-passed value still overrides it. Same convention (and
+    # same wording below) as _latent_eval.py's own stage-3 path.
+    #
+    # Without this, the CLI defaults (min_step=None -> 0,
+    # min_stdev_phi=None) applied NO filtering at all -- silently a much
+    # larger, different population than training saw. min_std_deriv
+    # matters most: it is applied only in stage 2, and on real 64x64 data
+    # discards tens of thousands of windows, so omitting it here was not
+    # a marginal difference.
+    data_config = checkpoint.get("data_config")
+    if data_config is None:
+        print("  WARNING: this checkpoint predates data_config being saved -- falling back to "
+              "min_step=0, min_stdev_phi=None, min_passing_steps=None, min_std_deriv=None. "
+              "That is almost certainly NOT what it was trained with, so the window population "
+              "below won't match training's own; pass the values explicitly to be sure.")
+        data_config = {}
+    min_step = min_step if min_step is not None else (data_config.get("min_step") or 0)
+    min_stdev_phi = min_stdev_phi if min_stdev_phi is not None else data_config.get("min_stdev_phi")
+    min_passing_steps = (min_passing_steps if min_passing_steps is not None
+                          else data_config.get("min_passing_steps"))
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  "
+          f"min_passing_steps={min_passing_steps} "
+          f"(from checkpoint's own data_config unless overridden above)")
+    # min_std_deriv is deliberately NOT re-applied, and cannot be:
+    # MicrostructureEvolutionDataset rejects it outright in cached-latent
+    # mode (its own constructor guard), because it filters on the RAW
+    # PIXEL derivative's spatial std, which has no defined meaning
+    # against a cached latent. train_stage2 can apply it only because it
+    # trains E/D and therefore runs in raw-pixel mode; this diagnostic
+    # uses a FROZEN encoder, so the two modes are structurally
+    # different. Reported rather than silently dropped, since it means
+    # the window population below genuinely differs from training's own
+    # -- on real 64x64 data that filter removed tens of thousands of
+    # windows, so the gap is not marginal.
+    trained_min_std_deriv = data_config.get("min_std_deriv")
+    if trained_min_std_deriv is not None:
+        print(f"  NOTE: this checkpoint was TRAINED with min_std_deriv="
+              f"{trained_min_std_deriv}, which cannot be reproduced here -- it filters on the "
+              f"raw-pixel derivative, undefined against the cached latents this diagnostic uses. "
+              f"The windows below therefore INCLUDE near-degenerate-derivative ones that training "
+              f"itself excluded; treat any comparison against training's own numbers accordingly.")
+
     dataset = MicrostructureEvolutionDataset(
         test_dirs, encoder=encoder, device=device, window_length=3 if deriv_target_centered else 2,
-        min_step=min_step or 0, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+        min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
         encode_both_streams=True,
     )
     print(f"Evaluating {len(dataset)} "

@@ -1,9 +1,28 @@
+"""
+Tests for train_lds() -- i.e. STAGE 3.
+
+NOTE ON THE FILENAME: "stage1b" is historical and no longer accurate.
+Stage 1b was a separate pass that has since been removed entirely --
+train_stage2() now builds the deriv stream itself in memory (see
+training/extend_encoder.py's own module docstring for why: stage 1b's
+own training loop had been inert since it started running at epochs=0,
+and D1, the one thing genuinely built only by that loop's surrounding
+setup, was confirmed permanently unnecessary). Everything in this file
+exercises train_lds and its stage-3 behaviour; nothing here tests stage
+1b, because there is no stage 1b.
+
+Kept under the old name deliberately: nothing imports this module, so a
+rename would be safe, but it would cost the file's history for no
+functional gain. Renaming it is fine if you're touching it anyway.
+
+Run from python/ (imports rely on that root being on sys.path):
+    pytest tests/test_train_lds_stage1b.py -v
+"""
 import numpy as np
 import torch
 import pytest
 
 from conftest import cached_sweep
-from pathlib import Path
 from utils import load_datasets as load
 from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2

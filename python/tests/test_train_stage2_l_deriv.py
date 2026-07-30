@@ -3,6 +3,8 @@ import torch
 from utils import load_datasets as load
 from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2
+import re
+
 import pytest
 
 from conftest import cached_sweep
@@ -511,9 +513,12 @@ def test_loss_component_scatter_values_reconstruct_train_total(tmp_path, isolate
         epoch = captured["epoch_history"][i]
         reconstructed = sum(captured["component_histories"][c]["train"][i]
                             for c in captured["component_histories"])
-        # Console line for this epoch starts with "{epoch:4d}|{train_total:7.4f}"
-        needle = f"{epoch:4d}|{reconstructed:7.4f}"
-        assert needle in printed, (
-            f"epoch {epoch}: reconstructed train_total={reconstructed:.4f} from the "
-            f"component histories doesn't match what the console actually printed"
+        m = re.search(rf"^{epoch:4d}\|\s*([\d.]+)\s*=", printed, re.MULTILINE)
+        assert m, f"epoch {epoch}: no console line found to compare against"
+        printed_total = float(m.group(1))
+        assert reconstructed == pytest.approx(printed_total, abs=5e-4), (
+            f"epoch {epoch}: reconstructed train_total={reconstructed:.4f} from the component "
+            f"histories doesn't match the console's own {printed_total:.4f} (tolerance 5e-4, "
+            f"matching the console's own 4-decimal rounding -- these are two independently "
+            f"computed, mathematically equal sums, not required to be bit-identical)"
         )

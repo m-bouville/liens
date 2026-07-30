@@ -29,7 +29,7 @@ from training.datasets import MicrostructureSnapshotDataset, complete_run_dirs, 
 from training.losses import ReconLoss, StatsLoss
 from training.stats_head import StatsHead
 from utils.naming import ae_checkpoint_name
-from utils.plots import loss_component_scatter, loss_curve
+from utils.plots import loss_component_scatter, loss_curve, should_write_loss_figure
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -429,10 +429,11 @@ def train_autoencoder(
         train_loss_history.append(train_total)
         val_loss_history.append(val_total)
         best_so_far_history.append(tracker.best_val_loss)
-        loss_curve(
-            epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-            loss_curve_path, title="Stage 1 loss",
-        )
+        if should_write_loss_figure(epoch, log_every_epoch):
+            loss_curve(
+                epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+                loss_curve_path, title="Stage 1 loss",
+            )
         if include_stats:
             current_val_components = {
                 "recon0": val_recon0 / recon0_scale,
@@ -445,9 +446,11 @@ def train_autoencoder(
             component_histories["stats0"]["train"].append(stats0_weight * train_stats0 / stats0_scale)
             component_histories["stats0"]["val"].append(current_val_components["stats0"])
             component_histories["stats0"]["best_so_far"].append(best_components["stats0"])
-            loss_component_scatter(
-                epoch_history, component_histories, loss_components_path, title="Stage 1 loss components",
-            )
+            if should_write_loss_figure(epoch, log_every_epoch):
+                loss_component_scatter(
+                    epoch_history, component_histories, loss_components_path,
+                    title="Stage 1 loss components",
+                )
 
         msg = f"{epoch:4d}|"
         if include_stats:
@@ -519,6 +522,22 @@ def train_autoencoder(
             print(f"Early stopping at epoch {epoch}: no improvement for "
                   f"{early_stopping_patience} epochs")
             break
+
+    # Unconditional final write: the in-loop calls are throttled (see
+    # should_write_loss_figure), and a run can end on an epoch that was
+    # skipped -- via early stopping, or simply because the last epoch
+    # wasn't a multiple of the interval. Without this the figures left on
+    # disk could be up to `every` epochs stale, which is exactly the
+    # state a finished run gets judged from.
+    loss_curve(
+        epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+        loss_curve_path, title="Stage 1 loss",
+    )
+    if component_histories:
+        loss_component_scatter(
+            epoch_history, component_histories, loss_components_path,
+            title="Stage 1 loss components",
+        )
 
     return checkpoint_path
 
