@@ -24,7 +24,7 @@ from models.encoder import Encoder
 from models.latent_streams import cross_check_stream_configs_against_state_dict, \
                                    resolve_stream_configs_from_checkpoint_config
 from training.checkpoint_criterion import (
-    CheckpointCriterionTracker, atomic_torch_save, clamp_grace_epochs,
+    CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save, clamp_grace_epochs,
 )
 from training.extend_encoder import extend_state_checkpoint_with_deriv_stream
 from training.datasets import VAL_DECORRELATED_AUG_INDICES, MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
@@ -32,7 +32,7 @@ from training.losses import ReconLoss, StatsLoss, centered_deriv_target, dt_weig
 from training.stats_head import StatsHead
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
-from utils.plots import loss_curve
+from utils.plots import loss_component_scatter, loss_curve
 from evaluation.check_interpolation import check_interpolation
 from evaluation.check_perturbation import check_perturbation
 
@@ -575,6 +575,13 @@ def train_stage2(
     if loss_curve_path is None:
         name = ae_checkpoint_name(size, model_cfg["latent_channels"], ancestor_stats_weight)
         loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage2" / f"{name}-stage2-loss_curve.png"
+    # Derived from loss_curve_path's own filename (not a new parameter)
+    # so every existing call site keeps working unchanged -- same
+    # "override just the one path you care about" pattern already used
+    # elsewhere in this project (see _latent_eval.py's own
+    # dz0dt_output_path/dt_dependence_output_path).
+    loss_components_path = loss_curve_path.with_name(
+        loss_curve_path.stem + "-components" + loss_curve_path.suffix)
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
@@ -921,6 +928,15 @@ def train_stage2(
         (stats1_weight, stats1_label, stats1_scale), (deriv_weight, "deriv", deriv_scale),
     ] if w > 0]
 
+    # loss_component_scatter's own bookkeeping -- recon0 (always present)
+    # plus whichever of stats0/stats1/deriv are actually active THIS run
+    # (active_terms, computed just above, is what decides that set).
+    component_names = ["recon0"] + [lbl for _, lbl, _ in active_terms]
+    component_histories: dict[str, dict[str, list[float]]] = {
+        name: {"train": [], "val": [], "best_so_far": []} for name in component_names
+    }
+    component_best_tracker = ComponentBestTracker()
+
     print(f"Stage 2: starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size}), "
           f"deriv_weight={deriv_weight}"
@@ -1179,15 +1195,6 @@ def train_stage2(
         val_ema = tracker.val_ema
         val_ema_str = f"{val_ema:7.4f}" if val_ema is not None else "(warmup)"
 
-        epoch_history.append(epoch)
-        train_loss_history.append(train_total)
-        val_loss_history.append(val_total)
-        best_so_far_history.append(tracker.best_val_loss)
-        loss_curve(
-            epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-            loss_curve_path, title="Stage 2 loss",
-        )
-
         # (train_weight, val_weight, scale, train_value, val_value) for
         # every entry, uniformly -- even stats0/stats1, whose two
         # weights are always equal, since they're never ramped. Only
@@ -1197,17 +1204,51 @@ def train_stage2(
         # not just tidy: these ARE what actually reproduces train_total/
         # val_total's own deriv component (step() only returns the raw,
         # unweighted deriv_loss; the weight multiplication happens HERE,
-        # in the printed breakdown, separately from step()'s own total
-        # computation) -- using one shared weight for both sides here
-        # would silently print a val breakdown that no longer sums to
-        # the correct val_total, even though val_total itself (computed
-        # inside step(), which DOES already use the right weight) stayed
-        # correct.
+        # separately from step()'s own total computation) -- using one
+        # shared weight for both sides here would silently print a val
+        # breakdown that no longer sums to the correct val_total, even
+        # though val_total itself (computed inside step(), which DOES
+        # already use the right weight) stayed correct.
+        #
+        # Moved ABOVE loss_curve()/loss_component_scatter() (used to sit
+        # just below) so the same weighted, scale-normalized values feed
+        # BOTH the console breakdown below AND the per-component history
+        # that loss_component_scatter needs -- computing it twice would
+        # risk the two silently drifting apart from each other.
         term_values = {
             stats_label: (stats0_weight, stats0_weight, stats0_scale, train_stats, val_stats),
             stats1_label: (stats1_weight, stats1_weight, stats1_scale, train_stats1, val_stats1),
             "deriv": (effective_deriv_weight, val_deriv_weight, deriv_scale, train_deriv, val_deriv),
         }
+
+        epoch_history.append(epoch)
+        train_loss_history.append(train_total)
+        val_loss_history.append(val_total)
+        best_so_far_history.append(tracker.best_val_loss)
+        loss_curve(
+            epoch_history, train_loss_history, val_loss_history, best_so_far_history,
+            loss_curve_path, title="Stage 2 loss",
+        )
+
+        # loss_component_scatter: recon0 (always present, weight 1) plus
+        # whichever of stats0/stats1/deriv are actually active this run
+        # -- same active_terms filter the console breakdown already
+        # uses, so the two never show a different set of components.
+        current_train_components = {"recon0": train_recon / recon0_scale}
+        current_val_components = {"recon0": val_recon / recon0_scale}
+        for _, lbl, _ in active_terms:
+            tw, vw, s, tv, vv = term_values[lbl]
+            current_train_components[lbl] = tw * tv / s
+            current_val_components[lbl] = vw * vv / s
+        best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
+        for name in current_train_components:
+            component_histories[name]["train"].append(current_train_components[name])
+            component_histories[name]["val"].append(current_val_components[name])
+            component_histories[name]["best_so_far"].append(best_components[name])
+        loss_component_scatter(
+            epoch_history, component_histories, loss_components_path, title="Stage 2 loss components",
+        )
+
         train_terms = " ".join(f"+{tw*tv/s:7.4f}" for lbl, (tw, _, s, tv, _) in term_values.items()
                                 if any(lbl == l for _, l, _ in active_terms))
         val_terms = " ".join(f"+{vw*vv/s:7.4f}" for lbl, (_, vw, s, _, vv) in term_values.items()

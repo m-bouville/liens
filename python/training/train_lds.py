@@ -342,7 +342,7 @@ def train_lds(
     hidden_dim: int = 256, n_hidden_layers: int = 2,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int = 1, min_step: int | None = None, min_stdev_phi: float | None = None,
-    min_passing_steps: int | None = None,
+    min_passing_steps: int | None = None, max_dt: float | None = None,
     condition_on_theta: bool | None = None,
     encode_batch_size: int = 256, val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5,
     early_stopping_patience: int | None = None,
@@ -505,6 +505,19 @@ def train_lds(
                           f"-- config.txt no longer provides ML training defaults.")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps}  "
           f"ae_stats_weight={ae_stats_weight}")
+    if max_dt is not None:
+        # Motivation, from check_parameter_dependence.py's own oracle-z1
+        # attribution on real 64x64 data: z1 BEATS a causal backward
+        # difference below dt ~= 150 (x1.47) and loses badly above it
+        # (x0.08 by dt~3e3, x0.001 by dt~3e4), and ~48% of test windows
+        # sit past that horizon. There, the first-order (z0 + z1*dt)
+        # term is already off by ~x60, so f_theta -- which only ever
+        # ADDS a dt^2/2 correction on top of it -- cannot recover the
+        # prediction, and training it on those windows spends capacity
+        # where it cannot help. Rerun that diagnostic after changing
+        # this: the causal/actual crossover is the number to watch, not
+        # aggregate val loss (which those same windows dominate).
+        print(f"max_dt={max_dt} -- windows with ANY transition longer than this are excluded")
     print(f"n_rollout_steps={n_rollout_steps}  one_step_weight={one_step_weight}")
     print(f"grad_clip={grad_clip}  lr_warmup_steps={lr_warmup_steps}  z0_noise_scale={z0_noise_scale}")
     print(f"lr={lr}  seed={seed}")
@@ -553,6 +566,7 @@ def train_lds(
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True,
         )
@@ -563,12 +577,14 @@ def train_lds(
         train_set = MicrostructureEvolutionDataset(
             train_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True,
         )
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True,
         )
@@ -863,7 +879,7 @@ def train_lds(
                 },
                 "data_config": {
                     "min_step": min_step, "min_stdev_phi": min_stdev_phi,
-                    "min_passing_steps": min_passing_steps,
+                    "min_passing_steps": min_passing_steps, "max_dt": max_dt,
                     "window_length": window_length, "n_rollout_steps": n_rollout_steps,
                     "z0_noise_scale": z0_noise_scale,
                 },

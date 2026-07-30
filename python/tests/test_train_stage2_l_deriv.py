@@ -1,5 +1,5 @@
 import torch
-from pathlib import Path
+
 from utils import load_datasets as load
 from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2
@@ -340,166 +340,6 @@ def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_pr
     assert "[epoch 2: switching to the centered L_deriv target now" in printed
 
 
-def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_project_root, capsys):
-    """
-    REGRESSION: resuming a stage-2 checkpoint already past
-    deriv_weight_warmup_epochs must start the NEW run centered from ITS
-    OWN epoch 1 -- not re-run a warmup that's already complete. Uses the
-    ancestor's own saved "epoch" (prior_stage2_epochs).
-
-    Asserts the deterministic schedule announcement rather than
-    use_centered_at_save, which depends on which epoch happened to save
-    -- see the sibling test above for why that made this flaky.
-    """
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1_resume.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_resume.png",
-    )
-    # An ancestor trained WITHOUT deriv_target_centered -- i.e. a real
-    # pre-existing checkpoint from before the feature existed.
-    stage2_ancestor_path = train_stage2(
-        base_path=base_path, resume_from=stage1_path,
-        deriv_weight=1.0, stats0_weight=0.01,
-        epochs=3, batch_size=4, num_workers=0,
-        min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2_ancestor.pt", device="cpu",
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_ancestor.png",
-    )
-    ancestor_epoch = torch.load(stage2_ancestor_path, map_location="cpu",
-                                 weights_only=True)["epoch"]
-    capsys.readouterr()
-
-    train_stage2(
-        base_path=base_path, resume_from=stage2_ancestor_path,
-        deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
-        epochs=1, batch_size=4, num_workers=0,
-        min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2_resumed.pt", device="cpu",
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_resumed.png",
-        deriv_target_centered=True,
-    )
-    printed = capsys.readouterr().out
-    assert f"prior_stage2_epochs={ancestor_epoch}" in printed
-    assert "centered from epoch 1" in printed, (
-        "an ancestor already past the warmup must yield a run that is centered from "
-        "its own epoch 1, not one that re-runs the cheap phase"
-    )
-    assert "[epoch 1: switching to the centered L_deriv target now" in printed
-
-
-def test_stats_head1_genuinely_trains_when_stats1_weight_nonzero(tmp_path, isolated_project_root):
-    """Regression test for a real, confirmed bug: stats_head1 is a
-    SEPARATE nn.Module from ae (not one of its submodules), left with
-    requires_grad=True in the Stage-1a-direct branch (deliberately, so
-    it gets its own first chance to learn something) -- but its own
-    parameters were never actually added to the optimizer anywhere,
-    so total.backward() genuinely computed gradients for it (the
-    printed stats1 loss term visibly decreases epoch over epoch) while
-    optimizer.step() never applied them. Confirmed directly: with the
-    bug present, stats_head1's true initial state_dict (captured via a
-    monkeypatch on extend_state_checkpoint_with_deriv_stream, since
-    it's constructed INSIDE train_stage2 -- a fresh, separately-built
-    comparison object would just be a different random draw, not the
-    actual initial state) was byte-identical to its state after 3 real
-    training epochs with stats1_weight=1.0, despite the loss
-    decreasing throughout (which came entirely from the shared trunk
-    moving via L_deriv/L_recon, not from stats_head1 itself)."""
-    import training.train_stage2 as train_stage2_module
-    from training.extend_encoder import extend_state_checkpoint_with_deriv_stream as real_extend
-
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-
-    captured = {}
-
-    def _recording_extend(*args, **kwargs):
-        ext = real_extend(*args, **kwargs)
-        captured["stats_head1_initial"] = {k: v.clone() for k, v in ext.stats_head1.state_dict().items()}
-        return ext
-
-    monkeypatch_target = train_stage2_module.extend_state_checkpoint_with_deriv_stream
-    train_stage2_module.extend_state_checkpoint_with_deriv_stream = _recording_extend
-    try:
-        stage2_path = train_stage2_module.train_stage2(
-            base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
-            stats1_weight=1.0, deriv_weight=1.0,
-            epochs=3, batch_size=4, num_workers=0,
-            val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-            checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
-            log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
-        )
-    finally:
-        train_stage2_module.extend_state_checkpoint_with_deriv_stream = monkeypatch_target
-
-    saved = torch.load(stage2_path, map_location="cpu", weights_only=True)
-    sh1_after = saved["stats_head1_state"]
-    sh1_before = captured["stats_head1_initial"]
-
-    changed = any(not torch.equal(sh1_before[k], sh1_after[k]) for k in sh1_before)
-    assert changed, (
-        "stats_head1's weights are byte-identical to their true initial values after 3 real "
-        "training epochs with stats1_weight=1.0 -- its own parameters aren't reaching the "
-        "optimizer (check train_stage2's own `params = [...]` construction)"
-    )
-
-
-def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_project_root, capsys):
-    """deriv_target_centered's own switch epoch is derived from
-    deriv_weight_warmup_epochs, not a separate knob (see train_stage2's
-    own docstring).
-
-    Asserts the SCHEDULE, which is deterministic, rather than whether a
-    save happened to occur after the switch -- that depends on whether
-    val_loss improved, which is stochastic, and made an earlier version
-    of this test flaky (it failed ~2 runs in 3 as part of the full suite
-    while passing alone). Papering over that with more epochs made the
-    test slow AND left it flaky; asserting the deterministic property
-    fixes both.
-    """
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1_centered.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_centered.png",
-    )
-    capsys.readouterr()
-
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1_path,
-        deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
-        epochs=3, batch_size=4, num_workers=0,
-        min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2_centered_fresh.pt", device="cpu",
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_centered_fresh.png",
-        deriv_target_centered=True,
-    )
-    printed = capsys.readouterr().out
-
-    cfg = torch.load(stage2_path, map_location="cpu", weights_only=True)["stage2_config"]
-    assert cfg["deriv_target_centered"] is True
-    assert cfg["deriv_switch_epoch"] == 2, "switch epoch must track deriv_weight_warmup_epochs"
-    # A FRESH run (prior_stage2_epochs=0) must spend its first epoch in
-    # the cheaper one-sided phase, then announce the switch at epoch 2.
-    assert "switching to the centered L_deriv target at epoch 2" in printed
-    assert "prior_stage2_epochs=0" in printed
-    assert "[epoch 2: switching to the centered L_deriv target now" in printed
-
-
 def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_project_root):
     """REGRESSION: resuming a stage-2 checkpoint that's already well
     past deriv_weight_warmup_epochs must start the NEW run directly in
@@ -568,3 +408,112 @@ def _build_sweep(tmp_path, *args, **kwargs):
     """
     return cached_sweep((__name__, args, tuple(sorted(kwargs.items()))),
                         lambda d: _build_sweep_uncached(d, *args, **kwargs))
+
+
+def test_loss_component_scatter_writes_a_SEPARATE_file_from_loss_curve(tmp_path, isolated_project_root):
+    """
+    REGRESSION: loss_components_path used to be derived via
+    loss_curve_path.name.replace("loss_curve", "loss_components") --
+    a silent no-op whenever the caller's own filename doesn't literally
+    contain the substring "loss_curve" (e.g. this very test file's own
+    "curve2.png"), making loss_components_path collide with
+    loss_curve_path itself. Since loss_component_scatter() is called
+    AFTER loss_curve() each epoch, it then silently OVERWROTE the real
+    loss-curve figure with the 3-panel component grid instead --
+    confirmed directly by image dimensions (loss_curve's own 800x500
+    vs the grid's 1500x450) before this was caught.
+    """
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1_path = train_autoencoder(
+        size=32, base_path=base_path, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1_scatter.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_scatter.png",
+    )
+    # Deliberately a filename with NO "loss_curve" substring in it at
+    # all -- the exact shape that broke the old .replace()-based
+    # derivation.
+    curve_path = tmp_path / "curve2.png"
+    train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, stats0_weight=0.01,
+        epochs=2, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_scatter.pt", device="cpu",
+        log_every_epoch=True, loss_curve_path=curve_path,
+    )
+
+    components_path = tmp_path / "curve2-components.png"
+    assert curve_path.exists()
+    assert components_path.exists()
+    assert components_path != curve_path
+
+    import struct
+    def _png_size(path):
+        data = path.read_bytes()[16:24]
+        return struct.unpack(">II", data)
+
+    assert _png_size(curve_path) == (800, 500), (
+        "loss_curve.png's own dimensions changed -- suggests it was overwritten by "
+        "something else again"
+    )
+    assert _png_size(components_path) != (800, 500), (
+        "the components figure has loss_curve's own dimensions -- the two are not "
+        "actually distinct files"
+    )
+
+
+def test_loss_component_scatter_values_reconstruct_train_total(tmp_path, isolated_project_root, monkeypatch):
+    """The per-component values fed to loss_component_scatter must sum
+    (recon0 + stats0 + deriv, all already weight/scale-normalized) to
+    EXACTLY the same train_total the console prints for that epoch --
+    otherwise the two diagnostics would silently disagree with each
+    other about the same run."""
+    import training.train_stage2 as ts2
+
+    captured = {}
+    real_fn = ts2.loss_component_scatter
+
+    def spy(epoch_history, component_histories, output_path, **kw):
+        captured["epoch_history"] = list(epoch_history)
+        captured["component_histories"] = {
+            k: {kk: list(vv) for kk, vv in v.items()} for k, v in component_histories.items()
+        }
+        return real_fn(epoch_history, component_histories, output_path, **kw)
+
+    monkeypatch.setattr(ts2, "loss_component_scatter", spy)
+
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    stage1_path = train_autoencoder(
+        size=32, base_path=base_path, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "stage1_recon.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_recon.png",
+    )
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        train_stage2(
+            base_path=base_path, resume_from=stage1_path,
+            deriv_weight=1.0, stats0_weight=0.01,
+            epochs=2, batch_size=4, num_workers=0,
+            min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / "stage2_recon.pt", device="cpu",
+            log_every_epoch=True, loss_curve_path=tmp_path / "curve2_recon.png",
+        )
+    printed = buf.getvalue()
+
+    assert captured["component_histories"], "loss_component_scatter was never called"
+    n = len(captured["epoch_history"])
+    for i in range(n):
+        epoch = captured["epoch_history"][i]
+        reconstructed = sum(captured["component_histories"][c]["train"][i]
+                            for c in captured["component_histories"])
+        # Console line for this epoch starts with "{epoch:4d}|{train_total:7.4f}"
+        needle = f"{epoch:4d}|{reconstructed:7.4f}"
+        assert needle in printed, (
+            f"epoch {epoch}: reconstructed train_total={reconstructed:.4f} from the "
+            f"component histories doesn't match what the console actually printed"
+        )

@@ -165,6 +165,45 @@ class CheckpointCriterionTracker:
         return criterion, should_save
 
 
+class ComponentBestTracker:
+    """
+    The per-COMPONENT analogue of CheckpointCriterionTracker.best_val_loss
+    -- that tracker holds the running-minimum of the scalar val criterion,
+    frozen between saves; this holds a whole DICT of val-side component
+    values (e.g. {"recon0": ..., "stats0": ..., "deriv": ...}), frozen at
+    whatever they were on the epoch a checkpoint was last actually saved.
+
+    Not each component's OWN running minimum -- that wouldn't correspond
+    to any single real checkpoint (component A's best epoch and component
+    B's best epoch are generally different epochs). This instead answers
+    "what were ALL the components at, on the epoch we'd actually reload
+    if training stopped now" -- the co-occurring values a genuine restore
+    would give, which is what loss_component_scatter's own "best so far"
+    curve is meant to show alongside train/valid.
+
+    Used by train_stage1()/train_stage2()/train_refinement() to build the
+    per-component history lists that feed loss_component_scatter (see
+    utils/plots.py); NOT used by train_lds(), whose own loss isn't a sum
+    of separately-weighted components in this sense.
+    """
+
+    def __init__(self) -> None:
+        self._best: dict[str, float] | None = None
+
+    def update(self, current_val_components: dict[str, float], saved_this_epoch: bool) -> dict[str, float]:
+        """Call once per epoch, with THIS epoch's own val-side component
+        values and whether a checkpoint was actually saved this epoch.
+        Returns the (possibly just-updated) frozen snapshot to append to
+        that epoch's history -- unconditionally, so every epoch's history
+        list stays the same length as epoch_history itself, including
+        epoch 1 before any save has ever happened (falls back to this
+        epoch's own values, matching CheckpointCriterionTracker's own
+        first-epoch behavior of taking whatever the first real value is)."""
+        if saved_this_epoch or self._best is None:
+            self._best = dict(current_val_components)
+        return dict(self._best)
+
+
 def atomic_torch_save(obj, path: Path) -> None:
     """
     torch.save(obj, path), but ATOMIC: any process reading `path`

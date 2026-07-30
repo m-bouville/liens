@@ -763,6 +763,7 @@ class MicrostructureEvolutionDataset(Dataset):
                  good_steps: dict[Path, list[int]] | None = None,
                  stat_names: list[str] | None = None, augment: bool = False,
                  min_std_deriv: float | None = None, encode_both_streams: bool = False,
+                 max_dt: float | None = None,
                  stats_frame_index: int = 0,
                  fixed_aug_indices: tuple[int, ...] | list[int] | None = None,
                  read_workers: int = 16):
@@ -972,6 +973,7 @@ class MicrostructureEvolutionDataset(Dataset):
         self.stat_names = stat_names
         self.augment = augment
         self.min_std_deriv = min_std_deriv
+        self.max_dt = max_dt
         # Which frame IN the window true_stats (and its own NaN guard)
         # refers to. 0 (default) is the long-standing behavior every
         # existing caller relies on: window[0], the window's own
@@ -1292,6 +1294,7 @@ class MicrostructureEvolutionDataset(Dataset):
         on its own.
         """
         n_degenerate_deriv_windows = 0
+        n_max_dt_windows = 0
 
         for (run_dir, metadata, kept_steps), run_data, run_data_deriv in zip(
             pending_meta, run_data_list, run_data_deriv_list
@@ -1327,7 +1330,27 @@ class MicrostructureEvolutionDataset(Dataset):
                     if first_deriv.std().item() < self.min_std_deriv:
                         n_degenerate_deriv_windows += 1
                         continue
+                if self.max_dt is not None:
+                    # Drops the window if ANY of its own transitions
+                    # exceeds max_dt -- not just the first, and not the
+                    # total span. A rollout window is only as usable as
+                    # its worst single step: one transition past the
+                    # horizon puts the whole chained prediction
+                    # off-distribution from that point on, so keeping
+                    # the window because its OTHER steps are fine would
+                    # defeat the filter entirely.
+                    if any((kept_steps[start + i + 1] - kept_steps[start + i]) * metadata.dt
+                           > self.max_dt for i in range(self.window_length - 1)):
+                        n_max_dt_windows += 1
+                        continue
                 self._index.append((run_idx, start))
+
+        if n_max_dt_windows:
+            print(f"MicrostructureEvolutionDataset: {n_max_dt_windows} candidate window(s) skipped "
+                  f"for having a transition longer than max_dt={self.max_dt}. Beyond that dt the "
+                  f"first-order (z0 + z1*dt) term's own error is large enough that f_theta can only "
+                  f"add a correction on top of an already-wrong prediction -- excluding those "
+                  f"windows trains f_theta only where it can actually help.")
 
         if n_degenerate_deriv_windows:
             print(f"MicrostructureEvolutionDataset: {n_degenerate_deriv_windows} candidate window(s) "

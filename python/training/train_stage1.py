@@ -22,12 +22,14 @@ from torch.utils.data import DataLoader
 from models.autoencoder import Autoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_streams import DEFAULT_STREAM_NAME, LatentStreamMode
-from training.checkpoint_criterion import CheckpointCriterionTracker, atomic_torch_save
+from training.checkpoint_criterion import (
+    CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
+)
 from training.datasets import MicrostructureSnapshotDataset, complete_run_dirs, split_run_dirs
 from training.losses import ReconLoss, StatsLoss
 from training.stats_head import StatsHead
 from utils.naming import ae_checkpoint_name
-from utils.plots import loss_curve
+from utils.plots import loss_component_scatter, loss_curve
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -187,11 +189,24 @@ def train_autoencoder(
     if loss_curve_path is None:
         name = ae_checkpoint_name(size, latent_channels, stats0_weight)
         loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage1" / f"{name}-loss_curve.png"
+    loss_components_path = loss_curve_path.with_name(
+        loss_curve_path.stem + "-components" + loss_curve_path.suffix)
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
+    # loss_component_scatter's own bookkeeping -- only meaningful when
+    # include_stats (recon0+stats0 are both real terms); with stats0
+    # inactive there is only ONE component, nothing to pair, and
+    # loss_component_scatter itself already returns None/writes nothing
+    # for that case, but there's no point building the (empty) history
+    # dict at all in that case either.
+    component_histories: dict[str, dict[str, list[float]]] = (
+        {name: {"train": [], "val": [], "best_so_far": []} for name in ("recon0", "stats0")}
+        if include_stats else {}
+    )
+    component_best_tracker = ComponentBestTracker()
 
     run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
@@ -418,6 +433,21 @@ def train_autoencoder(
             epoch_history, train_loss_history, val_loss_history, best_so_far_history,
             loss_curve_path, title="Stage 1 loss",
         )
+        if include_stats:
+            current_val_components = {
+                "recon0": val_recon0 / recon0_scale,
+                "stats0": stats0_weight * val_stats0 / stats0_scale,
+            }
+            best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
+            component_histories["recon0"]["train"].append(train_recon0 / recon0_scale)
+            component_histories["recon0"]["val"].append(current_val_components["recon0"])
+            component_histories["recon0"]["best_so_far"].append(best_components["recon0"])
+            component_histories["stats0"]["train"].append(stats0_weight * train_stats0 / stats0_scale)
+            component_histories["stats0"]["val"].append(current_val_components["stats0"])
+            component_histories["stats0"]["best_so_far"].append(best_components["stats0"])
+            loss_component_scatter(
+                epoch_history, component_histories, loss_components_path, title="Stage 1 loss components",
+            )
 
         msg = f"{epoch:4d}|"
         if include_stats:

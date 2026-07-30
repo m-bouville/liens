@@ -14,12 +14,14 @@ import torch
 from torch.utils.data import DataLoader
 
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
-from training.checkpoint_criterion import CheckpointCriterionTracker, atomic_torch_save
+from training.checkpoint_criterion import (
+    CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
+)
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import StatsLoss
 from training.model_assembly import build_models_from_components
 from training.refinement_loss import compute_stage45_loss
-from utils.plots import loss_curve
+from utils.plots import loss_component_scatter, loss_curve
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
 
@@ -193,11 +195,20 @@ def train_refinement(
     if loss_curve_path is None:
         stage_dir = "stage4" if freeze_decoder else "stage5"
         loss_curve_path = _PYTHON_ROOT.parent / "output" / stage_dir / "loss_curve.png"
+    loss_components_path = loss_curve_path.with_name(
+        loss_curve_path.stem + "-components" + loss_curve_path.suffix)
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
+    # loss_component_scatter's own bookkeeping -- rollout/recon0/stats0
+    # are all always active in this stage (no conditional gating like
+    # stage 1's include_stats or stage 2's active_terms).
+    component_histories: dict[str, dict[str, list[float]]] = {
+        name: {"train": [], "val": [], "best_so_far": []} for name in ("rollout", "recon0", "stats0")
+    }
+    component_best_tracker = ComponentBestTracker()
 
     def unpack(batch):
         if stat_names is not None:
@@ -313,6 +324,26 @@ def train_refinement(
         loss_curve(
             epoch_history, train_loss_history, val_loss_history, best_so_far_history,
             loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
+        )
+
+        current_val_components = {
+            "rollout": rollout_weight * val_rollout / rollout_scale,
+            "recon0": recon0_weight * val_recon0 / recon0_scale,
+            "stats0": stats0_weight * val_stats0 / stats0_scale,
+        }
+        best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
+        current_train_components = {
+            "rollout": rollout_weight * train_rollout / rollout_scale,
+            "recon0": recon0_weight * train_recon0 / recon0_scale,
+            "stats0": stats0_weight * train_stats0 / stats0_scale,
+        }
+        for name in component_histories:
+            component_histories[name]["train"].append(current_train_components[name])
+            component_histories[name]["val"].append(current_val_components[name])
+            component_histories[name]["best_so_far"].append(best_components[name])
+        loss_component_scatter(
+            epoch_history, component_histories, loss_components_path,
+            title=f"Stage {'4' if freeze_decoder else '5'} loss components",
         )
 
         ema_str = f"{tracker.val_ema:7.4f}" if tracker.val_ema is not None else "  (warmup)"

@@ -134,6 +134,176 @@ def loss_curve(
     return output_path
 
 
+def loss_component_scatter(
+    epoch_history: list[int], component_histories: dict[str, dict[str, list[float]]],
+    output_path: Path, title: str = "",
+) -> Path | None:
+    """
+    Companion to loss_curve(): for a COMPOSITE loss (total = sum of
+    several separately-weighted terms), plots every pairwise combination
+    of components against each other, one point per epoch, connected in
+    epoch order -- train/valid/best-so-far, same color code as
+    loss_curve() (tab:blue/tab:orange/tab:green).
+
+    Why this is useful beyond loss_curve() itself: loss_curve() shows
+    each quantity's own trajectory over epoch, but not how two components
+    trade off AGAINST each other -- e.g. whether a run is genuinely
+    improving both recon0 and deriv together, or buying one at the
+    other's expense (see z0_from_deriv_weight's own docstring for a real
+    case of exactly this trade). A 2D trajectory makes that visible
+    directly: a run converging cleanly heads toward the origin; a run
+    trading one term for another moves diagonally instead, roughly along
+    an iso-total line.
+
+    component_histories: {component_name: {"train": [...], "val": [...],
+    "best_so_far": [...]}}, one entry per epoch in epoch_history, in the
+    SAME units already used in each stage's own console breakdown and
+    checkpoint criterion -- i.e. the WEIGHTED, SCALE-NORMALIZED
+    contribution (e.g. stats0_weight*val_stats0/stats0_scale), not the
+    raw component value. This matters for two reasons: (1) it's what
+    genuinely sums to the total loss, so "(0, 0)" is the real convergence
+    point regardless of each term's own arbitrary scale, and (2) it
+    means an iso-TOTAL line restricted to any two axes is simply
+    x + y = c (slope -1), not a differently-sloped line per pair that
+    would need each term's own weight/scale threaded through here too.
+    "best_so_far": see ComponentBestTracker -- the val-side component
+    values co-occurring on the epoch a checkpoint was actually last
+    saved, NOT each component's own independent running minimum (which
+    wouldn't correspond to any single real, reloadable checkpoint).
+
+    Fewer than 2 components (nothing to pair) -- returns None, writes
+    nothing. This is a normal, expected case (e.g. stage 1 with
+    include_stats=False), not an error.
+
+    Iso-total lines: several parallel, dashed gray x + y = c lines,
+    c chosen from the actual data range (see _iso_total_levels), so they
+    frame the trajectory rather than being an arbitrary, possibly
+    off-screen grid. Restricted to the TWO plotted components' own
+    contribution to the total -- it ignores whatever other components
+    exist (deliberately: a true N-dimensional iso-surface sliced through
+    changing conditions, e.g. a ramping deriv_weight, would need
+    threading every OTHER component's own current value through here
+    too, for comparatively little extra visual clarity in what is meant
+    to stay a quick, at-a-glance diagnostic).
+
+    A run that resumes from a checkpoint trained under DIFFERENT
+    component weights can genuinely start this trajectory somewhere far
+    from (0, 0) and take a visibly different path than a fresh run would
+    -- not a bug in the plot; see this function's own caller for exactly
+    this situation (deriv_target_centered's own mid-run switch, or a
+    resume with different stats0_weight/deriv_weight).
+    """
+    names = list(component_histories.keys())
+    pairs = [(names[i], names[j]) for i in range(len(names)) for j in range(i + 1, len(names))]
+    if not pairs:
+        return None
+
+    n_cols = min(3, len(pairs))
+    n_rows = -(-len(pairs) // n_cols)  # ceil division
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4.5 * n_rows), squeeze=False)
+
+    for idx, (name_x, name_y) in enumerate(pairs):
+        ax = axes[idx // n_cols][idx % n_cols]
+        cx, cy = component_histories[name_x], component_histories[name_y]
+
+        for series_key, label, color, lw in [
+            ("train", "train", "tab:blue", 1.2),
+            ("val", "valid", "tab:orange", 1.2),
+            ("best_so_far", "best so far", "tab:green", 2.0),
+        ]:
+            x, y = cx[series_key], cy[series_key]
+            ax.plot(x, y, "-", color=color, alpha=0.6, linewidth=lw, zorder=2)
+            ax.scatter(x, y, s=14, color=color, alpha=0.7, zorder=3, label=label)
+
+        # Mark the trajectory's own start/end so its DIRECTION is legible
+        # without relying on line thickness or point density alone --
+        # important here specifically because, unlike loss_curve()'s own
+        # x-axis, epoch order isn't directly visible on a loss-vs-loss
+        # plot otherwise.
+        for series_key, color in [("train", "tab:blue"), ("val", "tab:orange")]:
+            x, y = component_histories[name_x][series_key], component_histories[name_y][series_key]
+            if x:
+                ax.scatter([x[0]], [y[0]], s=70, facecolors="none", edgecolors=color,
+                           linewidths=1.5, zorder=4)
+                ax.scatter([x[-1]], [y[-1]], s=90, marker="*", color=color,
+                           edgecolors="black", linewidths=0.5, zorder=5)
+
+        ax.set_xlim(left=0)
+        ax.set_ylim(bottom=0)
+        xmax = ax.get_xlim()[1]
+        ymax = ax.get_ylim()[1]
+        all_x = cx["train"] + cx["val"] + cx["best_so_far"]
+        all_y = cy["train"] + cy["val"] + cy["best_so_far"]
+        for c in _iso_total_levels(all_x, all_y):
+            segment = _clip_iso_total_segment(c, xmax, ymax)
+            if segment is not None:
+                (x0, y0), (x1, y1) = segment
+                ax.plot([x0, x1], [y0, y1], "--", color="gray", alpha=0.35,
+                        linewidth=0.8, zorder=1)
+        ax.set_xlim(0, xmax)
+        ax.set_ylim(0, ymax)
+        ax.set_xlabel(name_x)
+        ax.set_ylabel(name_y)
+        if idx == 0:
+            ax.legend(loc="upper right", fontsize=8)
+        ax.grid(alpha=0.25)
+
+    # Unused grid cells (n_rows*n_cols > len(pairs), e.g. 4 pairs in a
+    # 2x3 grid) hidden rather than left as blank axes with tick marks.
+    for idx in range(len(pairs), n_rows * n_cols):
+        axes[idx // n_cols][idx % n_cols].set_visible(False)
+
+    if title:
+        fig.suptitle(title)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=100)
+    plt.close(fig)
+    return output_path
+
+
+def _clip_iso_total_segment(
+    c: float, xmax: float, ymax: float,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """
+    The visible portion of the line x + y = c within the rectangle
+    [0, xmax] x [0, ymax], as ((x0, y0), (x1, y1)) -- or None if the
+    line doesn't intersect that rectangle at all (c < 0, or c so large
+    the whole line passes beyond both xmax and ymax).
+
+    The line's own two candidate endpoints inside the rectangle: where
+    it crosses x=0 (at y=c, valid only if 0 <= c <= ymax) and where it
+    crosses y=0 (at x=c, valid only if 0 <= c <= xmax). Between those,
+    the actual visible segment runs from
+    x = max(0, c - ymax) [the point where y is capped at ymax, if c is
+    large enough to need it] to x = min(c, xmax) [the point where either
+    x hits xmax or y hits 0, whichever comes first].
+    """
+    if c < 0 or xmax <= 0 or ymax <= 0:
+        return None
+    x0 = max(0.0, c - ymax)
+    x1 = min(c, xmax)
+    if x0 > x1:
+        return None
+    return (x0, c - x0), (x1, c - x1)
+
+
+def _iso_total_levels(all_x: list[float], all_y: list[float], n_levels: int = 4) -> list[float]:
+    """A handful of x+y=c levels spanning the actual plotted data, not an
+    arbitrary fixed grid that might land mostly off-screen for a
+    particular run's own loss scale. Returns [] if there's no data to
+    span at all (e.g. every history empty), rather than raising."""
+    if not all_x or not all_y:
+        return []
+    totals = [x + y for x, y in zip(all_x, all_y)]
+    lo, hi = min(totals), max(totals)
+    if hi <= lo:
+        return [hi] if hi > 0 else []
+    return list(np.linspace(lo, hi, n_levels))
+
+
+
 def show_snapshot(path: str | Path, nx: int, ny: int,
                    ax=None, cmap: str = "RdBu", vmin: float | None = None,
                    vmax: float | None = None, title: str | None = None):
