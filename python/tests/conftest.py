@@ -194,7 +194,6 @@ def isolated_project_root(tmp_path, monkeypatch):
     (root.parent / "output").mkdir(parents=True, exist_ok=True)
 
     stage_dirs = {1: root / "checkpoints" / "stage1",
-                  "1b": root / "checkpoints" / "stage1b",
                   2: root / "checkpoints" / "stage2",
                   3: root / "checkpoints" / "stage3",
                   "3a": root / "checkpoints" / "stage3a",

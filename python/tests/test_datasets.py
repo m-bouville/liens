@@ -9,7 +9,10 @@ Run from python/ (imports rely on that root being on sys.path):
 import torch
 import pytest
 
-from training.datasets import MicrostructureEvolutionDataset, MicrostructureSnapshotDataset
+from training.datasets import (
+    VAL_DECORRELATED_AUG_INDICES, _ANGLE_SAFE_AUG_INDICES, _apply_augmentation,
+    MicrostructureEvolutionDataset, MicrostructureSnapshotDataset,
+)
 from models.latent_streams import DEFAULT_STREAM_NAME
 
 
@@ -309,3 +312,91 @@ def test_missing_stat_column_raises_clear_error(tmp_run_dir_with_stats):
             stat_names=stat_names + ["nonexistent_stat"],
         )
 
+
+def test_val_decorrelated_aug_indices_are_all_angle_safe():
+    """
+    The 4 recommended validation variants must use ONLY dihedral
+    transforms whose "angle" stat correction is confirmed correct.
+    _transform_angle's own docstring flags the SIGN of its k*90 term for
+    k=1/k=3 as UNCONFIRMED -- putting one of those into a VALIDATION
+    metric would inject systematic error into the stats term (and unlike
+    training, where the model just learns whatever it's shown, a
+    systematic error here corrupts cross-epoch comparisons directly).
+    """
+    assert set(VAL_DECORRELATED_AUG_INDICES) <= _ANGLE_SAFE_AUG_INDICES
+    for aug_idx in VAL_DECORRELATED_AUG_INDICES:
+        _, k, _flip = _apply_augmentation(torch.zeros(1, 64, 64), aug_idx, 64, 64)
+        assert k in (0, 2), f"aug_idx {aug_idx} uses k={k}, whose angle correction is UNCONFIRMED"
+
+
+def test_val_decorrelated_aug_indices_maximize_decorrelation():
+    """
+    The point of this specific set (vs. e.g. the 4 translations at fixed
+    orientation) is a Latin-square spread: 4 DISTINCT dihedrals AND 4
+    DISTINCT translations, so the 4 evaluations differ along both axes
+    at once. Verified against a genuinely non-uniform, asymmetric field
+    -- a uniform one would make every spatial transform a no-op and let
+    a broken set pass trivially.
+    """
+    nx = ny = 64
+    frame = torch.arange(ny * nx, dtype=torch.float32).reshape(1, ny, nx) / (ny * nx)
+    outs, dihedrals = [], set()
+    for aug_idx in VAL_DECORRELATED_AUG_INDICES:
+        out, k, flip = _apply_augmentation(frame.clone(), aug_idx, nx, ny)
+        outs.append(out)
+        dihedrals.add((k, flip))
+    assert len(dihedrals) == 4, f"expected 4 distinct dihedrals, got {sorted(dihedrals)}"
+    for i in range(len(outs)):
+        for j in range(i + 1, len(outs)):
+            assert not torch.equal(outs[i], outs[j]), (
+                f"variants {VAL_DECORRELATED_AUG_INDICES[i]} and "
+                f"{VAL_DECORRELATED_AUG_INDICES[j]} produce identical output -- not decorrelated"
+            )
+    # Every variant must be an EXACT symmetry: same pixel multiset, so
+    # the TRUE loss is identical across all 4 and only the model's own
+    # equivariance error differs (that's the whole premise of averaging).
+    ref = torch.sort(frame.flatten()).values
+    for out in outs:
+        assert torch.allclose(ref, torch.sort(out.flatten()).values)
+
+
+def test_fixed_aug_indices_multiplies_length_and_preserves_window_info(tmp_run_dir_with_stats):
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+    base = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=2, min_step=0, min_stdev_phi=None,
+        stat_names=stat_names,
+    )
+    val4 = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=2, min_step=0, min_stdev_phi=None,
+        stat_names=stat_names, fixed_aug_indices=VAL_DECORRELATED_AUG_INDICES,
+    )
+    assert len(val4) == len(base) * 4
+    # All 4 slots of a given window must trace back to the SAME source
+    # window, and slot 0 (aug_idx 0 = identity) must be untransformed.
+    infos = [val4.window_info(i) for i in range(4)]
+    assert all(x == infos[0] for x in infos)
+    assert infos[0] == base.window_info(0)
+    assert torch.equal(val4[0][0], base[0][0])
+    # dt is a temporal quantity -- spatial transforms must never touch it
+    assert all(torch.equal(val4[i][1], base[0][1]) for i in range(4))
+
+
+def test_fixed_aug_indices_rejects_invalid_configurations(tmp_run_dir_with_stats):
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+
+    def build(**kw):
+        return MicrostructureEvolutionDataset(
+            [run_dir], encoder=None, window_length=2, min_step=0, min_stdev_phi=None,
+            stat_names=stat_names, **kw,
+        )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build(fixed_aug_indices=(0, 5), augment=True)
+    with pytest.raises(ValueError, match="non-empty"):
+        build(fixed_aug_indices=())
+    with pytest.raises(ValueError, match="duplicates"):
+        build(fixed_aug_indices=(0, 5, 5))
+    with pytest.raises(ValueError, match="out of range"):
+        build(fixed_aug_indices=(0, 32))
+    with pytest.raises(ValueError, match="out of range"):
+        build(fixed_aug_indices=(-1,))

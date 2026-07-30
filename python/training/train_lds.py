@@ -32,7 +32,9 @@ from models.latent_streams import (
     LatentStreamMode, cross_check_stream_configs_against_state_dict,
     resolve_stream_configs_from_checkpoint_config,
 )
-from training.checkpoint_criterion import CheckpointCriterionTracker, atomic_torch_save
+from training.checkpoint_criterion import (
+    CheckpointCriterionTracker, atomic_torch_save, clamp_grace_epochs,
+)
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss, compute_dt_decade_weights
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
@@ -762,8 +764,17 @@ def train_lds(
         # attached.
         return total.detach(), l_1step_scaled.detach()
 
-    tracker = CheckpointCriterionTracker(ema_warmup_epochs=ema_warmup_epochs,
-                                          val_ema_decay=val_ema_decay)
+    # Clamped against how many epoch iterations this run ACTUALLY makes
+    # -- see clamp_grace_epochs' own docstring. The loop below is
+    # range(0 if epochs == 0 else 1, epochs + 1), i.e. exactly ONE
+    # iteration when epochs==0 (the ablation mode, whose single epoch-0
+    # evaluation IS the deliverable -- ensure_lds_checkpoint depends on
+    # it saving) and `epochs` iterations otherwise.
+    n_epoch_iterations = max(1, epochs)
+    tracker = CheckpointCriterionTracker(
+        ema_warmup_epochs=clamp_grace_epochs(ema_warmup_epochs, n_epoch_iterations),
+        val_ema_decay=val_ema_decay,
+    )
     epochs_since_improvement = 0
 
     show_1step = n_rollout_steps > 1  # at n=1, L_1step == L_rollout always -- redundant to show

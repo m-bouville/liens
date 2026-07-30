@@ -82,6 +82,42 @@ def _transform_angle(angle: torch.Tensor, k: int, flip: bool) -> torch.Tensor:
 
 _N_AUGMENT_VARIANTS = 8 * 4  # N_DIHEDRAL(8) x 4 translations -- see _apply_augmentation
 
+# A FIXED set of 4 augmentation variants for VALIDATION-side averaging
+# (see MicrostructureEvolutionDataset's own fixed_aug_indices parameter).
+# Chosen as a Latin-square spread: 4 DISTINCT dihedral transforms x 4
+# DISTINCT translations, maximizing how decorrelated the model's own
+# errors are across the 4 evaluations of each window -- the whole point
+# being that these are exact symmetries (translations are periodic
+# rolls, valid since the solver uses periodic BCs; see _translate), so
+# the TRUE loss is identical across all of them and only the model's own
+# equivariance error differs.
+#
+# Restricted to the dihedral transforms whose "angle" statistic
+# correction is CONFIRMED correct -- k=0 (identity/mirror) and k=2
+# (180 degrees) -- deliberately EXCLUDING every k=1/k=3 variant
+# (aug_idx 8-15, 24-31). _transform_angle's own docstring flags the SIGN
+# of its k*90 term for k=1/k=3 as UNCONFIRMED; baking a possibly-wrong
+# angle target into a VALIDATION metric would put systematic error into
+# exactly the stats0 term that's already the noisiest and
+# worst-generalizing of the three, and unlike in training (where the
+# model simply learns whatever it's shown) a systematic error here
+# corrupts cross-epoch comparisons directly.
+#
+#   aug_idx  0 -> k=0, flip=False (identity),     shift (0, 0)
+#   aug_idx  5 -> k=0, flip=True  (mirror),       shift (0, nx//2+third)
+#   aug_idx 18 -> k=2, flip=False (180 deg),      shift (ny//2+third, 0)
+#   aug_idx 23 -> k=2, flip=True  (mirror+180),   shift (ny//2+2/3, nx//2+2/3)
+VAL_DECORRELATED_AUG_INDICES = (0, 5, 18, 23)
+
+# Every aug_idx whose own "angle" stat correction is confirmed correct
+# (see VAL_DECORRELATED_AUG_INDICES above for why this matters, and
+# _transform_angle's own docstring for the underlying uncertainty).
+_ANGLE_SAFE_AUG_INDICES = frozenset(
+    d_idx * 4 + t_idx
+    for d_idx in (0, 1, 4, 5)  # dihedral_idx = k*2 + flip, so these are k=0 and k=2 only
+    for t_idx in range(4)
+)
+
 
 def _apply_augmentation(x: torch.Tensor, aug_idx: int, nx: int, ny: int) -> tuple[torch.Tensor, int, bool]:
     """
@@ -728,6 +764,7 @@ class MicrostructureEvolutionDataset(Dataset):
                  stat_names: list[str] | None = None, augment: bool = False,
                  min_std_deriv: float | None = None, encode_both_streams: bool = False,
                  stats_frame_index: int = 0,
+                 fixed_aug_indices: tuple[int, ...] | list[int] | None = None,
                  read_workers: int = 16):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
@@ -827,6 +864,34 @@ class MicrostructureEvolutionDataset(Dataset):
         already-loaded frames (no extra disk I/O), so this is cheap
         even though it's a per-window check rather than a per-step one.
 
+        fixed_aug_indices: None (default) -- every window is returned
+        exactly once, untransformed. If given, every window is instead
+        returned once PER LISTED VARIANT, each transformed by that
+        variant's own (k, flip, shift) -- so __len__ is multiplied by
+        len(fixed_aug_indices), the same way augment=True multiplies it
+        by _N_AUGMENT_VARIANTS. See VAL_DECORRELATED_AUG_INDICES (this
+        module) for the recommended 4-variant set and the full reasoning
+        behind which variants are safe to use here.
+
+        Purpose: VALIDATION-side averaging. Since augmentation applies
+        to train only, a val set here is ~100x smaller in window count
+        than its train counterpart, AND fixed -- so its epoch-to-epoch
+        swing is not sampling noise, it's the model itself moving and
+        interacting idiosyncratically with those specific windows.
+        Evaluating each window under several exact-symmetry variants and
+        averaging damps that, because the model isn't perfectly
+        equivariant, so its errors on transformed copies are partially
+        decorrelated. Strictly weaker than simply having more DISTINCT
+        val windows (which are genuinely independent rather than
+        symmetry-related), but far cheaper -- 4x on a val set that's
+        already a rounding error against the augmented train set.
+
+        Must be an explicit, FIXED list, never resampled per epoch:
+        drawing fresh random variants each epoch would ADD a noise
+        source on top of the model variation this exists to see
+        through. Mutually exclusive with augment=True, and (like
+        augment) requires encoder=None.
+
         read_workers: 16 (default) -- every raw snapshot file is read
         via its own read_phi_half() call (see that function's own
         docstring: a single, small np.fromfile per file, no header, no
@@ -870,6 +935,15 @@ class MicrostructureEvolutionDataset(Dataset):
                 "constructor's own docstring). Pass encoder=None if you want augmented raw-pixel "
                 "windows."
             )
+        if fixed_aug_indices is not None and encoder is not None:
+            raise ValueError(
+                "fixed_aug_indices was given together with a real encoder (cached-latent, "
+                "stage-3 mode) -- same reason augment=True is rejected above (transforming a "
+                "cached LATENT has no well-defined meaning), plus a second one specific to "
+                "this mode: under encode_both_streams, __getitem__ transforms `window` but "
+                "NOT `window_deriv`, so the two streams would describe DIFFERENTLY-oriented "
+                "views of the same frame. Pass encoder=None for raw-pixel windows."
+            )
         if min_std_deriv is not None and encoder is not None:
             raise ValueError(
                 "min_std_deriv was given together with a real encoder (cached-latent, stage-3 "
@@ -910,6 +984,65 @@ class MicrostructureEvolutionDataset(Dataset):
         # they're predicting from, which is a real (measured, not
         # hypothetical) misalignment, not a rounding-level detail.
         self.stats_frame_index = stats_frame_index
+
+        # fixed_aug_indices: evaluate EVERY window under this exact,
+        # FIXED list of augmentation variants (see
+        # VAL_DECORRELATED_AUG_INDICES for the recommended set and the
+        # reasoning behind it), multiplying __len__ by len(list) the
+        # same way augment=True multiplies it by _N_AUGMENT_VARIANTS.
+        #
+        # Intended for VALIDATION-side averaging: the val set here is
+        # small (augmentation applies to train only, so val is ~100x
+        # smaller in window count) and FIXED, so its epoch-to-epoch
+        # swing isn't sampling noise -- it's the model itself moving,
+        # interacting idiosyncratically with those specific windows.
+        # Averaging each window over several exact-symmetry variants
+        # damps that, since the model isn't perfectly equivariant and
+        # its errors on transformed copies are partially decorrelated.
+        # Strictly weaker than simply having more DISTINCT val windows
+        # (those are genuinely independent), but far cheaper.
+        #
+        # MUST be a fixed list, never resampled per epoch -- drawing
+        # random variants each epoch would ADD a fresh noise source on
+        # top of the model variation this is meant to see through,
+        # achieving the exact opposite of the goal. That's why this
+        # takes an explicit list rather than a count.
+        if fixed_aug_indices is not None:
+            if augment:
+                raise ValueError(
+                    "fixed_aug_indices and augment=True are mutually exclusive -- augment "
+                    "already expands every window across all "
+                    f"{_N_AUGMENT_VARIANTS} variants (randomized coverage for TRAINING), "
+                    "while fixed_aug_indices pins an exact, reproducible subset (for "
+                    "deterministic VALIDATION averaging). Combining them would multiply "
+                    "the index twice over, with no coherent meaning."
+                )
+            if len(fixed_aug_indices) == 0:
+                raise ValueError("fixed_aug_indices must be non-empty (pass None to disable)")
+            if len(set(fixed_aug_indices)) != len(fixed_aug_indices):
+                raise ValueError(
+                    f"fixed_aug_indices has duplicates: {list(fixed_aug_indices)} -- a repeated "
+                    "variant just double-weights that one view, it doesn't add decorrelation"
+                )
+            bad_range = [i for i in fixed_aug_indices if not 0 <= i < _N_AUGMENT_VARIANTS]
+            if bad_range:
+                raise ValueError(
+                    f"fixed_aug_indices out of range: {bad_range} -- must each be in "
+                    f"[0, {_N_AUGMENT_VARIANTS})"
+                )
+            if stat_names is not None and "angle" in stat_names:
+                unsafe = sorted(set(fixed_aug_indices) - _ANGLE_SAFE_AUG_INDICES)
+                if unsafe:
+                    print(
+                        f"WARNING: fixed_aug_indices includes {unsafe}, which use k=1/k=3 "
+                        f"dihedral rotations -- _transform_angle's own docstring flags the SIGN "
+                        f"of its k*90 correction for those as UNCONFIRMED, and 'angle' IS in "
+                        f"stat_names, so this may put SYSTEMATIC error into the stats loss. "
+                        f"Consider VAL_DECORRELATED_AUG_INDICES ({list(VAL_DECORRELATED_AUG_INDICES)}) "
+                        f"instead, which spans 4 distinct dihedrals and 4 distinct translations "
+                        f"using only confirmed-correct angle handling."
+                    )
+        self.fixed_aug_indices = tuple(fixed_aug_indices) if fixed_aug_indices is not None else None
         self._run_dirs: list[Path] = []         # run_dir per run_idx, for tracing samples back
         self._run_steps: list[list[int]] = []   # kept step numbers per run, in order
         self._run_data: list[torch.Tensor] = []  # per run, on CPU: "state" latents (n_kept,C,8,8) if
@@ -1209,6 +1342,8 @@ class MicrostructureEvolutionDataset(Dataset):
         n = len(self._index)
         if self.augment:
             n *= _N_AUGMENT_VARIANTS
+        elif self.fixed_aug_indices is not None:
+            n *= len(self.fixed_aug_indices)
         return n
 
     def all_dts(self) -> np.ndarray:
@@ -1240,6 +1375,15 @@ class MicrostructureEvolutionDataset(Dataset):
     def __getitem__(self, idx: int):
         if self.augment:
             base_idx, aug_idx = divmod(idx, _N_AUGMENT_VARIANTS)
+        elif self.fixed_aug_indices is not None:
+            # Consecutive indices walk the variant list for one window
+            # before advancing to the next window -- so all of a given
+            # window's own variants land in the same neighbourhood of
+            # the index space. Ordering is irrelevant to the mean this
+            # feeds (see fixed_aug_indices' own comment in __init__),
+            # and val loaders don't shuffle anyway.
+            base_idx, slot = divmod(idx, len(self.fixed_aug_indices))
+            aug_idx = self.fixed_aug_indices[slot]
         else:
             base_idx, aug_idx = idx, None
 
@@ -1302,12 +1446,18 @@ class MicrostructureEvolutionDataset(Dataset):
         independent of which mode built this dataset.
 
         Correctly unwraps augmentation the same way __getitem__ does
-        (divmod by _N_AUGMENT_VARIANTS) when augment=True, so this
-        returns the true source window regardless of which augmented
-        variant idx happened to land on -- matching
-        MicrostructureSnapshotDataset.frame_info's identical pattern.
+        (divmod by _N_AUGMENT_VARIANTS when augment=True, or by
+        len(fixed_aug_indices) in that mode), so this returns the true
+        source window regardless of which variant idx happened to land
+        on -- matching MicrostructureSnapshotDataset.frame_info's
+        identical pattern.
         """
-        base_idx = idx // _N_AUGMENT_VARIANTS if self.augment else idx
+        if self.augment:
+            base_idx = idx // _N_AUGMENT_VARIANTS
+        elif self.fixed_aug_indices is not None:
+            base_idx = idx // len(self.fixed_aug_indices)
+        else:
+            base_idx = idx
         run_idx, start = self._index[base_idx]
         end = start + self.window_length
         return self._run_dirs[run_idx], self._run_steps[run_idx][start:end]

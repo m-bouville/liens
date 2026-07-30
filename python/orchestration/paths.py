@@ -22,8 +22,12 @@ path-policy history).
 from pathlib import Path
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/orchestration/paths.py -> python/
+# No "1b" entry: stage 1b was removed entirely (train_stage2 now builds
+# the deriv stream itself, see training/extend_encoder.py), so a
+# checkpoints/stage1b directory has nothing that could ever write to it.
+# It lingered here only because the old wholesale "create every stage
+# dir up front" loop in pipeline.py kept re-creating it on every run.
 _STAGE_DIRS = {1: _PYTHON_ROOT / "checkpoints" / "stage1",
-               "1b": _PYTHON_ROOT / "checkpoints" / "stage1b",
                2: _PYTHON_ROOT / "checkpoints" / "stage2",
                3: _PYTHON_ROOT / "checkpoints" / "stage3",
                "3a": _PYTHON_ROOT / "checkpoints" / "stage3a",

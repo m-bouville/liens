@@ -316,7 +316,7 @@ def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_pr
     stage2_path = train_stage2(
         base_path=base_path, resume_from=stage1_path,
         deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
-        epochs=4, batch_size=4, num_workers=0,
+        epochs=10, batch_size=4, num_workers=0,
         min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage2_centered_fresh.pt", device="cpu",
         log_every_epoch=False, loss_curve_path=tmp_path / "curve2_centered_fresh.png",
@@ -327,9 +327,12 @@ def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_pr
     cfg = saved["stage2_config"]
     assert cfg["deriv_target_centered"] is True
     assert cfg["deriv_switch_epoch"] == 2
-    # Saved checkpoint is from the run's LAST (best) epoch, which is
-    # past the switch point (epoch 2 of 4) -- so the checkpoint that
-    # ends up saved should reflect the centered phase already active.
+    # Saved checkpoint is from the run's LAST (best) epoch. With the
+    # switch's own grace period (see reset_with_grace) now blocking any
+    # save for several epochs right after the switch, epochs=10 leaves
+    # enough room past that window for a genuine post-grace save to
+    # happen -- the checkpoint that ends up saved should reflect the
+    # centered phase already active.
     assert cfg["use_centered_at_save"] is True
 
 
@@ -374,7 +377,7 @@ def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_
     stage2_resumed_path = train_stage2(
         base_path=base_path, resume_from=stage2_ancestor_path,
         deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
-        epochs=1, batch_size=4, num_workers=0,
+        epochs=20, batch_size=4, num_workers=0,
         min_step=0, min_stdev_phi=None,
         checkpoint_path=tmp_path / "stage2_resumed.pt", device="cpu",
         log_every_epoch=False, loss_curve_path=tmp_path / "curve2_resumed.png",

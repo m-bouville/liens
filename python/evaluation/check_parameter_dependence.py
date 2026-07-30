@@ -33,6 +33,7 @@ from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_dynamics import LatentDynamics
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
+from training.losses import centered_deriv_target
 from utils import load_datasets as load
 
 # GENERAL POLICY (matches training/train_refinement.py's own
@@ -459,6 +460,268 @@ def fit_saturating_exponential(dt: np.ndarray, error: np.ndarray, n_grid: int = 
     return best_c, best_tau, r2_real, best_sse, pred_real
 
 
+def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None = None):
+    """
+    THE stage-1-vs-stage-2 attribution test: is the euler-only error a
+    property of z1 (stage 2's own output), or is it already baked into
+    z0's own trajectory (stage 1) before z1 is even consulted?
+
+    Method -- substitute an ORACLE z1 and re-measure:
+
+        err_actual = || z0(t) + z1(t)*dt      - z0(t+dt) ||
+        err_oracle = || z0(t) + z0_dot_c*dt   - z0(t+dt) ||
+
+    where z0_dot_c is the second-order-accurate CENTERED derivative of
+    z0's OWN trajectory at t (see losses.centered_deriv_target), built
+    from z0(t-dt_minus), z0(t), z0(t+dt_plus). That is the best
+    first-order-update accuracy obtainable from z0's trajectory at all:
+    what remains is pure z0_ddot*dt^2/2 truncation, PLUS whatever noise
+    z0's own encoding carries (the centered estimate inherits it).
+
+    Reading the result:
+      err_oracle ~= err_actual  -> z1 is already as good as z0's own
+        trajectory permits. The floor lives in STAGE 1 (z0), and
+        further stage-2 work on z1 is capped -- no z1 could do much
+        better against this z0.
+      err_oracle << err_actual  -> z1 is leaving real accuracy on the
+        table that z0's trajectory would have supported. The problem is
+        STAGE 2, and improving z1 is worth doing.
+
+    Costs no extra encoding: this dataset is in cached-latent mode, so
+    every run's full latent sequence is already resident. The oracle
+    needs one frame BEFORE each window's own start, which exists for
+    every window except those starting at a run's first kept step --
+    those are reported and skipped, not silently dropped.
+
+    Deliberately reported per dt decade as well as overall, for the
+    same reason the saturation cross-tab is: error tracks log dt at
+    ~94% here, so any aggregate comparison that doesn't hold dt roughly
+    fixed mostly measures the dt distribution of whichever subset
+    happens to be included.
+    """
+    err_actual, err_oracle, err_causal, dts_ok = [], [], [], []
+    n_skipped = 0
+    # NaN-padded to len(dataset._index) so these align 1:1 with every
+    # results.* array (same dataset order, loader is unshuffled) -- the
+    # figure code needs that alignment; the console summary below only
+    # needs the compacted lists. NaN marks "no frame before this window".
+    n_all = len(dataset._index)
+    per_window = {k: np.full(n_all, np.nan, dtype=float)
+                  for k in ("causal_abs", "causal_signed", "oracle_abs", "oracle_signed")}
+    with torch.no_grad():
+        for w_idx, (run_idx, start) in enumerate(dataset._index):
+            if start == 0:  # no frame before this window -- no centered estimate possible
+                n_skipped += 1
+                continue
+            run_state = dataset._run_data[run_idx]
+            run_deriv = dataset._run_data_deriv[run_idx]
+            steps = dataset._run_steps[run_idx]
+            scale = dataset._run_dt_scale[run_idx]
+
+            z0_before, z0_t, z0_next = run_state[start - 1], run_state[start], run_state[start + 1]
+            z1_t = run_deriv[start]
+            dt_minus = (steps[start] - steps[start - 1]) * scale
+            dt_plus = (steps[start + 1] - steps[start]) * scale
+            if dt_minus <= 0 or dt_plus <= 0:
+                n_skipped += 1
+                continue
+
+            dtm = torch.tensor(dt_minus, dtype=z0_t.dtype)
+            dtp = torch.tensor(dt_plus, dtype=z0_t.dtype)
+            z0_dot_c = centered_deriv_target(z0_before, z0_t, z0_next, dtm, dtp)
+
+            # CAUSAL baseline: backward difference, built ONLY from
+            # z0(t-dt_minus) and z0(t) -- both available at prediction
+            # time. This is what z1 must actually be compared against
+            # (see this function's own docstring on the centered
+            # oracle's future-information leak).
+            z0_dot_back = (z0_t - z0_before) / dt_minus
+
+            resid_causal = z0_t + z0_dot_back * dt_plus - z0_next
+            resid_oracle = z0_t + z0_dot_c * dt_plus - z0_next
+            err_actual.append((z0_t + z1_t * dt_plus - z0_next).abs().mean().item())
+            err_oracle.append(resid_oracle.abs().mean().item())
+            err_causal.append(resid_causal.abs().mean().item())
+            dts_ok.append(dt_plus)
+
+            per_window["causal_abs"][w_idx] = resid_causal.abs().mean().item()
+            per_window["causal_signed"][w_idx] = resid_causal.mean().item()
+            per_window["oracle_abs"][w_idx] = resid_oracle.abs().mean().item()
+            per_window["oracle_signed"][w_idx] = resid_oracle.mean().item()
+
+    if not err_actual:
+        print("\n(oracle-z1 attribution: no window has a preceding frame -- nothing to compare)")
+        return per_window
+
+    a = np.array(err_actual); o = np.array(err_oracle); d = np.array(dts_ok)
+    c = np.array(err_causal)
+    print(f"\n{'='*70}")
+    print("Oracle-z1 attribution: is the euler error z1's (stage 2) or z0's (stage 1)?")
+    print(f"{'='*70}")
+    print(f"  {len(a)} windows usable ({n_skipped} skipped: no frame before the window's own start)")
+    print(f"  err_actual (real z1)                       = {a.mean():.6e}")
+    print(f"  err_causal (backward dz0/dt, PAST ONLY)    = {c.mean():.6e}   "
+          f"ratio {c.mean()/max(a.mean(), 1e-30):.3f}")
+    print(f"  err_oracle (centered dz0/dt, SEES FUTURE)  = {o.mean():.6e}   "
+          f"ratio {o.mean()/max(a.mean(), 1e-30):.3f}")
+
+    print("\n  per dt decade (error tracks log dt strongly -- aggregates alone mislead):")
+    print("  dt decade         n     err_actual     err_causal     err_oracle  causal/act  oracle/act")
+    finite = d > 0
+    if finite.any():
+        for e in range(int(np.floor(np.log10(d[finite].min()))),
+                        int(np.ceil(np.log10(d[finite].max())))):
+            m = finite & (d >= 10.0**e) & (d < 10.0**(e + 1))
+            if not m.any():
+                continue
+            print(f"  1e{e:<2d}- 1e{e+1:<3d} {m.sum():6d}   {a[m].mean():12.6e}   {c[m].mean():12.6e}   "
+                  f"{o[m].mean():12.6e}  {c[m].mean()/max(a[m].mean(), 1e-30):10.3f}  "
+                  f"{o[m].mean()/max(a[m].mean(), 1e-30):10.3f}")
+
+    ratio = c.mean() / max(a.mean(), 1e-30)  # CAUSAL ratio -- the fair one
+    if ratio > 0.7:
+        print("\n  -> oracle is close to actual: z1 is already near the best any first-order")
+        print("     update could do against THIS z0. The floor is in STAGE 1 (z0's own")
+        print("     trajectory), and further z1/stage-2 work is capped.")
+    elif ratio < 0.3:
+        print("\n  -> oracle is far below actual: z0's own trajectory supports a much more")
+        print("     accurate first-order update than z1 currently delivers. The problem is")
+        print("     in STAGE 2 (z1), and improving it is worth doing.")
+    else:
+        print("\n  -> intermediate: z1 leaves some accuracy on the table, but a real floor")
+        print("     from z0's own trajectory remains too. Both stages contribute.")
+    print("  (verdict is keyed on err_CAUSAL, not err_oracle: the centered oracle is built")
+    print("   from z0(t+dt) and then scored against that same z0(t+dt), so it absorbs part of")
+    print("   an error no causal predictor could avoid -- measured at ~50% on a deliberately")
+    print("   unpredictable trajectory. It is a smoothness probe of z0, NOT an achievable")
+    print("   target for z1, which sees only frame t. Both estimates also inherit z0's own")
+    print("   encoding noise, so neither is an absolute floor.)")
+    return per_window
+
+
+def _print_saturation_cross_tab(temperatures: np.ndarray, length_scales: np.ndarray,
+                                 abs_steps: np.ndarray, latent_losses: np.ndarray,
+                                 dts: np.ndarray, max_dist: int, n_bins: int = 8):
+    """
+    Saturation fraction of autocorr_length, cross-tabulated against
+    temperature -- the direct test of whether this run's own
+    "error grows with temperature" finding is really a FINITE-SIZE
+    artifact of the domain rather than a property of the model.
+
+    Why this matters, and why temperature specifically: the C++ search
+    cap is min(Nx*2/3, Ny*2/3) -- 42 px on a 64x64 domain -- and on
+    real 64x64 data ~86% of windows hit it. At the same time the
+    encoder's own theoretical receptive field is 43 px and the typical
+    feature is >= 42 px, so THREE candidate explanations for
+    "error grows with feature size" (receptive field too small,
+    measurement saturating, box smaller than the physics) are
+    numerically indistinguishable at this one domain size. Since the
+    correlation length diverges near T0, all three ALSO predict
+    "error grows with temperature" -- so the temperature finding cannot
+    be attributed from 64x64 data alone. If saturation turns out to be
+    strongly temperature-correlated, the temperature effect and the
+    length-scale effect are substantially the SAME effect, and the
+    finite-size component of it should largely vanish on a bigger
+    domain (the cap scales with the box, while a fixed-dx feature does
+    not).
+
+    Saturation is NOT one phenomenon, which is why the "no clear peak"
+    column below exists: autocorr_length saturates whenever the
+    correlation never decays within range, and that happens both when
+    structure is LARGER than the cap AND when there is effectively no
+    structure to decorrelate at all -- early, unpatterned noise (which
+    persists at ANY domain size) or late, fully-coarsened
+    near-single-phase states (which become very unlikely in a larger
+    box). Those scale in OPPOSITE directions, so a bare saturation
+    fraction can't be read as "features are large". abs_steps is
+    reported alongside as the cheapest available discriminator: early
+    saturated windows point at the unpatterned-noise cause, late ones
+    at the coarsened-out cause, and a saturated population concentrated
+    at NEITHER extreme is the genuinely-large-feature case.
+    """
+    saturated = length_scales >= max_dist
+    edges = np.linspace(temperatures.min(), temperatures.max(), n_bins + 1)
+    print(f"\nautocorr_length saturation (>= {max_dist} px) vs temperature -- "
+          f"finite-size confound check:")
+    print("temperature bin          n   sat%   median step (sat)  "
+          "mean loss (sat)  mean loss (unsat)")
+    for i in range(n_bins):
+        lo, hi = edges[i], edges[i + 1]
+        mask = (temperatures >= lo) & (temperatures <= hi if i == n_bins - 1 else temperatures < hi)
+        if mask.sum() == 0:
+            continue
+        sat_here = saturated & mask
+        uns_here = (~saturated) & mask
+        frac = 100.0 * sat_here.sum() / mask.sum()
+        med_step = f"{np.median(abs_steps[sat_here]):11.0f}" if sat_here.sum() else f"{'--':>11s}"
+        loss_sat = f"{latent_losses[sat_here].mean():13.6f}" if sat_here.sum() else f"{'--':>13s}"
+        loss_uns = f"{latent_losses[uns_here].mean():15.6f}" if uns_here.sum() else f"{'--':>15s}"
+        print(f"{lo:7.4f} - {hi:7.4f} {mask.sum():5d} {frac:5.1f}  {med_step}      "
+              f"{loss_sat}  {loss_uns}")
+
+    if not (saturated.sum() and (~saturated).sum()):
+        print("\n(all or no windows saturated -- cross-tab uninformative at this domain size)")
+        return
+
+    corr_sat_temp = np.corrcoef(temperatures, saturated.astype(float))[0, 1]
+    print(f"\ncorr(temperature, is_saturated) = {corr_sat_temp*100:.0f}%")
+    print(f"  overall saturated mean loss = {latent_losses[saturated].mean():.6f}  vs  "
+          f"unsaturated = {latent_losses[~saturated].mean():.6f}  "
+          f"(x{latent_losses[saturated].mean()/max(latent_losses[~saturated].mean(), 1e-12):.1f})")
+
+    # THE decisive statistic -- not the corr(temperature, is_saturated)
+    # above, which turned out to be the least informative number here.
+    # What actually settles the attribution is whether the temperature
+    # trend survives INSIDE each saturation class. If loss rises with
+    # temperature only among SATURATED windows and is flat/falling among
+    # unsaturated ones, then "error grows with temperature" is not a
+    # temperature property of the model at all -- it's a property of the
+    # saturated subpopulation, which is exactly the population a larger
+    # domain changes.
+    corr_within = {}
+    for label, mask in (("saturated", saturated), ("unsaturated", ~saturated)):
+        if mask.sum() >= 3 and np.ptp(temperatures[mask]) > 0:
+            corr_within[label] = np.corrcoef(temperatures[mask], latent_losses[mask])[0, 1]
+    if len(corr_within) == 2:
+        cs, cu = corr_within["saturated"], corr_within["unsaturated"]
+        print(f"\ncorr(temperature, loss) WITHIN each class:  "
+              f"saturated {cs*100:+.0f}%   unsaturated {cu*100:+.0f}%")
+        if cs > 0.2 and cu < 0.1:
+            print("  -> the temperature trend exists ONLY among saturated windows; among windows "
+                  "with genuinely resolvable structure it is absent or reversed. So this run's own "
+                  "temperature finding is a property of the SATURATED subpopulation, not of "
+                  "temperature per se -- re-check on a larger domain before spending anything on "
+                  "temperature-specific modelling changes.")
+        elif cu > 0.2:
+            print("  -> the temperature trend survives among UNSATURATED windows too, so it is NOT "
+                  "purely a saturation/finite-size artifact and is worth treating as real.")
+
+    # The remaining confound: saturated windows here are LATE windows,
+    # and late windows have large dt on a geometric save schedule --
+    # while error already correlates ~94% with log dt. So a raw
+    # saturated-vs-unsaturated loss gap may be mostly a dt gap. Compare
+    # them WITHIN each dt decade, where dt is held roughly fixed.
+    print("\nsaturated vs unsaturated WITHIN each dt decade (controls for the dt confound --")
+    print("late windows have large dt, and error already tracks log dt strongly):")
+    print("dt decade        n_sat  n_unsat   mean loss (sat)  mean loss (unsat)   ratio")
+    finite = dts > 0
+    if finite.sum():
+        lo_exp = int(np.floor(np.log10(dts[finite].min())))
+        hi_exp = int(np.ceil(np.log10(dts[finite].max())))
+        for e in range(lo_exp, hi_exp):
+            in_dec = finite & (dts >= 10.0**e) & (dts < 10.0**(e + 1))
+            ns, nu = (in_dec & saturated).sum(), (in_dec & ~saturated).sum()
+            if ns == 0 and nu == 0:
+                continue
+            ms = f"{latent_losses[in_dec & saturated].mean():15.6f}" if ns else f"{'--':>15s}"
+            mu = f"{latent_losses[in_dec & ~saturated].mean():17.6f}" if nu else f"{'--':>17s}"
+            ratio = (f"{latent_losses[in_dec & saturated].mean() / latent_losses[in_dec & ~saturated].mean():7.2f}"
+                     if ns and nu and latent_losses[in_dec & ~saturated].mean() > 0 else f"{'--':>7s}")
+            print(f"1e{e:<2d}- 1e{e+1:<3d}    {ns:5d}    {nu:5d}   {ms}  {mu} {ratio}")
+        print("  (ratios near 1.0 across decades -> the saturated/unsaturated gap was mostly a dt")
+        print("   effect; ratios staying well above 1.0 -> saturation carries real extra error)")
+
+
 def _print_binned_summary(name: str, values: np.ndarray, latent_losses: np.ndarray,
                            pixel_losses: np.ndarray | None = None, n_bins: int = 8):
     """Linear-space binned summary -- unlike dt (which spans orders of
@@ -793,6 +1056,10 @@ class _DerivedStats:
     itself produces. corr_dt_pixel is None whenever decode=False (see its
     own assignment site below for why)."""
     corr_dt_pixel: float | None
+    # Per-window oracle/causal residuals (NaN where a window has no
+    # preceding frame), aligned 1:1 with results.* -- see
+    # _print_oracle_z1_attribution. None when no dataset was passed.
+    oracle_per_window: dict | None
     corr_noise_abs: float
     corr_noise_signed: float
     corr_temp_abs: float
@@ -1182,7 +1449,8 @@ def _evaluate_windows(dataset, f_theta, ae_decoder, device, decode: bool, euler_
     )
 
 
-def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, decode: bool, euler_only: bool) -> _DerivedStats:
+def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, decode: bool,
+                               euler_only: bool, dataset=None, device=None) -> _DerivedStats:
     """Every console-only diagnostic that doesn't touch a figure object --
     bias/variance, the dt power-law/saturating-exponential model comparison,
     the euler-vs-full direct-magnitude comparison, the dt-decade table,
@@ -1375,6 +1643,19 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     print(f"\n{n_saturated}/{len(results.length_scales)} windows have autocorr_length >= "
           f"{max_dist} (the C++ search cap) -- treated as N/A (not a real length "
           f"scale, just 'never decayed within range') and excluded below.")
+    _print_saturation_cross_tab(results.temperatures, results.length_scales,
+                                 results.abs_steps, results.latent_losses, results.dts, max_dist)
+
+    # Oracle-z1 attribution -- placed here, alongside the other
+    # console-only diagnostics, since it answers the question the
+    # rest of this report can only circle around: WHICH STAGE the
+    # euler-only floor actually belongs to. Needs the dataset
+    # itself (not just results) because it reads one frame BEFORE
+    # each window, which no per-window results array carries.
+    oracle_per_window = None
+    if dataset is not None:
+        oracle_per_window = _print_oracle_z1_attribution(dataset, results, device)
+
     length_scales_valid = results.length_scales[~saturated]
     latent_losses_for_length = results.latent_losses[~saturated]
     log_latent_for_length = log_latent[~saturated]
@@ -1465,6 +1746,7 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
 
     return _DerivedStats(
         corr_dt_pixel=corr_dt_pixel,
+        oracle_per_window=oracle_per_window,
         corr_noise_abs=corr_noise_abs,
         corr_noise_signed=corr_noise_signed,
         corr_temp_abs=corr_temp_abs,
@@ -1681,6 +1963,35 @@ def _build_and_save_figures(
     # before where one axis's own two curves were genuinely different
     # things (signed vs absolute) needing separate scales.
     ax_signed, ax_abs = axes_dt[0, 0], axes_dt[1, 0]
+
+    # In EULER-ONLY mode (a stage-2/AE-family checkpoint, f_theta
+    # untrained) the "full" curve is a numerically IDENTICAL duplicate of
+    # euler-only -- two overlapping lines carrying one line's worth of
+    # information. That slot is far better spent on the causal/oracle
+    # derivative baselines, which answer the question a stage-2
+    # checkpoint actually raises: how much of this error is z1's own,
+    # versus already present in z0's trajectory (see
+    # _print_oracle_z1_attribution). In stage-3 mode "full" is the
+    # informative curve and is kept as-is; the oracle curves are then
+    # omitted rather than crowding four lines onto one panel.
+    oracle_curves = None
+    if euler_only and stats.oracle_per_window is not None:
+        opw = stats.oracle_per_window
+        ok = ~np.isnan(opw["causal_abs"])
+        if ok.any():
+            ox, o_causal_signed, o_causal_abs, _ = _mean_curves_by_unique_value(
+                results.dts[ok], opw["causal_signed"][ok] / results.dts[ok],
+                opw["causal_abs"][ok] / results.dts[ok])
+            _, o_oracle_signed, o_oracle_abs, _ = _mean_curves_by_unique_value(
+                results.dts[ok], opw["oracle_signed"][ok] / results.dts[ok],
+                opw["oracle_abs"][ok] / results.dts[ok])
+            oracle_curves = dict(
+                x=ox,
+                causal_signed=o_causal_signed * _DT_PANEL_SCALE,
+                causal_abs=o_causal_abs * _DT_PANEL_SCALE,
+                oracle_signed=o_oracle_signed * _DT_PANEL_SCALE,
+                oracle_abs=o_oracle_abs * _DT_PANEL_SCALE,
+            )
     # dt_n and dt_n_13 group the SAME dt array the same way -- only the
     # loss VALUES differ between euler-only/full, not which windows
     # landed in which dt bucket -- so one dot-sizing scheme covers both
@@ -1702,9 +2013,20 @@ def _build_and_save_figures(
     ax_signed.plot(dt_x_13, dt_signed_13, "-", color="tab:blue", linewidth=1, zorder=1)
     ax_signed.scatter(dt_x_13, dt_signed_13, s=sizes, color="tab:blue", zorder=2,
                        edgecolors="black", linewidths=0.3, label="euler-only")
-    ax_signed.plot(dt_x, dt_signed, "-", color="tab:orange", linewidth=1, zorder=1)
-    ax_signed.scatter(dt_x, dt_signed, s=sizes, color="tab:orange", zorder=2,
-                       edgecolors="black", linewidths=0.3, label="full")
+    if oracle_curves is None:
+        ax_signed.plot(dt_x, dt_signed, "-", color="tab:orange", linewidth=1, zorder=1)
+        ax_signed.scatter(dt_x, dt_signed, s=sizes, color="tab:orange", zorder=2,
+                           edgecolors="black", linewidths=0.3, label="full")
+    else:
+        oc = oracle_curves
+        ax_signed.plot(oc["x"], oc["causal_signed"], "-", color="tab:green", linewidth=1, zorder=1)
+        ax_signed.scatter(oc["x"], oc["causal_signed"], s=20, color="tab:green", zorder=2,
+                           marker="^", edgecolors="black", linewidths=0.3,
+                           label="causal dz0/dt (past only)")
+        ax_signed.plot(oc["x"], oc["oracle_signed"], ":", color="tab:purple", linewidth=1, zorder=1)
+        ax_signed.scatter(oc["x"], oc["oracle_signed"], s=20, color="tab:purple", zorder=2,
+                           marker="v", edgecolors="black", linewidths=0.3,
+                           label="oracle dz0/dt (sees future)")
     # Lock the y-range from empirical data alone, BEFORE the regression
     # curves (below) are drawn -- same reasoning as before: the curves'
     # own 1/dt divergence near results.dts.min() would otherwise crush the
@@ -1715,17 +2037,69 @@ def _build_and_save_figures(
     # hide by locking the range before plotting it.
     ax_signed.set_ylim(ax_signed.get_ylim())
 
-    ax_abs.plot(dt_x, dt_trivial_abs, "--", color="gray", linewidth=1, zorder=0)
-    ax_abs.scatter(dt_x, dt_trivial_abs, s=sizes, color="gray", zorder=0,
+    # |error| is strictly a magnitude, so it belongs on a LOG y-axis --
+    # the curves span 3+ decades here (a trivial-baseline floor near 1e-2
+    # against euler errors above 1e0), which a linear axis flattens into
+    # an unreadable band near zero. The signed panel above stays LINEAR:
+    # it legitimately crosses zero, which log cannot represent.
+    #
+    # Truncation rule: a mean |error| of exactly zero in some dt bin is
+    # not a real measurement -- it means that bin has too little usable
+    # data (often a single window, or one whose own residual underflowed)
+    # -- and log() of it is undefined anyway. Per the same reasoning that
+    # such a bin is dubious, EVERY dt at or above the first offending one
+    # is dropped too, not just the offending bin: the largest-dt bins are
+    # the sparsest, so one bad bin means the tail beyond it is
+    # untrustworthy rather than merely gappy.
+    abs_curves = [(dt_x, dt_trivial_abs), (dt_x_13, dt_abs_13)]
+    if oracle_curves is None:
+        abs_curves.append((dt_x, dt_abs))
+    else:
+        abs_curves += [(oracle_curves["x"], oracle_curves["causal_abs"]),
+                        (oracle_curves["x"], oracle_curves["oracle_abs"])]
+    dt_abs_cutoff = np.inf
+    for cx, cy in abs_curves:
+        bad = np.asarray(cy) <= 0
+        if bad.any():
+            dt_abs_cutoff = min(dt_abs_cutoff, float(np.asarray(cx)[bad].min()))
+    if np.isfinite(dt_abs_cutoff):
+        n_dropped = int((np.asarray(dt_x) >= dt_abs_cutoff).sum())
+        print(f"\n|error| panel: dropping dt >= {dt_abs_cutoff:.4g} "
+              f"({n_dropped} dt value(s)) -- a mean |error| of exactly zero there means too "
+              f"little usable data in that bin, so that dt and every larger one is dubious.")
+
+    def _keep(cx, *ys):
+        m = np.asarray(cx) < dt_abs_cutoff
+        return (np.asarray(cx)[m],) + tuple(np.asarray(y)[m] for y in ys) + (m,)
+
+    tx, t_triv, t_mask = _keep(dt_x, dt_trivial_abs)
+    ax_abs.plot(tx, t_triv, "--", color="gray", linewidth=1, zorder=0)
+    ax_abs.scatter(tx, t_triv, s=sizes[t_mask], color="gray", zorder=0,
                     marker="s", edgecolors="black", linewidths=0.3,
                     label="trivial (no change)")
-    ax_abs.plot(dt_x_13, dt_abs_13, "-", color="tab:blue", linewidth=1, zorder=1)
-    ax_abs.scatter(dt_x_13, dt_abs_13, s=sizes, color="tab:blue", zorder=2,
+    ex, e_abs, e_mask = _keep(dt_x_13, dt_abs_13)
+    ax_abs.plot(ex, e_abs, "-", color="tab:blue", linewidth=1, zorder=1)
+    ax_abs.scatter(ex, e_abs, s=sizes[e_mask], color="tab:blue", zorder=2,
                     edgecolors="black", linewidths=0.3, label="euler-only")
-    ax_abs.plot(dt_x, dt_abs, "-", color="tab:orange", linewidth=1, zorder=1)
-    ax_abs.scatter(dt_x, dt_abs, s=sizes, color="tab:orange", zorder=2,
-                    edgecolors="black", linewidths=0.3, label="full")
-    ax_abs.set_ylim(bottom=0)
+    if oracle_curves is None:
+        fx, f_abs, f_mask = _keep(dt_x, dt_abs)
+        ax_abs.plot(fx, f_abs, "-", color="tab:orange", linewidth=1, zorder=1)
+        ax_abs.scatter(fx, f_abs, s=sizes[f_mask], color="tab:orange", zorder=2,
+                        edgecolors="black", linewidths=0.3, label="full")
+    else:
+        oc = oracle_curves
+        ox, o_c, o_o, _ = _keep(oc["x"], oc["causal_abs"], oc["oracle_abs"])
+        ax_abs.plot(ox, o_c, "-", color="tab:green", linewidth=1, zorder=1)
+        ax_abs.scatter(ox, o_c, s=20, color="tab:green", zorder=2,
+                        marker="^", edgecolors="black", linewidths=0.3,
+                        label="causal dz0/dt (past only)")
+        ax_abs.plot(ox, o_o, ":", color="tab:purple", linewidth=1, zorder=1)
+        ax_abs.scatter(ox, o_o, s=20, color="tab:purple", zorder=2,
+                        marker="v", edgecolors="black", linewidths=0.3,
+                        label="oracle dz0/dt (sees future)")
+    # log scale, NOT set_ylim(bottom=0) -- 0 is not representable on a log
+    # axis, and matplotlib would silently clip to its own positive floor.
+    ax_abs.set_yscale("log")
 
     # Regression curves, SIGNED panel only -- still no equivalent shown
     # on the absolute panel; abs() of this same curve tracks E[signed
@@ -1740,9 +2114,16 @@ def _build_and_save_figures(
     raw_curve_euler = eps + eps_prime * dt_curve + C * dt_curve ** 2 - A * dt_curve ** 3
     ax_signed.plot(dt_curve, raw_curve_euler / dt_curve * _DT_PANEL_SCALE, "--",
                    color="tab:blue", linewidth=1, label=f"fit (euler): eps={eps:.3e}")
-    raw_curve_full = eps + eps_prime * dt_curve + D_or_C * dt_curve ** 2 - A * dt_curve ** 3
-    ax_signed.plot(dt_curve, raw_curve_full / dt_curve * _DT_PANEL_SCALE, "--",
-                   color="tab:orange", linewidth=1, label=f"fit (full): eps={eps:.3e}")
+    # "fit (full)" plotted ONLY when there is a genuinely separate full
+    # model to fit. Under euler_only=True the joint fit shares eps/eps'/A
+    # and D_or_C falls back to C, so this curve is numerically IDENTICAL
+    # to the euler one above -- a second dashed orange line exactly on
+    # top of the blue, plus a legend entry repeating the same eps. Same
+    # reasoning as dropping the duplicate "full" DATA curve in that mode.
+    if not euler_only:
+        raw_curve_full = eps + eps_prime * dt_curve + D_or_C * dt_curve ** 2 - A * dt_curve ** 3
+        ax_signed.plot(dt_curve, raw_curve_full / dt_curve * _DT_PANEL_SCALE, "--",
+                       color="tab:orange", linewidth=1, label=f"fit (full): eps={eps:.3e}")
 
     # Precise, not just "error": z0_pred(t+dt) = z0(t) + z1(t)*dt for
     # the euler-only curve, + f_theta(...)*dt^2/2 for the full curve
@@ -2123,7 +2504,8 @@ def check_parameter_dependence(
     )
     results = _evaluate_windows(ctx.dataset, ctx.f_theta, ctx.ae_decoder, ctx.device,
                                  decode, ctx.euler_only)
-    stats = _print_summary_statistics(results, ctx.ae_config, decode, ctx.euler_only)
+    stats = _print_summary_statistics(results, ctx.ae_config, decode, ctx.euler_only,
+                                       dataset=ctx.dataset, device=ctx.device)
     _build_and_save_figures(results, stats, ctx.lds_checkpoint_path, ctx.output_path,
                              ctx.dz0dt_output_path, ctx.dt_dependence_output_path,
                              decode, ctx.euler_only)

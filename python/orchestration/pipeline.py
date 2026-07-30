@@ -89,11 +89,30 @@ def run_from_params_file(params_path: Path, default_base: Path,
     extra_signature = {"Nx": nx, "Ny": ny}
 
     stem = params_path.stem
-    for stage_dir in _STAGE_DIRS.values():
-        stage_dir.mkdir(parents=True, exist_ok=True)
+
+    def stage_dir(stage_num: int | str) -> Path:
+        """
+        This stage's own checkpoint directory, created ON DEMAND rather
+        than up front. Replaces an earlier loop that mkdir'd EVERY entry
+        in _STAGE_DIRS on every run, which left behind directories for
+        stages this run never touches -- checkpoints/stage3 on a 3a/3b
+        curriculum run, and (until _STAGE_DIRS dropped the entry
+        entirely) checkpoints/stage1b, long after stage 1b stopped
+        existing. Empty, permanently-unused directories in a checkpoints
+        tree are actively misleading: they look like a stage that ran and
+        produced nothing.
+
+        Safe to defer: resolve_checkpoint's own lookups are globs, and
+        globbing a directory that doesn't exist yet returns empty rather
+        than raising -- so a not-yet-created stage dir reads exactly like
+        an empty one, which is what it is.
+        """
+        d = _STAGE_DIRS[stage_num]
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def stage_output_path(stage_num: int) -> Path:
-        return _STAGE_DIRS[stage_num] / f"{stem}-stage{stage_num}.pt"
+        return stage_dir(stage_num) / f"{stem}-stage{stage_num}.pt"
 
     def resolve_checkpoint(stage_num: int, force: bool, signature: dict,
                            target_epochs: int | None) -> Path | None:
@@ -114,7 +133,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 _report_checkpoint_epoch(own_path, target_epochs, device)
                 return own_path
         if not force:
-            registry_path = _STAGE_DIRS[stage_num] / f"registry-stage{stage_num}.csv"
+            registry_path = stage_dir(stage_num) / f"registry-stage{stage_num}.csv"
             match = _find_matching_checkpoint(registry_path, signature, stage_num)
             if match is not None:
                 _validate_checkpoint_stage(match, stage_num, device)
@@ -137,7 +156,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print("=" * 70)
             print("STAGE 1: training autoencoder")
             print("=" * 70)
-            registry1_path = _STAGE_DIRS[1] / "registry-stage1.csv"
+            registry1_path = stage_dir(1) / "registry-stage1.csv"
             stage1_checkpoint = train_autoencoder(
                 size=size, base_path=base_path,
                 checkpoint_path=stage_output_path(1), device=device,
@@ -234,7 +253,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print("=" * 70)
             print("STAGE 2: latent-space validation (L_deriv fine-tuning)")
             print("=" * 70)
-            registry2_path = _STAGE_DIRS[2] / "registry-stage2.csv"
+            registry2_path = stage_dir(2) / "registry-stage2.csv"
             stage2_checkpoint = train_stage2(
                 base_path=base_path, resume_from=stage2_resume_from,
                 checkpoint_path=stage_output_path(2), device=device,
@@ -363,7 +382,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 resume_note = f" (resuming from {resume_from})" if resume_from is not None else ""
                 print(f"STAGE {stage_key}: latent dynamics surrogate (frozen encoder){resume_note}")
                 print("=" * 70)
-                registry_path = _STAGE_DIRS[stage_key] / f"registry-stage{stage_key}.csv"
+                registry_path = stage_dir(stage_key) / f"registry-stage{stage_key}.csv"
                 checkpoint = train_lds(
                     size=size, base_path=base_path, ae_checkpoint_path=stage2_checkpoint,
                     checkpoint_path=stage_output_path(stage_key), device=device,
@@ -517,7 +536,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 resume_note = f" (resuming from {resume_from})" if resume_from is not None else ""
                 print(f"STAGE {stage_key}: {label}{resume_note}")
                 print("=" * 70)
-                registry_path = _STAGE_DIRS[stage_key] / f"registry-stage{stage_key}.csv"
+                registry_path = stage_dir(stage_key) / f"registry-stage{stage_key}.csv"
                 common_args = dict(
                     base_path=base_path, freeze_decoder=freeze_decoder,
                     checkpoint_path=stage_output_path(stage_key), device=device,

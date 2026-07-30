@@ -23,9 +23,11 @@ from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import cross_check_stream_configs_against_state_dict, \
                                    resolve_stream_configs_from_checkpoint_config
-from training.checkpoint_criterion import CheckpointCriterionTracker, atomic_torch_save
+from training.checkpoint_criterion import (
+    CheckpointCriterionTracker, atomic_torch_save, clamp_grace_epochs,
+)
 from training.extend_encoder import extend_state_checkpoint_with_deriv_stream
-from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
+from training.datasets import VAL_DECORRELATED_AUG_INDICES, MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import ReconLoss, StatsLoss, centered_deriv_target, dt_weighted_deriv_loss
 from training.stats_head import StatsHead
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
@@ -50,6 +52,7 @@ def train_stage2(
     deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats0_weight: float = 0.0,
     stats1_weight: float = 0.0, z0_from_deriv_weight: float = 0.0,
     deriv_dt_weight_exponent: float = 0.0, deriv_target_centered: bool = False,
+    val_aug_averaging: bool = False,
     recon0_scale: float = 1.0,
     stats0_scale: float = 1.0, stats1_scale: float = 1.0, deriv_scale: float = 1.0,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
@@ -289,6 +292,32 @@ def train_stage2(
     windows drop out, same as MicrostructureTripletDataset's own,
     already-existing window_length=3-equivalent construction already
     does for check_interpolation.py).
+
+    val_aug_averaging (default False): evaluate every VALIDATION window
+    under datasets.VAL_DECORRELATED_AUG_INDICES' own 4 exact-symmetry
+    variants and average, instead of the single untransformed view --
+    see that constant's own comment, and fixed_aug_indices' entry in
+    MicrostructureEvolutionDataset's own docstring, for the full
+    reasoning and for why those specific 4 variants.
+
+    Motivation, measured not assumed: on a real 64x64 run, val_total's
+    own per-epoch std was ~0.12 while the deriv term (the one stage 2
+    exists to improve) was improving at ~0.0014/epoch -- an ~85:1
+    noise-to-signal ratio that makes the save criterion and early
+    stopping fire on noise rather than on real progress. The val set is
+    the reason: augment applies to TRAIN only, so val ends up ~100x
+    smaller in window count (555872 vs 5232 in that run), and
+    min_std_deriv had already discarded roughly two thirds of the val
+    candidates on top of that.
+
+    Costs 4x the val-set forward passes, which is negligible against an
+    augmented train set two orders of magnitude larger. Note this
+    CHANGES WHAT val_loss MEANS (a symmetry-averaged mean rather than a
+    single-view one), so values aren't directly comparable against runs
+    trained without it -- and it does NOT touch training at all, only
+    the metric that decides saving/early stopping. Also strictly weaker
+    than simply enlarging val_fraction, since these 4 views are
+    symmetry-related rather than genuinely independent samples.
 
     on_checkpoint_saved: see train_autoencoder(). log_every_epoch: see
     train_autoencoder() -- same behavior here.
@@ -604,7 +633,9 @@ def train_stage2(
                                                   stats_frame_index=1 if deriv_target_centered else 0,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
-                                                  min_passing_steps=min_passing_steps)
+                                                  min_passing_steps=min_passing_steps,
+                                                  fixed_aug_indices=(VAL_DECORRELATED_AUG_INDICES
+                                                                      if val_aug_averaging else None))
         print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
               f"{len(val_set)} val "
               f"{'centered (t-dt_minus, t, t+dt_plus)' if deriv_target_centered else 'consecutive-pair'} windows")
@@ -621,7 +652,9 @@ def train_stage2(
                                                   stats_frame_index=1 if deriv_target_centered else 0,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
-                                                  min_passing_steps=min_passing_steps)
+                                                  min_passing_steps=min_passing_steps,
+                                                  fixed_aug_indices=(VAL_DECORRELATED_AUG_INDICES
+                                                                      if val_aug_averaging else None))
         print(f"{len(train_set)} train / {len(val_set)} val "
               f"{'centered (t-dt_minus, t, t+dt_plus)' if deriv_target_centered else 'consecutive-pair'} windows")
         train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
@@ -902,7 +935,9 @@ def train_stage2(
           f", deriv_dt_weight_exponent={deriv_dt_weight_exponent}"
           f"{' (favoring small-dt windows in L_deriv)' if deriv_dt_weight_exponent > 0 else ''}"
           f", deriv_target_centered={deriv_target_centered}"
-          f"{' (second-order accurate L_deriv target, window_length=3)' if deriv_target_centered else ''}")
+          f"{' (second-order accurate L_deriv target, window_length=3)' if deriv_target_centered else ''}"
+          f", val_aug_averaging={val_aug_averaging}"
+          f"{f' (val_loss averaged over {len(VAL_DECORRELATED_AUG_INDICES)} symmetry variants -- NOT comparable to runs without it)' if val_aug_averaging else ''}")
     formula = " ".join(f"+{w}*{lbl}/{s}" for w, lbl, s in active_terms)
     print(f"/{epochs:3d} train = recon0/{recon0_scale} {formula} | valid = ...  | ema")
 
@@ -1043,11 +1078,33 @@ def train_stage2(
         just_switched = use_centered_this_epoch and not _prev_use_centered
         _prev_use_centered = use_centered_this_epoch
         if just_switched:
-            print(f"  [epoch {epoch}: switching to the centered L_deriv target now -- "
-                  f"resetting best_val_loss/EMA, since val_loss computed under the OLD "
-                  f"target isn't a fair bar for the NEW target's own val_loss to clear]")
-            tracker.best_val_loss = float("inf")
-            tracker.val_ema = None
+            # grace_epochs derived from val_ema_decay's own effective
+            # averaging window (1/(1-decay)) -- max(2, ...) specifically,
+            # not max(1, ...): confirmed directly that a single-epoch
+            # grace period is mathematically IDENTICAL to the original
+            # bug (see reset_with_grace's own docstring) -- with only one
+            # epoch, there's no second value for the ema to blend with,
+            # so best_val_loss at the moment grace ends is exactly that
+            # one epoch's own raw value, lucky or not.
+            grace_epochs = max(2, round(1 / (1 - val_ema_decay))) if val_ema_decay < 1 else 2
+            # Clamped against the epochs ACTUALLY remaining after this
+            # one -- see clamp_grace_epochs' own docstring. Without
+            # this, a switch late in a short run (or any run with fewer
+            # epochs left than grace_epochs) covers every remaining
+            # epoch, so NO checkpoint is ever saved and the run
+            # produces no output file at all.
+            grace_epochs = clamp_grace_epochs(grace_epochs, epochs - epoch + 1)
+            if grace_epochs > 0:
+                print(f"  [epoch {epoch}: switching to the centered L_deriv target now -- "
+                      f"giving the tracker a {grace_epochs}-epoch grace period before comparing "
+                      f"again, since val_loss computed under the OLD target isn't a fair bar for "
+                      f"the NEW target's own val_loss to clear]")
+            else:
+                print(f"  [epoch {epoch}: switching to the centered L_deriv target now -- "
+                      f"resetting the save criterion with NO grace period, since too few epochs "
+                      f"remain ({epochs - epoch + 1}) to spend any on grace while still leaving "
+                      f"one that can save]")
+            tracker.reset_with_grace(grace_epochs)
 
         ae.train()
         # stats_head stays in eval mode always -- frozen, never trained
@@ -1188,6 +1245,7 @@ def train_stage2(
                                    "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
                                    "deriv_dt_weight_exponent": deriv_dt_weight_exponent,
                                    "deriv_target_centered": deriv_target_centered,
+                                   "val_aug_averaging": val_aug_averaging,
                                    "deriv_switch_epoch": deriv_switch_epoch,
                                    "use_centered_at_save": use_centered_this_epoch,
                                    "stats0_weight": stats0_weight, "stats1_weight": stats1_weight,

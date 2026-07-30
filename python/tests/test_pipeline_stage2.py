@@ -94,10 +94,16 @@ epochs = 0
         "expected an explicit warning about the stale '# Stage 1b' section, got none"
     )
 
-    from orchestration.paths import _STAGE_DIRS
-    stage1b_files = list(_STAGE_DIRS["1b"].glob("*.pt"))
-    assert len(stage1b_files) == 0, (
-        "a stage 1b checkpoint file was created despite stage 1b no longer being a real pass"
+    from orchestration.paths import _CHECKPOINTS_ROOT, _STAGE_DIRS
+    # Strictly stronger than the old "no .pt files in stage1b/" check:
+    # _STAGE_DIRS has no "1b" key at all anymore, and nothing should
+    # create that directory either. The old wholesale "mkdir every stage
+    # dir up front" loop in pipeline.py used to create checkpoints/stage1b
+    # (and checkpoints/stage3, on a 3a/3b run) on EVERY run, long after
+    # stage 1b stopped existing.
+    assert "1b" not in _STAGE_DIRS
+    assert not (_CHECKPOINTS_ROOT / "stage1b").exists(), (
+        "checkpoints/stage1b was created despite stage 1b no longer being a real pass"
     )
     stage2_files = list(_STAGE_DIRS[2].glob("test_pipeline_stale_1b-stage2.pt"))
     assert len(stage2_files) == 1, "stage 2 should still have run normally, ignoring the stale section"
