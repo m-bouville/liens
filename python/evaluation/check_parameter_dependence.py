@@ -19,6 +19,7 @@ being on sys.path):
 """
 
 import argparse
+import dataclasses
 import re
 import warnings
 from pathlib import Path
@@ -28,6 +29,8 @@ import numpy as np
 import torch
 
 from training.losses import centered_deriv_target
+from evaluation.check_stdev_phi_time import characteristic_time_for_run
+from utils import load_datasets as load
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every default checkpoint/output path is built from
@@ -68,7 +71,156 @@ from evaluation._latent_eval import (
     _DerivedStats, _EvaluationResults, _evaluate_windows, _load_models_and_dataset,
 )
 
-def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None = None):
+# Bins per figure when de-dimensionalizing. dt/tau spans ~4 decades on
+# this sweep, so 12 log bins is ~3 per decade -- enough to see the shape,
+# few enough that each bin holds a usable number of windows.
+_DEDIM_N_BINS = 12
+
+
+# A plotted point must be built from at least this fraction of the runs
+# contributing windows, or it is dropped. Composition bias is not a
+# result: at the extremes of a dt/tau axis only part of the sweep can
+# reach the bin at all (the top decade is unreachable for T >= 0.95,
+# since a run's reachable dt/tau range is set by its own tau), so a
+# point there describes a temperature-selected subpopulation while
+# looking like it describes the sweep.
+_MIN_RUN_COVERAGE = 0.75
+
+
+def _coverage_fractions(x_binned: np.ndarray, run_dirs, unique_x: np.ndarray) -> np.ndarray:
+    """Fraction of all contributing runs that put a window in each bin."""
+    keys = np.array([str(d) for d in run_dirs])
+    total_runs = len(set(keys.tolist()))
+    if total_runs == 0:
+        return np.ones(len(unique_x), dtype=float)
+    return np.array([len(np.unique(keys[x_binned == value])) / total_runs
+                      for value in unique_x])
+
+
+def _coverage_keep(x_binned: np.ndarray, run_dirs, unique_x: np.ndarray,
+                    min_fraction: float = _MIN_RUN_COVERAGE) -> np.ndarray:
+    """
+    Boolean mask over `unique_x`: keep a bin only if at least
+    min_fraction of all contributing runs put a window in it.
+
+    RUNS, not windows. A bin holding a thousand windows from six runs is
+    exactly the case this exists to reject -- window count says the point
+    is well determined, run count says it describes six runs.
+    """
+    if min_fraction <= 0:
+        return np.ones(len(unique_x), dtype=bool)
+    return _coverage_fractions(x_binned, run_dirs, unique_x) >= min_fraction
+
+
+def _snap_to_log_bins(values: np.ndarray, n_bins: int = _DEDIM_N_BINS) -> np.ndarray:
+    """
+    Replace each value by the geometric centre of its log-spaced bin.
+
+    Why snapping rather than switching every call site to
+    _mean_curves_by_bin: the figures group dt by UNIQUE VALUE
+    (_mean_curves_by_unique_value, _boxplot_by_x), and that choice is
+    correct and deliberate for raw dt -- every dt is an integer step
+    difference times the run's fixed per-step dt, so the set of dt values
+    occurring is genuinely finite and exact. Dividing by a PER-RUN tau
+    destroys exactly that property: dt/tau is continuous, every window
+    lands on its own x, and a per-unique-value grouping degenerates into
+    one point per window (the spiky, unreadable panels this fixes).
+
+    Snapping restores discreteness upstream of the groupers instead of
+    duplicating each of them, so unique-value grouping, box widths and
+    point-size-by-count all keep working unchanged, and raw-dt runs are
+    untouched because they never call this.
+
+    Applied at PLOTTING SITES ONLY -- never to results.dts itself, which
+    the Taylor-residual fits and the oracle decade table need at full
+    resolution.
+
+    Non-positive values pass through unchanged (log bins are undefined
+    there) rather than being silently dropped or clamped.
+    """
+    v = np.asarray(values, dtype=float)
+    out = v.copy()
+    positive = np.isfinite(v) & (v > 0)
+    if positive.sum() < 2:
+        return out
+    lo, hi = float(v[positive].min()), float(v[positive].max())
+    if not (hi > lo > 0):
+        return out
+    edges = np.geomspace(lo, hi, n_bins + 1)
+    centres = np.sqrt(edges[:-1] * edges[1:])
+    idx = np.clip(np.searchsorted(edges, v, side="right") - 1, 0, n_bins - 1)
+    out[positive] = centres[idx[positive]]
+    return out
+
+
+def _dedimensionalize_results(results, ref_fraction: float = 0.5):
+    """
+    Compute dt/tau and t/tau per window, for use as X-AXIS POSITIONS and
+    BIN BOUNDARIES only.
+
+    results.dts is deliberately returned UNCHANGED (physical). An earlier
+    version overwrote it, which was wrong: several panels plot
+    error/results.dts, and the Taylor-residual fit regresses on powers of
+    results.dts. Rescaling the field itself therefore multiplied every
+    such y value by tau and silently redefined the fitted coefficients --
+    a vertical shift of ~3 decades caused purely by relabelling the
+    horizontal axis. Changing what x MEANS must never move y.
+
+    Returns (results_filtered, keep_mask, dts_dimensionless,
+    steps_dimensionless); the two arrays are aligned with the FILTERED
+    results, not the originals.
+
+    Two different unit conventions have to be respected at once, which is
+    the whole reason this is done here rather than at each plotting site:
+    results.dts is already multiplied by the run's dt scale, while
+    results.abs_steps is a raw step number. So dts is divided by
+    tau*scale and abs_steps by tau alone; both reduce to the same
+    step_gap/tau_steps ratio, and the scale cancels exactly.
+
+    Windows whose run has no usable tau are DROPPED, not left raw and not
+    set to NaN. Leaving them raw would silently mix units inside one
+    array; NaN would poison every mean and correlation computed from it.
+    Dropping is visible, and the count is reported by the caller.
+
+    Because dts stays physical, the Taylor-residual coefficients keep
+    their usual physical meaning and stay comparable with a raw run's.
+    """
+    n = len(results.dts)
+    tau_steps = np.full(n, np.nan)
+    tau_scaled = np.full(n, np.nan)
+    cache: dict[str, tuple[float, float]] = {}
+    for i, run_dir in enumerate(results.run_dirs):
+        key = str(run_dir)
+        if key not in cache:
+            tau = characteristic_time_for_run(run_dir, ref_fraction)
+            metadata_path = Path(run_dir) / "metadata.txt"
+            scale = load.read_metadata(metadata_path).dt if metadata_path.exists() else float("nan")
+            cache[key] = (tau, tau * scale)
+        tau_steps[i], tau_scaled[i] = cache[key]
+
+    keep = np.isfinite(tau_scaled) & (tau_scaled > 0) & np.isfinite(tau_steps) & (tau_steps > 0)
+
+    def _subset(value):
+        # Only per-window containers get masked. Scalars (the running-sum
+        # tensor, n_total) and anything whose length doesn't match the
+        # window count are passed through untouched -- guessing at those
+        # would be how a shape bug gets introduced silently.
+        if isinstance(value, np.ndarray) and value.shape[:1] == (n,):
+            return value[keep]
+        if isinstance(value, list) and len(value) == n:
+            return [v for v, k in zip(value, keep) if k]
+        return value
+
+    fields = {f.name: _subset(getattr(results, f.name))
+              for f in dataclasses.fields(results)}
+    dts_dimensionless = results.dts[keep] / tau_scaled[keep]
+    steps_dimensionless = results.abs_steps[keep] / tau_steps[keep]
+    return type(results)(**fields), keep, dts_dimensionless, steps_dimensionless
+
+
+def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None = None,
+                                  dedimensionalize: bool = False, ref_fraction: float = 0.5,
+                                  keep_mask=None, dts_dim=None):
     """
     THE stage-1-vs-stage-2 attribution test: is the euler-only error a
     property of z1 (stage 2's own output), or is it already baked into
@@ -106,6 +258,38 @@ def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None 
     ~94% here, so any aggregate comparison that doesn't hold dt roughly
     fixed mostly measures the dt distribution of whichever subset
     happens to be included.
+
+    dedimensionalize (default False, an exact no-op): bin by dt/tau(run)
+    instead of by raw dt, where tau is the run's own characteristic time
+    from evaluation.check_stdev_phi_time.
+
+    Why this matters here specifically. This project's save schedule is
+    log-uniform, so Delta_t ~ t/8 for every window and
+    corr(log t, log Delta_t) = 0.997 -- raw dt decades are also time
+    decades, inseparably. Worse, tau was measured to follow
+    tau ~ 1/(T0-T): near-critical runs do their phase separation late,
+    hence at systematically coarser spacing, so a fixed dt decade
+    contains a DIFFERENT physical regime at each temperature. Binning by
+    dt/tau equalizes that within the existing data -- no regeneration,
+    no re-encode.
+
+    Reading the result: if the causal/actual column collapses across
+    temperature once binned this way, the apparent temperature
+    dependence was a sampling artifact and the crossover should be
+    quoted dimensionlessly. If it does not, a genuine temperature effect
+    survives, now isolated from the confound.
+
+    CAVEAT on which dimensionless group is right. tau is the timescale
+    OF THE TRANSITION. During self-similar coarsening the local
+    timescale is t itself, and Delta_t/t ~ 0.125 by construction for
+    every window in the sweep -- already equalized, so error growth
+    there cannot be explained by coarser sampling and dt/tau is not the
+    natural variable for it. These are two regimes and are worth reading
+    separately rather than pooled.
+
+    Windows from runs with no usable tau (incomplete, T >= T0, or never
+    reaching the threshold) cannot be de-dimensionalized; they are
+    reported and excluded, never silently rescaled by a fallback.
     """
     err_actual, err_oracle, err_causal, dts_ok = [], [], [], []
     n_skipped = 0
@@ -113,11 +297,19 @@ def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None 
     # results.* array (same dataset order, loader is unshuffled) -- the
     # figure code needs that alignment; the console summary below only
     # needs the compacted lists. NaN marks "no frame before this window".
-    n_all = len(dataset._index)
+    n_all = len(dataset._index) if keep_mask is None else int(np.sum(keep_mask))
     per_window = {k: np.full(n_all, np.nan, dtype=float)
                   for k in ("causal_abs", "causal_signed", "oracle_abs", "oracle_signed")}
+    # out_idx walks the results.* arrays, which -- when de-dimensionalizing
+    # -- have had windows without a usable tau removed. keep_mask maps
+    # dataset._index order onto that filtered order; without it every
+    # per_window write past the first dropped window would be off by one.
+    out_idx = -1
     with torch.no_grad():
         for w_idx, (run_idx, start) in enumerate(dataset._index):
+            if keep_mask is not None and not keep_mask[w_idx]:
+                continue
+            out_idx += 1
             if start == 0:  # no frame before this window -- no centered estimate possible
                 n_skipped += 1
                 continue
@@ -150,12 +342,23 @@ def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None 
             err_actual.append((z0_t + z1_t * dt_plus - z0_next).abs().mean().item())
             err_oracle.append(resid_oracle.abs().mean().item())
             err_causal.append(resid_causal.abs().mean().item())
-            dts_ok.append(dt_plus)
+            # The BINNING variable only. Every error above is untouched
+            # -- de-dimensionalizing changes which windows are grouped
+            # together, never what any of them measures.
+            #
+            # When de-dimensionalizing, the binning value comes from
+            # results.dts, which check_parameter_dependence has ALREADY
+            # divided by tau (see _dedimensionalize_results). Recomputing
+            # it here from dataset internals would be a second
+            # implementation of the same rescaling, free to drift from
+            # the one every figure and fit is using. dt_plus itself stays
+            # PHYSICAL above -- only the binning changes.
+            dts_ok.append(float(dts_dim[out_idx]) if dedimensionalize else dt_plus)
 
-            per_window["causal_abs"][w_idx] = resid_causal.abs().mean().item()
-            per_window["causal_signed"][w_idx] = resid_causal.mean().item()
-            per_window["oracle_abs"][w_idx] = resid_oracle.abs().mean().item()
-            per_window["oracle_signed"][w_idx] = resid_oracle.mean().item()
+            per_window["causal_abs"][out_idx] = resid_causal.abs().mean().item()
+            per_window["causal_signed"][out_idx] = resid_causal.mean().item()
+            per_window["oracle_abs"][out_idx] = resid_oracle.abs().mean().item()
+            per_window["oracle_signed"][out_idx] = resid_oracle.mean().item()
 
     if not err_actual:
         print("\n(oracle-z1 attribution: no window has a preceding frame -- nothing to compare)")
@@ -167,14 +370,20 @@ def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None 
     print("Oracle-z1 attribution: is the euler error z1's (stage 2) or z0's (stage 1)?")
     print(f"{'='*70}")
     print(f"  {len(a)} windows usable ({n_skipped} skipped: no frame before the window's own start)")
+    if dedimensionalize:
+        print(f"  DE-DIMENSIONALIZED: binning by dt/tau(run), tau at {ref_fraction:g}x the run's "
+              f"own equilibrium amplitude")
     print(f"  err_actual (real z1)                       = {a.mean():.6e}")
     print(f"  err_causal (backward dz0/dt, PAST ONLY)    = {c.mean():.6e}   "
           f"ratio {c.mean()/max(a.mean(), 1e-30):.3f}")
     print(f"  err_oracle (centered dz0/dt, SEES FUTURE)  = {o.mean():.6e}   "
           f"ratio {o.mean()/max(a.mean(), 1e-30):.3f}")
 
-    print("\n  per dt decade (error tracks log dt strongly -- aggregates alone mislead):")
-    print("  dt decade         n     err_actual     err_causal     err_oracle  causal/act  oracle/act")
+    axis_name = "dt/tau" if dedimensionalize else "dt   "
+    print(f"\n  per {axis_name.strip()} decade (error tracks log dt strongly -- "
+          f"aggregates alone mislead):")
+    print(f"  {axis_name} decade      n     err_actual     err_causal     err_oracle  "
+          f"causal/act  oracle/act")
     finite = d > 0
     if finite.any():
         for e in range(int(np.floor(np.log10(d[finite].min()))),
@@ -444,6 +653,12 @@ def _size_by_count(n_windows: np.ndarray, min_size: float = 20.0, max_size: floa
     absurdly oversized ones.
     """
     n_windows = np.asarray(n_windows, dtype=float)
+    if n_windows.size == 0:
+        # An empty curve is a legitimate outcome (e.g. every point filtered
+        # out for insufficient run coverage), and .min() on an empty array
+        # raises rather than returning anything -- so this has to be handled
+        # here, not left to whichever caller happens to hit it first.
+        return n_windows
     lo, hi = n_windows.min(), n_windows.max()
     if hi <= lo:
         return np.full_like(n_windows, (min_size + max_size) / 2)
@@ -606,7 +821,9 @@ def _local_widths(unique_x: np.ndarray, factor: float = 0.6) -> np.ndarray:
 
 
 def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, decode: bool,
-                               euler_only: bool, dataset=None, device=None) -> _DerivedStats:
+                               euler_only: bool, dataset=None, device=None,
+                               dedimensionalize: bool = False, keep_mask=None,
+                               dts_dim=None) -> _DerivedStats:
     """Every console-only diagnostic that doesn't touch a figure object --
     bias/variance, the dt power-law/saturating-exponential model comparison,
     the euler-vs-full direct-magnitude comparison, the dt-decade table,
@@ -810,7 +1027,9 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     # each window, which no per-window results array carries.
     oracle_per_window = None
     if dataset is not None:
-        oracle_per_window = _print_oracle_z1_attribution(dataset, results, device)
+        oracle_per_window = _print_oracle_z1_attribution(
+            dataset, results, device, dedimensionalize=dedimensionalize, keep_mask=keep_mask,
+            dts_dim=dts_dim)
 
     length_scales_valid = results.length_scales[~saturated]
     latent_losses_for_length = results.latent_losses[~saturated]
@@ -917,6 +1136,7 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
 def _build_and_save_figures(
     results: _EvaluationResults, stats: _DerivedStats, lds_checkpoint_path: Path, output_path: Path,
     dz0dt_output_path: Path, dt_dependence_output_path: Path, decode: bool, euler_only: bool,
+    dedimensionalize: bool = False, dts_dim=None, steps_dim=None,
 ) -> None:
     """Builds and saves all three output figures (parameter_dependence.png,
     dt_dependence.png, dz0dt.png), extracted verbatim as ONE function rather
@@ -929,6 +1149,60 @@ def _build_and_save_figures(
     "compute all stats, then plot" sequence, so splitting it further would
     require REORDERING logic, not just extracting it. Pure side effect
     (writes three files), returns nothing."""
+    # Axis labels must state the units the data is actually in -- a panel
+    # labelled "dt" while plotting dt/tau is worse than no panel at all.
+    _dt_label = "dt / tau(run)" if dedimensionalize else "dt"
+    _t_label = ("t / tau(run)" if dedimensionalize
+                 else "t (window's own starting step)")
+
+    # X-AXIS arrays. Every y value below keeps using results.* -- in
+    # particular error/results.dts stays a physical per-unit-time error.
+    _dt_x = dts_dim if dedimensionalize else results.dts
+    _t_x = steps_dim if dedimensionalize else results.abs_steps
+
+    def _px(values):
+        """x as the panels should GROUP and PLOT it (see _snap_to_log_bins)."""
+        return _snap_to_log_bins(values) if dedimensionalize else values
+
+    _coverage_report = {"dropped": 0, "best": 0.0, "emptied": 0}
+
+    def _grp(x_raw, y_signed, y_abs, run_dirs=None):
+        """
+        Group for plotting, then drop any point that fewer than
+        _MIN_RUN_COVERAGE of the runs contributed to. Same return shape as
+        _mean_curves_by_unique_value, so call sites are unchanged apart
+        from the name.
+        """
+        x_binned = _px(x_raw)
+        dirs = results.run_dirs if run_dirs is None else run_dirs
+        unique_x, mean_signed, mean_abs, n = _mean_curves_by_unique_value(
+            x_binned, y_signed, y_abs)
+        fractions = _coverage_fractions(x_binned, dirs, unique_x)
+        _coverage_report["best"] = max(_coverage_report["best"],
+                                        float(fractions.max()) if len(fractions) else 0.0)
+        keep = fractions >= _MIN_RUN_COVERAGE
+        if not keep.any():
+            # Emptying a curve entirely is never the useful outcome: the
+            # panel becomes blank and every downstream consumer has to
+            # cope with a zero-length array. Fall back to the unfiltered
+            # curve and say so loudly -- the points ARE composition-biased,
+            # and the caller needs to know that AND still see the data,
+            # rather than getting one or the other.
+            _coverage_report["emptied"] += 1
+            return unique_x, mean_signed, mean_abs, n
+        _coverage_report["dropped"] += int((~keep).sum())
+        return unique_x[keep], mean_signed[keep], mean_abs[keep], n[keep]
+
+    # left=10 was correct for raw dt (whose smallest value on this sweep
+    # is ~25) and badly wrong for dt/tau, which reaches ~1e-2 -- it
+    # clipped away all but the top decade. Data-driven when
+    # de-dimensionalized, unchanged otherwise.
+    _positive_dts = _dt_x[np.isfinite(_dt_x) & (_dt_x > 0)]
+    _x_left = (float(_positive_dts.min()) / 1.5
+                if dedimensionalize and len(_positive_dts) else 10)
+    _positive_t = _t_x[np.isfinite(_t_x) & (_t_x > 0)]
+    _t_left = (float(_positive_t.min()) / 1.5
+                if dedimensionalize and len(_positive_t) else 1000)
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
     # dt_dependence.png: the 4 panels whose x-axis is dt (error,
     # |error|, pixel-space, and the combined dz0/dz0dt panel), moved
@@ -1006,10 +1280,10 @@ def _build_and_save_figures(
         # the SAME residual, run through the decoder, not an independently
         # computed pixel-space quantity.
         ax = axes_dt[1, 1]
-        _boxplot_by_x(ax, results.dts, results.pixel_losses, log_x=True)
+        _boxplot_by_x(ax, _px(_dt_x), results.pixel_losses, log_x=True)
         ax.set_yscale("log")
-        ax.set_xlabel("dt")
-        ax.set_xlim(left=10)
+        ax.set_xlabel(_dt_label)
+        ax.set_xlim(left=_x_left)
         ax.set_ylabel(f"pixel-space{_euler_tag}: decode(z0(t+dt)): mean|pred - true|")
         ax.set_title(f"pixel-space (L1, decoded){_euler_tag}\n"
                      f"corr w.r.t. log dt: log |error| {stats.corr_dt_pixel * 100:.0f}%")
@@ -1046,8 +1320,8 @@ def _build_and_save_figures(
     # regression curve below without needing separate handling) and
     # labeling the axis "[1e-3]" keeps the actual numbers readable.
     _DT_PANEL_SCALE = 1000
-    dt_x, dt_signed, dt_abs, dt_n = _mean_curves_by_unique_value(
-        results.dts, results.latent_losses_signed / results.dts, results.latent_losses / results.dts)
+    dt_x, dt_signed, dt_abs, dt_n = _grp(_dt_x, results.latent_losses_signed / results.dts,
+          results.latent_losses / results.dts)
     dt_signed, dt_abs = dt_signed * _DT_PANEL_SCALE, dt_abs * _DT_PANEL_SCALE
 
     # Trivial baseline: the "assume nothing changes" predictor,
@@ -1063,8 +1337,7 @@ def _build_and_save_figures(
     # model at all -- either curve beating it is the real bar for
     # "learned something dt-dependent worth having", not just "beat
     # zero".
-    _, dt_trivial_signed, dt_trivial_abs, _ = _mean_curves_by_unique_value(
-        results.dts, results.dz0dt_signed, results.dz0dt_abs)
+    _, dt_trivial_signed, dt_trivial_abs, _ = _grp(_dt_x, results.dz0dt_signed, results.dz0dt_abs)
     dt_trivial_signed = -dt_trivial_signed * _DT_PANEL_SCALE
     dt_trivial_abs = dt_trivial_abs * _DT_PANEL_SCALE
 
@@ -1084,8 +1357,8 @@ def _build_and_save_figures(
     # an expected, harmless redundancy in that specific mode, not a
     # bug, since [1,3]'s own point is to stay meaningful specifically
     # when [0,3] is NOT already euler-only.
-    dt_x_13, dt_signed_13, dt_abs_13, dt_n_13 = _mean_curves_by_unique_value(
-        results.dts, results.euler_losses_signed / results.dts, results.euler_losses / results.dts)
+    dt_x_13, dt_signed_13, dt_abs_13, dt_n_13 = _grp(_dt_x, results.euler_losses_signed / results.dts,
+          results.euler_losses / results.dts)
     dt_signed_13, dt_abs_13 = dt_signed_13 * _DT_PANEL_SCALE, dt_abs_13 * _DT_PANEL_SCALE
 
     # Regression curve overlay: eps/eps'/A are SHARED (the joint fit's
@@ -1104,6 +1377,15 @@ def _build_and_save_figures(
     C = taylor_fit["C"]
     D_or_C = C if euler_only else taylor_fit["D"]
     dt_curve = np.geomspace(results.dts.min(), results.dts.max(), 400)
+    # The fit is a function of PHYSICAL dt, and tau varies per run, so a
+    # given physical dt maps to as many dt/tau positions as there are
+    # runs -- the overlay has no single x on a de-dimensionalized axis.
+    # Drawing it anyway would put a curve fitted in one coordinate on
+    # top of points plotted in another, which is exactly the mismatch
+    # that made it look wrong. Suppressed instead, with the reason
+    # stated on the panel; the coefficients are still fitted, still
+    # physical, and still printed to the console.
+    _draw_fit_curve = not dedimensionalize
 
     # Two panels now, one per QUANTITY (signed "error", absolute
     # "|error|"), each showing BOTH euler-only and full (mode-
@@ -1135,12 +1417,12 @@ def _build_and_save_figures(
         opw = stats.oracle_per_window
         ok = ~np.isnan(opw["causal_abs"])
         if ok.any():
-            ox, o_causal_signed, o_causal_abs, _ = _mean_curves_by_unique_value(
-                results.dts[ok], opw["causal_signed"][ok] / results.dts[ok],
-                opw["causal_abs"][ok] / results.dts[ok])
-            _, o_oracle_signed, o_oracle_abs, _ = _mean_curves_by_unique_value(
-                results.dts[ok], opw["oracle_signed"][ok] / results.dts[ok],
-                opw["oracle_abs"][ok] / results.dts[ok])
+            ox, o_causal_signed, o_causal_abs, _ = _grp(_dt_x[ok], opw["causal_signed"][ok] / results.dts[ok],
+                opw["causal_abs"][ok] / results.dts[ok],
+                run_dirs=[d for d, k in zip(results.run_dirs, ok) if k])
+            _, o_oracle_signed, o_oracle_abs, _ = _grp(_dt_x[ok], opw["oracle_signed"][ok] / results.dts[ok],
+                opw["oracle_abs"][ok] / results.dts[ok],
+                run_dirs=[d for d, k in zip(results.run_dirs, ok) if k])
             oracle_curves = dict(
                 x=ox,
                 causal_signed=o_causal_signed * _DT_PANEL_SCALE,
@@ -1268,8 +1550,12 @@ def _build_and_save_figures(
     # euler-only one -- the expected, harmless redundancy this session
     # has established elsewhere for that specific mode).
     raw_curve_euler = eps + eps_prime * dt_curve + C * dt_curve ** 2 - A * dt_curve ** 3
-    ax_signed.plot(dt_curve, raw_curve_euler / dt_curve * _DT_PANEL_SCALE, "--",
-                   color="tab:blue", linewidth=1, label=f"fit (euler): eps={eps:.3e}")
+    if not _draw_fit_curve:
+        ax_signed.plot([], [], " ", label="(Taylor fit omitted: fitted in physical dt,\n"
+                                            " which has no single position on a dt/tau axis)")
+    if _draw_fit_curve:
+        ax_signed.plot(dt_curve, raw_curve_euler / dt_curve * _DT_PANEL_SCALE, "--",
+                        color="tab:blue", linewidth=1, label=f"fit (euler): eps={eps:.3e}")
     # "fit (full)" plotted ONLY when there is a genuinely separate full
     # model to fit. Under euler_only=True the joint fit shares eps/eps'/A
     # and D_or_C falls back to C, so this curve is numerically IDENTICAL
@@ -1278,8 +1564,9 @@ def _build_and_save_figures(
     # reasoning as dropping the duplicate "full" DATA curve in that mode.
     if not euler_only:
         raw_curve_full = eps + eps_prime * dt_curve + D_or_C * dt_curve ** 2 - A * dt_curve ** 3
-        ax_signed.plot(dt_curve, raw_curve_full / dt_curve * _DT_PANEL_SCALE, "--",
-                       color="tab:orange", linewidth=1, label=f"fit (full): eps={eps:.3e}")
+        if _draw_fit_curve:
+            ax_signed.plot(dt_curve, raw_curve_full / dt_curve * _DT_PANEL_SCALE, "--",
+                            color="tab:orange", linewidth=1, label=f"fit (full): eps={eps:.3e}")
 
     # Precise, not just "error": z0_pred(t+dt) = z0(t) + z1(t)*dt for
     # the euler-only curve, + f_theta(...)*dt^2/2 for the full curve
@@ -1293,8 +1580,8 @@ def _build_and_save_figures(
     for ax, name, title in [(ax_signed, "error", "error (mean, signed)\nerror = (z0_pred(t+dt)-z0_true(t+dt))/dt"),
                              (ax_abs, "|error|", "|error| (mean, absolute)\nerror = (z0_pred(t+dt)-z0_true(t+dt))/dt")]:
         ax.set_xscale("log")
-        ax.set_xlabel("dt")
-        ax.set_xlim(left=10)
+        ax.set_xlabel(_dt_label)
+        ax.set_xlim(left=_x_left)
         ax.set_ylabel(f"mean({name}) [1e-3]" if name == "error" else f"mean{name} [1e-3]")
         ax.set_title(title)
         ax.legend(fontsize=7, loc="best")
@@ -1467,8 +1754,8 @@ def _build_and_save_figures(
     # with dt, |dz0/dt| roughly doesn't, per this session's own earlier
     # finding), so one shared axis would flatten whichever has the
     # smaller range.
-    dt_x7, _, dz0_abs_by_dt, _ = _mean_curves_by_unique_value(results.dts, results.dz0_signed, results.dz0_abs)
-    _, _, dz0dt_abs_by_dt, _ = _mean_curves_by_unique_value(results.dts, results.dz0dt_signed, results.dz0dt_abs)
+    dt_x7, _, dz0_abs_by_dt, _ = _grp(_dt_x, results.dz0_signed, results.dz0_abs)
+    _, _, dz0dt_abs_by_dt, _ = _grp(_dt_x, results.dz0dt_signed, results.dz0dt_abs)
     dz0_abs_by_dt = dz0_abs_by_dt * _DT_PANEL_SCALE
     dz0dt_abs_by_dt = dz0dt_abs_by_dt * _DT_PANEL_SCALE
     ax7 = axes_dt[0, 1]
@@ -1476,8 +1763,8 @@ def _build_and_save_figures(
     ax7.plot(dt_x7, dz0_abs_by_dt, "o-", color="tab:orange", label="mean|dz0|")
     twin7.plot(dt_x7, dz0dt_abs_by_dt, "o-", color="tab:red", label="mean|dz0/dt|")
     ax7.set_xscale("log")
-    ax7.set_xlabel("dt")
-    ax7.set_xlim(left=10)
+    ax7.set_xlabel(_dt_label)
+    ax7.set_xlim(left=_x_left)
     ax7.set_ylabel("mean|dz0| [1e-3]", color="tab:orange")
     twin7.set_ylabel("mean|dz0/dt| [1e-3]", color="tab:red")
     ax7.tick_params(axis="y", labelcolor="tab:orange")
@@ -1532,8 +1819,8 @@ def _build_and_save_figures(
         (results.dz0dt_signed, results.dz0dt_abs, "dz0/dt", 1),
     ]
     for y_signed, y_abs, name, row in panel_rows:
-        t_x, t_signed_y, t_abs_y, _ = _mean_curves_by_unique_value(results.abs_steps, y_signed, y_abs)
-        dt_x, dt_signed_y, dt_abs_y, _ = _mean_curves_by_unique_value(results.dts, y_signed, y_abs)
+        t_x, t_signed_y, t_abs_y, _ = _grp(_t_x, y_signed, y_abs)
+        dt_x, dt_signed_y, dt_abs_y, _ = _grp(_dt_x, y_signed, y_abs)
         # x1000 for readability -- these values are naturally tiny,
         # matching the same reasoning/named-constant convention as
         # _DT_PANEL_SCALE in the main figure's own dt panels above.
@@ -1546,7 +1833,7 @@ def _build_and_save_figures(
         ax_t.axhline(0, color="gray", linewidth=0.7, linestyle=":")
         ax_t.plot(t_x, t_signed_y, "o-", color="tab:blue", label=f"mean({name})")
         twin_t.plot(t_x, t_abs_y, "o-", color="tab:orange", label=f"mean|{name}|")
-        ax_t.set_xlabel("t (window's own starting step)")
+        ax_t.set_xlabel(_t_label)
         ax_t.set_ylabel(f"mean({name})", color="tab:blue")
         twin_t.set_ylabel(f"mean|{name}|", color="tab:orange")
         ax_t.tick_params(axis="y", labelcolor="tab:blue")
@@ -1558,7 +1845,7 @@ def _build_and_save_figures(
         # (sparse, few windows this early relative to min_step) rather
         # than let it dominate the axis the way [0,3]'s own divergent
         # small-dt region did earlier in this session.
-        ax_t.set_xlim(left=1000)
+        ax_t.set_xlim(left=_t_left)
         lines1, labels1 = ax_t.get_legend_handles_labels()
         lines2, labels2 = twin_t.get_legend_handles_labels()
         ax_t.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="best")
@@ -1566,14 +1853,14 @@ def _build_and_save_figures(
         ax_dt.axhline(0, color="gray", linewidth=0.7, linestyle=":")
         ax_dt.plot(dt_x, dt_signed_y, "o-", color="tab:blue", label=f"mean({name})")
         twin_dt.plot(dt_x, dt_abs_y, "o-", color="tab:orange", label=f"mean|{name}|")
-        ax_dt.set_xlabel("dt")
+        ax_dt.set_xlabel(_dt_label)
         ax_dt.set_ylabel(f"mean({name})", color="tab:blue")
         twin_dt.set_ylabel(f"mean|{name}|", color="tab:orange")
         ax_dt.tick_params(axis="y", labelcolor="tab:blue")
         twin_dt.tick_params(axis="y", labelcolor="tab:orange")
         ax_dt.set_title(f"real {name} vs dt")
         ax_dt.set_xscale("log")
-        ax_dt.set_xlim(left=10)
+        ax_dt.set_xlim(left=_x_left)
         lines1, labels1 = ax_dt.get_legend_handles_labels()
         lines2, labels2 = twin_dt.get_legend_handles_labels()
         ax_dt.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="best")
@@ -1612,7 +1899,7 @@ def check_parameter_dependence(
     base_path: Path | None = None, size: int | None = None,
     ae_stats_weight: float | None = None, hidden_dim: int = 256, n_hidden_layers: int = 2,
     condition_on_theta: bool | None = None,
-    euler_only: bool | None = None,
+    euler_only: bool | None = None, dedimensionalize: bool = False,
     output_path: Path | None = None, dz0dt_output_path: Path | None = None,
     dt_dependence_output_path: Path | None = None, decode: bool = False, device: str | None = None,
 ) -> Path:
@@ -1660,11 +1947,25 @@ def check_parameter_dependence(
     )
     results = _evaluate_windows(ctx.dataset, ctx.f_theta, ctx.ae_decoder, ctx.device,
                                  decode, ctx.euler_only)
+    keep_mask, dts_dim, steps_dim = None, None, None
+    if dedimensionalize:
+        n_before = len(results.dts)
+        results, keep_mask, dts_dim, steps_dim = _dedimensionalize_results(results)
+        n_dropped = n_before - len(results.dts)
+        print("\nDE-DIMENSIONALIZED: the oracle-attribution bins and every figure's dt/t AXIS "
+              "are dt/tau(run) and t/tau(run). All plotted and fitted VALUES stay physical -- "
+              "relabelling an axis must not move the data on it.")
+        if n_dropped:
+            print(f"  {n_dropped}/{n_before} window(s) dropped: their run has no usable tau "
+                  f"(incomplete, T >= T0, or never reached the threshold). They have no position "
+                  f"on a dimensionless axis at all, so they are removed rather than misplaced.")
     stats = _print_summary_statistics(results, ctx.ae_config, decode, ctx.euler_only,
-                                       dataset=ctx.dataset, device=ctx.device)
+                                       dataset=ctx.dataset, device=ctx.device,
+                                       dedimensionalize=dedimensionalize, keep_mask=keep_mask,
+                                       dts_dim=dts_dim)
     _build_and_save_figures(results, stats, ctx.lds_checkpoint_path, ctx.output_path,
                              ctx.dz0dt_output_path, ctx.dt_dependence_output_path,
-                             decode, ctx.euler_only)
+                             decode, ctx.euler_only, dedimensionalize, dts_dim, steps_dim)
     return ctx.output_path
 
 
@@ -1698,6 +1999,14 @@ def main():
                               "checkpoint -- arbitrary, since that network is never trained here")
     parser.add_argument("--n-hidden-layers", type=int, default=2, help="see --hidden-dim")
     parser.add_argument("--condition-on-theta", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--dedimensionalize", action=argparse.BooleanOptionalAction, default=False,
+                         help="bin the oracle-z1 attribution table by dt/tau(run) instead of raw "
+                              "dt, where tau is the run's own characteristic time (see "
+                              "evaluation/check_stdev_phi_time.py). Default off = today's "
+                              "behaviour exactly. The schedule makes raw dt and t collinear "
+                              "(corr(log t, log dt) = 0.997) and tau ~ 1/(T0-T), so a fixed raw-dt "
+                              "decade holds a different physical regime at each temperature; this "
+                              "equalizes that within the existing data")
     parser.add_argument("--euler-only", action=argparse.BooleanOptionalAction, default=None,
                          help="default: auto-detect (True if --lds-checkpoint got converted from "
                               "an AE-family checkpoint, False for a real stage-3 one). Force "
@@ -1715,6 +2024,7 @@ def main():
         base_path=args.base_path, size=args.size, ae_stats_weight=args.ae_stats_weight,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         condition_on_theta=args.condition_on_theta, euler_only=args.euler_only,
+        dedimensionalize=args.dedimensionalize,
         output_path=args.output, device=args.device,
     )
 

@@ -296,6 +296,7 @@ def _load_models_and_dataset(
     meaning; unchanged here."""
     _stage_folder = _stage_folder_from_checkpoint_stem(lds_checkpoint_path)
 
+    output_path_defaulted = output_path is None
     if output_path is None:
         output_path = (_PYTHON_ROOT.parent / "output" / _stage_folder
                        / f"{lds_checkpoint_path.stem}-parameter_dependence.png")
@@ -314,7 +315,28 @@ def _load_models_and_dataset(
     # output_path (the old, single-parameter calling convention) is
     # still enough to redirect all three consistently.
     if dz0dt_output_path is None:
-        dz0dt_output_path = output_path.parent / f"{lds_checkpoint_path.stem}-dz0dt.png"
+        # dz0dt.png reports the GROUND-TRUTH dz0 / dz0dt of the encoded
+        # data -- a property of the dataset at a given encoder, not of
+        # f_theta -- so with everything left at its defaults it is
+        # written next to the other dataset-level diagnostics
+        # (output/datasets/{size}x{size}-dz0dt.png) rather than under the
+        # per-stage folder.
+        #
+        # ONLY when output_path was itself defaulted, though. The cascade
+        # described above exists because a caller overriding just
+        # output_path (every test predating these two parameters) must
+        # still redirect all three, or the run leaves real files in the
+        # live output/ tree. Sending this one to a fixed absolute
+        # location unconditionally would reintroduce exactly that
+        # reported bug.
+        #
+        # NOTE the name drops the checkpoint stem, so two checkpoints for
+        # the same grid size (e.g. stage 2 and stage 3) now write to ONE
+        # file and the later run overwrites the earlier. Pass
+        # dz0dt_output_path explicitly to keep both.
+        dz0dt_output_path = ((_PYTHON_ROOT.parent / "output" / "datasets"
+                               / f"{size}x{size}-dz0dt.png") if output_path_defaulted
+                              else output_path.parent / f"{lds_checkpoint_path.stem}-dz0dt.png")
     dz0dt_output_path.parent.mkdir(parents=True, exist_ok=True)
     if dt_dependence_output_path is None:
         dt_dependence_output_path = output_path.parent / f"{lds_checkpoint_path.stem}-dt_dependence.png"
