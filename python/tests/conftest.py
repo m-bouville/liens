@@ -4,6 +4,7 @@ checkpoint anywhere -- these are small, deterministic stand-ins whose
 only job is to have the right SHAPE and be cheap to run, so tests stay
 fast and don't depend on any particular training run having happened.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -22,11 +23,13 @@ if str(_PYTHON_ROOT) not in sys.path:
 import torch
 import torch.nn as nn
 import itertools
+import shutil
 import tempfile
 
 import pytest
 
 from models.constants import LATENT_SPATIAL_SIZE
+from training.train_stage1 import train_autoencoder
 from models.latent_streams import DEFAULT_STREAM_NAME
 
 
@@ -96,6 +99,8 @@ _SWEEP_ROOT: Path | None = None
 # up once a test popped its own probe key -- but a counter that can go
 # backwards is fragile regardless of who currently triggers it.
 _SWEEP_SEQ = itertools.count()
+_ARTIFACT_CACHE: dict = {}
+_ARTIFACT_SEQ = itertools.count()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -120,6 +125,7 @@ def _sweep_cache_root(tmp_path_factory):
     _SWEEP_ROOT = tmp_path_factory.mktemp("cached_sweeps")
     yield
     _SWEEP_CACHE.clear()
+    _ARTIFACT_CACHE.clear()
 
 
 def cached_sweep(key, builder):
@@ -139,6 +145,135 @@ def cached_sweep(key, builder):
             base.mkdir(parents=True, exist_ok=False)
         _SWEEP_CACHE[key] = builder(base)
     return _SWEEP_CACHE[key]
+
+
+def cached_artifact(key, builder):
+    """
+    Like cached_sweep, but for artifacts a test may WRITE to -- checkpoints,
+    above all.
+
+    Motivation: across tests/, `train_autoencoder` is called 31 times and
+    `train_stage2` 38 times, and almost none of those are testing stage 1 or
+    stage 2. They are manufacturing an ANCESTOR so that stage 3, or the
+    pipeline, or checkpoint extraction can be tested at all. In
+    test_train_lds.py alone, 11 tests build 11 stage-1 checkpoints from a
+    single distinct config and 11 stage-2 checkpoints from two -- roughly
+    three quarters of each test's runtime spent reconstructing something
+    another test already built.
+
+    THE DIFFERENCE FROM cached_sweep, and why this is not just an alias:
+    cached_sweep's own docstring notes it is "safe only because sweeps are
+    read-only". Checkpoints are not. A test that passes an ancestor as
+    `resume_from` to a stage which then saves in place would corrupt the
+    shared copy for every test scheduled after it, producing failures that
+    depend on execution order and vanish under `-k`. So `builder` writes into
+    a cached directory ONCE, and every caller receives a fresh COPY (a
+    ~1 MB file copy, microseconds) rather than the cached path itself.
+
+    KEYING. Derive the key MECHANICALLY from the full set of arguments that
+    reach the artifact -- not from a hand-written label. A key that is too
+    coarse hands a test an ancestor built with different settings, and the
+    failure mode is silent: the test still passes, it just stops testing what
+    it claims to. That is strictly worse than the slowness this removes.
+    Output paths must be excluded (they differ per test by construction and
+    cannot affect content); everything else must be included, even arguments
+    that look inert.
+
+    builder(dir) -> a Path, or a tuple/list whose Path entries are copied.
+    Non-Path entries (e.g. a sweep directory, which IS read-only) pass
+    through unchanged.
+    """
+    if key not in _ARTIFACT_CACHE:
+        if _SWEEP_ROOT is None:
+            base = Path(tempfile.mkdtemp(prefix="artifact_uncleaned_"))
+        else:
+            base = _SWEEP_ROOT / f"artifact_{next(_ARTIFACT_SEQ):03d}"
+            base.mkdir(parents=True, exist_ok=False)
+        _ARTIFACT_CACHE[key] = builder(base)
+    return _ARTIFACT_CACHE[key]
+
+
+def copy_cached_files(cached, dest_dir: Path):
+    """Copy every Path in `cached` into dest_dir, returning the same shape.
+
+    Files, not directories: a cached sweep directory is read-only and shared
+    deliberately (see cached_sweep), so copying it would throw away the very
+    saving this exists for. Only the writable artifacts are duplicated.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    def _one(item):
+        if isinstance(item, Path) and item.is_file():
+            target = dest_dir / item.name
+            shutil.copy2(item, target)
+            return target
+        return item
+
+    if isinstance(cached, (tuple, list)):
+        return type(cached)(_one(i) for i in cached)
+    return _one(cached)
+
+
+def cached_stage1_ancestor(tmp_path, build_sweep, **stage1_kwargs):
+    """A (base_path, stage1_checkpoint) pair, built once per distinct config.
+
+    Most tests that call train_autoencoder are not testing stage 1 -- they need
+    an ANCESTOR before stage 2 or stage 3 can be exercised at all. Across
+    tests/ that is 31 calls producing a handful of distinct checkpoints.
+
+    build_sweep(dir) must return the sweep's base_path; pass the caller's own
+    _build_sweep so each file keeps its own sweep shape. The returned
+    checkpoint is a fresh copy in tmp_path (see cached_artifact on why a copy
+    and not the cached path); base_path is the shared, read-only sweep.
+
+    The key is the FULL stage1_kwargs, so a test differing in any argument --
+    even one that looks inert, such as augment=False vs its default -- gets its
+    own ancestor rather than silently inheriting another test's.
+    """
+    def _build(cache_dir):
+        base_path = build_sweep(cache_dir)
+        checkpoint = train_autoencoder(
+            base_path=base_path,
+            checkpoint_path=cache_dir / "stage1_ancestor.pt",
+            loss_curve_path=cache_dir / "stage1_ancestor_curve.png",
+            **stage1_kwargs,
+        )
+        return base_path, Path(checkpoint)
+
+    key = ("stage1_ancestor", getattr(build_sweep, "__module__", "?"),
+           tuple(sorted((k, repr(v)) for k, v in stage1_kwargs.items())))
+    base_path, cached = cached_artifact(key, _build)
+    return base_path, copy_cached_files(cached, tmp_path)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _limit_torch_threads_under_xdist():
+    """One torch intra-op thread per pytest-xdist worker.
+
+    torch sizes its thread pool to the machine's core count, per PROCESS. Under
+    `-n 4` that is four pools of N threads competing for N cores, and the
+    oversubscription is severe rather than marginal: measured on this suite,
+    a test that takes ~4 s serially took 20.65 s under `-n 4` -- 5.2x slower
+    each -- so four-way parallelism returned only 1.7x overall (204 s -> 121 s).
+
+    Nothing here is large enough to want intra-op threading anyway. These
+    fixtures train base_channels=4 models on 32x32 inputs at batch 4; at that
+    size thread dispatch costs more than it saves, which is why capping to 1
+    is close to free per test and lets the four workers actually run in
+    parallel.
+
+    Applied ONLY under xdist (PYTEST_XDIST_WORKER is set per worker), so a
+    plain serial `pytest` keeps whatever threading it had -- this fixes a
+    contention problem that does not exist there, and changing serial
+    behaviour would be an unmeasured side effect.
+    """
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        previous = torch.get_num_threads()
+        torch.set_num_threads(1)
+        yield
+        torch.set_num_threads(previous)
+    else:
+        yield
 
 
 @pytest.fixture

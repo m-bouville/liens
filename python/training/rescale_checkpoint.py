@@ -56,11 +56,25 @@ memory in the shallow blocks that DID transfer.
 
 What this deliberately does NOT do
 -----------------------------------
-- It does not recompute `stats_config`'s stats_mean/stats_std -- it STRIPS them,
-  keeping `stat_names`. Those two are properties of the DATA, not the model, and
-  the distributions genuinely differ at the new size (autocorr_length's search
-  cap is min(Nx,Ny)*2/3, so 42 -> 84), so carrying the old values forward would
-  leave every stats target miscentred and mis-scaled with no error anywhere.
+- It STRIPS both `stats_head_state` and `stats_config`'s stats_mean/stats_std,
+  keeping `stat_names`.
+
+  stats_head_state goes for the SAME reason f_theta does: StatsHead maps
+  latent -> statistics, and the latent basis is defined by the state
+  bottleneck, which this function reinitialises. Its weights encode a mapping
+  in a coordinate system that no longer exists. Keeping them was also an
+  outright crash whenever the new run requests a different `stat_names` than
+  the source used -- StatsHead's output layer is sized by len(stat_names), so
+  a 12-stat source resumed into a 1-stat run fails with a bare
+  "size mismatch for net.2.weight", nowhere near anything mentioning a port.
+  Dropping it lets train_stage1 build a correctly-sized head instead; it
+  already guards on `prev.get("stats_head_state") is not None`.
+
+  stats_mean/stats_std go because they are properties of the DATA, not the
+  model, and the distributions genuinely differ at the new size
+  (autocorr_length's search cap is min(Nx,Ny)*2/3, so 42 -> 84) -- carrying
+  the old values forward would leave every stats target miscentred and
+  mis-scaled with no error anywhere.
 
   Stripping rather than refusing, because `train_stage1` recomputes the
   normalisation from its own dataset on every run (via
@@ -324,6 +338,9 @@ def rescale_checkpoint_to_size(
     # stats_head is on the fixed latent grid, so its weights are shape-valid.
     # Its NORMALISATION is not (see strict_stats above) -- carried over here
     # only so the returned checkpoint has the same shape as a real stage-1 one.
+    # Deliberately NOT carried forward -- see this module's docstring. Built
+    # here only so callers that want to inspect the source's head still can;
+    # it is not written into the returned checkpoint.
     stats_head = None
     if prev.get("stats_head_state") is not None and prev.get("stats_config") is not None:
         stats_head = StatsHead(latent_channels=state_cfg.channels,
@@ -401,7 +418,7 @@ def rescale_checkpoint_to_size(
 
     checkpoint = {
         "model_state": model_state,
-        "stats_head_state": stats_head.state_dict() if stats_head is not None else None,
+        "stats_head_state": None,
         "epoch": 0,
         "val_loss": float("inf"),
         "val_loss_ema": None,

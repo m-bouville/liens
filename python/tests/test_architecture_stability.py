@@ -60,6 +60,10 @@ if str(_PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(_PYTHON_ROOT))
 
 import pytest
+import contextlib
+from datetime import datetime
+import shutil
+
 import torch
 import torch.nn.functional as F
 
@@ -100,6 +104,44 @@ def _build_reference_input(seed: int = _SEED) -> torch.Tensor:
     # docstring).
     generator = torch.Generator().manual_seed(seed)
     return torch.randn(_BATCH_SIZE, 1, _SIZE, _SIZE, generator=generator)
+
+
+@contextlib.contextmanager
+def _deterministic_numerics():
+    """Pin torch to ONE intra-op thread for the duration.
+
+    This fixture is compared with torch.equal -- BIT-exact -- but the values
+    it stores are not bit-stable across thread counts: torch parallelises the
+    reductions inside convolutions and BatchNorm, and a different number of
+    threads sums the same numbers in a different order. Float addition is not
+    associative, so the result differs in the last ulp or two.
+
+    That made the test silently MACHINE-DEPENDENT. It passed everywhere it had
+    been run only because every run happened to use the same thread count; it
+    surfaced the moment the suite was run under pytest-xdist with one thread
+    per worker, as:
+
+        x_recon: max abs diff = 8.345e-07
+        z:       max abs diff = 1.192e-07
+        loss:    1.254752e+00 vs 1.254752e+00     <- identical
+
+    A loss that matches exactly while its own intermediates differ at 1e-7 is
+    the signature of reassociation, not of an architecture change: the
+    reduction that produces the scalar loss happens to be order-insensitive at
+    this precision while the tensors feeding it are not.
+
+    Pinning to one thread (rather than loosening the comparison to a
+    tolerance) keeps the check at full strength -- the point of a golden
+    master is to notice ANY change -- while removing the one source of
+    variation that is not about the architecture. Applied to BOTH capture()
+    and the comparison, so the two always agree.
+    """
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 def _forward_backward_and_step(ae: Autoencoder, x: torch.Tensor) -> dict:
@@ -166,7 +208,8 @@ def capture(output_path: Path = _FIXTURE_PATH, force: bool = False) -> Path:
         )
     ae = _build_reference_model()
     x = _build_reference_input()
-    result = _forward_backward_and_step(ae, x)
+    with _deterministic_numerics():
+        result = _forward_backward_and_step(ae, x)
     result["config"] = {
         "size": _SIZE, "base_channels": _BASE_CHANNELS,
         "latent_channels": _LATENT_CHANNELS, "batch_size": _BATCH_SIZE,
@@ -221,7 +264,8 @@ def _compare_against_fixture(fixture_path: Path = _FIXTURE_PATH) -> dict:
     )
     _load_state_dict_into_current_model(ae, fixture["initial_state_dict"])
 
-    result = _forward_backward_and_step(ae, fixture["input"])
+    with _deterministic_numerics():
+        result = _forward_backward_and_step(ae, fixture["input"])
 
     checks = {}
 
@@ -291,7 +335,30 @@ def test_architecture_matches_golden_master():
 
 
 if __name__ == "__main__":
-    # Run this once, now (pre-redesign), to (re)generate the fixture:
-    #   python tests/test_architecture_stability.py
+    # Generate the fixture:
+    #   python tests/test_architecture_stability.py            (first time)
+    #   python tests/test_architecture_stability.py --force    (regenerate)
     # (from python/, so the models package import resolves).
-    capture()
+    #
+    # --force exists because capture() deliberately refuses to overwrite, and
+    # without a way through that refusal the documented regeneration command
+    # simply raises. Regeneration IS occasionally legitimate -- the numerics
+    # are pinned to one thread now (see _deterministic_numerics), so a fixture
+    # captured before that pin no longer matches on any machine.
+    #
+    # The existing fixture is ARCHIVED first, not replaced. Regenerating is the
+    # one operation that can silently bless an architecture change: it
+    # overwrites the only record of what the architecture used to compute. The
+    # archive means a regeneration done for the wrong reason is recoverable,
+    # and it can be diffed afterwards to see what actually moved.
+    _force = "--force" in sys.argv
+    if _force and _FIXTURE_PATH.exists():
+        _stamp = datetime.fromtimestamp(_FIXTURE_PATH.stat().st_mtime).strftime("%Y%m%d_%Hh%M")
+        _archive = _FIXTURE_PATH.with_name(f"{_FIXTURE_PATH.stem}-{_stamp}{_FIXTURE_PATH.suffix}")
+        if not _archive.exists():
+            shutil.copy2(_FIXTURE_PATH, _archive)
+            print(f"archived the existing fixture to {_archive.name}")
+        print("REGENERATING: verify the test passed BEFORE this change was applied -- a green "
+              "run on the old fixture is what proves the architecture itself has not drifted. "
+              "Regenerating on a red run would bless whatever caused it.")
+    capture(force=_force)

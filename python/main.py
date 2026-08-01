@@ -121,11 +121,48 @@ from orchestration.pipeline import run_from_params_file
 from orchestration.sweep_status import check_sweep_status
 
 
+
+def _free_vram(label: str) -> None:
+    """
+    Release VRAM held by anything unreferenced, and report what is actually
+    free.
+
+    Called BEFORE each params file, not only after the last one. main() used
+    to clear only at the very end, which is correct for a one-shot `python
+    main.py` but wrong for the way this is usually run: inside a persistent
+    IPython/Jupyter kernel, where a previous run's (or a crashed run's, or a
+    diagnostic's) allocations are still held by PyTorch's caching allocator
+    when the next run starts. The result is an OOM whose size makes no sense
+    -- a 128x128 stage 1 at batch 64 needs ~3.1 GB of a nominally ~7.2 GB
+    budget, and still fails at the FIRST conv of epoch 1 because most of the
+    card was never free to begin with.
+
+    The free/total report is the point as much as the release is: without it
+    an OOM cannot be told apart from "this configuration genuinely does not
+    fit", and those two have opposite fixes -- restart the kernel versus
+    lower the batch size.
+    """
+    if not torch.cuda.is_available():
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    free_b, total_b = torch.cuda.mem_get_info()
+    reserved_b = torch.cuda.memory_reserved()
+    print(f"VRAM {label}: {free_b / 1024**3:.2f} GB free of {total_b / 1024**3:.2f} GB"
+          f" (this process reserves {reserved_b / 1024**3:.2f} GB)")
+    if free_b < 0.5 * total_b:
+        print("  WARNING: under half the card is free before training has even started. "
+              "In a persistent IPython/Jupyter kernel this usually means an earlier run's "
+              "tensors are still referenced somewhere and gc could not release them -- "
+              "restart the kernel. Lowering batch_size treats the symptom instead.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("params_files", type=Path, nargs="*",
-                         default=[_PYTHON_ROOT / "params" / "64x64.txt"],
+                         default=[_PYTHON_ROOT / "params" / "128x128.txt"],
                          help="one or more stage-parameters file paths -- the pipeline runs "
                               "once per file, in order given. Defaults to "
                               "params/64x64.txt if none given (e.g. hitting Run in an IDE "
@@ -149,15 +186,14 @@ def main():
         print("#" * 70)
         print(f"# {params_path}")
         print("#" * 70)
+        # Before, not only after: see _free_vram. Also between files, so a
+        # long multi-file run does not accumulate.
+        _free_vram("before " + Path(params_path).name)
         run_from_params_file(params_path, default_base=args.base, device=args.device)
         print()
 
 
-    if torch.cuda.is_available():
-        # clear VRAM
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+    _free_vram("after all params files")
 
 
 

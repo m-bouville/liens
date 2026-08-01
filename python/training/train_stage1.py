@@ -72,6 +72,37 @@ class _RunningStats:
         return mean, var ** 0.5
 
 
+
+def _vram_report(tag: str) -> str:
+    """
+    allocated / reserved / free, as one line.
+
+    The three together are what separates the two causes of an OOM that
+    arrives WELL INTO an epoch rather than at its start:
+
+      - allocated stays flat, reserved grows  -> FRAGMENTATION. The caching
+        allocator is holding blocks it cannot coalesce into one large enough
+        for the next request. Retry with the environment variable
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which lets it grow
+        segments instead of splitting them.
+      - allocated itself grows                -> a genuine leak: something is
+        keeping a reference per iteration.
+      - both flat but `free` small            -> another process (or an
+        earlier cell in the same IPython kernel) owns the rest of the card,
+        and no change here will help.
+
+    A 128x128 stage 1 at batch 64 needs ~3.1 GB steady-state, so on an 8 GB
+    card any of these is survivable ONLY if it is identified.
+    """
+    if not torch.cuda.is_available():
+        return ""
+    free_b, total_b = torch.cuda.mem_get_info()
+    return (f"    [vram {tag}] allocated {torch.cuda.memory_allocated() / 1024**3:.2f}"
+            f" / reserved {torch.cuda.memory_reserved() / 1024**3:.2f}"
+            f" / peak {torch.cuda.max_memory_allocated() / 1024**3:.2f}"
+            f" / free {free_b / 1024**3:.2f} of {total_b / 1024**3:.2f} GB")
+
+
 def train_autoencoder(
     size: int, base_path: Path,
     epochs: int = 100, batch_size: int = 64, lr: float = 1e-3,
@@ -88,7 +119,7 @@ def train_autoencoder(
     resume_from: Path | None = None, device: str | None = None,
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
     log_every_epoch: bool = True,
-    loss_curve_path: Path | None = None,
+    loss_curve_path: Path | None = None, vram_log_every: int = 0,
 ) -> Path:
     """
     Stage 1a: train a SINGLE-stream AE (state only) on individual
@@ -145,6 +176,13 @@ def train_autoencoder(
     stats_head_state from before training starts (e.g. to continue stage
     1a training itself with more epochs -- NOT how stage 2 works, a
     separate function with a different loss/data structure).
+
+    vram_log_every: print a VRAM breakdown every N training batches (0 =
+    never, the default). Useful when an OOM arrives partway through an
+    epoch rather than at its start -- see _vram_report for how the three
+    numbers separate fragmentation from a leak from a busy card. An
+    augmented 128x128 epoch is ~48k batches, so ~2000 gives about 25
+    lines per epoch.
 
     cache_in_memory: hold every decoded snapshot in RAM (default True,
     which is what this function did unconditionally before the flag
@@ -394,6 +432,70 @@ def train_autoencoder(
                 f"valid = ...  | ema") if include_stats else f"train = recon0/{recon0_scale} | valid | ema"
     print(heading)
 
+    if epochs > 0 and resume_from is not None:
+        # Epoch-0 reference: how the model that resume_from actually loaded
+        # performs BEFORE this run touches it. Without it a resumed run's
+        # epoch 1 has nothing to be compared against -- and after a SIZE PORT
+        # that is the single number worth having, since it says what the
+        # transferred weights were worth before any 128x128 training happened.
+        # train_stage2 has had this for a while; stage 1 did not.
+        #
+        # Deliberately NOT a real epoch: it never calls tracker.update, never
+        # saves, and never appends to epoch_history or the loss curve. If it
+        # participated in any of those it would ALWAYS win the first save
+        # (nothing beats best_val_loss=inf), writing a checkpoint labelled
+        # epoch 0 before any training happened.
+        #
+        # RNG state is saved and restored around the whole block, for the
+        # reason train_stage2's own reference row documents: the forward
+        # passes below advance torch's global RNG, which would change
+        # train_loader's shuffle order at epoch 1 (shuffle=True) and so
+        # silently alter the training trajectory depending on whether a
+        # purely diagnostic row was printed at all.
+        _rng_state = torch.get_rng_state()
+        _cuda_rng_state = torch.cuda.get_rng_state() if device.type == "cuda" else None
+        # step() writes into these via closure, and the epoch loop rebinds them
+        # per epoch -- so they must exist before the first call, and the
+        # instances used here are DISCARDED when epoch 1 rebinds them. That is
+        # correct: the z0 mean/std line is a per-epoch statistic and this
+        # reference pass must not contribute to epoch 1's.
+        z0_train_stats, z0_val_stats = _RunningStats(), _RunningStats()
+        ae.eval()
+        if stats_head is not None:
+            stats_head.eval()
+        _ref_total = torch.zeros((), device=device)
+        _ref_recon0 = torch.zeros((), device=device)
+        _ref_stats0 = torch.zeros((), device=device)
+        with torch.no_grad():
+            for batch in val_loader:
+                bs = batch[0].size(0) if include_stats else batch.size(0)
+                total, recon0, stats0 = step(batch, train=False)
+                _ref_total += total * bs
+                _ref_recon0 += recon0 * bs
+                _ref_stats0 += stats0 * bs
+        _n = len(val_set)
+        _r_total = (_ref_total / _n).item()
+        _r_recon0 = (_ref_recon0 / _n).item()
+        _r_stats0 = (_ref_stats0 / _n).item()
+        # SCALED exactly as the epoch rows are (see the msg built below):
+        # step() returns RAW component values and the epoch line divides them
+        # by recon0_scale / stats0_scale and applies stats0_weight, because
+        # that is what the heading advertises ("recon0/0.0001 +1*stats0/0.01")
+        # and what actually sums to total. Printing them raw here made the ref
+        # row the only line in the table whose components did NOT add up --
+        # 6.9589 alongside 0.0003 + 0.0381 -- which reads as a broken total
+        # rather than a units mismatch.
+        if include_stats:
+            print(f"{'ref':>4}|    nan =    nan +    nan "
+                  f"|{_r_total:7.4f} ={_r_recon0 / recon0_scale:7.4f} "
+                  f"+{stats0_weight * _r_stats0 / stats0_scale:7.4f} |(before this run)",
+                  flush=True)
+        else:
+            print(f"{'ref':>4}|    nan |{_r_total:7.4f}  (before this run)", flush=True)
+        torch.set_rng_state(_rng_state)
+        if _cuda_rng_state is not None:
+            torch.cuda.set_rng_state(_cuda_rng_state)
+
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         # Fresh each epoch -- see step() for where these get updated,
         # and the epoch-end print below for where they're reported.
@@ -418,13 +520,18 @@ def train_autoencoder(
         train_stats0_sum = torch.zeros((), device=device)
         n_train = 0
         if epoch > 0:
-            for batch in train_loader:
+            for batch_idx, batch in enumerate(train_loader):
                 bs = batch[0].size(0) if include_stats else batch.size(0)
                 total, recon0, stats0 = step(batch, train=True)
                 train_total_sum += total * bs
                 train_recon0_sum += recon0 * bs
                 train_stats0_sum += stats0 * bs
                 n_train += bs
+                if vram_log_every and batch_idx % vram_log_every == 0:
+                    # Printed from INSIDE the batch loop on purpose: an epoch
+                    # here can be ~48k batches, so a per-epoch report would
+                    # first appear only after the point where the OOM happens.
+                    print(_vram_report(f"epoch {epoch} batch {batch_idx}"), flush=True)
             train_total = (train_total_sum / n_train).item()
             train_recon0 = (train_recon0_sum / n_train).item()
             train_stats0 = (train_stats0_sum / n_train).item()
@@ -590,6 +697,11 @@ def main():
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--vram-log-every", type=int, default=0,
+                         help="print a VRAM breakdown every N training batches (0 = never). Use "
+                              "when an OOM arrives partway through an epoch: allocated flat with "
+                              "reserved growing means fragmentation, allocated growing means a "
+                              "leak, both flat with little free means another process owns the card")
     parser.add_argument("--cache-in-memory", action=argparse.BooleanOptionalAction, default=True,
                          help="hold every decoded snapshot in RAM (default). --no-cache-in-memory "
                               "from 128x128 up: the cache is ~2.3 GB at 128 and ~9.4 GB at 256, "
@@ -634,6 +746,7 @@ def main():
         base_channels=args.base_channels, latent_channels=args.latent_channels,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
         num_workers=args.num_workers, cache_in_memory=args.cache_in_memory,
+        vram_log_every=args.vram_log_every,
         min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
         min_passing_steps=args.min_passing_steps,
         stat_names=args.stat_names, stats0_weight=args.stats_weight,

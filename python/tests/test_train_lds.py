@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from conftest import cached_artifact, copy_cached_files
 import pytest
 from pathlib import Path
 from utils import load_datasets as load
@@ -48,6 +49,50 @@ def _build_sweep(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
+def _cached_stage2_ancestor(tmp_path, **stage2_overrides):
+    """A (base_path, stage2_checkpoint) pair, built ONCE per distinct config.
+
+    Every test in this file needs a stage-2 checkpoint before it can exercise
+    train_lds at all, and building one costs a sweep plus a stage-1 run plus a
+    stage-2 run -- roughly three quarters of each test's runtime, for an
+    artifact that is identical across all 11 of them (one stage-1 config, two
+    stage-2 configs).
+
+    The returned checkpoint is a fresh COPY in the caller's own tmp_path, so a
+    test may resume from it, overwrite it, or delete it without affecting any
+    other. base_path is the SHARED sweep directory, which is read-only by
+    construction (see cached_sweep).
+
+    The cache key is the full stage-2 kwargs, so any test needing a different
+    ancestor transparently gets its own -- see cached_artifact on why the key
+    is mechanical rather than a hand-written label.
+    """
+    def _build(cache_dir):
+        base_path = _build_sweep(cache_dir, n_runs=6, size=32)
+        stage1a_path = train_autoencoder(
+            size=32, base_path=base_path,
+            epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+            val_fraction=0.34, test_fraction=0.17, num_workers=0,
+            min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+            checkpoint_path=cache_dir / "stage1a.pt", device="cpu", seed=0,
+            log_every_epoch=False, loss_curve_path=cache_dir / "curve1a.png",
+        )
+        stage2_path = train_stage2(
+            base_path=base_path, resume_from=stage1a_path,
+            epochs=1, batch_size=4, num_workers=0, augment=False,
+            val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
+            checkpoint_path=cache_dir / "stage2.pt", device="cpu", seed=0,
+            log_every_epoch=False, loss_curve_path=cache_dir / "curve2.png",
+            **stage2_overrides,
+        )
+        return base_path, stage2_path
+
+    key = ("stage2_ancestor", tuple(sorted(stage2_overrides.items())))
+    base_path, cached_stage2 = cached_artifact(key, _build)
+    return base_path, copy_cached_files(cached_stage2, tmp_path)
+
+
+
 def test_train_lds_loads_a_named_decoder_checkpoint_correctly(tmp_path, isolated_project_root):
     """Regression test for a real bug: train_lds (stage 3) had the exact
     same construction gap check_reconstruction.py did -- assumed a
@@ -63,22 +108,7 @@ def test_train_lds_loads_a_named_decoder_checkpoint_correctly(tmp_path, isolated
     was about a NAMED (non-"shared") decoder key existing at all, which
     "decoders.D0." alone still is, not specifically about there being
     two of them (D0 and D1 together)."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path, stats0_weight=0.01,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path, stats0_weight=0.01)
     saved = torch.load(stage2_path, map_location="cpu", weights_only=True)
     assert saved["config"]["decoder_for_stream"] == {"state": "D0"}, (
         "test's own premise broke -- expected a single, NAMED (non-'shared') decoder key"
@@ -110,22 +140,7 @@ def test_l_1step_display_uses_the_same_rollout_scale_as_the_main_loss(tmp_path, 
     symptom was l_1step appearing "orders of magnitude smaller" than
     the main loss. Confirms they're now on the same scale (a small,
     O(1) ratio, not 1/rollout_scale) for a real, multi-step run."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
 
     train_lds(
         size=32, base_path=base_path, ae_checkpoint_path=stage2_path,
@@ -157,21 +172,7 @@ def test_l_1step_display_uses_the_same_rollout_scale_as_the_main_loss(tmp_path, 
 
 def test_epochs_zero_actually_writes_a_checkpoint_stage3(tmp_path, capsys, isolated_project_root):
     """Same regression test as Stage 1a/1b/2's own, for train_lds."""
-    base_path = _build_sweep(tmp_path, n_runs=6)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
 
     checkpoint_path = tmp_path / "stage3_ablation.pt"
     assert not checkpoint_path.exists()
@@ -212,22 +213,7 @@ def test_use_dt_decade_weights_false_never_computes_or_calls_the_weights_fn(tmp_
 
     monkeypatch.setattr(train_lds_module, "compute_dt_decade_weights", _raise_if_called)
 
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2_off.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_off.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
     # THE actual test: must complete without the patched function ever firing.
     lds_path = train_lds(
         size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
@@ -270,22 +256,7 @@ def test_use_dt_decade_weights_true_is_computed_and_actually_used(tmp_path, monk
 
     monkeypatch.setattr(train_lds_module, "compute_dt_decade_weights", _recording_compute)
 
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2_on.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_on.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
     lds_path = train_lds(
         size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
@@ -366,22 +337,7 @@ def test_compute_euler_only_losses_matches_independent_manual_computation(tmp_pa
 
     monkeypatch.setattr(train_lds_module, "compute_euler_only_losses", _recording)
 
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a_euler.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a_euler.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2_euler.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_euler.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
     lds_path = train_lds(
         size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
@@ -432,22 +388,7 @@ def test_z0_noise_scale_perturbs_train_only_not_val(tmp_path, monkeypatch, isola
 
     monkeypatch.setattr(LatentDynamics, "rollout", _recording_rollout)
 
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a_noise.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a_noise.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2_noise.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2_noise.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
 
     def _run(z0_noise_scale, suffix):
         calls.clear()
@@ -534,22 +475,7 @@ def test_rollout_loss_constructed_with_exponent_deriv_zero_and_dt_passed_at_call
 
     monkeypatch.setattr(train_lds_module, "RolloutLoss", _RecordingRolloutLoss)
 
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
     lds_path = train_lds(
         size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
@@ -576,22 +502,7 @@ def test_dt_cap_default_round_trips_as_inf(tmp_path, isolated_project_root):
     missing key) -- so anything reading the checkpoint later gets an
     unambiguous answer via direct key lookup, not needing to know a
     separate, external default to interpret a missing key correctly."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
     lds_path = train_lds(
         size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
@@ -614,22 +525,7 @@ def test_dt_cap_finite_value_round_trips_and_is_actually_applied(tmp_path, isola
     own loading paths do) must actually exhibit the capped forward()
     behavior -- not just that the number made it into a dict somewhere,
     but that it genuinely changes what the reloaded model computes."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
     dt_cap_value = 50.0
     lds_path = train_lds(
         size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
@@ -687,22 +583,7 @@ def test_dt_cap_mismatch_on_resume_raises_a_clear_error(tmp_path, isolated_proje
     dangerous inconsistency the existing architecture-mismatch check
     exists to catch. Confirms dt_cap was actually added to that check,
     not just to construction/saving."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1a_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
-        val_fraction=0.34, test_fraction=0.17, num_workers=0,
-        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1a.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1a.png",
-    )
-    stage2_path = train_stage2(
-        base_path=base_path, resume_from=stage1a_path,
-        epochs=1, batch_size=4, num_workers=0, augment=False,
-        val_fraction=0.34, test_fraction=0.17, min_step=0, min_stdev_phi=None,
-        checkpoint_path=tmp_path / "stage2.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve2.png",
-    )
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
     stage3a_path = train_lds(
         size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
         epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,

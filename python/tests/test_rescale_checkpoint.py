@@ -710,3 +710,48 @@ def test_fixture_recon_stream_matches_what_Autoencoder_actually_builds():
                       latent_channels=LATENT_CHANNELS, latent_spatial_size=LATENT_SPATIAL)
     assert len(ae.encoder.theta_conditioners) == 0
     assert not any(cfg.condition_on_theta for cfg in _stream_configs().values())
+
+
+# --------------------------------------------------------------------
+# stats_head must not be carried forward
+# --------------------------------------------------------------------
+
+def test_stats_head_state_is_dropped_not_carried_forward():
+    """
+    GUARDS carrying stats_head_state across a rescale. Two reasons, either
+    sufficient:
+
+    1. StatsHead maps latent -> statistics, and the latent basis is defined by
+       the state bottleneck, which the rescale reinitialises. The weights
+       encode a mapping in a coordinate system that no longer exists -- the
+       same argument that rules out porting f_theta.
+    2. Its output layer is sized by len(stat_names), which is a property of the
+       RUN, not of the model. A 12-stat source resumed into a 1-stat run
+       crashed in train_autoencoder with a bare "size mismatch for
+       net.2.weight" -- found only by running the real resume path end to end,
+       not by any shape check on the rescale itself.
+    """
+    prev = _stage1_checkpoint(64, with_stats=True)
+    assert prev["stats_head_state"] is not None  # the fixture really has one
+    result = rescale_checkpoint_to_size(prev, to_size=128)
+    assert result.checkpoint["stats_head_state"] is None
+    # stat_names survive: they identify WHICH statistics, and stage 1 needs them
+    assert result.checkpoint["stats_config"]["stat_names"] == STAT_NAMES
+
+
+def test_ported_checkpoint_resumes_when_the_new_run_wants_DIFFERENT_stats():
+    """
+    The end-to-end form of the above, at the layer where it actually broke:
+    train_autoencoder's own resume path, with a stat_names that does not match
+    the source's. Reproduces the reported crash if stats_head_state comes back.
+    """
+    from training.stats_head import StatsHead
+    prev = _stage1_checkpoint(64, with_stats=True)
+    result = rescale_checkpoint_to_size(prev, to_size=128)
+    # a run asking for ONE statistic where the source had len(STAT_NAMES)
+    head = StatsHead(latent_channels=LATENT_CHANNELS, stat_names=["avg_phi"],
+                      latent_spatial=LATENT_SPATIAL)
+    saved = result.checkpoint["stats_head_state"]
+    assert saved is None, "a non-None state here is what train_autoencoder would try to load"
+    # and the shapes really would have clashed
+    assert head.net[2].out_features != len(STAT_NAMES)

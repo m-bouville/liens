@@ -246,13 +246,22 @@ def loss_component_scatter(
         ax = axes[idx // n_cols][idx % n_cols]
         cx, cy = component_histories[name_x], component_histories[name_y]
 
-        for series_key, label, color, lw in [
-            ("train", "train", "tab:blue", 1.2),
-            ("val", "valid", "tab:orange", 1.2),
-            ("best_so_far", "best so far", "tab:green", 2.0),
+        # best_so_far is DASHED, and that is not decoration. It coincides
+        # EXACTLY with val on every epoch where a checkpoint was saved (see
+        # ComponentBestTracker: on a saved epoch it takes that epoch's own val
+        # values), so on a run that improves every epoch -- common early, and
+        # the normal case for a short run -- a solid green line of width 2.0
+        # drawn last hides the orange one completely. The plot then shows two
+        # curves and three legend entries, which reads as a missing series
+        # rather than as two series agreeing. Dashes let the val line show
+        # through the gaps, so coincidence looks like coincidence.
+        for series_key, label, color, lw, ls in [
+            ("train", "train", "tab:blue", 1.2, "-"),
+            ("val", "valid", "tab:orange", 1.2, "-"),
+            ("best_so_far", "best so far", "tab:green", 2.0, "--"),
         ]:
             x, y = cx[series_key], cy[series_key]
-            ax.plot(x, y, "-", color=color, alpha=0.6, linewidth=lw, zorder=2)
+            ax.plot(x, y, ls, color=color, alpha=0.6, linewidth=lw, zorder=2)
             ax.scatter(x, y, s=14, color=color, alpha=0.7, zorder=3, label=label)
 
         # Mark the trajectory's own start/end so its DIRECTION is legible
@@ -285,7 +294,14 @@ def loss_component_scatter(
         ax.set_xlabel(name_x)
         ax.set_ylabel(name_y)
         if idx == 0:
-            ax.legend(loc="upper right", fontsize=8)
+            # "best", not a fixed corner. These trajectories head toward the
+            # origin, so they occupy the LOWER-LEFT... except early in a run,
+            # when every point is still up and to the right and a hardcoded
+            # "upper right" lands the legend squarely on the data while three
+            # quarters of the axes are empty. matplotlib's own overlap
+            # minimisation costs a little draw time and gets it right in both
+            # regimes.
+            ax.legend(loc="best", fontsize=8)
         ax.grid(alpha=0.25)
 
     # Unused grid cells (n_rows*n_cols > len(pairs), e.g. 4 pairs in a

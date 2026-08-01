@@ -174,6 +174,19 @@ def run_from_params_file(params_path: Path, default_base: Path,
                   **extra_signature, **_signature_kwargs(stage1_kwargs)}
     stage1_checkpoint = resolve_checkpoint(1, force1, signature1, stage1_kwargs.get("epochs"))
     if stage1_checkpoint is None:
+        # Same hazard stage 2 guards against, and for the same reason (see the
+        # _backup_before_overwrite call in the stage-2 block below): stage 1
+        # has no ancestor in the ordinary flow, so its output is never at risk
+        # automatically -- but an explicit `resume_from` commonly points at
+        # THIS stage's own prior output, which is exactly how a size port is
+        # continued (resume_from=checkpoints/stage1/128x128-ported.pt, or the
+        # stage's own previous run). force=True then overwrites it in place
+        # with nothing kept, and the WARNING line that prints is not a backup.
+        _stage1_resume = stage1_kwargs.get("resume_from")
+        if _stage1_resume is not None and Path(_stage1_resume).resolve() == \
+                stage_output_path(1).resolve():
+            _backup_before_overwrite(stage_output_path(1))
+            _backup_before_overwrite(stage_output_path(1).with_suffix(".log"))
         with _log_to_file(stage_output_path(1).with_suffix(".log")):
             print("=" * 70)
             print("STAGE 1: training autoencoder")

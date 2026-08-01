@@ -7,7 +7,7 @@ import re
 
 import pytest
 
-from conftest import cached_sweep
+from conftest import cached_sweep, cached_stage1_ancestor
 
 
 def _build_run_dir(base_dir, name, temperature=0.8, noise=0.01, seed_val=1, size=32):
@@ -124,15 +124,12 @@ def test_stage2_accepts_single_stream_ancestor_and_builds_deriv(tmp_path, isolat
     own integration level, not just extend_encoder.py's own isolated
     unit tests -- confirms the two are actually wired together
     correctly, end to end, including a real training epoch."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1_single.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1.png",
+        device="cpu", seed=0, log_every_epoch=False,
     )
 
     stage2_path = train_stage2(
@@ -178,15 +175,12 @@ def test_epoch0_reference_does_not_perturb_training_rng(tmp_path, isolated_proje
     independent of whether any particular seed/architecture happens
     to expose it as a visible training difference.
     """
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1_epoch0ref.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_epoch0ref.png",
+        device="cpu", seed=0, log_every_epoch=False,
     )
 
     import torch as torch_module
@@ -310,14 +304,12 @@ def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_pr
     test slow AND left it flaky; asserting the deterministic property
     fixes both.
     """
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1_centered.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_centered.png",
+        device="cpu", seed=0, log_every_epoch=False,
     )
     capsys.readouterr()
 
@@ -355,15 +347,12 @@ def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_
     run's own deriv_weight_warmup_epochs at all) needs to resume
     smoothly into deriv_target_centered=True without wasting the prior
     run's own computation."""
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path,
-        epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1_resume.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_resume.png",
+        device="cpu", seed=0, log_every_epoch=False,
     )
     # A "fully trained" ancestor, well past any reasonable warmup --
     # trained WITHOUT deriv_target_centered at all, matching a real
@@ -425,13 +414,12 @@ def test_loss_component_scatter_writes_a_SEPARATE_file_from_loss_curve(tmp_path,
     confirmed directly by image dimensions (loss_curve's own 800x500
     vs the grid's 1500x450) before this was caught.
     """
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1_scatter.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_scatter.png",
+        device="cpu", seed=0, log_every_epoch=False,
     )
     # Deliberately a filename with NO "loss_curve" substring in it at
     # all -- the exact shape that broke the old .replace()-based
@@ -486,13 +474,12 @@ def test_loss_component_scatter_values_reconstruct_train_total(tmp_path, isolate
 
     monkeypatch.setattr(ts2, "loss_component_scatter", spy)
 
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    stage1_path = train_autoencoder(
-        size=32, base_path=base_path, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
         val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
         min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-        checkpoint_path=tmp_path / "stage1_recon.pt", device="cpu", seed=0,
-        log_every_epoch=False, loss_curve_path=tmp_path / "curve1_recon.png",
+        device="cpu", seed=0, log_every_epoch=False,
     )
     import io, contextlib
     buf = io.StringIO()
