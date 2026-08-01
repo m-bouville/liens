@@ -222,7 +222,7 @@ def test_pure_time_rescaling_is_detected_as_a_collapse(tmp_path, capsys):
                       "stdev_by_step": _sigmoid_curve(tau, _equilibrium_amplitude(temp))})
     base_path = _build_sweep(tmp_path, runs)
     check_stdev_phi_time(base_path=base_path, size=SIZE,
-                          output_path=tmp_path / "out.png")
+                          plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     before = float(out.split("normalized stdev_phi vs t        = ")[1].split("\n")[0])
     after = float(out.split("normalized stdev_phi vs t/tau(T) = ")[1].split("\n")[0])
@@ -245,7 +245,7 @@ def test_shape_difference_is_NOT_reported_as_a_collapse(tmp_path, capsys):
          "stdev_by_step": _sigmoid_curve(10000, _equilibrium_amplitude(0.8), width=3.0)},
     ]
     base_path = _build_sweep(tmp_path, runs)
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "COLLAPSES" not in out
 
@@ -269,7 +269,7 @@ def test_averages_over_noise_and_seed_at_fixed_temperature(tmp_path, capsys):
          "stdev_by_step": _sigmoid_curve(2000, _equilibrium_amplitude(0.6))},
     ]
     base_path = _build_sweep(tmp_path, runs)
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     line = [ln for ln in out.splitlines() if ln.strip().startswith("0.800")][0]
     assert line.split()[1] == "2"  # n_runs
@@ -288,7 +288,7 @@ def test_single_temperature_sweep_reports_undefined_rather_than_a_number(tmp_pat
         {"name": "T800_n010_s0", "temperature": 0.8,
          "stdev_by_step": _sigmoid_curve(10000, _equilibrium_amplitude(0.8))},
     ])
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "UNDEFINED" in out
 
@@ -309,7 +309,7 @@ def test_temperature_at_or_above_T0_is_excluded_not_silently_dropped(tmp_path, c
          "stdev_by_step": _sigmoid_curve(50000, 0.01)},
     ]
     base_path = _build_sweep(tmp_path, runs)
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "equilibrium amplitude is 0" in out
     assert "1.0" in out
@@ -327,7 +327,7 @@ def test_incomplete_and_statless_runs_are_skipped_and_counted(tmp_path, capsys):
          "stdev_by_step": _sigmoid_curve(5000, _equilibrium_amplitude(0.65))},
     ]
     base_path = _build_sweep(tmp_path, runs)
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "1 incomplete" in out
     assert "1 missing" in out
@@ -347,7 +347,7 @@ def test_reports_delta_t_in_force_at_tau(tmp_path, capsys):
          "stdev_by_step": _sigmoid_curve(70000, _equilibrium_amplitude(0.8))},
     ]
     base_path = _build_sweep(tmp_path, runs)
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     cold = [ln for ln in out.splitlines() if ln.strip().startswith("0.600")][0]
     warm = [ln for ln in out.splitlines() if ln.strip().startswith("0.800")][0]
@@ -480,7 +480,7 @@ def test_late_steps_from_a_few_long_runs_are_dropped(tmp_path, capsys):
     runs.append({"name": "T800_n010_s99", "temperature": 0.8, "seed": 99,
                   "stdev_by_step": _sigmoid_curve(2000, _equilibrium_amplitude(0.8))})
     base_path = _build_sweep(tmp_path, runs)
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "saturation cap: t <= 100000" in out
     assert "beyond it dropped" in out
@@ -495,7 +495,7 @@ def test_saturation_cap_can_be_disabled(tmp_path, capsys):
               "stdev_by_step": _sigmoid_curve(10000, _equilibrium_amplitude(0.8))}]
     base_path = _build_sweep(tmp_path, runs)
     check_stdev_phi_time(base_path=base_path, size=SIZE, min_run_fraction=0.0,
-                          output_path=tmp_path / "out.png")
+                          plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "saturation cap: DISABLED" in out
 
@@ -546,7 +546,7 @@ def test_varying_contributor_count_across_steps_is_reported(tmp_path, capsys):
         f"Nx = {SIZE}", f"Ny = {SIZE}", "temperatures = 0.8", "noises = 0.01",
         "seeds = 0", "subdirs =", "T800_n010_s0", "T800_n010_s1", "T600_n010_s0"]))
     check_stdev_phi_time(base_path=tmp_path / "datasets", size=SIZE,
-                          output_path=tmp_path / "out.png")
+                          plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "VARYING number of contributing seeds" in out
     assert "1-2" in out
@@ -581,7 +581,7 @@ def test_spread_is_across_seeds_not_across_runs(tmp_path, capsys):
         f"Nx = {SIZE}", f"Ny = {SIZE}", "temperatures = 0.8", "noises = 0.01",
         "seeds = 0", "subdirs =", *names]))
     check_stdev_phi_time(base_path=tmp_path / "datasets", size=SIZE,
-                          output_path=tmp_path / "out.png")
+                          plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     line = [ln for ln in out.splitlines() if ln.strip().startswith("0.800")][0]
     assert line.split()[1] == "12"  # runs
@@ -605,7 +605,7 @@ def test_per_seed_table_makes_an_anomalous_seed_identifiable(tmp_path, capsys):
         f"Nx = {SIZE}", f"Ny = {SIZE}", "temperatures = 0.8", "noises = 0.01",
         "seeds = 0", "subdirs =", *names]))
     check_stdev_phi_time(base_path=tmp_path / "datasets", size=SIZE,
-                          output_path=tmp_path / "out.png")
+                          plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "per-seed comparison, stratified" in out
     assert "--exclude-seeds" in out
@@ -626,7 +626,7 @@ def test_exclude_seeds_removes_a_seed_everywhere(tmp_path, capsys):
         f"Nx = {SIZE}", f"Ny = {SIZE}", "temperatures = 0.8", "noises = 0.01",
         "seeds = 0", "subdirs =", *names]))
     check_stdev_phi_time(base_path=tmp_path / "datasets", size=SIZE,
-                          exclude_seeds={1}, output_path=tmp_path / "out.png")
+                          exclude_seeds={1}, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "2 excluded by --exclude-seeds" in out
     for line in out.splitlines():
@@ -692,7 +692,7 @@ def test_seed_covering_only_high_T_is_not_flagged_for_its_coverage(tmp_path, cap
     composition artifact. Stratified rank must not.
     """
     base_path = _sweep_with_specialised_seed(tmp_path, specialist_behaves_normally=True)
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "stratified by (temperature, step)" in out
     assert "seeds cover different numbers of temperatures" in out
@@ -707,7 +707,7 @@ def test_genuinely_anomalous_seed_is_still_flagged(tmp_path, capsys):
     catch this, or it has bought its immunity by detecting nothing.
     """
     base_path = _sweep_with_specialised_seed(tmp_path, specialist_behaves_normally=False)
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     flagged = [ln for ln in out.splitlines() if "more than 3 MADs" in ln]
     assert flagged and "99" in flagged[0], out
@@ -715,7 +715,7 @@ def test_genuinely_anomalous_seed_is_still_flagged(tmp_path, capsys):
 
 def test_rank_is_reported_per_seed_with_its_temperature_coverage(tmp_path, capsys):
     base_path = _sweep_with_specialised_seed(tmp_path)
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     line = [ln for ln in out.splitlines() if ln.strip().startswith("99")][0]
     assert line.split()[1] == "2"                    # covers 2 temperatures, not 5
@@ -771,7 +771,7 @@ def _seed_breakdown_sweep(tmp_path, anomalous_noises):
 def test_seed_wide_anomaly_is_attributed_to_the_seed(tmp_path, capsys):
     base_path = _seed_breakdown_sweep(tmp_path, {0.005, 0.01, 0.02, 0.05})
     check_stdev_phi_time(base_path=base_path, size=SIZE, inspect_seed=99,
-                          output_path=tmp_path / "out.png")
+                          plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "-> SEED." in out
     assert "--exclude-seeds 99" in out
@@ -786,7 +786,7 @@ def test_anomaly_in_a_few_runs_is_NOT_attributed_to_the_seed(tmp_path, capsys):
     """
     base_path = _seed_breakdown_sweep(tmp_path, {0.01})
     check_stdev_phi_time(base_path=base_path, size=SIZE, inspect_seed=99,
-                          output_path=tmp_path / "out.png")
+                          plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "-> RUNS." in out
     assert "-> SEED." not in out
@@ -795,7 +795,7 @@ def test_anomaly_in_a_few_runs_is_NOT_attributed_to_the_seed(tmp_path, capsys):
 def test_seed_breakdown_names_the_offending_runs(tmp_path, capsys):
     base_path = _seed_breakdown_sweep(tmp_path, {0.01})
     check_stdev_phi_time(base_path=base_path, size=SIZE, inspect_seed=99,
-                          output_path=tmp_path / "out.png")
+                          plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     line = [ln for ln in out.splitlines() if "most extreme runs" in ln][0]
     assert "0.01" in line  # the anomalous noise value is named
@@ -844,7 +844,7 @@ def test_median_snaps_to_the_majority_absorbing_state(tmp_path, capsys, n_trappe
     4-of-5 trapped must give the two extremes, not 0.2 and 0.8.
     """
     check_stdev_phi_time(base_path=_bimodal_sweep(tmp_path, n_trapped), size=SIZE,
-                          statistic="median", output_path=tmp_path / "out.png")
+                          statistic="median", plot=False, output_path=tmp_path / "out.png")
     assert _plateau_at_T800(capsys.readouterr().out) == pytest.approx(expected, abs=0.02)
 
 
@@ -856,17 +856,17 @@ def test_mean_recovers_the_trapping_fraction(tmp_path, capsys, n_trapped):
     probability can be read straight off it.
     """
     check_stdev_phi_time(base_path=_bimodal_sweep(tmp_path, n_trapped), size=SIZE,
-                          statistic="mean", output_path=tmp_path / "out.png")
+                          statistic="mean", plot=False, output_path=tmp_path / "out.png")
     assert _plateau_at_T800(capsys.readouterr().out) == pytest.approx(n_trapped / 5, abs=0.02)
 
 
 def test_band_matches_the_statistic(tmp_path, capsys):
     base_path = _bimodal_sweep(tmp_path, 2)
     check_stdev_phi_time(base_path=base_path, size=SIZE, statistic="median",
-                          output_path=tmp_path / "m.png")
+                          plot=False, output_path=tmp_path / "m.png")
     assert "MEDIAN at both levels" in capsys.readouterr().out
     check_stdev_phi_time(base_path=base_path, size=SIZE, statistic="mean",
-                          output_path=tmp_path / "a.png")
+                          plot=False, output_path=tmp_path / "a.png")
     out = capsys.readouterr().out
     assert "MEAN at both levels" in out
     assert "bimodal" not in out  # the caveat belongs to the median only
@@ -875,7 +875,7 @@ def test_band_matches_the_statistic(tmp_path, capsys):
 def test_unknown_statistic_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="statistic must be one of"):
         check_stdev_phi_time(base_path=_bimodal_sweep(tmp_path, 2), size=SIZE,
-                              statistic="average", output_path=tmp_path / "x.png")
+                              statistic="average", plot=False, output_path=tmp_path / "x.png")
 
 
 def test_band_type_follows_the_statistic(tmp_path, capsys):
@@ -886,10 +886,10 @@ def test_band_type_follows_the_statistic(tmp_path, capsys):
     """
     base_path = _bimodal_sweep(tmp_path, 2)
     check_stdev_phi_time(base_path=base_path, size=SIZE, statistic="median",
-                          output_path=tmp_path / "m.png")
+                          plot=False, output_path=tmp_path / "m.png")
     assert "band = p25-p75" in capsys.readouterr().out
     check_stdev_phi_time(base_path=base_path, size=SIZE, statistic="mean",
-                          output_path=tmp_path / "a.png")
+                          plot=False, output_path=tmp_path / "a.png")
     assert "band = +-1 sd" in capsys.readouterr().out
 
 
@@ -920,10 +920,10 @@ def test_statistic_is_applied_to_noise_within_a_seed_too(tmp_path, capsys):
         "seeds = 0", "subdirs =", *names]))
 
     check_stdev_phi_time(base_path=tmp_path / "datasets", size=SIZE, statistic="median",
-                          output_path=tmp_path / "m.png")
+                          plot=False, output_path=tmp_path / "m.png")
     assert _plateau_at_T800(capsys.readouterr().out) == pytest.approx(0.0, abs=0.02)
     check_stdev_phi_time(base_path=tmp_path / "datasets", size=SIZE, statistic="mean",
-                          output_path=tmp_path / "a.png")
+                          plot=False, output_path=tmp_path / "a.png")
     assert _plateau_at_T800(capsys.readouterr().out) == pytest.approx(1 / 3, abs=0.02)
 
 
@@ -987,7 +987,7 @@ def test_tau_down_column_and_collapse_are_reported(tmp_path, capsys):
         f"Nx = {SIZE}", f"Ny = {SIZE}", "temperatures = 0.8", "noises = 0.01",
         "seeds = 0", "subdirs =", *names]))
     check_stdev_phi_time(base_path=tmp_path / "datasets", size=SIZE,
-                          output_path=tmp_path / "out.png")
+                          plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "tau_down" in out
     assert "collapse test on tau_down" in out
@@ -1006,7 +1006,7 @@ def test_tau_down_absent_everywhere_is_reported_as_such(tmp_path, capsys):
         {"name": "T800_n010_s0", "temperature": 0.8,
          "stdev_by_step": _sigmoid_curve(10000, _equilibrium_amplitude(0.8))},
     ])
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "NOT REACHED at any temperature" in out
 
@@ -1094,7 +1094,7 @@ def test_autocorr_cap_is_taken_from_the_data_not_the_formula(tmp_path, capsys):
     """
     off_by_one = int(SIZE * 2 / 3) - 1
     check_stdev_phi_time(base_path=_sweep_with_autocorr(tmp_path, off_by_one, 20000),
-                          size=SIZE, output_path=tmp_path / "out.png")
+                          size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert f"capped at {off_by_one:g} px" in out
     assert "DIFFERS" in out            # the mismatch with the nominal formula is flagged
@@ -1103,7 +1103,7 @@ def test_autocorr_cap_is_taken_from_the_data_not_the_formula(tmp_path, capsys):
 
 def test_autocorr_reports_saturation_fraction_and_onset(tmp_path, capsys):
     check_stdev_phi_time(base_path=_sweep_with_autocorr(tmp_path, CAP_32, 20000),
-                          size=SIZE, output_path=tmp_path / "out.png")
+                          size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "autocorr_length, search capped at 21 px" in out
     line = [ln for ln in out.splitlines() if ln.strip().startswith("0.600")][-1]
@@ -1118,7 +1118,7 @@ def test_autocorr_absent_is_reported_not_crashed(tmp_path, capsys):
         {"name": "T800_n010_s0", "temperature": 0.8,
          "stdev_by_step": _sigmoid_curve(10000, _equilibrium_amplitude(0.8))},
     ])
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     assert "autocorr_length: not present" in capsys.readouterr().out
 
 
@@ -1150,7 +1150,135 @@ def test_autocorr_survives_an_integer_typed_column(tmp_path, capsys):
     base_path = _sweep_with_autocorr(tmp_path, CAP_32, 20000)
     written = _pd.read_csv(base_path / f"{SIZE}x{SIZE}" / "T600_n010_s0" / "statistics.csv")
     assert written["autocorr_length"].dtype.kind == "i", "fixture must reproduce the real dtype"
-    check_stdev_phi_time(base_path=base_path, size=SIZE, output_path=tmp_path / "out.png")
+    check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=tmp_path / "out.png")
     out = capsys.readouterr().out
     assert "autocorr_length: not present" not in out
     assert "search capped at" in out
+
+
+def test_plot_false_skips_rendering_entirely(tmp_path, capsys):
+    """
+    GUARDS rendering the figure regardless of `plot`. Rendering is ~99% of this
+    function's runtime (measured: 1.47 s of a 1.48 s call on a two-run sweep),
+    so a regression here would not fail any assertion -- it would just make the
+    suite several times slower, which is exactly the kind of thing that goes
+    unnoticed until the whole suite is minutes long. Asserted on the file, not
+    on the clock, so it is not flaky under load.
+    """
+    base_path = _build_sweep(tmp_path, [
+        {"name": "T600_n010_s0", "temperature": 0.6,
+         "stdev_by_step": _sigmoid_curve(2000, _equilibrium_amplitude(0.6))},
+        {"name": "T800_n010_s0", "temperature": 0.8,
+         "stdev_by_step": _sigmoid_curve(10000, _equilibrium_amplitude(0.8))},
+    ])
+    out = tmp_path / "unwritten.png"
+    returned = check_stdev_phi_time(base_path=base_path, size=SIZE, plot=False, output_path=out)
+    assert returned == out          # still reports where the figure WOULD go
+    assert not out.exists()         # but nothing was rendered
+    text = capsys.readouterr().out
+    assert "Saved figure" not in text
+    assert "collapse test" in text  # the console analysis is unaffected
+
+
+# --------------------------------------------------------------------
+# the driving-force law fit
+# --------------------------------------------------------------------
+
+def test_driving_force_fit_recovers_a_known_coefficient_and_exponent():
+    """
+    tau = C/(T0-T)^n with C and n both fitted. n is NOT fixed at 1: linear
+    instability predicts sigma = M*a0*(T0-T), i.e. exactly 1, so the fitted
+    value is the measurement -- a departure from 1 is a fact about the data.
+    """
+    from evaluation.check_stdev_phi_time import _fit_driving_force_law
+    T0, C, n = 1.0, 3100.0, 1.0
+    temps = [0.55, 0.7, 0.8, 0.9, 0.95, 0.98]
+    taus = {t: C / (T0 - t) ** n for t in temps}
+    fit_c, fit_n, n_points = _fit_driving_force_law(temps, taus, T0)
+    assert fit_c == pytest.approx(C, rel=1e-6)
+    assert fit_n == pytest.approx(n, rel=1e-6)
+    assert n_points == len(temps)
+
+
+def test_driving_force_fit_detects_an_exponent_other_than_one():
+    """GUARDS hardcoding the exponent at 1 and fitting only the coefficient."""
+    from evaluation.check_stdev_phi_time import _fit_driving_force_law
+    temps = [0.55, 0.7, 0.8, 0.9, 0.95]
+    taus = {t: 3100.0 / (1.0 - t) ** 1.25 for t in temps}
+    _, fit_n, _ = _fit_driving_force_law(temps, taus, 1.0)
+    assert fit_n == pytest.approx(1.25, rel=1e-6)
+
+
+def test_driving_force_fit_excludes_temperatures_at_or_above_T0():
+    """
+    At T >= T0 the driving force is zero or reversed -- log(T0-T) is undefined
+    and there is no instability to time. Excluded rather than allowed to poison
+    the fit with a NaN.
+    """
+    from evaluation.check_stdev_phi_time import _fit_driving_force_law
+    temps = [0.6, 0.8, 1.0, 1.1]
+    taus = {0.6: 7750.0, 0.8: 15500.0, 1.0: 1e9, 1.1: 1e9}
+    _, fit_n, n_points = _fit_driving_force_law(temps, taus, 1.0)
+    assert n_points == 2
+    assert fit_n == pytest.approx(1.0, rel=1e-6)
+
+
+def test_driving_force_fit_is_nan_with_too_few_points():
+    from evaluation.check_stdev_phi_time import _fit_driving_force_law
+    c, n, n_points = _fit_driving_force_law([0.6], {0.6: 7750.0}, 1.0)
+    assert math.isnan(c) and math.isnan(n) and n_points == 1
+
+
+def test_driving_force_fit_uses_the_run_T0_not_a_hardcoded_one():
+    """
+    GUARDS assuming T0 = 1. Every temperature is relative to the run's own T0,
+    which is read from metadata; a hardcoded 1 would silently mis-fit any sweep
+    with a different Landau threshold.
+    """
+    from evaluation.check_stdev_phi_time import _fit_driving_force_law
+    T0 = 2.0
+    temps = [1.1, 1.5, 1.8, 1.95]
+    taus = {t: 3100.0 / (T0 - t) for t in temps}
+    fit_c, fit_n, _ = _fit_driving_force_law(temps, taus, T0)
+    assert fit_c == pytest.approx(3100.0, rel=1e-6)
+    assert fit_n == pytest.approx(1.0, rel=1e-6)
+    # with the wrong T0 the same data does not fit a clean power law
+    _, wrong_n, _ = _fit_driving_force_law(temps, taus, 1.0)
+    assert wrong_n != pytest.approx(1.0, rel=1e-3)
+
+
+def test_T0_reaches_the_plot_from_run_metadata_not_from_a_default(tmp_path, monkeypatch):
+    """
+    GUARDS the WIRING, which the helper-level T0 test above does not: every
+    fixture in this file uses T0=1, which is also _plot's default, so dropping
+    the `T0_value = float(metadata.T0)` read changes nothing any of them can
+    see. Captured at the _plot boundary with a sweep whose T0 is deliberately
+    not 1.
+    """
+    import evaluation.check_stdev_phi_time as mod
+
+    base_dir = tmp_path / "datasets" / f"{SIZE}x{SIZE}"
+    base_dir.mkdir(parents=True)
+    names = []
+    for temp, amp in ((1.2, 0.6), (1.6, 0.4)):
+        name = f"T{round(temp * 1000)}_n010_s0"
+        _build_run(base_dir, name, temp, _sigmoid_curve(3100.0 / (2.0 - temp), amp))
+        # rewrite the one field the fixture hardcodes
+        meta_path = base_dir / name / "metadata.txt"
+        meta = meta_path.read_text()
+        assert f"T0 = {T0}" in meta, "fixture format changed -- this rewrite would no-op"
+        meta_path.write_text(meta.replace(f"T0 = {T0}", "T0 = 2.0"))
+        names.append(name)
+    (base_dir / "metadata.txt").write_text("\n".join([
+        f"Nx = {SIZE}", f"Ny = {SIZE}", "temperatures = 1.2", "noises = 0.01",
+        "seeds = 0", "subdirs =", *names]))
+
+    seen = {}
+
+    def fake_plot(*args, **kwargs):
+        seen["T0"] = args[-1] if not kwargs else kwargs.get("T0_value", args[-1])
+
+    monkeypatch.setattr(mod, "_plot", fake_plot)
+    mod.check_stdev_phi_time(base_path=tmp_path / "datasets", size=SIZE,
+                              output_path=tmp_path / "out.png")
+    assert seen["T0"] == pytest.approx(2.0), "T0 must come from metadata, not the default"

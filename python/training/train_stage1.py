@@ -78,7 +78,7 @@ def train_autoencoder(
     base_channels: int = 32, latent_channels: int = 8,
     latent_spatial_size: int = LATENT_SPATIAL_SIZE,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
-    augment: bool = True,
+    augment: bool = True, cache_in_memory: bool = True,
     min_step: int | None = None, min_stdev_phi: float | None = None,
     min_passing_steps: int | None = None,
     stat_names: list[str] | None = None, stats0_weight: float | None = None,
@@ -145,6 +145,37 @@ def train_autoencoder(
     stats_head_state from before training starts (e.g. to continue stage
     1a training itself with more epochs -- NOT how stage 2 works, a
     separate function with a different loss/data structure).
+
+    cache_in_memory: hold every decoded snapshot in RAM (default True,
+    which is what this function did unconditionally before the flag
+    existed). Snapshots are float16 on disk and cached as float32, so
+    the cache is 2x the on-disk bytes, and on Windows the DataLoader
+    spawns rather than forks -- each of `num_workers` workers receives
+    its own pickled copy of the dataset, cache included. Total is
+    therefore ~(1 + num_workers) x cache size:
+
+        size    cache    with num_workers=4
+          64   0.6 GB              2.9 GB
+         128   2.3 GB             11.7 GB
+         256   9.4 GB             46.8 GB
+         512  37.5 GB            187.4 GB
+
+    (~38k snapshots, measured on a real sweep; scales with the number
+    of runs kept, not with grid size, so only the per-snapshot bytes
+    change down that column.)
+
+    Set False from 128x128 up. It also makes STARTUP faster, which is
+    the counter-intuitive part: the cache is built by a serial
+    `[self._load(i) for i in ...]` in the dataset's own __init__, one
+    file at a time on one thread with the GPU idle, whereas uncached
+    reads happen inside the `num_workers` DataLoader workers, in
+    parallel, overlapped with compute. Caching moves that I/O from
+    where it is parallel to where it is not.
+
+    Keep True only when the dataset genuinely fits with room to spare
+    AND the same frames are re-read many times per epoch (augment=True
+    re-reads each base frame up to 32x, which is the case it was
+    originally added for).
 
     early_stopping_patience: stop once val_ema hasn't improved for this
     many consecutive epochs, instead of always running the full `epochs`
@@ -227,16 +258,17 @@ def train_autoencoder(
         # MicrostructureSnapshotDataset's own construction is cheaper
         # than MicrostructureEvolutionDataset's (no min_std_deriv --
         # nothing here needs to read snapshot PAIRS to compute a
-        # derivative), but cache_in_memory=True still means reading
-        # every train snapshot into memory upfront, for a dataset
-        # that's then never iterated -- skipped entirely instead.
+        # derivative), but with cache_in_memory left at its default it
+        # still means reading every train snapshot into memory upfront,
+        # for a dataset that's then never iterated -- skipped entirely
+        # instead.
         # stat_names normally locks to whatever train_set itself
         # auto-detected -- with train_set skipped, val_set's own
         # auto-detection is used directly instead, since it's the
         # only dataset being built at all in this case.
         train_set = train_loader = None
         val_set = MicrostructureSnapshotDataset(
-            val_dirs, cache_in_memory=True, augment=False,
+            val_dirs, cache_in_memory=cache_in_memory, augment=False,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             include_stats=include_stats, stat_names=stat_names,
         )
@@ -244,7 +276,7 @@ def train_autoencoder(
               f"{val_set.n_base_samples} (val, unaugmented)")
     else:
         train_set = MicrostructureSnapshotDataset(
-            train_dirs, cache_in_memory=True, augment=augment,
+            train_dirs, cache_in_memory=cache_in_memory, augment=augment,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             include_stats=include_stats, stat_names=stat_names,
         )
@@ -253,7 +285,7 @@ def train_autoencoder(
         # against a different run's schema than train was).
         val_stat_names = train_set.stat_names if include_stats else None
         val_set = MicrostructureSnapshotDataset(
-            val_dirs, cache_in_memory=True, augment=False,
+            val_dirs, cache_in_memory=cache_in_memory, augment=False,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             include_stats=include_stats, stat_names=val_stat_names,
         )
@@ -558,6 +590,13 @@ def main():
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--cache-in-memory", action=argparse.BooleanOptionalAction, default=True,
+                         help="hold every decoded snapshot in RAM (default). --no-cache-in-memory "
+                              "from 128x128 up: the cache is ~2.3 GB at 128 and ~9.4 GB at 256, "
+                              "duplicated into each of --num-workers DataLoader workers on "
+                              "Windows, and building it is a serial single-threaded read with the "
+                              "GPU idle -- so disabling it usually makes startup FASTER as well "
+                              "as leaner")
     parser.add_argument("--min-step", type=int, default=None)
     parser.add_argument("--min-stdev-phi", type=float, default=None)
     parser.add_argument("--min-passing-steps", type=int, default=None,
@@ -594,7 +633,8 @@ def main():
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         base_channels=args.base_channels, latent_channels=args.latent_channels,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
-        num_workers=args.num_workers, min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
+        num_workers=args.num_workers, cache_in_memory=args.cache_in_memory,
+        min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
         min_passing_steps=args.min_passing_steps,
         stat_names=args.stat_names, stats0_weight=args.stats_weight,
         val_ema_decay=args.val_ema_decay, early_stopping_patience=args.early_stopping_patience,

@@ -1191,6 +1191,11 @@ def train_stage2(
         val_stats1 = (val_stats1_sum / n_val).item()
         val_deriv = (val_deriv_sum / n_val).item()
 
+        # Captured BEFORE update(), which decrements the grace counter and
+        # flips in_grace_period to False on the FINAL grace epoch -- an epoch
+        # that still could not save. Reading it afterwards would count that one
+        # as a real non-improvement.
+        was_in_grace_period = tracker.in_grace_period
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
         val_ema_str = f"{val_ema:7.4f}" if val_ema is not None else "(warmup)"
@@ -1332,8 +1337,18 @@ def train_stage2(
             msg += "  -> saved"
             if on_checkpoint_saved is not None:
                 on_checkpoint_saved(checkpoint_path, epoch)
-        else:
+        elif not was_in_grace_period:
             epochs_since_improvement += 1
+        # During a grace window should_save is UNCONDITIONALLY False (see
+        # CheckpointCriterionTracker.reset_with_grace) -- the criterion is
+        # deliberately declining to answer while the EMA re-primes, not
+        # reporting a plateau. Counting those epochs as non-improvement made
+        # early stopping fire whenever grace_epochs >= early_stopping_patience,
+        # which the deriv_target_centered switch reaches routinely: with
+        # grace=5 and patience=4 the run stopped at epoch 18, one epoch before
+        # the criterion became usable again, while its EMA was still falling
+        # monotonically (50.36 -> 50.01 -> 47.86 -> 47.51). The grace window
+        # could never complete.
 
         if log_every_epoch or saved_this_epoch:
             print(msg)

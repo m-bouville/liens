@@ -343,6 +343,32 @@ def _normalized_ylim(ax) -> None:
     ax.set_ylim(top=max(100.0, ax.get_ylim()[1]))
 
 
+def _fit_driving_force_law(temperatures, taus, T0: float) -> tuple[float, float, int]:
+    """
+    Least-squares fit of tau = C / (T0 - T)^n, in log-log.
+
+    Returns (C, n, n_points). C is in whatever units `taus` is passed in, so
+    the caller must label it -- a coefficient with no stated units is the kind
+    of number that gets quoted back later attached to the wrong axis.
+
+    n is fitted rather than fixed at 1. The linear-instability growth rate is
+    sigma = M*a0*(T0-T), which predicts exactly n = 1, so the FITTED value is
+    the interesting output: a departure from 1 is a real measurement about the
+    data, not a fitting artifact to be assumed away. Measured n has come out
+    around 1.03-1.05, with the excess concentrated near T0.
+    """
+    x, y = [], []
+    for temp in temperatures:
+        drive, tau = T0 - temp, taus.get(temp, float("nan"))
+        if drive > 0 and np.isfinite(tau) and tau > 0:
+            x.append(np.log(drive))
+            y.append(np.log(tau))
+    if len(x) < 2:
+        return float("nan"), float("nan"), len(x)
+    slope, intercept = np.polyfit(np.array(x), np.array(y), 1)
+    return float(np.exp(intercept)), float(-slope), len(x)
+
+
 def _last_and_max(values: np.ndarray) -> tuple[float, float]:
     """Final and maximum value of a curve, NaN-safe (an all-NaN curve
     gives NaN rather than raising, so one bad temperature cannot take the
@@ -626,12 +652,21 @@ def check_stdev_phi_time(
     base_path: Path, size: int, min_step: int = 1, ref_fraction: float = 0.5,
     min_run_fraction: float = 0.9, exclude_seeds: set[int] | None = None,
     inspect_seed: int | None = None, statistic: str = "median",
-    output_path: Path | None = None,
+    plot: bool = True, output_path: Path | None = None,
 ) -> Path:
     """
     Collects stdev_phi(t) for every complete run in the sweep, groups by
     temperature (averaging over noise and seed), and tests whether the
     temperature dependence is a pure time rescaling.
+
+    plot (default True): render the figure. Set False for the console
+    tables alone -- tau/tau_down, the collapse ratios, the per-seed
+    comparison and the autocorr_length summary are all console output and
+    do not need the figure. Rendering eight panels of ~24 curves at
+    24x9in/120dpi costs ~1.5 s and is 99% of this function's total
+    runtime on a small sweep, so it dominates any repeated or scripted
+    use. The return value is still the path the figure WOULD occupy; no
+    file is written.
 
     statistic ("median" by default, or "mean"): how runs are combined at
     both levels, and what the shaded band means (p25-p75 for the median,
@@ -716,6 +751,7 @@ def check_stdev_phi_time(
     by_cell: dict[tuple[float, int, float, int], list[float]] = defaultdict(list)
     by_cell_ac: dict[tuple[float, int, float, int], list[float]] = defaultdict(list)
     grid_nx = grid_ny = 0
+    T0_value = 1.0  # overwritten from the first run's own metadata; never assumed
     temp_amplitude: dict[float, float] = {}
     temp_save_steps: dict[float, list[int]] = {}
     temp_dt_scale: dict[float, float] = {}
@@ -757,6 +793,7 @@ def check_stdev_phi_time(
         temp_run_count[temp] += 1
         temp_seeds[temp].add(metadata.seed)
         grid_nx, grid_ny = metadata.nx, metadata.ny
+        T0_value = float(metadata.T0)
 
         has_autocorr = "autocorr_length" in stats_df.columns
         this_run_max = 0
@@ -1065,14 +1102,16 @@ def check_stdev_phi_time(
               "~ L^2), not by the local growth rate -- unlike tau it is expected to depend on "
               "the system size.")
 
-    _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps, down_temps,
-           ref_fraction, output_path, statistic)
-    print(f"\nSaved figure to {output_path}")
+    if plot:
+        _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps, down_temps,
+               ref_fraction, output_path, statistic, T0_value)
+        print(f"\nSaved figure to {output_path}")
     return output_path
 
 
 def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps, down_temps,
-          ref_fraction, output_path: Path, statistic: str = "median") -> None:
+          ref_fraction, output_path: Path, statistic: str = "median",
+          T0_value: float = 1.0) -> None:
     r"""
     Six panels, arranged so that panels sharing an x axis sit in the SAME
     COLUMN, one above the other, with their axes linked (both panels keep
@@ -1154,6 +1193,7 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
 
     ax = axes[1, 1]
     finite = [t for t in temperatures if np.isfinite(taus[t])]
+    drive_xlim = None
     if finite:
         xs = [temp_amplitude[t] ** 2 for t in finite]
         ys = [taus[t] / 1000.0 for t in finite]  # thousands of steps; see the y label
@@ -1165,13 +1205,28 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
         ax.set_yscale("log")
         _log_axis_ticks(ax.xaxis, min(xs), max(xs))
         _log_axis_ticks(ax.yaxis, min(ys), max(ys))
+        # Remembered so [1,2] can share it: both panels plot against the same
+        # x quantity, but tau_down is defined at fewer temperatures, so letting
+        # it autoscale would silently show a narrower slice of the same axis
+        # and invite a visual comparison of two different ranges.
+        drive_xlim = ax.get_xlim()
     # x is -a(T)/b, i.e. the squared equilibrium amplitude, which is
     # LINEAR in the driving force a(T). Plotting tau against it directly
     # tests the "weaker driving force -> proportionally slower" reading:
     # a straight line of slope -1 here is exactly tau ~ 1/|T-T0|.
     ax.set_xlabel("-a(T)/b   (linear in driving force; labels are T)")
     ax.set_ylabel("tau (thousand steps)")
-    ax.set_title("does the driving force set the clock?\nslope -1 => tau ~ 1/|T-T0|")
+    # (T0 - T), not |T - T0|: below T0 the driving force a(T) = a0*(T-T0) is
+    # negative and the ordered phase grows; at or above T0 there is no
+    # instability at all and no tau to measure. The absolute value would imply
+    # a symmetry that does not exist.
+    coeff, exponent, n_fit = _fit_driving_force_law(temperatures, taus, T0_value)
+    if np.isfinite(coeff):
+        ax.set_title(f"does the driving force set the clock?\n"
+                      f"fit: tau = {coeff / 1000:.3g}k / (T0-T)^{exponent:.3f}  ({n_fit} points)")
+    else:
+        ax.set_title("does the driving force set the clock?\n"
+                      "tau ~ 1/(T0-T) would give exponent 1")
 
     ax = axes[0, 2]
     for temp in down_temps:
@@ -1195,24 +1250,33 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
     finite_down = [t for t in temperatures if np.isfinite(taus_down[t])]
     if finite_down:
         xs = [temp_amplitude[t] ** 2 for t in finite_down]
-        ys = [taus_down[t] / 1000.0 for t in finite_down]
+        ys = [taus_down[t] / 1e6 for t in finite_down]  # millions of steps
         ax.plot(xs, ys, "o-", color="tab:purple")
         for t, x, y in zip(finite_down, xs, ys):
             ax.annotate(_format_temp(t), (x, y), fontsize=6,
                          textcoords="offset points", xytext=(3, 3))
         ax.set_xscale("log")
-        ax.set_yscale("log")
+        # LINEAR y, unlike [1,1]. tau spans ~90x across this axis and needs a
+        # log scale to be readable at all; tau_down varies by well under a
+        # factor of 2, and a log scale would stretch that near-constancy into
+        # something that looks like a trend. The contrast between the two
+        # panels IS the result -- one quantity follows the driving force, the
+        # other essentially ignores it -- so the axes should not make them look
+        # alike.
         _log_axis_ticks(ax.xaxis, min(xs), max(xs))
-        _log_axis_ticks(ax.yaxis, min(ys), max(ys))
+        ax.set_ylim(bottom=0.0)
     else:
         ax.text(0.5, 0.5, "tau_down undefined at every T", ha="center", va="center",
                  transform=ax.transAxes, fontsize=9)
+    if drive_xlim is not None:
+        ax.set_xscale("log")
+        ax.set_xlim(drive_xlim)  # same x range as [1,1] -- see there
     # Same x as [1,1] so the two can be read directly against each other.
     # tau is a local growth time and lies on a clean -1 slope; tau_down
     # terminates when domains reach the BOX, so it need not, and its
     # VERTICAL position is the size-dependent quantity.
     ax.set_xlabel("-a(T)/b   (linear in driving force; labels are T)")
-    ax.set_ylabel("tau_down (thousand steps)")
+    ax.set_ylabel("tau_down (million steps)")
     ax.set_title("coarsening completion vs driving force\n(this one scales with the box)")
 
     # --- column 3: where the collapse breaks ----------------------------
@@ -1274,6 +1338,10 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
             ax_norm.axhline(100.0 * ref_fraction, color="k", ls=":", lw=1,
                              label=f"tau threshold ({100 * ref_fraction:g}%)")
 
+        # Anchored at 0 so the raw curve is read as a magnitude rather than as
+        # a shape: autoscaling a monotone decay makes a 15% fall look like a
+        # collapse. The normalized twin keeps its own scaling (0-100%).
+        ax.set_ylim(bottom=0.0)
         ax.set_ylabel("raw stdev_phi", color="tab:blue")
         ax.tick_params(axis="y", labelcolor="tab:blue")
         ax_norm.set_ylabel("stdev_phi / sqrt(-a(T)/b)  [%]", color="tab:orange")
@@ -1303,6 +1371,9 @@ def main():
                               "estimated from, so raising this further discards the signal this "
                               "diagnostic is built on")
     parser.add_argument("--ref-fraction", type=float, default=0.5)
+    parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True,
+                         help="--no-plot skips rendering the figure, which is ~99%% of the "
+                              "runtime; the console tables are unaffected")
     parser.add_argument("--statistic", choices=sorted(_AGGREGATORS), default="median",
                          help="how runs are combined at both levels (default median). Only "
                               "'mean' carries the late-time trapping probability; see "
@@ -1324,6 +1395,7 @@ def main():
                           min_run_fraction=args.min_run_fraction,
                           exclude_seeds=set(args.exclude_seeds) if args.exclude_seeds else None,
                           inspect_seed=args.inspect_seed, statistic=args.statistic,
+                          plot=args.plot,
                           output_path=args.output)
 
 
