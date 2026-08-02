@@ -158,3 +158,51 @@ def test_all_zero_component_falls_back_to_linear_axes(tmp_path):
         hist["stats0"][key] = [0.0] * 4
     out = loss_component_scatter([1, 2, 3, 4], hist, tmp_path / "zz.png", title="t")
     assert out is not None and Path(out).exists()
+
+
+# --------------------------------------------------------------------
+# loss_curve must survive a diverged loss
+# --------------------------------------------------------------------
+
+@pytest.mark.parametrize("label,train,val", [
+    ("every value inf", [float("inf")], [float("inf")]),
+    ("every value nan", [float("nan"), float("nan")], [float("nan"), float("nan")]),
+    ("one inf among finite", [2.0, float("inf")], [2.2, 1.6]),
+    ("one nan among finite", [2.0, float("nan")], [2.2, 1.6]),
+    ("all finite", [2.0, 1.5], [2.2, 1.6]),
+])
+def test_loss_curve_survives_non_finite_losses(tmp_path, label, train, val):
+    """
+    GUARDS crashing the TRAINING RUN from inside the plot. A diverged loss is a
+    real outcome, not corrupt input, and the figure is what shows you WHERE it
+    diverged -- losing the run to its own diagnostic is the worst possible
+    trade. This killed a 1000-epoch stage-3b run at epoch 1, after that
+    epoch's work was already done.
+
+    Two separate holes, both needed:
+
+      * the y guard was `min(all_values) > 0`, which PASSES when every value
+        is +inf (min([inf, inf]) is inf, and inf > 0 is True), so log scale
+        was set on data with no finite positive value. nan hid this in
+        testing because min() with a nan is order-dependent:
+        min([2.0, nan]) is 2.0 but min([nan, 2.0]) is nan.
+      * with no finite y anywhere, matplotlib registers no data limits at
+        all, so the X interval is degenerate too and the x-axis LogLocator
+        raises the identical error despite the epoch numbers being positive.
+        Filtering y alone was not enough.
+    """
+    from utils.plots import loss_curve
+    out = loss_curve(list(range(1, len(train) + 1)), train, val, val,
+                      tmp_path / f"{label.replace(' ', '_')}.png", title="t",
+                      secondary_train=train, secondary_val=val, secondary_label="1step")
+    assert out is None or Path(out).exists()
+
+
+def test_a_single_finite_point_still_gets_log_scale(tmp_path):
+    """The fallback must not be over-eager: one real value among non-finite
+    ones is still enough to scale by."""
+    import inspect
+    from utils import plots
+    src = inspect.getsource(plots.loss_curve)
+    assert "if math.isfinite(v)" in src, "non-finite values must be filtered, not tolerated"
+    assert "and bool(all_values)" in src, "the x-axis must stand down with the y-axis"

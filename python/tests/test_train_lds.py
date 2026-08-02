@@ -382,9 +382,12 @@ def test_z0_noise_scale_perturbs_train_only_not_val(tmp_path, monkeypatch, isola
     calls = []
     original_rollout = LatentDynamics.rollout
 
-    def _recording_rollout(self, z0, window1, dt_window, theta):
+    def _recording_rollout(self, z0, window1, dt_window, theta, **kwargs):
+        # **kwargs, not an explicit list: this wrapper only cares about z0 and
+        # the training flag, so it should not have to be edited every time
+        # rollout() gains an option (it broke once when z1_resync was added).
         calls.append((z0.detach().clone(), self.training))
-        return original_rollout(self, z0, window1, dt_window, theta)
+        return original_rollout(self, z0, window1, dt_window, theta, **kwargs)
 
     monkeypatch.setattr(LatentDynamics, "rollout", _recording_rollout)
 

@@ -4,6 +4,8 @@ evolves over time, given z1 (the derivative stream) as a known input at
 every step -- without solving the discretized phase-field PDE.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -67,10 +69,47 @@ class LatentDynamics(nn.Module):
 
     def __init__(self, latent_channels: int, n_theta: int = 1,
                  latent_spatial: int = LATENT_SPATIAL_SIZE, hidden_dim: int = 256,
-                 n_hidden_layers: int = 2, dt_cap: float = float("inf")):
+                 n_hidden_layers: int = 2, dt_cap: float = float("inf"),
+                 n_substeps: int = 1):
         super().__init__()
         self.latent_channels = latent_channels
         self.latent_spatial = latent_spatial
+        # n_substeps: how many integration steps rollout() takes BETWEEN two
+        # real frames. 1 is the historical behaviour exactly -- one step of
+        # the full dt, which is what forward() does and what stage 3a uses.
+        #
+        # It lives on the MODEL (like dt_cap, and unlike a training-loop
+        # policy) because it changes what f_theta MEANS. At n_substeps=1 the
+        # exact target is [z0(t+dt) - z0 - z1*dt]*2/dt^2, the AVERAGE
+        # curvature over the interval -- a quantity that depends on dt, which
+        # f_theta cannot see. As n_substeps grows that target converges to the
+        # pointwise z1_dot the design doc defines f_theta to be. Two f_theta
+        # checkpoints with the same shapes can therefore mean different
+        # things, which is why this is checkpointed and cross-checked on
+        # resume exactly as dt_cap is.
+        if n_substeps < 1:
+            raise ValueError(f"n_substeps must be >= 1, got {n_substeps}")
+        self.n_substeps = int(n_substeps)
+        if self.n_substeps > 1 and math.isfinite(dt_cap):
+            # dt_cap and sub-stepping are two answers to ONE question: how to
+            # stop f*(dt^2/2) dominating at large dt. The cap truncates the
+            # term; sub-stepping removes the large dt. Using both makes an
+            # n_substeps sweep measure their interaction rather than
+            # integration accuracy -- and the interaction is violent, because
+            # the cap bounds z0's second-order term while z1 still evolves on
+            # the UNCAPPED h. Measured at dt=2500, dt_cap=125, f=1: the total
+            # f contribution goes 7.8e3 (N=1) -> 1.6e6 (N=2) -> 3.1e6 (N=32,
+            # where h < cap and the cap is finally inert). A 400x spread that
+            # is entirely an artifact of the two mechanisms fighting.
+            #
+            # Not an error: a cap set BELOW every h is harmless, and refusing
+            # would be over-strict. But it must be visible, because the
+            # symptom is a plausible-looking sweep with a meaningless trend.
+            print(f"WARNING: n_substeps={self.n_substeps} together with a finite dt_cap="
+                  f"{dt_cap}. These compensate for the SAME thing, and any dt where "
+                  f"dt/n_substeps > dt_cap will have its second-order term truncated while z1 "
+                  f"keeps evolving on the uncapped step -- so an n_substeps sweep measures the "
+                  f"cap, not the integration. Use dt_cap=inf when sweeping n_substeps.")
         # dt_cap: caps dt ITSELF inside the second-order term only
         # (f_val*(dt^2/2) becomes f_val*(min(dt,dt_cap)^2/2)), NOT the
         # first-order z1*dt term, which keeps growing unbounded. Default
@@ -178,8 +217,67 @@ class LatentDynamics(nn.Module):
         dt_capped = torch.clamp(dt_r, max=self.dt_cap)
         return z0 + z1 * dt_r + f_val * (dt_capped ** 2 / 2)
 
+    def _integrate(self, z0: torch.Tensor, z1: torch.Tensor, dt: torch.Tensor,
+                    theta: torch.Tensor, f_carry: torch.Tensor | None = None):
+        """
+        Advance (z0, z1) across ONE real transition of `dt`, in
+        self.n_substeps sub-steps of delta_t = dt / n_substeps.
+
+        Returns (z0_next, z1_next, f_next). f_next is the f_theta value at the
+        arrival state, carried into the following transition so that each
+        sub-step costs exactly ONE f_theta evaluation.
+
+        SCHEME -- semi-implicit (predictor-corrector) velocity Verlet:
+
+            z0_{n+1} = z0_n + z1_n*h + f_n*h^2/2
+            z1~      = z1_n + f_n*h                        (predictor, Euler)
+            f_{n+1}  = f_theta(z0_{n+1}, z1~, theta)
+            z1_{n+1} = z1_n + (f_n + f_{n+1})*h/2          (corrector, trapezoid)
+
+        Semi-implicit, not implicit: z1_{n+1} appears inside f_{n+1}, and that
+        dependence is resolved by the Euler predictor rather than by a solve.
+        Nothing is evaluated at a state that has not yet been computed, so the
+        scheme is causal and runs unchanged at inference, where no future frame
+        exists.
+
+        WHY THE TRAPEZOIDAL z1 UPDATE, and not z1 += f*h. The one-sided Euler
+        update is FIRST order, and it drags the whole scheme down with it even
+        though z0's own update is second order: z1's O(h) error feeds back
+        through the z1*h term. Measured orders of convergence:
+
+            z1 += f*h                   1.02
+            z1 += (f_n + f_{n+1})*h/2   2.00
+
+        This is also what makes g_theta unnecessary HERE. g_theta approximates
+        z1_ddot and would buy a third-order z1 update; a centred average of
+        f_theta already recovers second order using f_theta alone. Note the
+        parallel with derivative_estimators.md: there a centred stencil beat a
+        one-sided one for ESTIMATING z0_dot; here a centred average beats a
+        one-sided evaluation for PROPAGATING z1. Same asymmetry, same fix.
+
+        RECYCLING f_{n+1} as the next sub-step's f_n (rather than
+        re-evaluating at the corrected z1) keeps the order at 2.00 for half the
+        evaluations, and at equal budget is slightly MORE accurate
+        (4.9e-5 at N=64 recycled vs 5.7e-5 at N=32 re-evaluated).
+
+        dt_cap applies to the SUB-step, so it becomes inert as n_substeps
+        grows -- which is the point: it exists to bound f*(dt^2/2) at large dt,
+        and sub-stepping removes the large dt.
+        """
+        dt_r = dt.view(-1, 1, 1, 1)
+        h = dt_r / self.n_substeps
+        h_capped = torch.clamp(h, max=self.dt_cap)
+        f_n = self.f(z0, z1, theta) if f_carry is None else f_carry
+        for _ in range(self.n_substeps):
+            z0 = z0 + z1 * h + f_n * (h_capped ** 2 / 2)
+            z1_pred = z1 + f_n * h
+            f_next = self.f(z0, z1_pred, theta)
+            z1 = z1 + (f_n + f_next) * (h / 2)
+            f_n = f_next
+        return z0, z1, f_n
+
     def rollout(self, z0: torch.Tensor, z1_sequence: torch.Tensor, dts: torch.Tensor,
-                theta: torch.Tensor) -> torch.Tensor:
+                theta: torch.Tensor, z1_resync: bool = True) -> torch.Tensor:
         """
         Repeated application of forward(), with z1 TEACHER-FORCED at
         its real (ground-truth) value at every step -- see class
@@ -206,7 +304,32 @@ class LatentDynamics(nn.Module):
         n_steps = dts.shape[1]
         z0_hats = [z0]
         z0_cur = z0
+
+        if self.n_substeps == 1 and z1_resync:
+            # The historical path, kept EXACTLY as it was rather than being
+            # expressed as a special case of the loop below. _integrate's
+            # trapezoidal z1 update produces a different (better) z1, and with
+            # z1 resynced at every frame that z1 is discarded anyway -- so the
+            # two agree numerically, but only for a reason that has to be
+            # re-derived every time someone reads it. A separate branch makes
+            # "the default is untouched" checkable by inspection.
+            for i in range(n_steps):
+                z0_cur = self.forward(z0_cur, z1_sequence[:, i], dts[:, i], theta)
+                z0_hats.append(z0_cur)
+            return torch.stack(z0_hats, dim=1)
+
+        # z1 is now PROPAGATED across sub-steps by _integrate. z1_resync
+        # decides only what happens at a REAL frame: True overwrites the
+        # propagated value with the encoder's (today's teacher-forcing),
+        # False keeps it (what inference is obliged to do, since no frame
+        # exists there to resync to).
+        z1_cur = z1_sequence[:, 0]
+        f_carry = None
         for i in range(n_steps):
-            z0_cur = self.forward(z0_cur, z1_sequence[:, i], dts[:, i], theta)
+            if z1_resync:
+                z1_cur = z1_sequence[:, i]
+                f_carry = None  # the carried f belongs to the value just discarded
+            z0_cur, z1_cur, f_carry = self._integrate(
+                z0_cur, z1_cur, dts[:, i], theta, f_carry)
             z0_hats.append(z0_cur)
         return torch.stack(z0_hats, dim=1)

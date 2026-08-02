@@ -3,6 +3,7 @@ Visualization helpers for phase-field snapshots -- displaying raw binary
 files directly, without going through the solver's PNG export.
 """
 
+import math
 from pathlib import Path
 
 import matplotlib.animation as animation
@@ -122,7 +123,22 @@ def loss_curve(
         all_series.append(secondary_train)
     if secondary_val is not None:
         all_series.append(secondary_val)
-    all_values = [v for series in all_series for v in series]
+    # FINITE values only. The previous version filtered nothing and tested
+    # min(all_values) > 0, which passes when every value is +inf --
+    # min([inf, inf]) is inf, and inf > 0 is True -- so log scale was set on
+    # data containing no finite positive value at all, and matplotlib raised
+    # "Data has no positive values, and therefore cannot be log-scaled" from
+    # deep inside tight_layout(). That killed a 1000-epoch training run at
+    # epoch 1, after the epoch's real work was already done.
+    #
+    # nan behaves differently and hid the problem in testing: min() with a nan
+    # is ORDER-DEPENDENT (min([2.0, nan]) is 2.0, min([nan, 2.0]) is nan), so
+    # a nan sometimes tripped the guard and sometimes did not.
+    #
+    # A diverged loss is a real outcome, not a corrupt input -- the figure
+    # should degrade to linear and keep the run alive, so the operator can see
+    # WHERE it diverged instead of losing the run to its plot.
+    all_values = [v for series in all_series for v in series if math.isfinite(v)]
     # Log scale needs every value strictly > 0 -- log(0) and log(negative)
     # are undefined. Losses are positive in practice, but this is a real
     # (if rare) edge case worth falling back gracefully for, not
@@ -155,7 +171,13 @@ def loss_curve(
     # generic plotting function called from several places -- same
     # defensive fallback already applied to loss values below, not an
     # assumption this will always hold.
-    use_log_x = bool(epochs) and min(epochs) > 0
+    # `and all_values`: with no finite y value anywhere, matplotlib registers
+    # no data limits at all (non-finite points are skipped), so the X view
+    # interval is degenerate too and ITS LogLocator raises the same
+    # "Data has no positive values" -- even though the epoch numbers are
+    # perfectly positive. Filtering y alone was not enough; the two axes have
+    # to stand down together.
+    use_log_x = bool(epochs) and min(epochs) > 0 and bool(all_values)
     if use_log_x:
         ax.set_xscale("log")
 

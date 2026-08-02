@@ -16,6 +16,7 @@ being on sys.path):
 """
 
 import argparse
+import math
 from collections.abc import Callable
 from pathlib import Path
 
@@ -55,7 +56,7 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_l
 
 def compute_euler_only_losses(
     f_theta: LatentDynamics, train_set, device: torch.device,
-    batch_size: int = 512, num_workers: int = 0,
+    batch_size: int = 512, num_workers: int = 0, z1_resync: bool = True,
 ) -> tuple["np.ndarray", "np.ndarray"]:
     """
     One pass over train_set with a FRESHLY-INITIALIZED f_theta (its
@@ -113,7 +114,13 @@ def compute_euler_only_losses(
             # through the real code path keeps this measurement exactly
             # consistent with what gets reweighted later, not a
             # separate approximation of it.
-            z0_hat_full = f_theta.rollout(z0, window1, dt_window, theta)
+            # z1_resync threaded through for the reason this comment block
+            # already gives: the baseline exists to be COMPARED against what
+            # training produces, so it has to be measured under the same
+            # rollout regime. Measuring it teacher-forced while training runs
+            # unforced would silently rescale the loss.
+            z0_hat_full = f_theta.rollout(z0, window1, dt_window, theta,
+                                           z1_resync=z1_resync)
             z0_hat = z0_hat_full[:, 1:]
 
             diff = z0_hat - z0_true
@@ -268,7 +275,8 @@ def _load_frozen_encoder(
 
 def _resume_f_theta_from_checkpoint(
     f_theta: torch.nn.Module, resume_from: Path, ae_config: dict,
-    hidden_dim: int, n_hidden_layers: int, dt_cap: float, n_rollout_steps: int,
+    hidden_dim: int, n_hidden_layers: int, dt_cap: float, n_substeps: int,
+    n_rollout_steps: int,
     device: torch.device,
 ) -> None:
     """
@@ -276,7 +284,7 @@ def _resume_f_theta_from_checkpoint(
     rollout: train at n_rollout_steps=1 first, then resume here at the
     target n_rollout_steps), validating the architecture matches
     exactly first -- latent_channels, hidden_dim, n_hidden_layers,
-    dt_cap, and latent_spatial_size. Mutates f_theta in place via
+    dt_cap, n_substeps, and latent_spatial_size. Mutates f_theta in place via
     load_state_dict, matching the idiom load_state_dict itself uses;
     no return value. Extracted verbatim from train_lds()'s own former
     body -- same logic, same order, just named and callable on its
@@ -325,6 +333,26 @@ def _resume_f_theta_from_checkpoint(
         print(f"Resumed f_theta from {resume_from} (epoch {prev_lds['epoch']}, "
               f"val_loss={prev_lds['val_loss']:.6f}, trained at n_rollout_steps="
               f"{prev_n_rollout if prev_n_rollout is not None else '?'})\n")
+        # n_substeps is REPORTED, not fatal -- unlike dt_cap and the shape
+        # parameters above. It changes what f_theta MEANS (a dt-averaged
+        # corrector at 1, the pointwise z1_dot as it grows), so it must be
+        # visible; but changing it is exactly what the 3a -> 3b handoff DOES.
+        # 3a is single-step by design -- that is what makes it
+        # ground-truth-conditioned -- and 3b sub-steps. Making the change
+        # fatal blocked the one transition the parameter exists to enable.
+        # Same reasoning as n_rollout_steps just below, which also changes
+        # legitimately at that boundary and is warned about rather than
+        # refused.
+        prev_n_substeps = prev_config.get("n_substeps", 1)
+        if prev_n_substeps != n_substeps:
+            print(f"NOTE: resuming from a checkpoint trained at n_substeps="
+                  f"{prev_n_substeps}, now running at n_substeps={n_substeps}. This is the "
+                  f"expected 3a -> 3b direction if it is 1 -> N: f_theta was fitted as a "
+                  f"dt-AVERAGED corrector over the whole step and will now be refined toward "
+                  f"the pointwise z1_dot the sub-stepped integrator needs. Going N -> 1 "
+                  f"instead would use a pointwise f_theta as a one-shot corrector, which is "
+                  f"NOT equivalent -- double-check that is intentional.\n")
+
         if prev_n_rollout is not None and n_rollout_steps <= prev_n_rollout:
             print(f"WARNING: resuming from a checkpoint trained at n_rollout_steps="
                   f"{prev_n_rollout}, but this run asks for n_rollout_steps="
@@ -356,7 +384,7 @@ def train_lds(
     one_step_weight: float = 0.0,
     use_dt_decade_weights: bool = False,
     z0_noise_scale: float = 0.0,
-    dt_cap: float = float("inf"),
+    dt_cap: float = float("inf"), n_substeps: int = 1, z1_resync: bool = True,
 ) -> Path:
     """
     Stage 3. Returns the path of the best checkpoint saved. Either give
@@ -398,6 +426,22 @@ def train_lds(
     point; there's no settled answer here yet on which direction is
     actually better in practice, just this tension to be aware of
     before picking one.
+
+    n_substeps: integration steps taken BETWEEN two real frames
+    (default 1 = today's behaviour exactly). Recorded in the checkpoint
+    and cross-checked on resume, because it changes what f_theta MEANS --
+    see LatentDynamics.__init__.
+
+    z1_resync: whether z1 is reset to its real, encoder-provided value at
+    each REAL frame of a rollout (default True = today's teacher-forcing).
+    A TRAINING policy, not a model property: at inference there is no frame
+    to resync to, so it has no meaning on the model itself, which is why it
+    is not a LatentDynamics constructor argument.
+
+    The two are orthogonal and must stay so: n_substeps changes the
+    integration BETWEEN frames, z1_resync changes what happens AT one.
+    (1, True) is both the current behaviour and exactly stage 3a's
+    configuration, so 3a needs no new parameters at all.
 
     one_step_weight: adds epsilon*L_1step on top of the (possibly
     step-weighted) rollout loss -- L = L_rollout + one_step_weight*L_1step,
@@ -605,7 +649,7 @@ def train_lds(
     f_theta = LatentDynamics(latent_channels=ae_config["latent_channels"], n_theta=1,
                               latent_spatial=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
-                              dt_cap=dt_cap).to(device)
+                              dt_cap=dt_cap, n_substeps=n_substeps).to(device)
 
     # Global per-decade loss weights, computed ONCE from train_set's own
     # full dt distribution AND its own raw per-transition loss
@@ -619,6 +663,7 @@ def train_lds(
     if use_dt_decade_weights and train_set is not None:
         all_dts, all_losses = compute_euler_only_losses(
             f_theta, train_set, device, batch_size=batch_size, num_workers=num_workers,
+            z1_resync=z1_resync,
         )
         dt_decade_weights_fn = compute_dt_decade_weights(all_dts, all_losses)
         print(f"use_dt_decade_weights=True: per-decade weights computed from "
@@ -627,7 +672,8 @@ def train_lds(
               f"{dict(sorted(dt_decade_weights_fn.decade_weight.items()))}\n")
 
     _resume_f_theta_from_checkpoint(
-        f_theta, resume_from, ae_config, hidden_dim, n_hidden_layers, dt_cap, n_rollout_steps, device,
+        f_theta, resume_from, ae_config, hidden_dim, n_hidden_layers, dt_cap, n_substeps,
+        n_rollout_steps, device,
     )
 
     step_weights_tensor = torch.tensor(step_weights, dtype=torch.float32, device=device) \
@@ -692,11 +738,17 @@ def train_lds(
             euler_step_scale = (z1_step0 * dt_step0).abs()
             z0 = z0 + z0_noise_scale * euler_step_scale * torch.randn_like(z0)
 
-        # window1 passed WHOLE (not just window1[:, 0]) -- rollout()
-        # teacher-forces the REAL z1 at every step, not a predicted
-        # one (see LatentDynamics' own class docstring: this is what
-        # makes f_theta directly testable without g_theta existing).
-        z0_hat_full = f_theta.rollout(z0, window1, dt_window, theta)
+        # window1 passed WHOLE (not just window1[:, 0]): at z1_resync=True
+        # (the default) rollout() teacher-forces the REAL z1 at every step
+        # rather than a predicted one -- see LatentDynamics' class docstring,
+        # this is what makes f_theta testable without g_theta existing.
+        #
+        # At z1_resync=False only window1[:, 0] is read and z1 is propagated
+        # by the integrator instead, which is what inference is obliged to do
+        # (no frame exists mid-rollout to resync to). The whole sequence is
+        # still passed so the two paths share one call signature.
+        z0_hat_full = f_theta.rollout(z0, window1, dt_window, theta,
+                                       z1_resync=z1_resync)
         z0_hat = z0_hat_full[:, 1:]
 
         # exponent_deriv=0.0 (set at RolloutLoss's own construction
@@ -877,6 +929,8 @@ def train_lds(
                     "latent_spatial_size": ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                     "hidden_dim": hidden_dim, "n_hidden_layers": n_hidden_layers,
                     "dt_cap": dt_cap,
+                    "n_substeps": n_substeps,
+                    "z1_resync": z1_resync,
                 },
                 "data_config": {
                     "min_step": min_step, "min_stdev_phi": min_stdev_phi,
@@ -917,6 +971,38 @@ def train_lds(
         secondary_val=val_1step_history if show_1step else None,
         secondary_label="1step",
     )
+
+    if not checkpoint_path.exists():
+        # A run that never saved is a FAILED run, and it must say so HERE.
+        # Returning the path anyway hands a non-existent file to the pipeline,
+        # which then dies inside the sanity check with a bare
+        # FileNotFoundError naming a checkpoint nobody asked about -- the real
+        # cause (nothing ever improved) is nowhere in that traceback.
+        #
+        # The usual cause is a diverged loss: `criterion < best_val_loss` is
+        # False for every comparison once val_loss is nan or inf, so no epoch
+        # can ever save and early stopping then fires on patience. The loss
+        # curve is still written just above, so it is available to look at.
+        finite = [v for v in val_loss_history if math.isfinite(v)]
+        diagnosis = (
+            "val_loss was never finite -- the run diverged. With n_substeps>1 the quantity "
+            "that must be small is the SUB-step h = dt/n_substeps at your LARGEST dt, not dt "
+            "itself: the second-order term goes as h^2/2.\n"
+            "        A finite dt_cap does NOT protect this. The cap bounds z0's own "
+            "second-order term, but z1 is advanced with the UNCAPPED h (z1 += f*h) and z0 then "
+            "picks that back up through z1*h -- so sub-stepping routes the divergence around "
+            "the cap. Raising n_substeps while leaving the cap in place therefore makes things "
+            "WORSE, not better.\n"
+            "        Either raise n_substeps until h is comparable to the largest dt stage 3a "
+            "trained on, or keep a max_dt in stage 3b so h stays in that range."
+            if not finite else
+            f"val_loss stayed finite (best {min(finite):.6g}) but never improved on the "
+            f"criterion -- check ema_warmup_epochs vs early_stopping_patience."
+        )
+        raise RuntimeError(
+            f"stage 3 finished without ever saving a checkpoint to {checkpoint_path}. "
+            f"{diagnosis} Loss curve written to {loss_curve_path}."
+        )
 
     return checkpoint_path
 
@@ -964,6 +1050,20 @@ def main():
                               "window's own |z1(t0)|*dt Euler-step magnitude -- see "
                               "train_lds()'s own docstring for the full rationale (default "
                               "0.0: off, exact prior behavior)")
+    parser.add_argument("--n-substeps", type=int, default=1,
+                         help="integration steps taken BETWEEN two real frames (default 1 = "
+                              "today's behaviour, and stage 3a's configuration). delta_t = dt/N, "
+                              "so a fixed N scales delta_t proportionally at every dt rather than "
+                              "capping it -- deliberately neutral, since capping would assume the "
+                              "large-delta_t answer the sweep is meant to test. Recorded in the "
+                              "checkpoint and cross-checked on resume: it changes what f_theta "
+                              "MEANS, not just how it is applied")
+    parser.add_argument("--z1-resync", action=argparse.BooleanOptionalAction, default=True,
+                         help="--no-z1-resync stops teacher-forcing z1 at real frames, so z1 is "
+                              "propagated by the integrator throughout -- what inference is "
+                              "obliged to do. Expect the rollout loss to RISE when this is turned "
+                              "off even if f_theta improved: errors now compound in z1 as well as "
+                              "z0. Judge it on the n_substeps sweep, not on the loss moving")
     parser.add_argument("--dt-cap", type=float, default=float("inf"),
                          help="caps dt INSIDE f_theta's own second-order correction term only "
                               "(f_val*(min(dt,dt_cap)^2/2)), not the first-order z1*dt term -- "
@@ -991,7 +1091,7 @@ def main():
         ae_stats_weight=args.ae_stats_weight,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
-        dt_cap=args.dt_cap,
+        dt_cap=args.dt_cap, n_substeps=args.n_substeps, z1_resync=args.z1_resync,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
         num_workers=args.num_workers, n_rollout_steps=args.n_rollout_steps,
         min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
