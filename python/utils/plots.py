@@ -277,20 +277,52 @@ def loss_component_scatter(
                 ax.scatter([x[-1]], [y[-1]], s=90, marker="*", color=color,
                            edgecolors="black", linewidths=0.5, zorder=5)
 
-        ax.set_xlim(left=0)
-        ax.set_ylim(bottom=0)
-        xmax = ax.get_xlim()[1]
-        ymax = ax.get_ylim()[1]
         all_x = cx["train"] + cx["val"] + cx["best_so_far"]
         all_y = cy["train"] + cy["val"] + cy["best_so_far"]
+
+        # LOG-LOG. These components span more than a decade within a single
+        # run -- stage 2's deriv went 0.79 -> 0.09 while recon0 went 8.5 -> 3.2
+        # -- and on linear axes the early, large values compress the whole
+        # late trajectory into a corner, which is exactly the part worth
+        # reading. Log axes give every factor-of-two the same visual weight.
+        #
+        # Non-positive values cannot be shown on a log axis. They are dropped
+        # from the LIMIT calculation rather than silently clipped, and a
+        # component that is legitimately 0 (an inactive term, e.g.
+        # stats1_weight=0) simply has no point to draw.
+        positive_x = [v for v in all_x if v > 0]
+        positive_y = [v for v in all_y if v > 0]
+        if positive_x and positive_y:
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            xlo, xmax = min(positive_x) / 1.6, max(positive_x) * 1.6
+            ylo, ymax = min(positive_y) / 1.6, max(positive_y) * 1.6
+        else:
+            ax.set_xlim(left=0)
+            ax.set_ylim(bottom=0)
+            xlo, ylo = 0.0, 0.0
+            xmax, ymax = ax.get_xlim()[1], ax.get_ylim()[1]
+
         for c in _iso_total_levels(all_x, all_y):
-            segment = _clip_iso_total_segment(c, xmax, ymax)
-            if segment is not None:
-                (x0, y0), (x1, y1) = segment
-                ax.plot([x0, x1], [y0, y1], "--", color="gray", alpha=0.35,
-                        linewidth=0.8, zorder=1)
-        ax.set_xlim(0, xmax)
-        ax.set_ylim(0, ymax)
+            if ax.get_xscale() == "log":
+                # x + y = c is a STRAIGHT line only on linear axes; on log-log
+                # it curves, so it has to be sampled rather than drawn from two
+                # endpoints. Sampled in log x, so the curve stays smooth across
+                # the whole decade rather than bunching near the right edge.
+                xs = np.geomspace(max(xlo, c * 1e-3), min(xmax, c), 200)
+                ys = c - xs
+                keep = ys > 0
+                if keep.sum() >= 2:
+                    ax.plot(xs[keep], ys[keep], "--", color="gray", alpha=0.35,
+                            linewidth=0.8, zorder=1)
+            else:
+                segment = _clip_iso_total_segment(c, xmax, ymax)
+                if segment is not None:
+                    (x0, y0), (x1, y1) = segment
+                    ax.plot([x0, x1], [y0, y1], "--", color="gray", alpha=0.35,
+                            linewidth=0.8, zorder=1)
+        ax.set_xlim(xlo if xlo else 0, xmax)
+        ax.set_ylim(ylo if ylo else 0, ymax)
         ax.set_xlabel(name_x)
         ax.set_ylabel(name_y)
         if idx == 0:

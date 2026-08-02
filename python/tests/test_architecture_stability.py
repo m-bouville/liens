@@ -82,7 +82,9 @@ _BATCH_SIZE = 4  # >1 required for BatchNorm's training-mode statistics
 _LR = 0.01
 _SEED = 0
 
-_FIXTURE_PATH = Path(__file__).resolve().parent / "architecture_v1_golden_master.pt"
+# tests/data/, alongside the real checkpoint the rescale tests run against --
+# binary fixtures live together rather than loose among the test modules.
+_FIXTURE_PATH = Path(__file__).resolve().parent / "data" / "architecture_v1_golden_master.pt"
 
 
 def _build_reference_model(seed: int = _SEED) -> Autoencoder:
@@ -352,6 +354,7 @@ if __name__ == "__main__":
     # archive means a regeneration done for the wrong reason is recoverable,
     # and it can be diffed afterwards to see what actually moved.
     _force = "--force" in sys.argv
+    _FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
     if _force and _FIXTURE_PATH.exists():
         _stamp = datetime.fromtimestamp(_FIXTURE_PATH.stat().st_mtime).strftime("%Y%m%d_%Hh%M")
         _archive = _FIXTURE_PATH.with_name(f"{_FIXTURE_PATH.stem}-{_stamp}{_FIXTURE_PATH.suffix}")

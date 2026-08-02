@@ -47,6 +47,24 @@ from evaluation.check_perturbation import check_perturbation
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_stage2.py -> python/
 
 
+def _compact_loss(value: float, width: int = 7, precision: int = 4) -> str:
+    """`f"{value:7.4f}"`, unless that overflows the field -- then 4 SIGNIFICANT
+    figures instead.
+
+    The epoch rows are all small numbers and fixed-point suits them. The
+    reference row is not: it reports an UNTRAINED component, and a freshly
+    built deriv stream starts around 4e4, which `:7.4f` renders as
+    "40613.3085" -- ten characters in a seven-character field, and nine
+    significant figures for a number whose leading digit is the only one that
+    means anything. It broke the column alignment and implied a precision the
+    quantity does not have.
+
+    Identical output for anything that fits, so the epoch rows are unchanged.
+    """
+    fixed = f"{value:{width}.{precision}f}"
+    return fixed if len(fixed) <= width else f"{value:{width}.{precision}g}"
+
+
 def train_stage2(
     base_path: Path, resume_from: Path,
     deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats0_weight: float = 0.0,
@@ -1023,13 +1041,14 @@ def train_stage2(
             stats1_label: (stats1_weight, stats1_scale, ref_stats1),
             "deriv": (deriv_weight, deriv_scale, ref_deriv),
         }
-        ref_terms = " ".join(f"+{w*v/s:7.4f}" for lbl, (w, s, v) in ref_term_values.items()
+        ref_terms = " ".join(f"+{_compact_loss(w * v / s)}" for lbl, (w, s, v) in ref_term_values.items()
                               if any(lbl == l for _, l, _ in active_terms))
-        nan_terms = " ".join(f"+{float('nan'):7.4f}" for lbl, (_, _, _) in ref_term_values.items()
+        nan_terms = " ".join(f"+{_compact_loss(float('nan'))}" for lbl, (_, _, _) in ref_term_values.items()
                               if any(lbl == l for _, l, _ in active_terms))
         print(f"{'ref':>4}|"
-              f"{float('nan'):7.4f} ={float('nan'):7.4f} {nan_terms} |"
-              f"{ref_total:7.4f} ={ref_recon/recon0_scale:7.4f} {ref_terms} |"
+              f"{_compact_loss(float('nan'))} ={_compact_loss(float('nan'))} {nan_terms} |"
+              f"{_compact_loss(ref_total)} ={_compact_loss(ref_recon / recon0_scale)} "
+              f"{ref_terms} |"
               f"{'(before this run)':>9}")
         torch.set_rng_state(_rng_state)
         if _cuda_rng_state is not None:

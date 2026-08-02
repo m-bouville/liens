@@ -23,7 +23,7 @@ from models.autoencoder import Autoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_streams import DEFAULT_STREAM_NAME, LatentStreamMode
 from training.checkpoint_criterion import (
-    CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
+    CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save, clamp_grace_epochs,
 )
 from training.datasets import MicrostructureSnapshotDataset, complete_run_dirs, split_run_dirs
 from training.losses import ReconLoss, StatsLoss
@@ -114,7 +114,7 @@ def train_autoencoder(
     min_passing_steps: int | None = None,
     stat_names: list[str] | None = None, stats0_weight: float | None = None,
     recon0_scale: float = 1.0, stats0_scale: float = 1.0,
-    val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
+    val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5, early_stopping_patience: int | None = None,
     seed: int = 0, checkpoint_path: Path | None = None,
     resume_from: Path | None = None, device: str | None = None,
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
@@ -183,6 +183,27 @@ def train_autoencoder(
     numbers separate fragmentation from a leak from a busy card. An
     augmented 128x128 epoch is ~48k batches, so ~2000 gives about 25
     lines per epoch.
+
+    ema_warmup_epochs: the save criterion is suppressed for this many
+    epochs at the start of a run (default 5, matching train_lds), while
+    the EMA accumulates real history.
+
+    It used to be 0, which made stage 1 the ONLY stage without the
+    protection, and the failure mode is the one
+    CheckpointCriterionTracker's own docstring describes: with no
+    warmup, epoch 1's raw, unsmoothed val_loss seeds BOTH the EMA and
+    best_val_loss, so a lucky first epoch sets a bar that later,
+    properly-smoothed values struggle to clear (smoothing pulls toward
+    an average, which rarely beats an extreme single-epoch low).
+
+    Observed on a real 128x128 run: epoch 1's val_loss was the minimum
+    of all 11 epochs, nothing was ever saved again, and early stopping
+    fired at epoch 11 while TRAIN loss was still falling (-19.6% over
+    the run). Stage 2 then trained from that epoch-1 checkpoint.
+
+    0 restores the old behaviour. clamp_grace_epochs() caps it so at
+    least one epoch can always save, which matters for short runs and
+    for epochs=0 ablations.
 
     cache_in_memory: hold every decoded snapshot in RAM (default True,
     which is what this function did unconditionally before the flag
@@ -422,7 +443,11 @@ def train_autoencoder(
         # step() -- see either function's own identical comment.
         return total.detach(), recon0.detach(), stats0.detach()
 
-    tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
+    # clamp_grace_epochs, not the raw value: a grace period covering every
+    # remaining epoch means NO checkpoint is written at all -- a missing file,
+    # not a worse one, and every downstream consumer fails far from the cause.
+    _grace = clamp_grace_epochs(ema_warmup_epochs, epochs)
+    tracker = CheckpointCriterionTracker(ema_warmup_epochs=_grace, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
 
     print(f"Starting {epochs} epochs (early_stopping_patience: "
@@ -657,7 +682,15 @@ def train_autoencoder(
             print(f"      z0: train mean={z0_train_mean:+.4e} std={z0_train_std:.4e} | "
                   f"val mean={z0_val_mean:+.4e} std={z0_val_std:.4e}")
 
-        if early_stopping_patience is not None and epochs_since_improvement >= early_stopping_patience:
+        # `epoch > _grace`, mirroring train_lds: during the warmup window
+        # should_save is unconditionally False, so every one of those epochs
+        # increments epochs_since_improvement. Without this, any
+        # ema_warmup_epochs >= early_stopping_patience would stop the run
+        # before the criterion had even started answering -- the same
+        # interaction that made train_stage2's deriv_target_centered switch
+        # stop one epoch short of its own grace window.
+        if (early_stopping_patience is not None and epoch > _grace
+                and epochs_since_improvement >= early_stopping_patience):
             print(f"Early stopping at epoch {epoch}: no improvement for "
                   f"{early_stopping_patience} epochs")
             break

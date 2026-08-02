@@ -755,3 +755,90 @@ def test_ported_checkpoint_resumes_when_the_new_run_wants_DIFFERENT_stats():
     assert saved is None, "a non-None state here is what train_autoencoder would try to load"
     # and the shapes really would have clashed
     assert head.net[2].out_features != len(STAT_NAMES)
+
+
+# --------------------------------------------------------------------
+# extract_stage1_checkpoint: stage 2 -> stage 1, SAME size
+# --------------------------------------------------------------------
+
+def test_extract_keeps_every_recon_weight_and_drops_only_the_deriv_stream():
+    """
+    The whole point, and what distinguishes this from a rescale: at unchanged
+    size NOTHING needs reinitialising, so the trunk, the state bottleneck, the
+    decoder and stats_head all carry over bit-for-bit. Running a rescale at
+    equal size would discard exactly those.
+    """
+    from training.rescale_checkpoint import extract_stage1_checkpoint
+    prev = _stage1_checkpoint(64, n_streams=2)
+    result = extract_stage1_checkpoint(prev)
+    state = result["model_state"]
+
+    for i in (0, 1, 2):
+        key = f"encoder.down_blocks.{i}.conv.block.0.weight"
+        src = f"encoders.shared.down_blocks.{i}.conv.block.0.weight"
+        assert torch.equal(state[key], prev["model_state"][src]), key
+    # the state bottleneck survives -- it is reinitialised by a PORT, not here
+    assert any("bottleneck" in k for k in state)
+    assert not any("deriv" in k for k in state)
+    assert list(result["config"]["stream_configs"]) == ["state"]
+    assert result["stats_head_state"] is not None
+
+
+def test_extract_output_loads_strictly_into_the_class_train_stage1_builds():
+    from models.autoencoder import Autoencoder
+    from training.rescale_checkpoint import extract_stage1_checkpoint
+    result = extract_stage1_checkpoint(_stage1_checkpoint(64, n_streams=2))
+    ae = Autoencoder(size=64, channels=1, base_channels=BASE_CHANNELS,
+                      latent_channels=LATENT_CHANNELS, latent_spatial_size=LATENT_SPATIAL)
+    ae.load_state_dict(result["model_state"])  # strict
+
+
+def test_extract_keeps_stats_normalisation_unlike_a_port():
+    """
+    GUARDS copying the port's stats-stripping into the extractor. A port
+    changes the grid size, so stats_mean/stats_std -- properties of the DATA --
+    are stale. An extract does not: same size, same sweep, still correct.
+    Stripping them would force a needless recomputation for a reason that does
+    not apply here.
+    """
+    from training.rescale_checkpoint import extract_stage1_checkpoint
+    prev = _stage1_checkpoint(64, n_streams=2)
+    result = extract_stage1_checkpoint(prev)
+    assert result["stats_config"]["stats_mean"] is not None
+    assert result["stats_config"]["stats_std"] is not None
+
+
+def test_extract_resets_the_training_history():
+    """
+    epoch/val_loss must not be inherited: the resumed stage-1 run has its own
+    save criterion and its own EMA, and a val_loss measured under stage 2's
+    weighting (and val_aug_averaging) is not a bar this run should have to
+    clear.
+    """
+    from training.rescale_checkpoint import extract_stage1_checkpoint
+    result = extract_stage1_checkpoint(_stage1_checkpoint(64, n_streams=2))
+    assert result["epoch"] == 0
+    assert math.isinf(result["val_loss"])
+    assert result["config"]["extracted_from_stage2"] is True
+
+
+def test_extract_accepts_an_already_single_stream_checkpoint():
+    from training.rescale_checkpoint import extract_stage1_checkpoint
+    result = extract_stage1_checkpoint(_stage1_checkpoint(64, n_streams=1))
+    assert list(result["config"]["stream_configs"]) == ["state"]
+
+
+@_needs_real
+def test_extract_on_the_real_stage2_checkpoint():
+    from models.autoencoder import Autoencoder
+    from training.rescale_checkpoint import extract_stage1_checkpoint
+    prev = torch.load(REAL_CHECKPOINT, map_location="cpu", weights_only=True)
+    cfg = prev["config"]
+    result = extract_stage1_checkpoint(REAL_CHECKPOINT)
+    ae = Autoencoder(size=cfg["size"], channels=1, base_channels=cfg["base_channels"],
+                      latent_channels=cfg["latent_channels"],
+                      latent_spatial_size=cfg["latent_spatial_size"])
+    ae.load_state_dict(result["model_state"])
+    key = "encoder.down_blocks.0.conv.block.0.weight"
+    assert torch.equal(result["model_state"][key],
+                        prev["model_state"]["encoders.shared." + key[len("encoder."):]])

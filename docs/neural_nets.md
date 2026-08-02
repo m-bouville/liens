@@ -32,22 +32,21 @@ There are five losses, which can be mixed and matched at the different stages:
 - one-step latent prediction loss: $L_\mathrm{1step}$,
 - multi-step rollout loss: $L_\mathrm{rollout}$.
 
-| \#| Stage                  | Trained |Frozen|Unused| C$_0$/C$_1$|Space | Loss                            |
+
+| \#| Stage             | Trained | Frozen | Unused | Space | Snapshots | Loss                            |
 |---|-------------------|--------------|------|------|-------|-------|---------------------------------|
-| 1 a| autoencoder (C$_0$) | E, D$_0$, SH$_0$|         | f    | C$_0$ | real  | `L_recon0 + λ L_stats0`           |
-| 2 | derivative (C$_1$) |E${}^*$, D$_0^*$| SH$_0$ | f | C$_1^\dagger$ | both |`L_recon0 + λ L_stats0+1 + λ₁ L_deriv` |
-| 3a| LDS               | f       | E, SH$_0$ | D$_0$ | both | latent| `L_1step + λ₁ L_deriv`           |
-| 3b| LDS               | f       | E, SH$_0$ | D$_0$ | both | latent| `L_rollout + ε L_1step + λ₁ L_deriv` |
-| 4 | encoder refinement| E, f    | D$_0$, SH$_0$|   | both | lat + ε real|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
-| 5 | end-to-end        | E, f, D$_0$ | SH$_0$  |      | both | real  |`L_recon + λ L_stats + λ₂ L_rollout + λ₁ L_deriv` |
+| 1 a| autoencoder (C$_0$)|E, D$_0$, SH$_0$|   | f    | real  | 1    | `L_recon0 + λ L_stats0`           |
+| 2 | derivative (C$_1$) |E${}^*$, D$_0^*$| SH$_0$ | f |latent$^\dagger$|3| `L_recon0 + λ L_stats0 + λ₁ L_deriv` |
+| 3a| LDS               | f       | E, SH$_0$ | D$_0$ | latent| 2    | `L_1step + λ₁ L_deriv`           |
+| 3b| LDS               | f       | E, SH$_0$ | D$_0$ | latent| n+1  | `L_rollout + ε L_1step + λ₁ L_deriv` |
+| 4 | encoder refinement| E, f    | D$_0$, SH$_0$|  | latent$^\dagger$|n+1|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
+| 5 | end-to-end        | E, f, D$_0$ | SH$_0$  |      | real  | n+1 | `L_recon + λ L_stats + λ₂ L_rollout + λ₁ L_deriv` |
 
 Notes:
-- `L_recon` means reconstruction for both C$_0$ (on µstructure itself) and C$_1$ (on time derivative),
-- likewise for `L_stats` (we do not heavily split them, so no need to at this high level),
-- SH: `stats_head`,
-- ${}^*$: outter layers frozen,
+- `L_deriv` requires three consecutive snapshots: adding it to stage 1 would double the computational cost (3 E + 1D instead of 1 E + 1 D);
+- SH: `stats_head`, n: `n_rollout_steps;
+- ${}^*$: outter layers frozen;
 - ${}^\dagger$: mostly.
-
 
 
 ![structure of stages and checkpoints](/assets/docs/liens_stage_checkpoint_flow.png "structure of stages and checkpoints")
@@ -195,107 +194,6 @@ again accounting for $\theta$.
 
 In stage 3a, we use only one step, `L_1step`. Stage 3b will involve several consecutive steps (`L_rollout`)​.
 
-
-### Residuals
-We have that
-$$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t))\,(\Delta t^2/2)$$
-approximates
-$$z_0(t + \Delta t) = z_0(t) + \dot{z}_0(t)\,\Delta t + \ddot{z}_0(t)\,(\Delta t^2/2) + A\,\Delta t^3.$$
-
-So, the residual is
-$$\frac{\tilde{z}_0(t + \Delta t) - z_0(t + \Delta t)}{\Delta t} = [z_1(t) - \dot{z}_0(t)] + \frac{1}{2}\left[f_\theta(z_0(t), z_1(t)) - \ddot{z}_0(t)\right]\Delta t - A \Delta t^2.$$
-The leading order is the error on $z_1$ and the next that on $f_\theta$.
-
-At stage 2 (before $f_\theta$ is available),
-$$\frac{[z_0(t) + z_1(t)\,\Delta t] - z_0(t + \Delta t)}{\Delta t} = [z_1(t) - \dot{z}_0(t)] - \frac{1}{2} \ddot{z}_0(t)\,\Delta t.$$
-
-
-#### The structure of residuals
-$z_1$ approximates $\dot{z}_0$:
-$$z_1(t) = \frac{z_0(t + \Delta t) - z_0(t) + \varepsilon_1}{\Delta t} + \varepsilon_1'.$$ 
-Hence, $$z_1(t) - \dot{z}_0(t) = \frac{\varepsilon_1}{\Delta t} + \varepsilon_1',$$ so that 
-$$\frac{[z_0(t) + z_1(t)\,\Delta t] - z_0(t + \Delta t)}{\Delta t} = \frac{\varepsilon_1}{\Delta t} + \varepsilon_1' - \frac{1}{2} \ddot{z}_0(t)\,\Delta t,$$
-and
-$$\frac{\tilde{z}_0(t + \Delta t) - z_0(t + \Delta t)}{\Delta t} = \frac{\varepsilon_1}{\Delta t} + \varepsilon_1' + \frac{1}{2}\left[f_\theta(z_0(t), z_1(t)) - \ddot{z}_0(t)\right]\Delta t - A \Delta t^2.$$
-
-$f_\theta$ approximates $\ddot{z}_0$, $f_\theta(z_0(t), z_1(t)) = \ddot{z}_0(t) + \varepsilon_{\!f} / \Delta t + \varepsilon_{\!f}'$,
-where $\varepsilon_{\!f}$ and $\varepsilon_{\!f}'$ may depend on $\varepsilon_1$ and $\varepsilon_1'$.
-This yields
-$$\frac{\tilde{z}_0(t + \Delta t) - z_0(t + \Delta t)}{\Delta t} = \frac{\varepsilon_1}{\Delta t} + \left(\varepsilon_1' + \frac{\varepsilon_{\!f}}{2}\right) + \frac{\varepsilon_{\!f}'}{2} \, \Delta t - A \Delta t^2.$$
-
-
-### t + 2 Dt
-
-Just like
-
-$$z_0(t + \Delta t) = z_0(t) + \dot{z}_0(t)\,\Delta t + \ddot{z}_0(t)\,(\Delta t^2/2) + A\,\Delta t^3,$$
-
-we have
-
-$$z_0(t + 2\Delta t) = z_0(t + \Delta t) + \dot{z}_0(t + \Delta t)\,\Delta t + \ddot{z}_0(t + \Delta t)\,(\Delta t^2/2) + A\,\Delta t^3.$$
-
-
-$$z_0(t + 2\Delta t) = 
-z_0(t) 
-{} + [\dot{z}_0(t) + \dot{z}_0(t + \Delta t)]\,\Delta t
-{} + [\ddot{z}_0(t) + \ddot{z}_0(t + \Delta t)]\,(\Delta t^2/2)
-{} + 2\,A\,\Delta t^3.$$
-
-
-
-We also know that
-<!-- $$z_1(t + \Delta t) = \dot{z}_0(t + \Delta t) + \frac{\varepsilon_1}{\Delta t} + \varepsilon_1',$$-->
-$$z_1(t) + z_1(t + \Delta t) = \dot{z}_0(t) + \dot{z}_0(t + \Delta t) + 2 \frac{\varepsilon_1}{\Delta t} + 2 \varepsilon_1',$$
-
-and
-<!--$$f_\theta(z_0(t + \Delta t), z_1(t + \Delta t)) = \ddot{z}_0(t + \Delta t) + \varepsilon_{\!f} / \Delta t + \varepsilon_{\!f}',$$-->
-$$f_\theta(z_0(t), z_1(t)) + f_\theta(z_0(t + \Delta t), z_1(t + \Delta t)) = \ddot{z}_0(t) + \ddot{z}_0(t + \Delta t) + 2\varepsilon_{\!f} / \Delta t + 2\varepsilon_{\!f}',$$
-
-yielding
-<!--$$z_0(t + 2\Delta t) = 
-z_0(t) 
-{} + [z_1(t) + z_1(t + \Delta t) - 2 \frac{\varepsilon_1}{\Delta t} - 2 \varepsilon_1']\,\Delta t
-{} + [f_\theta(z_0(t), z_1(t)) + f_\theta(z_0(t + \Delta t), z_1(t + \Delta t)) - 2\varepsilon_{\!f} / \Delta t - 2\varepsilon_{\!f}']\,(\Delta t^2/2)
-{} + 2\,A\,\Delta t^3.$$-->
-
-<!--$$z_0(t + 2\Delta t) = 
-z_0(t) 
-{} + [z_1(t) + z_1(t + \Delta t)] \,\Delta t - 2 \varepsilon_1 - 2 \varepsilon_1'\,\Delta t
-{} + [f_\theta(z_0(t), z_1(t)) + f_\theta(z_0(t + \Delta t), z_1(t + \Delta t))]\,(\Delta t^2/2) - \varepsilon_{\!f} \, \Delta t - \varepsilon_{\!f}'\,\Delta t^2
-{} + 2\,A\,\Delta t^3.$$-->
-
-<!--$$z_0(t + 2\Delta t) = 
-z_0(t) 
-{} + [z_1(t) + z_1(t + \Delta t)] \,\Delta t
-{} + [f_\theta(z_0(t), z_1(t)) + f_\theta(z_0(t + \Delta t), z_1(t + \Delta t))]\,(\Delta t^2/2) 
-{} - 2 \varepsilon_1 - (2 \varepsilon_1' + \varepsilon_{\!f}) \, \Delta t - \varepsilon_{\!f}'\,\Delta t^2
-{} + 2\,A\,\Delta t^3.$$-->
-
-<!--Or, more simply,-->
-$$z_0(t + 2\Delta t) = 
-z_0(t) 
-{} + [z_1(t) + z_1(t + \Delta t)] \,\Delta t
-{} + [f_\theta(t) + f_\theta(t + \Delta t)]\,(\Delta t^2/2) 
-{} - 2 \varepsilon_1 - (2 \varepsilon_1' + \varepsilon_{\!f}) \, \Delta t - \varepsilon_{\!f}'\,\Delta t^2
-{} + 2\,A\,\Delta t^3.$$
-
-
-By training of $$g_\theta$$,
-<!--$$z_1(t + \Delta t) \approx z_1(t) + f_\theta(z_0(t), z_1(t))\,\Delta t + g_\theta(z_0(t), z_1(t)) \, (\Delta t^2/2) - \varepsilon_{\!g} / \Delta t - \varepsilon_{\!g}'.$$-->
-$$z_1(t + \Delta t) \approx z_1(t) + f_\theta(t)\,\Delta t + g_\theta(t) \, (\Delta t^2/2) - \varepsilon_{\!g} / \Delta t - \varepsilon_{\!g}'.$$
-
-
-Finally,
-
-$$z_0(t + 2\Delta t) = 
-z_0(t) 
-{} + 2 z_1(t) \, \Delta t 
-{} + [3f_\theta(t) + f_\theta(t + \Delta t)]\,(\Delta t^2/2) 
-{} - 2 \varepsilon_1 - \varepsilon_{\!g}  - (2 \varepsilon_1' + \varepsilon_{\!f} + \varepsilon_{\!g}') \, \Delta t - \varepsilon_{\!f}'\,\Delta t^2
-{}  + [g_\theta(t)/2 + 2\,A] \, \Delta t^3.$$
-
-
----------------------------------
 
 
 ### Interpolation and perturbation

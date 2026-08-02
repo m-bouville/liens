@@ -509,3 +509,24 @@ def test_loss_component_scatter_values_reconstruct_train_total(tmp_path, isolate
             f"matching the console's own 4-decimal rounding -- these are two independently "
             f"computed, mathematically equal sums, not required to be bit-identical)"
         )
+
+
+def test_reference_row_keeps_its_column_width_on_a_huge_untrained_component():
+    """
+    GUARDS `:7.4f` on the reference row. It reports UNTRAINED components, and a
+    freshly built deriv stream starts around 4e4 -- rendered as "40613.3085":
+    ten characters in a seven-character field, and nine significant figures for
+    a number whose leading digit is the only meaningful one. It broke the
+    column and overstated the precision.
+
+    Values that fit are unchanged, so the epoch rows are untouched.
+    """
+    from training.train_stage2 import _compact_loss
+
+    assert _compact_loss(22.3422) == "22.3422"      # fits: identical to :7.4f
+    assert _compact_loss(0.7916) == " 0.7916"
+    assert len(_compact_loss(float("nan"))) == 7
+
+    big = _compact_loss(40613.3085)
+    assert len(big) < len(f"{40613.3085:7.4f}"), "must be shorter than the fixed-point form"
+    assert big.strip() == "4.061e+04", big

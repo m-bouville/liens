@@ -276,6 +276,42 @@ def _limit_torch_threads_under_xdist():
         yield
 
 
+def assert_figure_was_really_written(output_path, min_kb: float = 5.0):
+    """The figure exists and is not empty or truncated.
+
+    This is a MODEST check and the docstring says so on purpose, because two
+    stronger versions were tried and neither works:
+
+    - a fixed byte floor cannot separate blank from real across panel counts.
+      Measured at dpi=120: a CLEARED six-panel figure is 16.4 kB while a REAL
+      single-panel one is 13.3 kB. Any threshold that passes the second
+      accepts the first.
+    - normalising by a blank figure of the same pixel dimensions does not fix
+      it either: cleared-1-panel scores 4.66x its blank equivalent, real
+      24-panel only 2.21x.
+    - pixel metrics are worse still. "Fraction of non-white pixels" reads
+      0.0184 blank against 0.0230 for a real curve; "distinct colours" reads
+      198 against 439 but only 213 for a legitimate GRAYSCALE image plot --
+      and the reconstruction figures are exactly that.
+
+    So what this catches is a file that is MISSING, EMPTY or TRUNCATED -- a
+    real class of failure (an exception between savefig and close, a full
+    disk) that bare `.exists()` misses, and nothing more.
+
+    For "the figure was written but is WRONG or was drawn from NO DATA", assert
+    on what the script REPORTS: several return their window/sample counts
+    directly, and the rest print them. That is the check that actually
+    discriminates, and it is what the callers of this helper also do.
+    """
+    output_path = Path(output_path)
+    assert output_path.exists(), f"{output_path} was not written at all"
+    size_kb = output_path.stat().st_size / 1024
+    assert size_kb >= min_kb, (
+        f"{output_path.name} is only {size_kb:.1f} kB -- empty or truncated, not a figure"
+    )
+    return output_path
+
+
 @pytest.fixture
 def fake_encoder():
     return FakeEncoder(size=64, latent_channels=4)

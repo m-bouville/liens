@@ -295,3 +295,89 @@ def test_reference_row_components_sum_to_its_total(tmp_path, capsys):
     assert total == pytest.approx(recon0 + stats0, rel=1e-3), (
         f"ref components must sum to the ref total: {total} vs {recon0} + {stats0}"
     )
+
+
+# --------------------------------------------------------------------
+# ema_warmup_epochs in stage 1
+# --------------------------------------------------------------------
+
+def test_stage1_has_an_ema_warmup_by_default():
+    """
+    GUARDS ema_warmup_epochs=0, which made stage 1 the ONLY stage without the
+    protection every other stage has. With no warmup, epoch 1's raw val_loss
+    seeds BOTH the EMA and best_val_loss, so a lucky first epoch sets a bar
+    later smoothed values struggle to clear.
+
+    Observed on a real 128x128 run: epoch 1 was the minimum of all 11 epochs,
+    nothing saved again, early stop at epoch 11 with TRAIN loss still falling
+    19.6% -- and stage 2 then trained from that epoch-1 checkpoint.
+    """
+    assert inspect.signature(train_autoencoder).parameters["ema_warmup_epochs"].default == 5
+
+
+def test_stage1_warmup_epochs_do_not_count_toward_early_stopping():
+    """
+    GUARDS counting warmup epochs as non-improvement. During the window
+    should_save is unconditionally False, so every warmup epoch increments the
+    counter -- any ema_warmup_epochs >= early_stopping_patience would stop the
+    run before the criterion had begun answering. Exactly the interaction that
+    made stage 2's deriv_target_centered switch stop one epoch short of its
+    own grace window.
+    """
+    source = inspect.getsource(train_autoencoder)
+    guard = [l for l in source.splitlines() if "epochs_since_improvement >= early_stopping_patience" in l]
+    assert guard, "could not find the early-stopping check"
+    window = source[source.index("if (early_stopping_patience is not None"):]
+    assert "epoch > _grace" in window.split(":")[0]
+
+
+def test_stage1_warmup_is_clamped_so_a_short_run_can_still_save():
+    """
+    GUARDS passing ema_warmup_epochs straight through. A grace period covering
+    every remaining epoch means NO checkpoint is written at all -- a missing
+    file rather than a worse one, and every downstream consumer fails far from
+    the cause. clamp_grace_epochs exists for this and stage 1 must use it.
+    """
+    from training.checkpoint_criterion import clamp_grace_epochs
+    assert "clamp_grace_epochs(ema_warmup_epochs, epochs)" in inspect.getsource(train_autoencoder)
+    assert clamp_grace_epochs(5, 3) == 2      # always leaves one epoch able to save
+    assert clamp_grace_epochs(5, 1) == 0
+
+
+def test_no_epoch_inside_the_warmup_window_can_save(tmp_path, capsys):
+    """
+    The behaviour, end to end: no epoch within the warmup window may save, so
+    none of them can plant a flag later epochs must beat. That -- not "a save
+    happens afterwards" -- is the actual guarantee.
+
+    An earlier version of this test asserted a save occurred AFTER the window.
+    It passed alone and failed in-file, because whether any epoch improves at
+    all depends on the loss trajectory, which depends on which sweep the shared
+    ancestor cache happened to build first. Asserting on the mechanism instead
+    of on a data-dependent outcome makes it deterministic.
+    """
+    base_path, first = _ref_row_ancestor(tmp_path)
+    config = dict(_REF_ROW_CONFIG)
+    # ema_warmup_epochs=2 over 3 epochs, not the default 5 over 8: the property
+    # is "no epoch inside the window saves", which needs only the window plus
+    # one epoch past it to be observable. Running the default cost 19.9 s and
+    # made this the slowest test in the whole suite, for no extra coverage --
+    # the DEFAULT's value is pinned separately by
+    # test_stage1_has_an_ema_warmup_by_default, and clamp_grace_epochs by its
+    # own test, so nothing here needs to re-derive either.
+    warmup = 2
+    config.update(epochs=3, ema_warmup_epochs=warmup, early_stopping_patience=None,
+                   log_every_epoch=True)
+    capsys.readouterr()
+    train_autoencoder(base_path=base_path, checkpoint_path=tmp_path / "w.pt",
+                       loss_curve_path=tmp_path / "w.png", resume_from=first, **config)
+
+    saved_epochs = []
+    for line in capsys.readouterr().out.splitlines():
+        head = line.split("|")[0].strip()
+        if "-> saved" in line and head.isdigit():
+            saved_epochs.append(int(head))
+    assert all(e > warmup for e in saved_epochs), (
+        f"epoch(s) {[e for e in saved_epochs if e <= warmup]} saved inside the "
+        f"{warmup}-epoch warmup window -- the grace period is not suppressing saves"
+    )

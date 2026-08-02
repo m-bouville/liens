@@ -34,7 +34,8 @@ from orchestration.paths import _STAGE_DIRS
 from orchestration.stage_params import _backup_before_overwrite
 from training.checkpoint_criterion import atomic_torch_save
 from training.rescale_checkpoint import (
-    describe_rescale, reestimate_batchnorm_statistics, rescale_checkpoint_to_size,
+    describe_rescale, extract_stage1_checkpoint, reestimate_batchnorm_statistics,
+    rescale_checkpoint_to_size,
 )
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/X.py -> python/
@@ -159,8 +160,15 @@ def main():
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", type=Path, required=True,
                          help="a stage-1 (single-stream) checkpoint to port")
-    parser.add_argument("--to-size", type=int, required=True,
-                         help="new grid size; must be the source size * 2^k")
+    parser.add_argument("--to-size", type=int, default=None,
+                         help="new grid size; must be the source size * 2^k. Omit it together "
+                              "with --extract-stage1 to convert in place at the same size")
+    parser.add_argument("--extract-stage1", action="store_true",
+                         help="no rescale: turn a stage-2 checkpoint back into a stage-1-shaped "
+                              "one AT THE SAME SIZE, keeping every trained weight the recon "
+                              "pathway owns (stats_head included) and dropping only the deriv "
+                              "stream -- for restarting stage 1 from the autoencoder training "
+                              "stage 2 has already done")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--base-path", type=Path, default=None,
                          help="the NEW size's dataset root; if given, BatchNorm running "
@@ -178,6 +186,24 @@ def main():
                          help="report what would happen and write nothing")
     args = parser.parse_args()
 
+    if args.extract_stage1:
+        source = args.checkpoint
+        out = args.output or _STAGE_DIRS[1] / f"{source.stem}-as-stage1{source.suffix}"
+        checkpoint = extract_stage1_checkpoint(source, device=args.device)
+        if args.dry_run:
+            print(f"dry run -- would write {out}")
+            return
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.exists():
+            _backup_before_overwrite(out)
+        atomic_torch_save(checkpoint, out)
+        print(f"\nwrote {out}")
+        print(f"next: run STAGE 1 with resume_from={out.name}. Its epoch/val_loss are reset, so "
+              f"the run starts a fresh save history rather than inheriting stage 2's.")
+        return
+
+    if args.to_size is None:
+        parser.error("--to-size is required unless --extract-stage1 is given")
     port_checkpoint(
         checkpoint_path=args.checkpoint, to_size=args.to_size, output_path=args.output,
         base_path=args.base_path, batch_size=args.batch_size, n_batches=args.n_batches,

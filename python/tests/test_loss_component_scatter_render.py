@@ -107,3 +107,54 @@ def test_default_iso_level_count_is_four():
 
 def test_iso_levels_are_empty_rather_than_raising_on_no_data():
     assert _iso_total_levels([], []) == []
+
+
+def test_axes_are_log_log_when_every_value_is_positive(tmp_path):
+    """
+    Components span more than a decade within a run (stage 2: deriv 0.79 ->
+    0.09 while recon0 went 8.5 -> 3.2). On linear axes the early large values
+    compress the late trajectory -- the part worth reading -- into a corner.
+    """
+    import inspect
+    from utils import plots
+    src = inspect.getsource(plots.loss_component_scatter)
+    assert 'ax.set_xscale("log")' in src and 'ax.set_yscale("log")' in src
+
+    out = loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
+    assert out is not None and Path(out).exists()
+
+
+def test_iso_lines_are_sampled_not_drawn_as_straight_segments_on_log_axes():
+    """
+    GUARDS reusing _clip_iso_total_segment on log axes. x + y = c is a straight
+    line only on LINEAR axes; on log-log it curves, so a two-endpoint segment
+    would draw a chord that crosses the real iso-total instead of tracing it --
+    a reference line that is wrong everywhere except at its two ends.
+    """
+    import inspect
+    from utils import plots
+    src = inspect.getsource(plots.loss_component_scatter)
+    log_branch = src[src.index('if ax.get_xscale() == "log":'):]
+    assert "geomspace" in log_branch.split("else:")[0]
+
+
+def test_non_positive_values_do_not_crash_the_log_axes(tmp_path):
+    """
+    A component can be legitimately 0 -- an inactive term, e.g.
+    stats1_weight=0. Log axes cannot show it, so it must be excluded from the
+    limits rather than crashing or silently clipping every other point.
+    """
+    hist = _histories()
+    hist["stats0"]["val"] = [0.0] + hist["stats0"]["val"][1:]
+    out = loss_component_scatter([1, 2, 3, 4], hist, tmp_path / "z.png", title="t")
+    assert out is not None and Path(out).exists()
+
+
+def test_all_zero_component_falls_back_to_linear_axes(tmp_path):
+    """The fallback must exist: a component that is zero throughout has no
+    positive value at all, and a log axis with no valid range is an error."""
+    hist = _histories()
+    for key in ("train", "val", "best_so_far"):
+        hist["stats0"][key] = [0.0] * 4
+    out = loss_component_scatter([1, 2, 3, 4], hist, tmp_path / "zz.png", title="t")
+    assert out is not None and Path(out).exists()

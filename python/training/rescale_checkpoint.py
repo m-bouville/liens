@@ -533,3 +533,127 @@ def reestimate_batchnorm_statistics(
             "replace, and silent. Check that `batches` is not an exhausted iterator."
         )
     return seen
+
+
+def extract_stage1_checkpoint(
+    source: Path | dict, device: str | torch.device | None = None,
+) -> dict:
+    """
+    A stage-1-shaped checkpoint from a stage-2 one, AT THE SAME SIZE.
+
+    Use when stage 1 stopped early and stage 2 has since kept training the
+    autoencoder: with z0_from_deriv_weight=0, stage 2's L_deriv cannot shape
+    z0, so every improvement in its recon0/stats0 is ordinary stage-1 progress
+    bought at stage-2 prices. This hands that progress back so stage 1 can
+    resume from it instead of from its own (possibly much earlier) checkpoint.
+
+    NOT a rescale, and deliberately a separate function rather than
+    rescale_checkpoint_to_size(to_size == from_size). The two differ in the
+    thing that matters most:
+
+        rescale   channels[-1] doubles, so the bottleneck, the FiLM
+                  conditioners and the decoder's unbottleneck CANNOT carry
+                  over -- they are reinitialised, and f_theta/stats_head are
+                  discarded because the latent basis is rebuilt.
+        extract   nothing changes shape, so EVERYTHING the recon pathway
+                  owns carries over unchanged, stats_head included. The only
+                  losses are the deriv stream and its head, which stage 2
+                  rebuilds from scratch anyway.
+
+    Running a rescale at equal size would therefore throw away exactly the
+    trained weights this function exists to preserve.
+
+    stats_config is kept INTACT here, unlike in a port: stats_mean/stats_std
+    are properties of the DATA, and at the same size on the same sweep they
+    are still correct. Stripping them would force a needless recomputation and
+    would look like the port's behaviour for a reason that does not apply.
+
+    Returns the checkpoint dict; the caller writes it (see port_checkpoint.py
+    for the atomic-save + backup convention).
+    """
+    device = torch.device(device or "cpu")
+    if isinstance(source, dict):
+        prev, origin = source, "<in-memory checkpoint>"
+    else:
+        prev = torch.load(source, map_location=device, weights_only=True)
+        origin = str(source)
+
+    model_cfg = prev["config"]
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, prev["model_state"],
+    )
+    dropped = [n for n in stream_configs if n != recon_stream_name]
+
+    encoder_state = _strip_encoder_or_decoder_prefix(prev["model_state"], "encoder")
+    decoder_state = _strip_decoder_prefix_for_stream(
+        prev["model_state"], model_cfg, recon_stream_name)
+    if not encoder_state or not decoder_state:
+        raise ValueError(
+            f"Could not find encoder and/or decoder weights in {origin} under any known key "
+            f"layout. Keys begin: {sorted(prev['model_state'])[:4]}"
+        )
+
+    # Only the recon stream's own bottleneck/conditioner: the ModuleDicts are
+    # keyed by stream name, so the dropped streams' entries must go with them
+    # or the single-stream Encoder will refuse them as unexpected keys.
+    keep = {}
+    for key, value in encoder_state.items():
+        parts = key.split(".")
+        if parts[0] in ("bottlenecks", "theta_conditioners"):
+            if len(parts) > 1 and parts[1] != recon_stream_name:
+                continue
+        keep[key] = value
+    encoder_state = keep
+
+    state_cfg = stream_configs[recon_stream_name]
+    size = int(model_cfg["size"])
+    autoencoder = Autoencoder(size=size, channels=1,
+                               base_channels=int(model_cfg["base_channels"]),
+                               latent_channels=state_cfg.channels,
+                               latent_spatial_size=state_cfg.spatial_size)
+    # The single-stream Autoencoder names its bottleneck without a stream key
+    # (see models/autoencoder.py's own _STREAM_NAME), so the recon stream's
+    # entries are renamed rather than dropped.
+    target = set(autoencoder.encoder.state_dict())
+    renamed = {}
+    for key, value in encoder_state.items():
+        if key not in target:
+            stripped = key.replace(f".{recon_stream_name}.", ".", 1)
+            if stripped in target:
+                key = stripped
+        renamed[key] = value
+    autoencoder.encoder.load_state_dict(renamed)
+    autoencoder.decoder.load_state_dict(decoder_state)
+    autoencoder = autoencoder.to(device)
+
+    new_config = dict(model_cfg)
+    new_config["stream_configs"] = {
+        recon_stream_name: {"channels": state_cfg.channels,
+                             "spatial_size": state_cfg.spatial_size,
+                             "mode": state_cfg.mode.value,
+                             "condition_on_theta": state_cfg.condition_on_theta}
+    }
+    new_config["recon_stream_name"] = recon_stream_name
+    new_config.pop("decoder_for_stream", None)
+    new_config["extracted_from_stage2"] = True
+
+    if dropped:
+        print(f"extracted a stage-1 checkpoint from {origin}: kept the recon pathway "
+              f"({recon_stream_name} + its decoder + stats_head), dropped stream(s) {dropped}. "
+              f"Nothing was reinitialised -- the size is unchanged, so every trained weight the "
+              f"recon pathway owns carries over.")
+
+    return {
+        "model_state": {k: v.detach().clone() for k, v in autoencoder.state_dict().items()},
+        # stats_head0 is on the recon latent, whose basis is UNCHANGED here, so
+        # unlike a port its weights are still meaningful.
+        "stats_head_state": prev.get("stats_head_state"),
+        "epoch": 0,
+        "val_loss": float("inf"),
+        "val_loss_ema": None,
+        "normalized": prev.get("normalized", False),
+        "test_dirs": prev.get("test_dirs", []),
+        "config": new_config,
+        "stats_config": prev.get("stats_config"),
+    }

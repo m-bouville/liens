@@ -33,7 +33,11 @@ AttributeError, not something a mock could paper over.
 from pathlib import Path
 
 import torch
+import re
+
 import pytest
+
+from conftest import assert_figure_was_really_written
 
 from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.decoder import Decoder
@@ -161,7 +165,7 @@ def test_check_latent_channels_non_default_spatial_size(tmp_path, tmp_run_dir):
     output_path = check_latent_channels(
         ae_checkpoint_path=ae_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
     )
-    assert output_path.exists()
+    assert_figure_was_really_written(output_path)
 
 
 @pytest.mark.filterwarnings("ignore:checkpoint's saved config only described streams")
@@ -177,12 +181,12 @@ def test_check_latent_channels_stale_multi_stream_metadata(tmp_path, tmp_run_dir
     output_path = check_latent_channels(
         ae_checkpoint_path=ae_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
     )
-    assert output_path.exists()
+    assert_figure_was_really_written(output_path)
 
 
 # ---- check_reconstruction ---------------------------------------------------
 
-def test_check_reconstruction_non_default_spatial_size(tmp_path, tmp_run_dir):
+def test_check_reconstruction_non_default_spatial_size(tmp_path, tmp_run_dir, capsys):
     run_dir, steps = tmp_run_dir
     ae_path = tmp_path / "fake-stage2.pt"
     _save_ae_checkpoint(ae_path, [run_dir], size=64, latent_spatial_size=_NON_DEFAULT_SPATIAL)
@@ -190,11 +194,18 @@ def test_check_reconstruction_non_default_spatial_size(tmp_path, tmp_run_dir):
     output_path = check_reconstruction(
         checkpoint_path=ae_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
     )
-    assert output_path.exists()
-
+    assert_figure_was_really_written(output_path)
+    # A script that found NO data still writes its figure, so the blank check
+    # above cannot see that case; the count it prints can.
+    printed = capsys.readouterr().out
+    counts = [int(n) for n in re.findall(r"(\d+) samples", printed)]
+    assert counts and max(counts) > 0, (
+        f"the script reported no samples -- it wrote a figure without processing "
+        f"any data:\n{printed[-400:]}"
+    )
 
 @pytest.mark.filterwarnings("ignore:checkpoint's saved config only described streams")
-def test_check_reconstruction_stale_multi_stream_metadata(tmp_path, tmp_run_dir):
+def test_check_reconstruction_stale_multi_stream_metadata(tmp_path, tmp_run_dir, capsys):
     run_dir, steps = tmp_run_dir
     ae_path = tmp_path / "fake-stage2-stale.pt"
     _save_ae_checkpoint(ae_path, [run_dir], size=64, latent_spatial_size=_NON_DEFAULT_SPATIAL,
@@ -203,12 +214,20 @@ def test_check_reconstruction_stale_multi_stream_metadata(tmp_path, tmp_run_dir)
     output_path = check_reconstruction(
         checkpoint_path=ae_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
     )
-    assert output_path.exists()
+    assert_figure_was_really_written(output_path)
 
 
 # ---- check_interpolation / check_perturbation -------------------------------
 # Both need real statistics.csv data (stat_names must match real columns)
 # -- tmp_run_dir_with_stats provides that.
+    # A script that found NO data still writes its figure, so the blank check
+    # above cannot see that case; the count it prints can.
+    printed = capsys.readouterr().out
+    counts = [int(n) for n in re.findall(r"(\d+) samples", printed)]
+    assert counts and max(counts) > 0, (
+        f"the script reported no samples -- it wrote a figure without processing "
+        f"any data:\n{printed[-400:]}"
+    )
 
 def test_check_interpolation_non_default_spatial_size(tmp_path, tmp_run_dir_with_stats):
     run_dir, steps, stat_names = tmp_run_dir_with_stats
@@ -219,7 +238,7 @@ def test_check_interpolation_non_default_spatial_size(tmp_path, tmp_run_dir_with
     output_path = check_interpolation(
         checkpoint_path=ae_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
     )
-    assert output_path.exists()
+    assert_figure_was_really_written(output_path)
 
 
 def test_check_perturbation_non_default_spatial_size(tmp_path, tmp_run_dir_with_stats):
@@ -232,14 +251,14 @@ def test_check_perturbation_non_default_spatial_size(tmp_path, tmp_run_dir_with_
         checkpoint_path=ae_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
         n_samples=2, n_repeats=2,
     )
-    assert output_path.exists()
+    assert_figure_was_really_written(output_path)
 
 
 # ---- check_rollout / check_parameter_dependence -----------------------------
 # Both need a real (AE, LDS) pair, LDS pointing back at the AE via
 # "ae_checkpoint" -- the exact shape train_lds.py itself produces.
 
-def test_check_rollout_non_default_spatial_size(tmp_path, tmp_run_dir):
+def test_check_rollout_non_default_spatial_size(tmp_path, tmp_run_dir, capsys):
     run_dir, steps = tmp_run_dir
     ae_path = tmp_path / "fake-stage2.pt"
     lds_path = tmp_path / "fake-stage3b.pt"
@@ -248,14 +267,17 @@ def test_check_rollout_non_default_spatial_size(tmp_path, tmp_run_dir):
     _save_lds_checkpoint(lds_path, ae_path, latent_spatial_size=_NON_DEFAULT_SPATIAL,
                           run_dirs=[run_dir])
 
-    output_path, _windows = check_rollout(
+    output_path, windows = check_rollout(
         lds_checkpoint_path=lds_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
         n_samples=1,
     )
-    assert output_path.exists()
+    assert_figure_was_really_written(output_path)
+    # check_rollout RETURNS its windows, so assert on those rather than on
+    # parsed console text: the figure is written unconditionally, so "it
+    # exists" cannot distinguish a real run from one that found nothing.
+    assert len(windows) > 0, "check_rollout wrote a figure without processing any window"
 
-
-def test_check_parameter_dependence_non_default_spatial_size(tmp_path, tmp_run_dir_with_stats):
+def test_check_parameter_dependence_non_default_spatial_size(tmp_path, tmp_run_dir_with_stats, capsys):
     run_dir, steps, stat_names = tmp_run_dir_with_stats
     # check_parameter_dependence specifically needs "autocorr_length"
     # for its length-scale panel -- the shared fixture's stat set
@@ -278,8 +300,15 @@ def test_check_parameter_dependence_non_default_spatial_size(tmp_path, tmp_run_d
     output_path = check_parameter_dependence(
         lds_checkpoint_path=lds_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
     )
-    assert output_path.exists()
-
+    assert_figure_was_really_written(output_path)
+    # A script that found NO data still writes its figure, so the blank check
+    # above cannot see that case; the count it prints can.
+    printed = capsys.readouterr().out
+    counts = [int(n) for n in re.findall(r"(\d+) windows", printed)]
+    assert counts and max(counts) > 0, (
+        f"the script reported no windows -- it wrote a figure without processing "
+        f"any data:\n{printed[-400:]}"
+    )
 
 @pytest.mark.filterwarnings("ignore:checkpoint's saved config only described streams")
 def test_check_rollout_stale_multi_stream_metadata(tmp_path, tmp_run_dir):
@@ -297,7 +326,7 @@ def test_check_rollout_stale_multi_stream_metadata(tmp_path, tmp_run_dir):
         lds_checkpoint_path=lds_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
         n_samples=1,
     )
-    assert output_path.exists()
+    assert_figure_was_really_written(output_path)
 
 
 def test_check_reconstruction_min_stdev_phi_is_actually_enforced(tmp_path, tmp_run_dir_with_stats):
@@ -321,7 +350,7 @@ def test_check_reconstruction_min_stdev_phi_is_actually_enforced(tmp_path, tmp_r
         checkpoint_path=ae_path, device="cpu", min_step=0, min_stdev_phi=None,
         output_path=tmp_path / "out_unfiltered.png",
     )
-    assert output_path.exists()
+    assert_figure_was_really_written(output_path)
 
     # The actual fix under test: a min_stdev_phi higher than every
     # stdev_phi value in the fixture must exclude every window,
@@ -377,6 +406,6 @@ def test_check_reconstruction_derivative_panel_uses_6_cols_with_symmetric_d0(tmp
     finally:
         check_reconstruction_module.plt.subplots = real_subplots
 
-    assert output_path.exists()
+    assert_figure_was_really_written(output_path)
     axes = captured["axes"]
     assert axes.shape[1] == 6, f"expected 6 columns with a derivative panel, got {axes.shape[1]}"

@@ -648,6 +648,172 @@ def _report_autocorr_length(by_cell_ac: dict, taus: dict, nx: int, ny: int,
           "unless the sweeps ran for a similar number of steps.")
 
 
+def _report_seed_ranks(by_temp_seed_step: dict, temp_amplitude: dict,
+                        temperatures: list, aggregate=np.median) -> None:
+    """Console table ranking each seed against the seeds it shares a cell with.
+
+    Extracted from check_stdev_phi_time, which reached ~460 lines as each
+    finding this session added a section to it. Everything below the curve
+    construction is a pure function of already-computed data, so naming the
+    blocks costs nothing and makes the top-level function readable as a
+    sequence of steps rather than one long script.
+    """
+    # Per-seed comparison, STRATIFIED by (temperature, step).
+    #
+    # A seed's raw median over its own samples is NOT comparable across
+    # seeds, because seeds do not all cover the same temperatures: this
+    # sweep has general-purpose seeds present at every temperature and
+    # others run only at the high-T end, where stdev_phi is small for
+    # purely physical reasons. Ranking seeds by their raw medians
+    # therefore sorts them mostly by WHICH TEMPERATURES THEY COVER, and
+    # an outlier test built on that centre compares two different
+    # populations.
+    #
+    # Fixed by comparing seeds only against the seeds they actually share
+    # a cell with. Within each (temperature, step) cell every seed sees
+    # identical physics, so a seed's position within that cell is
+    # meaningful; aggregating those positions over its own cells gives a
+    # statistic that does not care which cells it has. Two are reported:
+    #   med rank -- median normalized rank within a cell (0 = lowest of
+    #     the seeds present, 1 = highest, 0.5 = typical). Scale-free, so
+    #     it is not dominated by the low-T cells where values are large.
+    #   med dev  -- median (value - cell median), for magnitude, since a
+    #     rank alone cannot say whether being highest matters.
+    # The outlier flag keys on RANK; dev is context.
+    cell_values: dict[tuple[float, int], dict[int, float]] = defaultdict(dict)
+    for (temp, seed, step), values in by_temp_seed_step.items():
+        amp = temp_amplitude.get(temp, 0.0)
+        if amp > 0:
+            cell_values[(temp, step)][seed] = float(aggregate(values)) / amp
+
+    seed_ranks: dict[int, list[float]] = defaultdict(list)
+    seed_devs: dict[int, list[float]] = defaultdict(list)
+    seed_temps: dict[int, set] = defaultdict(set)
+    for (temp, _step), per_seed in cell_values.items():
+        if len(per_seed) < 2:
+            continue  # a rank within a cell of one is not a comparison
+        seeds_here = list(per_seed)
+        vals = np.array([per_seed[sd] for sd in seeds_here])
+        cell_median = float(np.median(vals))
+        order = _average_ranks(vals)  # ties share their mean rank -- see _average_ranks
+        for position, sd in zip(order, seeds_here):
+            seed_ranks[sd].append(float(position) / (len(seeds_here) - 1))
+            seed_devs[sd].append(per_seed[sd] - cell_median)
+            seed_temps[sd].add(temp)
+
+    if seed_ranks:
+        print("\nper-seed comparison, stratified by (temperature, step) -- seeds are compared "
+              "ONLY against seeds present in the same cell, so a seed run at a subset of "
+              "temperatures is not penalised for its coverage:")
+        print("     seed   n_temps          T range   med rank    med dev    p10 dev    p90 dev"
+              "    n cells")
+        rows = []
+        for sd, ranks in seed_ranks.items():
+            devs = np.array(seed_devs[sd])
+            temps_here = sorted(seed_temps[sd])
+            rows.append((sd, len(temps_here), temps_here[0], temps_here[-1],
+                          float(np.median(ranks)), float(np.median(devs)),
+                          float(np.percentile(devs, 10)), float(np.percentile(devs, 90)),
+                          len(ranks)))
+        rows.sort(key=lambda r: r[4])
+        for sd, n_t, t_lo, t_hi, med_rank, med_dev, p10, p90, n_cells in rows:
+            print(f"  {sd:7d}   {n_t:7d}   {t_lo:6.3f}-{t_hi:6.3f}   {med_rank:8.3f}   "
+                  f"{med_dev:+8.4f}   {p10:+8.4f}   {p90:+8.4f}   {n_cells:8d}")
+
+        coverages = {r[1] for r in rows}
+        if len(coverages) > 1:
+            print(f"  NOTE: seeds cover different numbers of temperatures {sorted(coverages)}. "
+                  f"That is exactly why the flag below uses rank-within-cell and not the raw "
+                  f"per-seed median, which would mostly rank seeds by their coverage.")
+
+        med_ranks = np.array([r[4] for r in rows])
+        if len(med_ranks) >= 3:
+            centre = float(np.median(med_ranks))
+            spread = float(np.median(np.abs(med_ranks - centre)))
+            if spread > 0:
+                outliers = [r[0] for r in rows if abs(r[4] - centre) > 3 * spread]
+            else:
+                # MAD collapses to exactly zero whenever a majority of
+                # seeds agree to the last bit. A "> 3 * spread" test then
+                # flags nothing at all -- silently failing in precisely
+                # the case where the outlier is CLEAREST, since every
+                # other seed agreeing is what drove the spread to zero.
+                tolerance = 1e-9 + 0.01 * max(abs(centre), 1e-3)
+                outliers = [r[0] for r in rows if abs(r[4] - centre) > tolerance]
+            if outliers:
+                print(f"  -> seed(s) {outliers} sit more than 3 MADs from the median seed RANK. "
+                      f"Re-run with --exclude-seeds {' '.join(str(o) for o in outliers)} to see "
+                      f"the effect on every number above.")
+
+
+def _report_collapse_tests(curves: dict, taus: dict, taus_down: dict, temperatures: list):
+    """The two collapse tests -- on tau (growth) and on tau_down (coarsening).
+
+    Returns (collapse_temps, down_temps): the temperature subsets each test
+    could actually use. _plot needs both, so that its panels show exactly the
+    curves the printed ratios were computed from -- if the two ever disagreed,
+    the figure would be illustrating a different population than the number
+    beside it.
+    """
+    # THE TEST. Spread across temperature curves before vs after
+    # rescaling t by tau. Both computed on normalized curves so the
+    # amplitude difference (which rescaling t cannot possibly fix) is
+    # not being counted as a failure to collapse.
+    collapse_temps = [t for t in temperatures
+                       if curves[t]["normalized"] is not None and np.isfinite(taus[t])]
+    before = _curve_spread([(curves[t]["steps"], curves[t]["normalized"]) for t in collapse_temps])
+    after = _curve_spread([(curves[t]["steps"] / taus[t], curves[t]["normalized"])
+                            for t in collapse_temps])
+
+    print(f"\ncollapse test over {len(collapse_temps)} temperature(s):")
+    if not np.isfinite(before) or not np.isfinite(after):
+        print("  UNDEFINED -- needs at least two temperatures with a well-defined tau and an "
+              "overlapping time range. A single-temperature sweep cannot pose this question.")
+    else:
+        ratio = after / before if before > 0 else float("nan")
+        print(f"  mean across-curve spread, normalized stdev_phi vs t        = {before:.4f}")
+        print(f"  mean across-curve spread, normalized stdev_phi vs t/tau(T) = {after:.4f}")
+        print(f"  ratio after/before = {ratio:.3f}")
+        if ratio < 0.5:
+            print("  -> COLLAPSES. The temperature dependence is largely a pure time rescaling: "
+                  "near-T0 runs are a SLOWER version of the same evolution, not a different one. "
+                  "'Poor near T0' and 'poor at long times' are then the same statement, and the "
+                  "Delta_t column above shows the mechanism -- the same physical state is sampled "
+                  "at a systematically larger step spacing near T0.")
+        elif ratio < 0.9:
+            print("  -> PARTIAL collapse. Time rescaling explains some of the temperature "
+                  "dependence but not all of it; both effects are present and neither can be "
+                  "dismissed.")
+        else:
+            print("  -> DOES NOT COLLAPSE. Temperature is doing something beyond setting the clock "
+                  "speed, so it must be treated as an independent variable and cannot be explained "
+                  "away as a Delta_t artifact.")
+
+    down_temps = [t for t in temperatures
+                   if curves[t]["normalized"] is not None and np.isfinite(taus_down[t])]
+    before_d = _curve_spread([(curves[t]["steps"], curves[t]["normalized"]) for t in down_temps])
+    after_d = _curve_spread([(curves[t]["steps"] / taus_down[t], curves[t]["normalized"])
+                              for t in down_temps])
+    print(f"\ncollapse test on tau_down (coarsening completion) over {len(down_temps)} "
+          f"temperature(s):")
+    if not down_temps:
+        print("  NOT REACHED at any temperature: no curve falls back through the threshold inside "
+              "the simulated window. Coarsening does not complete on this box in this many steps, "
+              "so there is no late-time absorbing state to contaminate the tau collapse above.")
+    elif not np.isfinite(before_d) or not np.isfinite(after_d):
+        print("  UNDEFINED -- needs at least two temperatures with a finite tau_down and an "
+              "overlapping time range.")
+    else:
+        ratio_d = after_d / before_d if before_d > 0 else float("nan")
+        print(f"  mean across-curve spread vs t          = {before_d:.4f}")
+        print(f"  mean across-curve spread vs t/tau_down = {after_d:.4f}")
+        print(f"  ratio after/before = {ratio_d:.3f}")
+        print("  tau_down is set by domains growing to the BOX size (R ~ sqrt(t), so completion "
+              "~ L^2), not by the local growth rate -- unlike tau it is expected to depend on "
+              "the system size.")
+    return collapse_temps, down_temps
+
+
 def check_stdev_phi_time(
     base_path: Path, size: int, min_step: int = 1, ref_fraction: float = 0.5,
     min_run_fraction: float = 0.9, exclude_seeds: set[int] | None = None,
@@ -953,154 +1119,15 @@ def check_stdev_phi_time(
               f"normalized curve and tau are undefined. Raw curves still plotted; excluded from "
               f"the collapse test below.")
 
-    # Per-seed comparison, STRATIFIED by (temperature, step).
-    #
-    # A seed's raw median over its own samples is NOT comparable across
-    # seeds, because seeds do not all cover the same temperatures: this
-    # sweep has general-purpose seeds present at every temperature and
-    # others run only at the high-T end, where stdev_phi is small for
-    # purely physical reasons. Ranking seeds by their raw medians
-    # therefore sorts them mostly by WHICH TEMPERATURES THEY COVER, and
-    # an outlier test built on that centre compares two different
-    # populations.
-    #
-    # Fixed by comparing seeds only against the seeds they actually share
-    # a cell with. Within each (temperature, step) cell every seed sees
-    # identical physics, so a seed's position within that cell is
-    # meaningful; aggregating those positions over its own cells gives a
-    # statistic that does not care which cells it has. Two are reported:
-    #   med rank -- median normalized rank within a cell (0 = lowest of
-    #     the seeds present, 1 = highest, 0.5 = typical). Scale-free, so
-    #     it is not dominated by the low-T cells where values are large.
-    #   med dev  -- median (value - cell median), for magnitude, since a
-    #     rank alone cannot say whether being highest matters.
-    # The outlier flag keys on RANK; dev is context.
-    cell_values: dict[tuple[float, int], dict[int, float]] = defaultdict(dict)
-    for (temp, seed, step), values in by_temp_seed_step.items():
-        amp = temp_amplitude.get(temp, 0.0)
-        if amp > 0:
-            cell_values[(temp, step)][seed] = float(aggregate(values)) / amp
-
-    seed_ranks: dict[int, list[float]] = defaultdict(list)
-    seed_devs: dict[int, list[float]] = defaultdict(list)
-    seed_temps: dict[int, set] = defaultdict(set)
-    for (temp, _step), per_seed in cell_values.items():
-        if len(per_seed) < 2:
-            continue  # a rank within a cell of one is not a comparison
-        seeds_here = list(per_seed)
-        vals = np.array([per_seed[sd] for sd in seeds_here])
-        cell_median = float(np.median(vals))
-        order = _average_ranks(vals)  # ties share their mean rank -- see _average_ranks
-        for position, sd in zip(order, seeds_here):
-            seed_ranks[sd].append(float(position) / (len(seeds_here) - 1))
-            seed_devs[sd].append(per_seed[sd] - cell_median)
-            seed_temps[sd].add(temp)
-
-    if seed_ranks:
-        print("\nper-seed comparison, stratified by (temperature, step) -- seeds are compared "
-              "ONLY against seeds present in the same cell, so a seed run at a subset of "
-              "temperatures is not penalised for its coverage:")
-        print("     seed   n_temps          T range   med rank    med dev    p10 dev    p90 dev"
-              "    n cells")
-        rows = []
-        for sd, ranks in seed_ranks.items():
-            devs = np.array(seed_devs[sd])
-            temps_here = sorted(seed_temps[sd])
-            rows.append((sd, len(temps_here), temps_here[0], temps_here[-1],
-                          float(np.median(ranks)), float(np.median(devs)),
-                          float(np.percentile(devs, 10)), float(np.percentile(devs, 90)),
-                          len(ranks)))
-        rows.sort(key=lambda r: r[4])
-        for sd, n_t, t_lo, t_hi, med_rank, med_dev, p10, p90, n_cells in rows:
-            print(f"  {sd:7d}   {n_t:7d}   {t_lo:6.3f}-{t_hi:6.3f}   {med_rank:8.3f}   "
-                  f"{med_dev:+8.4f}   {p10:+8.4f}   {p90:+8.4f}   {n_cells:8d}")
-
-        coverages = {r[1] for r in rows}
-        if len(coverages) > 1:
-            print(f"  NOTE: seeds cover different numbers of temperatures {sorted(coverages)}. "
-                  f"That is exactly why the flag below uses rank-within-cell and not the raw "
-                  f"per-seed median, which would mostly rank seeds by their coverage.")
-
-        med_ranks = np.array([r[4] for r in rows])
-        if len(med_ranks) >= 3:
-            centre = float(np.median(med_ranks))
-            spread = float(np.median(np.abs(med_ranks - centre)))
-            if spread > 0:
-                outliers = [r[0] for r in rows if abs(r[4] - centre) > 3 * spread]
-            else:
-                # MAD collapses to exactly zero whenever a majority of
-                # seeds agree to the last bit. A "> 3 * spread" test then
-                # flags nothing at all -- silently failing in precisely
-                # the case where the outlier is CLEAREST, since every
-                # other seed agreeing is what drove the spread to zero.
-                tolerance = 1e-9 + 0.01 * max(abs(centre), 1e-3)
-                outliers = [r[0] for r in rows if abs(r[4] - centre) > tolerance]
-            if outliers:
-                print(f"  -> seed(s) {outliers} sit more than 3 MADs from the median seed RANK. "
-                      f"Re-run with --exclude-seeds {' '.join(str(o) for o in outliers)} to see "
-                      f"the effect on every number above.")
+    _report_seed_ranks(by_temp_seed_step, temp_amplitude, temperatures, aggregate)
 
     _report_autocorr_length(by_cell_ac, taus, grid_nx or size, grid_ny or size, aggregate)
 
     if inspect_seed is not None:
         _report_seed_breakdown(by_cell, temp_amplitude, inspect_seed, aggregate)
 
-    # THE TEST. Spread across temperature curves before vs after
-    # rescaling t by tau. Both computed on normalized curves so the
-    # amplitude difference (which rescaling t cannot possibly fix) is
-    # not being counted as a failure to collapse.
-    collapse_temps = [t for t in temperatures
-                       if curves[t]["normalized"] is not None and np.isfinite(taus[t])]
-    before = _curve_spread([(curves[t]["steps"], curves[t]["normalized"]) for t in collapse_temps])
-    after = _curve_spread([(curves[t]["steps"] / taus[t], curves[t]["normalized"])
-                            for t in collapse_temps])
-
-    print(f"\ncollapse test over {len(collapse_temps)} temperature(s):")
-    if not np.isfinite(before) or not np.isfinite(after):
-        print("  UNDEFINED -- needs at least two temperatures with a well-defined tau and an "
-              "overlapping time range. A single-temperature sweep cannot pose this question.")
-    else:
-        ratio = after / before if before > 0 else float("nan")
-        print(f"  mean across-curve spread, normalized stdev_phi vs t        = {before:.4f}")
-        print(f"  mean across-curve spread, normalized stdev_phi vs t/tau(T) = {after:.4f}")
-        print(f"  ratio after/before = {ratio:.3f}")
-        if ratio < 0.5:
-            print("  -> COLLAPSES. The temperature dependence is largely a pure time rescaling: "
-                  "near-T0 runs are a SLOWER version of the same evolution, not a different one. "
-                  "'Poor near T0' and 'poor at long times' are then the same statement, and the "
-                  "Delta_t column above shows the mechanism -- the same physical state is sampled "
-                  "at a systematically larger step spacing near T0.")
-        elif ratio < 0.9:
-            print("  -> PARTIAL collapse. Time rescaling explains some of the temperature "
-                  "dependence but not all of it; both effects are present and neither can be "
-                  "dismissed.")
-        else:
-            print("  -> DOES NOT COLLAPSE. Temperature is doing something beyond setting the clock "
-                  "speed, so it must be treated as an independent variable and cannot be explained "
-                  "away as a Delta_t artifact.")
-
-    down_temps = [t for t in temperatures
-                   if curves[t]["normalized"] is not None and np.isfinite(taus_down[t])]
-    before_d = _curve_spread([(curves[t]["steps"], curves[t]["normalized"]) for t in down_temps])
-    after_d = _curve_spread([(curves[t]["steps"] / taus_down[t], curves[t]["normalized"])
-                              for t in down_temps])
-    print(f"\ncollapse test on tau_down (coarsening completion) over {len(down_temps)} "
-          f"temperature(s):")
-    if not down_temps:
-        print("  NOT REACHED at any temperature: no curve falls back through the threshold inside "
-              "the simulated window. Coarsening does not complete on this box in this many steps, "
-              "so there is no late-time absorbing state to contaminate the tau collapse above.")
-    elif not np.isfinite(before_d) or not np.isfinite(after_d):
-        print("  UNDEFINED -- needs at least two temperatures with a finite tau_down and an "
-              "overlapping time range.")
-    else:
-        ratio_d = after_d / before_d if before_d > 0 else float("nan")
-        print(f"  mean across-curve spread vs t          = {before_d:.4f}")
-        print(f"  mean across-curve spread vs t/tau_down = {after_d:.4f}")
-        print(f"  ratio after/before = {ratio_d:.3f}")
-        print("  tau_down is set by domains growing to the BOX size (R ~ sqrt(t), so completion "
-              "~ L^2), not by the local growth rate -- unlike tau it is expected to depend on "
-              "the system size.")
+    collapse_temps, down_temps = _report_collapse_tests(
+        curves, taus, taus_down, temperatures)
 
     if plot:
         _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps, down_temps,

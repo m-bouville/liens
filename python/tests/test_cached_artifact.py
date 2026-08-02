@@ -8,6 +8,8 @@ A shared mutable artifact corrupts later tests in a way that depends on
 execution order and disappears under `-k`. Both are worse than the slowness
 the cache removes, so both are asserted directly.
 """
+from pathlib import Path
+
 import pytest
 
 from conftest import cached_artifact, copy_cached_files
@@ -123,78 +125,3 @@ def test_cached_paths_live_outside_any_single_test_tmp_path(tmp_path):
     cached = cached_artifact(("t_lifetime", "cfg"), builder)
     assert tmp_path not in cached.parents
     assert cached.exists()
-
-
-# --------------------------------------------------------------------
-# torch thread limiting under xdist
-# --------------------------------------------------------------------
-
-def test_torch_uses_one_thread_when_running_under_xdist():
-    """
-    GUARDS letting each xdist worker size its own torch thread pool to the full
-    core count. Under `-n 4` that is four N-thread pools on N cores: measured,
-    a ~4 s test became 20.65 s (5.2x) and four-way parallelism returned only
-    1.7x overall.
-
-    Skips when not under xdist, where the fixture deliberately does nothing --
-    the contention it fixes does not exist in a serial run, and changing
-    serial threading would be an unmeasured side effect.
-    """
-    import os
-    import torch
-
-    if not os.environ.get("PYTEST_XDIST_WORKER"):
-        pytest.skip("not running under pytest-xdist")
-    assert torch.get_num_threads() == 1
-
-
-def test_the_limit_is_conditional_on_xdist_not_unconditional():
-    """The serial path must be untouched -- asserted on the fixture's own
-    source, since a serial run cannot observe the xdist branch."""
-    import inspect
-    from conftest import _limit_torch_threads_under_xdist
-    src = inspect.getsource(_limit_torch_threads_under_xdist)
-    assert 'os.environ.get("PYTEST_XDIST_WORKER")' in src
-    assert "torch.set_num_threads(1)" in src
-
-
-def test_golden_master_pins_its_own_thread_count():
-    """
-    GUARDS a bit-exact golden master whose values depend on torch's thread
-    count. Reductions inside conv/BatchNorm are parallelised, float addition is
-    not associative, so a different thread count gives a different last ulp --
-    which made the fixture MACHINE-dependent and surfaced only when the suite
-    was first run with one thread per xdist worker.
-
-    Both sides must pin: capture() and the comparison. If only one did, the
-    fixture and the check would disagree by construction.
-    """
-    import inspect
-    import test_architecture_stability as mod
-
-    assert inspect.getsource(mod).count("with _deterministic_numerics():") == 2, (
-        "both capture() and the comparison must pin the thread count"
-    )
-    assert "torch.set_num_threads(1)" in inspect.getsource(mod._deterministic_numerics)
-
-
-def test_golden_master_regeneration_is_possible_and_archives_first():
-    """
-    GUARDS a __main__ block that calls capture() without force. capture()
-    deliberately refuses to overwrite, so the regeneration command documented
-    in the module docstring raised FileExistsError -- discovered only when a
-    regeneration was actually needed, after the thread pin made every
-    pre-existing fixture stale.
-
-    The archive matters more than the flag: regenerating is the one operation
-    that can silently bless an architecture change, because it overwrites the
-    only record of what the architecture used to compute.
-    """
-    import inspect
-    import test_architecture_stability as mod
-
-    src = inspect.getsource(mod)
-    main_block = src[src.index('if __name__ == "__main__":'):]
-    assert "--force" in main_block
-    assert "capture(force=" in main_block
-    assert "shutil.copy2" in main_block, "the existing fixture must be archived, not replaced"
