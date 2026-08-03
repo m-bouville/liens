@@ -27,8 +27,38 @@ from utils.plots import loss_component_scatter, loss_curve, should_write_loss_fi
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
 
 
+def geometric_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int,
+                             start_fraction: float) -> float:
+    """`full_weight` ramped GEOMETRICALLY from start_fraction to 1 over warmup_epochs.
+
+    A module-level function rather than an expression inline in the epoch
+    loop, so a test can exercise the ACTUAL formula. An inline version forced
+    the test to re-implement it, and an off-by-one mutation in the production
+    copy then left every endpoint assertion green -- the test was checking its
+    own arithmetic.
+
+    Geometric, not linear (which is what stage 2 uses for deriv_weight),
+    because the quantity being ramped behaves differently. L_deriv is O(1)
+    throughout; L_rollout collapses ~6e9 over the first ten epochs
+    (1.76e9 -> 0.29, measured). A linear ramp at epoch 1 gives
+    0.10 * 1.76e9 = 1.76e8 -- eight decades above the converged contribution,
+    so it barely softens the transient it exists to absorb. Geometric holds
+    weight*L_rollout roughly flat instead, which is the gradient scale the
+    optimiser actually sees.
+
+    epoch is 1-based: epoch 1 gives exactly start_fraction*full_weight, epoch
+    warmup_epochs and beyond give exactly full_weight.
+    """
+    if warmup_epochs <= 0 or epoch >= warmup_epochs:
+        return full_weight
+    frac = (epoch - 1) / max(1, warmup_epochs - 1)
+    return full_weight * (start_fraction ** (1.0 - frac))
+
+
 def train_refinement(
     base_path: Path, freeze_decoder: bool, size: int | None = None,
+    rollout_weight_warmup_epochs: int = 0,
+    rollout_weight_warmup_start: float = 1e-6,
     max_dt: float | None = None, min_passing_steps: int | None = None,
     ae_checkpoint_path: Path | None = None, lds_checkpoint_path: Path | None = None,
     resume_from: Path | None = None,
@@ -130,6 +160,18 @@ def train_refinement(
     print(f"Stage {'4' if freeze_decoder else '5'}: loaded {ancestor_note}")
     print(f"size={size}, latent_channels={components['encoder'].config['latent_channels']}, "
           f"freeze_decoder={freeze_decoder}")
+    if rollout_weight_warmup_epochs > 0:
+        print(f"rollout_weight ramped GEOMETRICALLY from {rollout_weight_warmup_start:g}x to 1x "
+              f"over {rollout_weight_warmup_epochs} epoch(s) -- geometric, not linear, because "
+              f"L_rollout itself collapses by orders of magnitude over those epochs (measured "
+              f"1.76e9 -> 0.29 across ten), so a linear ramp still leaves epoch 1 eight decades "
+              f"above the converged contribution. The geometric ramp holds the CONTRIBUTION "
+              f"roughly flat instead. "
+              f"f_theta is FROZEN and the encoder starts on exactly the "
+              f"distribution it was fitted to, so a full-strength rollout gradient at epoch 1 "
+              f"drives the encoder off that distribution faster than recon0/stats0 can anchor "
+              f"it. VAL is never ramped, so val_loss stays comparable across epochs and "
+              f"against runs without a warmup.")
     print(f"rollout_weight={rollout_weight}  recon0_weight={recon0_weight}  "
           f"stats0_weight={stats0_weight}")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  n_rollout_steps={n_rollout_steps}\n")
@@ -168,6 +210,10 @@ def train_refinement(
     # check_rollout. This was missed because stage 4 is a TRAINING stage,
     # and the test enforcing the rule only covered diagnostics.
     lds_data_config = components["lds"].provenance.get("data_config") or {}
+    # The rollout REGIME, alongside max_dt above. f_theta trained with
+    # z1_resync=False expects z1 to be propagated, not reset at each real
+    # frame; applying it teacher-forced is the "NOT equivalent" direction.
+    lds_z1_resync = components["lds"].config.get("z1_resync", True)
     max_dt = max_dt if max_dt is not None else lds_data_config.get("max_dt")
     min_passing_steps = (min_passing_steps if min_passing_steps is not None
                           else lds_data_config.get("min_passing_steps"))
@@ -195,6 +241,7 @@ def train_refinement(
         train_set = MicrostructureEvolutionDataset(
             train_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
+            max_dt=max_dt, min_passing_steps=min_passing_steps,
         )
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=None, window_length=window_length,
@@ -250,14 +297,17 @@ def train_refinement(
         x_window, dt_window, theta = batch
         return x_window.to(device), dt_window.to(device), theta.to(device), None
 
-    def step(batch, train: bool):
+    def step(batch, train: bool, effective_rollout_weight: float | None = None):
         x_window, dt_window, theta, true_stats = unpack(batch)
         loss, components = compute_stage45_loss(
             ae, f_theta, stats_head, x_window, dt_window, theta,
-            rollout_weight=rollout_weight, recon0_weight=recon0_weight, stats0_weight=stats0_weight,
+            rollout_weight=(rollout_weight if effective_rollout_weight is None
+                             else effective_rollout_weight),
+            recon0_weight=recon0_weight, stats0_weight=stats0_weight,
             rollout_scale=rollout_scale, recon0_scale=recon0_scale, stats0_scale=stats0_scale,
             stats_loss_fn=stats_loss_fn, true_stats=true_stats,
             recon_stream_name=recon_stream_name, return_components=True,
+            z1_resync=lds_z1_resync,
         )
         if train:
             optimizer.zero_grad()
@@ -304,6 +354,46 @@ def train_refinement(
         # own docstring/comment: the ONLY host sync per phase (train/
         # val) is the batch of four .item() calls after each loop
         # ends, not four per batch.
+        # ROLLOUT WEIGHT RAMP, mirroring stage 2's deriv_weight_warmup_epochs
+        # and needed here for a sharper reason: stage 2's new stream can adapt,
+        # while stage 4's f_theta is FROZEN and cannot.
+        #
+        # The encoder starts at exactly stage 2's optimum -- which is the
+        # distribution f_theta was fitted to. A full-strength rollout gradient
+        # immediately pulls it OFF that distribution, which raises the rollout
+        # loss, which pulls harder: positive feedback, and f*dt^2/2 makes it
+        # quadratic. Measured on a real run, the raw rollout fell 6e9 between
+        # epoch 1 and epoch 10 (1.76e9 -> 0.29), so NO single rollout_scale
+        # serves both ends -- calibrated on the converged value it makes epoch
+        # 1 explosive, calibrated on epoch 1 it makes the term irrelevant
+        # later. rollout_scale=1 stalled the run outright; 10 was the largest
+        # gradient the transient tolerated.
+        #
+        # The ramp separates those two jobs: recon0 and stats0 hold the encoder
+        # (they have the decoder and the statistics as tethers, and their
+        # train/val gap stayed under 2x while rollout's hit 83x) while the
+        # rollout term comes up gradually. rollout_scale can then be set from
+        # the CONVERGED magnitude, which is what it is for.
+        #
+        # Lowering lr instead would damp the transient AND everything after it.
+        # GEOMETRIC, not linear. Linear is what stage 2 uses for
+        # deriv_weight, and it is wrong here because the quantity being ramped
+        # behaves completely differently: L_deriv is O(1) from the start, while
+        # L_rollout collapses by ~6e9 over the first ten epochs
+        # (1.76e9 -> 0.29, measured). A linear ramp at epoch 1 gives
+        # 0.10 * 1.76e9 = 1.76e8 -- still eight orders of magnitude above the
+        # converged contribution, so it barely softens the transient it exists
+        # to absorb.
+        #
+        # Geometric from rollout_weight_warmup_start to 1 over the window
+        # tracks the collapse instead: 1e-6 * 1.76e9 = 1.8e3 at epoch 1, then
+        # ~0.34 at epochs 2 and 5, then 0.29 at epoch 10. The CONTRIBUTION is
+        # roughly flat across the ramp, which is the actual goal -- a constant
+        # gradient scale while the encoder settles, rather than a constant
+        # weight applied to a wildly varying loss.
+        effective_rollout_weight = geometric_warmup_weight(
+            epoch, rollout_weight, rollout_weight_warmup_epochs, rollout_weight_warmup_start)
+
         train_loss_sum = torch.zeros((), device=device)
         train_rollout_sum = torch.zeros((), device=device)
         train_recon0_sum = torch.zeros((), device=device)
@@ -312,7 +402,8 @@ def train_refinement(
             n_train = len(train_set)
             for batch in train_loader:
                 bs = batch[0].size(0)
-                loss, rollout, recon0, stats0 = step(batch, train=True)
+                loss, rollout, recon0, stats0 = step(
+                    batch, train=True, effective_rollout_weight=effective_rollout_weight)
                 train_loss_sum += loss * bs
                 train_rollout_sum += rollout * bs
                 train_recon0_sum += recon0 * bs
@@ -382,13 +473,55 @@ def train_refinement(
 
         ema_str = f"{tracker.val_ema:7.4f}" if tracker.val_ema is not None else "  (warmup)"
         msg = (f"{epoch:4d}|"
-               f"{train_loss:7.4f} ={rollout_weight*train_rollout/rollout_scale:7.4f} "
+               # effective_rollout_weight, not rollout_weight: during the ramp
+               # the printed train component must be what was actually
+               # OPTIMISED, or the columns will not sum to the train_loss
+               # beside them and the discrepancy reads as a bug.
+               f"{train_loss:7.4f} ={effective_rollout_weight*train_rollout/rollout_scale:7.4f} "
                f"+{recon0_weight*train_recon0/recon0_scale:7.4f} "
                f"+{stats0_weight*train_stats0/stats0_scale:7.4f} |"
                f"{val_loss:7.4f} ={rollout_weight*val_rollout/rollout_scale:7.4f} "
                f"+{recon0_weight*val_recon0/recon0_scale:7.4f} "
                f"+{stats0_weight*val_stats0/stats0_scale:7.4f} |"
-               f"{ema_str:>10}")
+               f"{ema_str:>10}"
+               + (f"  [rollout_weight {effective_rollout_weight:.3g}/{rollout_weight:g}]"
+                  if effective_rollout_weight < rollout_weight else ""))
+
+        if epoch == 1:
+            # ONE component dominating the loss means the *_scale values are
+            # mis-calibrated for THIS stage, and the weights beside them mean
+            # nothing. Reported once, at the first epoch, because that is when
+            # it is cheap to act on.
+            #
+            # rollout_scale in particular is easy to inherit wrongly: stage 3
+            # FREEZES the encoder, so f_theta sees exactly the latents it was
+            # fitted to and its rollout loss is ~1e-6. Stage 4 unfreezes it, so
+            # f_theta is off-distribution from the first update and the same
+            # quantity is ~0.7 -- 6e5 times larger. A single global
+            # rollout_scale=1e-6 in a params file therefore makes stage 4's
+            # loss 99.997% rollout, with recon0 and stats0 contributing 26 parts
+            # per MILLION. Stage 4's entire purpose is the balance between them.
+            contributions = {
+                "rollout": rollout_weight * val_rollout / rollout_scale,
+                "recon0": recon0_weight * val_recon0 / recon0_scale,
+                "stats0": stats0_weight * val_stats0 / stats0_scale,
+            }
+            total = sum(abs(v) for v in contributions.values())
+            if total > 0:
+                worst, share = max(((k, abs(v) / total) for k, v in contributions.items()),
+                                    key=lambda kv: kv[1])
+                if share > 0.99:
+                    others = ", ".join(f"{k} {100 * abs(v) / total:.4f}%"
+                                        for k, v in contributions.items() if k != worst)
+                    print(f"\n  WARNING: '{worst}' is {100 * share:.4f}% of the validation "
+                          f"loss ({others}). The *_scale values are calibrated for a "
+                          f"different stage -- each scale should be the RAW magnitude of its "
+                          f"own component here, so the weights beside them mean what they say. "
+                          f"Raw values this epoch: "
+                          + ", ".join(f"{k}={w * v / sc:.3e}" for k, (w, v, sc) in {
+                              "rollout": (1.0, val_rollout, 1.0),
+                              "recon0": (1.0, val_recon0, 1.0),
+                              "stats0": (1.0, val_stats0, 1.0)}.items()) + "\n")
 
         if saved_this_epoch:
             epochs_since_improvement = 0

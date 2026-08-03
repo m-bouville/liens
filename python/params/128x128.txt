@@ -15,7 +15,6 @@ recon0_scale  = 0.1e-3
 stats0_scale  = 0.01
 
 deriv_scale   = 0.02e-3
-rollout_scale = 1e-6
 
 # force 	      = True
 
@@ -83,6 +82,7 @@ n_rollout_steps= 1			# always 1 for 3a
 n_substeps     = 1			# always 1 for 3a
 z1_resync      = True		# always True for 3a
 
+rollout_scale = 1e-6
 ae_stats_weight= 1.
 
 use_dt_decade_weights = True
@@ -109,26 +109,27 @@ n_rollout_steps= 2			# always > 1 for 3b
 n_substeps     = 3
 z1_resync      = False		# always False for 3b
 
-resume_from = checkpoints/stage3b/128x128-stage3b-z1_resync_False-n_substeps_3.pt
+# resume_from = checkpoints/stage3b/128x128-stage3b-z1_resync_False-n_substeps_3.pt
 
+rollout_scale = 1e-6
 ae_stats_weight= 1.
 one_step_weight= 0.5
 
 use_dt_decade_weights = True
 
-epochs 		  =4000
-patience 	  = 400
+epochs 		  =5000
+patience 	  = 500
 
 num_workers	  = same
 batches		  = same
 
-lr 			  =   0.1e-3  	# default: 1.e-3
+lr 			  =   0.5e-4  	# default: 1.e-3
 z0_noise_scale=   0.1
 
 dt_cap		  = same		# must be
 max_dt        = same
 
-force 	      = True
+# force 	      = True
 
 
 
@@ -136,13 +137,24 @@ force 	      = True
 #   encoder refinement
 rollout_weight = 1.0        # primary term for stage 4 (matches the default, but explicit is safer)
 recon0_weight   = 0.2  # was 0.5       # small but > 0 anchor
-stats0_weight   = 1  # was 0.01
+stats0_weight   = 0.2
 
 n_rollout_steps= same
 
-batches		  = 128
-epochs 		  =  50
-patience 	  =   5 	# tends to shoot up: patience won't pay
+recon0_scale    =   1.e-3
+stats0_scale    =   0.1
+
+rollout_scale   =   5.
+rollout_weight_warmup_epochs= 10
+rollout_weight_warmup_start = 1e-6  # geometric warmup
+
+lr 			  =   0.2e-4  	# default: 1.e-3
+
+
+epochs 		  = 100
+patience 	  =  15 	# tends to shoot up: patience won't pay
+
+batches		  =  96
 
 max_dt        = same
 
@@ -154,13 +166,14 @@ force 	      = True
 #   end-to-end refinement
 rollout_weight = 0.2        # now secondary -- see reasoning below
 recon0_weight   = 1  # was 1.0        # now primary, per the original design intent
-stats0_weight   = 1  # was 0.01
+stats0_weight   = 0.25
 
 n_rollout_steps= same      # match stage 4's -- same reasoning as before
 
-batches        = 128
-epochs         =  30
-patience       =   5
+epochs         =  50
+patience       =  10
+
+batches        =  96
 
 max_dt         = same
 

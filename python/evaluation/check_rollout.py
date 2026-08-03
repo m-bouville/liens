@@ -77,7 +77,7 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py 
 
 
 def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
-                    ae_config: dict, device: torch.device):
+                    ae_config: dict, device: torch.device, z1_resync: bool = True):
     """
     Everything needed for one row of the comparison figure, computed
     FRESH from the raw snapshot files and the frozen encoder/decoder --
@@ -156,7 +156,8 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         dts = torch.tensor([dt_per_step], dtype=torch.float32, device=device)
         theta = torch.tensor([[theta_val]], dtype=torch.float32, device=device)
 
-        z0_hat_full = f_theta.rollout(z0_t, z1_sequence, dts, theta)
+        z0_hat_full = f_theta.rollout(z0_t, z1_sequence, dts, theta,
+                                       z1_resync=z1_resync)
         z0_next_pred = z0_hat_full[:, -1]
 
         x_next_pred = ae_decoder(z0_next_pred)[0, 0].cpu().numpy()
@@ -286,7 +287,7 @@ def check_rollout(
     lds_checkpoint_path: Path, n_samples: int = 6, seed: int = 0,
     fixed_windows: list[str] | None = None,
     min_step: int | None = None, min_stdev_phi: float | None = None,
-    max_dt: float | None = None,
+    max_dt: float | None = None, z1_resync: bool | None = None,
     output_path: Path | None = None, device: str | None = None,
 ) -> tuple[Path, list[str]]:
     """Saves a visual rollout-comparison figure and returns
@@ -390,6 +391,23 @@ def check_rollout(
         # the model. Same defect that made check_parameter_dependence report
         # "f_theta is worse on 88% of windows".
         max_dt = max_dt if max_dt is not None else data_config.get("max_dt")
+        # z1_resync from the checkpoint's own config unless overridden. This is
+        # the ONLY diagnostic in which the flag means anything:
+        # check_parameter_dependence evaluates a SINGLE forward() step with the
+        # real z1 supplied, so there is nothing to resync. Only a chained
+        # rollout can distinguish the two regimes.
+        #
+        # It is also the comparison the training losses cannot make. With
+        # z1_resync=True the encoder hands back the true z1 at every real
+        # frame, so errors cannot compound; with False they must. A model
+        # trained under False therefore has a WORSE training loss while doing
+        # the harder, inference-matching job -- and only evaluating both under
+        # the SAME regime says which network is actually better.
+        z1_resync = (z1_resync if z1_resync is not None
+                      else lds_config.get("z1_resync", True))
+        print(f"z1_resync={z1_resync} "
+              f"({'from the checkpoint' if z1_resync is None else 'in effect'}): "
+              f"{'z1 reset to the encoder value at each real frame' if z1_resync else 'z1 PROPAGATED throughout -- the inference regime'}")
         window_length = data_config["window_length"]
 
         test_dirs = lds_checkpoint.get("test_dirs") or []
@@ -436,7 +454,7 @@ def check_rollout(
 
     for row, (run_dir, steps) in enumerate(windows):
         x_t_raw, x_next_raw, x_next_pred, x_next_ae_baseline, dt_total, dt_per_step = compute_sample(
-            run_dir, steps, ae, f_theta, ae_config, device,
+            run_dir, steps, ae, f_theta, ae_config, device, z1_resync=z1_resync,
         )
 
         x_next_pred_t = torch.from_numpy(x_next_pred).unsqueeze(0).unsqueeze(0)
@@ -523,8 +541,11 @@ def check_rollout(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--size", type=int, required=True,
-                         help="grid size (square only) -- config.txt is never read")
+    parser.add_argument("--size", type=int, default=None,
+                         help="grid size (square only) -- config.txt is never read. Needed ONLY "
+                              "to RECONSTRUCT a checkpoint path from --latent-channels/"
+                              "--stats-weight/--n-rollout-steps; with --lds-checkpoint given it "
+                              "is unused, and requiring it there was pure friction")
     parser.add_argument("--latent-channels", type=int, default=None, help="see --size")
     parser.add_argument("--stats-weight", type=float, default=None)
     parser.add_argument("--n-rollout-steps", type=int, default=None, help="see --size")
@@ -552,18 +573,30 @@ def main():
             help="default: <repo root>/output/rollout_check_png/<lds checkpoint name>"
                  "[-seed<N> if random-sampling].png -- named after the checkpoint "
                  "(and seed) so different checks don't collide")
+    parser.add_argument("--z1-resync", action=argparse.BooleanOptionalAction, default=None,
+                         help="default: whatever the checkpoint was TRAINED with. "
+                              "--no-z1-resync propagates z1 throughout the rollout instead of "
+                              "resetting it to the encoder value at each real frame -- the "
+                              "regime inference is actually in. Evaluating two models in the "
+                              "SAME regime is the only way to compare them: a model trained "
+                              "with z1_resync=False has a worse TRAINING loss purely because "
+                              "its objective is harder. Meaningless in "
+                              "check_parameter_dependence, which evaluates a single forward() "
+                              "step with the real z1 supplied")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     if args.lds_checkpoint is None:
-        missing = [n for n, v in [("--latent-channels", args.latent_channels),
+        missing = [n for n, v in [("--size", args.size),
+                                   ("--latent-channels", args.latent_channels),
                                    ("--stats-weight", args.stats_weight),
                                    ("--n-rollout-steps", args.n_rollout_steps)] if v is None]
         if missing:
             raise ValueError(
-                f"Provide either --lds-checkpoint directly, or --latent-channels, "
-                f"--stats-weight, and --n-rollout-steps (missing: {', '.join(missing)})."
+                f"Provide either --lds-checkpoint directly, or the pieces needed to "
+                f"reconstruct its path: --size, --latent-channels, --stats-weight, "
+                f"--n-rollout-steps (missing: {', '.join(missing)})."
             )
         name = lds_checkpoint_name(args.size, args.latent_channels, args.stats_weight,
                                     args.n_rollout_steps)
@@ -574,6 +607,7 @@ def main():
         lds_checkpoint_path=args.lds_checkpoint, n_samples=args.n_samples, seed=args.seed,
         fixed_windows=args.fixed_windows, min_step=args.min_step,
         min_stdev_phi=args.min_stdev_phi, output_path=args.output, device=args.device,
+        z1_resync=args.z1_resync,
     )
 
 

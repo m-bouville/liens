@@ -31,6 +31,7 @@ def compute_stage45_loss(
     stats_loss_fn: StatsLoss | None = None,
     true_stats: torch.Tensor | None = None, return_components: bool = False,
     recon_stream_name: str = DEFAULT_STREAM_NAME, deriv_stream_name: str = "deriv",
+    z1_resync: bool = True,
 ):
     """
     x_window: (B, n_r+1, 1, ny, nx) raw pixel window -- x_window[:,0] is
@@ -124,7 +125,15 @@ def compute_stage45_loss(
     # LatentDynamics' own class docstring).
     z1_sequence = torch.cat([z1_0.unsqueeze(1), z1_future], dim=1)
 
-    z_hat_full = f_theta.rollout(z0, z1_sequence, dt_window, theta)
+    # z1_resync must match the regime f_theta was TRAINED in. Stage 3b can
+    # train with z1_resync=False -- z1 propagated throughout, no reset at real
+    # frames, matching inference -- and applying such an f_theta teacher-forced
+    # is the same "NOT equivalent" direction that n_substeps N -> 1 is. Both
+    # are inherited from the LDS checkpoint; this one was missed because the
+    # rollout call sits in refinement_loss.py rather than beside the model
+    # construction in model_assembly.py.
+    z_hat_full = f_theta.rollout(z0, z1_sequence, dt_window, theta,
+                                  z1_resync=z1_resync)
     z_hat = z_hat_full[:, 1:]
 
     # No exponent_deriv here -- see train_lds.py's own identical

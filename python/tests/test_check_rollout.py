@@ -399,3 +399,59 @@ def test_check_rollout_threads_dt_cap_from_the_saved_checkpoint(monkeypatch, tmp
 
     assert "dt_cap" in captured, "LatentDynamics was never constructed at all"
     assert captured["dt_cap"] == 125.0
+
+
+# --------------------------------------------------------------------
+# CLI ergonomics
+# --------------------------------------------------------------------
+
+def test_size_is_not_required_when_a_checkpoint_is_given():
+    """
+    REGRESSION: --size was `required=True`, so
+
+        python -m evaluation.check_rollout --lds-checkpoint <path> --no-z1-resync
+
+    failed with "the following arguments are required: --size" -- for a value
+    the checkpoint already determines and that this path never reads. It is
+    used ONLY to RECONSTRUCT a checkpoint filename from
+    --latent-channels/--stats-weight/--n-rollout-steps, i.e. exactly when
+    --lds-checkpoint is absent.
+    """
+    from conftest import source_without_comments
+    import evaluation.check_rollout as mod
+
+    src = source_without_comments(mod)
+    assert 'parser.add_argument("--size", type=int, required=True' not in src, (
+        "--size must not be required: with --lds-checkpoint given it is unused"
+    )
+    assert '"--size", type=int, default=None' in src
+
+
+def test_size_is_still_demanded_on_the_path_that_uses_it():
+    """
+    GUARDS making it optional and then failing obscurely later: without
+    --lds-checkpoint the filename cannot be built without it, and the error
+    must say so alongside the others rather than surfacing as a TypeError.
+    """
+    from conftest import source_without_comments
+    import evaluation.check_rollout as mod
+
+    src = source_without_comments(mod)
+    missing_block = src[src.index("missing = ["):]
+    missing_block = missing_block[:missing_block.index("]")]
+    assert '"--size"' in missing_block, (
+        "--size must appear in the missing-argument list for the reconstruct path"
+    )
+
+
+def test_check_rollout_needs_no_base_path():
+    """
+    Pins the asymmetry with check_parameter_dependence, which DOES take
+    --base-path. check_rollout works entirely from the absolute test_dirs
+    stored in the checkpoint, so passing --base-path is an error rather than
+    an oversight -- worth a test so nobody "fixes" it by adding one.
+    """
+    import inspect
+
+    from evaluation.check_rollout import check_rollout
+    assert "base_path" not in inspect.signature(check_rollout).parameters

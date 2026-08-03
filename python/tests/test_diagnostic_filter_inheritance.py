@@ -43,6 +43,48 @@ _F_THETA_CONSUMERS = _STAGE3_DIAGNOSTICS + ["training/train_refinement.py"]
 _FILTERS = ["min_step", "min_stdev_phi", "max_dt"]
 
 
+def _dataset_constructions(module):
+    """Every MicrostructureEvolutionDataset(...) call, with balanced parens."""
+    src = source_without_comments(_ROOT / module)
+    out = []
+    for m in re.finditer(r"MicrostructureEvolutionDataset\(", src):
+        depth, i = 0, m.end() - 1
+        while i < len(src):
+            if src[i] == "(":
+                depth += 1
+            elif src[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    out.append(src[m.start():i + 1])
+                    break
+            i += 1
+    return out
+
+
+@pytest.mark.parametrize("module", _F_THETA_CONSUMERS)
+def test_EVERY_dataset_construction_gets_the_filters(module):
+    """
+    GUARDS filtering some datasets and not others.
+
+    Reported: train_refinement has THREE constructions -- val, train, val --
+    and a fix anchored on the val block reached two of them. Stage 4 then
+    trained on 93,317 unfiltered windows against 4,776 filtered val ones, and
+    the rollout term was NaN from epoch 1 while recon0 (170.9) was finite.
+
+    Asserting the kwarg appears SOMEWHERE in the module passes in exactly that
+    state, which is how it got through: the earlier version of this test did
+    precisely that.
+    """
+    constructions = _dataset_constructions(module)
+    assert constructions, f"no MicrostructureEvolutionDataset(...) in {module}"
+    for i, call in enumerate(constructions):
+        which = "train" if "train_dirs" in call else "val/other"
+        assert "max_dt=max_dt" in call, (
+            f"{module} construction #{i} ({which}) does not pass max_dt -- it will build "
+            f"a window population f_theta never saw"
+        )
+
+
 @pytest.mark.parametrize("module", _F_THETA_CONSUMERS)
 def test_every_f_theta_consumer_inherits_max_dt(module):
     """
@@ -163,3 +205,60 @@ def test_stage2_diagnostics_are_correctly_excluded():
     assert "max_dt" not in inspect.signature(train_stage2).parameters
     from training.train_lds import train_lds
     assert "max_dt" in inspect.signature(train_lds).parameters
+
+
+# --------------------------------------------------------------------
+# z1_resync: meaningful in exactly one diagnostic
+# --------------------------------------------------------------------
+
+def test_check_rollout_accepts_and_inherits_z1_resync():
+    """
+    check_rollout CHAINS rollout() across transitions, so the two regimes
+    genuinely differ there. Inherited from the checkpoint by default -- a
+    diagnostic silently evaluating in a regime the model did not train in is
+    the max_dt bug again.
+    """
+    from evaluation.check_rollout import check_rollout
+    assert "z1_resync" in inspect.signature(check_rollout).parameters
+    src = source_without_comments(_ROOT / "evaluation/check_rollout.py")
+    assert 'lds_config.get("z1_resync", True)' in src, "must default to the checkpoint's own"
+    # BOTH hops, checked separately. There are two: check_rollout ->
+    # compute_sample, and compute_sample -> rollout(). Asserting the substring
+    # once passes when only the inner hop survives, and compute_sample then
+    # quietly uses its own default -- verified: dropping the outer hop left
+    # this test green until it was split.
+    assert "device, z1_resync=z1_resync" in src, (
+        "the flag does not reach compute_sample -- it will use its default"
+    )
+    assert "z1_resync=z1_resync)" in src, "the flag does not reach rollout()"
+
+
+def test_check_parameter_dependence_REFUSES_z1_resync_with_a_reason():
+    """
+    GUARDS silently accepting a flag that changes nothing. This diagnostic
+    evaluates ONE forward() step per window with the real z1 supplied, so
+    there is nothing propagated and nothing to resync -- and forward() does
+    not sub-step either, so n_substeps is inert here for the same reason.
+
+    Accepting it and doing nothing would be worse than the bare argparse
+    error: two runs differing only in the flag would produce identical output
+    and look like evidence that the regime does not matter.
+    """
+    src = source_without_comments(_ROOT / "evaluation/check_parameter_dependence.py")
+    assert "--z1-resync" in src, "the flag must be accepted, to explain itself"
+    assert "parser.error(" in src
+    assert "check_rollout" in src, "the error must name the right tool"
+
+
+def test_the_single_step_claim_is_true():
+    """
+    Pins the fact both tests above rest on: check_parameter_dependence's
+    evaluation calls f_theta(...) directly -- one forward() step -- and never
+    rollout(). If that ever changes, the refusal above becomes wrong.
+    """
+    src = source_without_comments(_ROOT / "evaluation/_latent_eval.py")
+    assert "f_theta(z0_t, z1_t, dt, theta_b)" in src
+    assert ".rollout(" not in src, (
+        "_latent_eval now rolls out -- z1_resync has become meaningful there and "
+        "check_parameter_dependence should stop refusing it"
+    )

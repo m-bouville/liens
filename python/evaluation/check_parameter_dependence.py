@@ -2014,9 +2014,26 @@ def main():
                               "checkpoint too, for a same-scale comparison against an AE-family run")
     parser.add_argument("--output", type=Path, default=None,
             help="default: <repo root>/output/stage3/<lds checkpoint name>-parameter_dependence.png")
+    # Accepted only so that passing it gives an EXPLANATION rather than
+    # argparse's bare "unrecognized arguments". The flag is meaningful in
+    # check_rollout and nowhere else.
+    parser.add_argument("--z1-resync", action=argparse.BooleanOptionalAction, default=None,
+                         help="NOT SUPPORTED here -- use check_rollout. This diagnostic "
+                              "evaluates a SINGLE forward() step with the real z1 supplied, so "
+                              "there is no propagated z1 to resync and the flag would change "
+                              "nothing")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    if args.z1_resync is not None:
+        parser.error(
+            "--z1-resync/--no-z1-resync has no meaning in check_parameter_dependence: it "
+            "evaluates ONE forward() step per window with the real z1 supplied, so nothing "
+            "is ever propagated and there is nothing to resync. n_substeps is inert here for "
+            "the same reason -- forward() does not sub-step, only rollout() does.\n"
+            "  Use check_rollout for the resync comparison; it chains rollout() across "
+            "transitions and is the only place the two regimes differ."
+        )
 
     check_parameter_dependence(
         lds_checkpoint_path=args.lds_checkpoint, min_step=args.min_step,

@@ -358,42 +358,40 @@ def test_no_epoch_inside_the_warmup_window_can_save(tmp_path, capsys):
     """
     base_path, first = _ref_row_ancestor(tmp_path)
     config = dict(_REF_ROW_CONFIG)
-    # ema_warmup_epochs=2 over 3 epochs, not the default 5 over 8: the property
-    # is "no epoch inside the window saves", which needs only the window plus
-    # one epoch past it to be observable. Running the default cost 19.9 s and
-    # made this the slowest test in the whole suite, for no extra coverage --
-    # the DEFAULT's value is pinned separately by
-    # test_stage1_has_an_ema_warmup_by_default, and clamp_grace_epochs by its
-    # own test, so nothing here needs to re-derive either.
     warmup = 2
     config.update(epochs=3, ema_warmup_epochs=warmup, early_stopping_patience=None,
                    log_every_epoch=True)
+    checkpoint_path = tmp_path / "w.pt"
     capsys.readouterr()
-    train_autoencoder(base_path=base_path, checkpoint_path=tmp_path / "w.pt",
-                       loss_curve_path=tmp_path / "w.png", resume_from=first, **config)
 
-    # THE CHECKPOINT, not the console. This assertion was originally a parse
-    # of stdout for "-> saved" lines, and it failed ONCE in a full-suite run
-    # while passing alone, in-file, and on two subsequent full runs -- i.e. it
-    # was flaky, and the only plausible source of the flake was stray output
-    # reaching the capture between the readouterr() above and the parse.
+    # Nothing may save during grace, so with epochs=3 and warmup=2 the ONLY
+    # epoch that can save is 3 -- and whether it does depends on the loss
+    # trajectory, because the tracker leaves best_val_loss at the EMA reached
+    # during grace and epoch 3 has to beat it.
     #
-    # The saved checkpoint records the epoch it was written at, which is the
-    # same fact without an interference channel. It is also STRICTLY stronger
-    # for what matters here: if any epoch inside the grace window had saved,
-    # the file would exist with that epoch, and a later save can only replace
-    # it with a LATER one.
-    saved = torch.load(tmp_path / "w.pt", map_location="cpu", weights_only=True)
+    # Both outcomes are consistent with the property under test, and the test
+    # accepts both rather than pretending the trajectory is deterministic. An
+    # earlier version asserted a save occurred, which was flaky; the version
+    # after that read the checkpoint unconditionally, which turned the same
+    # flake into a RuntimeError from the no-save guard.
+    #
+    # It still catches the bug: with grace=0, epoch 1 always saves (nothing
+    # beats inf), so a checkpoint would exist carrying epoch 1 <= warmup.
+    try:
+        train_autoencoder(base_path=base_path, checkpoint_path=checkpoint_path,
+                           loss_curve_path=tmp_path / "w.png", resume_from=first, **config)
+    except RuntimeError as exc:
+        assert "without ever saving" in str(exc), exc
+        assert not checkpoint_path.exists()
+        return          # nothing saved at all -- vacuously inside no window
+
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     assert saved["epoch"] > warmup, (
         f"the saved checkpoint is from epoch {saved['epoch']}, inside the "
         f"{warmup}-epoch warmup window -- the grace period is not suppressing saves"
     )
-    # And the console agrees, as a cross-check on the checkpoint's own bookkeeping.
-    saved_epochs = []
-    for line in capsys.readouterr().out.splitlines():
-        head = line.split("|")[0].strip()
-        if "-> saved" in line and head.isdigit():
-            saved_epochs.append(int(head))
+    saved_epochs = [int(l.split("|")[0].strip()) for l in capsys.readouterr().out.splitlines()
+                    if "-> saved" in l and l.split("|")[0].strip().isdigit()]
     assert all(e > warmup for e in saved_epochs), (
         f"epoch(s) {[e for e in saved_epochs if e <= warmup]} saved inside the "
         f"{warmup}-epoch warmup window"
