@@ -288,6 +288,41 @@ def _resolve_stage_specific_ancestor(kwargs: dict, default, label: str,
     return {k: v for k, v in kwargs.items() if k != key}, override, True
 
 
+# Directories an already-made backup may have been MOVED into. Searched as
+# immediate subdirectories of the file's own directory, so that tidying old
+# archives out of checkpoints/stage2/ into checkpoints/stage2/_archives/ does
+# not make _backup_before_overwrite copy them all over again.
+_ARCHIVE_DIR_NAMES = ("_archives", "_archive", "archives", "archive", "_old", "old", "backups")
+
+
+def _find_existing_backup(source: Path, backup_name: str) -> Path | None:
+    """The already-archived copy of `source`, wherever it has been filed.
+
+    Identity is name AND size, not name alone. The name encodes the stem and
+    the source's own mtime, which is nearly unique already -- but a bare name
+    match would silently accept an unrelated file that happens to collide, and
+    the consequence of a false positive is skipping a backup, i.e. losing the
+    file this function exists to protect. A size check costs one stat and
+    removes that class of mistake.
+
+    A name match with a DIFFERENT size is reported rather than trusted: it
+    means something is already filed under the name this backup wants, so the
+    copy still proceeds (to the primary location) and the operator is told.
+    """
+    candidates = [source.with_name(backup_name)]
+    candidates += [source.parent / d / backup_name for d in _ARCHIVE_DIR_NAMES]
+    source_size = source.stat().st_size
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if candidate.stat().st_size == source_size:
+            return candidate
+        print(f"NOTE: {candidate} has the name this backup wants but a different size "
+              f"({candidate.stat().st_size} vs {source_size}) -- not treating it as an "
+              f"existing archive.")
+    return None
+
+
 def _backup_before_overwrite(path: Path) -> None:
     """
     If `path` already exists, copies it to `<stem>-<timestamp><suffix>`
@@ -332,9 +367,15 @@ def _backup_before_overwrite(path: Path) -> None:
     if not path.exists():
         return
     timestamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y%m%d_%Hh%M")
-    backup_path = path.with_name(f"{path.stem}-{timestamp}{path.suffix}")
-    if backup_path.exists():
-        print(f"NOTE: {path} is already archived at {backup_path} (unchanged since -- "
+    backup_name = f"{path.stem}-{timestamp}{path.suffix}"
+    backup_path = path.with_name(backup_name)
+    # Sibling archive directories too, not just this one: a backup that has
+    # been tidied into checkpoints/stage2/_archives/ is still a backup, and
+    # re-copying it defeats the point of having filed it away.
+    existing = _find_existing_backup(path, backup_name)
+    if existing is not None:
+        where = "" if existing.parent == path.parent else f" (filed under {existing.parent.name}/)"
+        print(f"NOTE: {path} is already archived at {existing}{where} (unchanged since -- "
               f"same mtime) -- not re-copying.")
         return
     shutil.copy2(path, backup_path)

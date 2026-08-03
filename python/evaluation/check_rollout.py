@@ -330,6 +330,13 @@ def check_rollout(
         # if dt_cap were still inf, with no error or warning anywhere
         # to indicate the mismatch.
         dt_cap=lds_config.get("dt_cap", float("inf")),
+        # n_substeps from the checkpoint too, and for a SHARPER reason than
+        # dt_cap: it changes what f_theta MEANS. Rebuilding a model trained
+        # at n_substeps=N as n_substeps=1 applies a POINTWISE z1_dot as a
+        # one-shot corrector over the whole dt -- the "NOT equivalent"
+        # direction train_lds warns about on resume. The weights load
+        # cleanly, so nothing else would catch it.
+        n_substeps=lds_config.get("n_substeps", 1),
     ).to(device)
     f_theta.load_state_dict(lds_checkpoint["model_state"])
     f_theta.eval()

@@ -187,6 +187,77 @@ def _apply_augmentation(x: torch.Tensor, aug_idx: int, nx: int, ny: int) -> tupl
     return x, k, bool(flip)
 
 
+# (sweep, nx, ny) already reported in this process -- see complete_run_dirs.
+_REPORTED_SWEEPS: set[str] = set()
+
+
+def report_save_step_distribution(run_dirs: list[Path]) -> None:
+    """One-line-per-group summary of how far each run was actually evolved.
+
+    Printed on FIRST discovery of a sweep because a sweep is not necessarily
+    homogeneous: runs regenerated later to reach past tau_down carry many more
+    saved steps than the originals, and nothing else in the pipeline says so.
+    Every window count downstream is then a mixture of two populations, and a
+    change in the mixture looks exactly like a change in the physics.
+
+    This matters most where it is least visible. tau_down grows as ~L^2.5
+    (measured: 6e5 at 64, 2.5e6 at 128, ~1.4e7 at 256), so at large sizes only
+    the deliberately-extended runs reach coarsening completion at all -- and
+    those runs are the only source of the frozen absorbing states that dominate
+    the large-dt error. A sweep that is half-extended behaves differently from
+    either of its halves.
+
+    Grouped by final saved step rather than listed per run: the interesting
+    structure is "two populations, 900 runs to 2.5e6 and 300 to 1e7", not 1200
+    individual numbers.
+    """
+    if not run_dirs:
+        return
+    # Deduplicated HERE rather than by each caller: the diagnostics that
+    # discover runs directly (check_stdev_phi_time, check_stdev_phi_temperature)
+    # bypass complete_run_dirs entirely, so a dedup key owned by that one
+    # function silences nothing for them and duplicates nothing either -- it
+    # simply never runs. Keyed on the directory the runs live in, which is what
+    # actually identifies a sweep+size.
+    sweep_key = str(run_dirs[0].parent.resolve())
+    if sweep_key in _REPORTED_SWEEPS:
+        return
+    _REPORTED_SWEEPS.add(sweep_key)
+
+    counts: dict[tuple[int, int], int] = {}
+    for run_dir in run_dirs:
+        try:
+            # read_metadata takes the FILE, not the directory -- the rest of
+            # this module already calls it that way; passing the directory
+            # raises IsADirectoryError, which the except below would have
+            # swallowed as "no metadata", silently reporting nothing at all.
+            metadata = load.read_metadata(run_dir / "metadata.txt")
+        except (OSError, KeyError, ValueError):
+            continue
+        steps = metadata.save_steps
+        if not steps:
+            continue
+        counts[(len(steps), steps[-1])] = counts.get((len(steps), steps[-1]), 0) + 1
+    if not counts:
+        return
+    total = sum(counts.values())
+    if len(counts) == 1:
+        (n_steps, last), n_runs = next(iter(counts.items()))
+        print(f"  save schedule: all {n_runs} runs have {n_steps} saved steps, "
+              f"last at {last:,}")
+        return
+    print(f"  save schedule: {len(counts)} distinct lengths across {len(run_dirs)} runs "
+          f"-- a MIXED sweep, so window counts below pool populations evolved to "
+          f"different times")
+    for (n_steps, last), n_runs in sorted(counts.items()):
+        # Percentages of the runs that HAVE readable metadata, not of
+        # len(run_dirs): an unreadable run contributes to neither, so dividing
+        # by the directory count would make the column silently fail to reach
+        # 100% with no indication why.
+        print(f"    {n_runs:5d} runs ({100 * n_runs / total:4.1f}%): "
+              f"{n_steps:3d} saved steps, last at {last:>12,}")
+
+
 def complete_run_dirs(base: str | Path, nx: int, ny: int) -> list[Path]:
     """
     All directories for one grid size that exist on disk and are marked
@@ -196,7 +267,12 @@ def complete_run_dirs(base: str | Path, nx: int, ny: int) -> list[Path]:
     THIS directory, with no risk of describing an unrelated sweep (which
     a shared, possibly-currently-mutated config.txt could).
     """
-    return [d for d in load.enumerate_run_dirs_from_metadata(base, nx, ny) if load.is_complete(d)]
+    run_dirs = [d for d in load.enumerate_run_dirs_from_metadata(base, nx, ny)
+                if load.is_complete(d)]
+    # Once per sweep+size per process (the dedup lives in the reporter itself,
+    # so the diagnostics that bypass this function get the same treatment).
+    report_save_step_distribution(run_dirs)
+    return run_dirs
 
 
 def split_run_dirs(run_dirs: list[Path], val_fraction: float, test_fraction: float = 0.0,

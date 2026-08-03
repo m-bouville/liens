@@ -208,7 +208,14 @@ def build_models_from_components(
                               # inf (exact no-op) for any checkpoint saved
                               # before dt_cap existed -- same reasoning as
                               # latent_spatial_size's own .get() above.
-                              dt_cap=lds_cfg.get("dt_cap", float("inf"))).to(device)
+                              dt_cap=lds_cfg.get("dt_cap", float("inf")),
+                              # n_substeps too, and for a sharper reason than dt_cap:
+                              # it changes what f_theta MEANS. Rebuilding a model
+                              # trained at n_substeps=N as 1 applies a POINTWISE
+                              # z1_dot as a one-shot corrector over the whole dt --
+                              # the "NOT equivalent" direction train_lds warns about
+                              # on resume. The weights load cleanly either way.
+                              n_substeps=lds_cfg.get("n_substeps", 1)).to(device)
     f_theta.load_state_dict(components["lds"].state_dict)
 
     return ae, stats_head, f_theta, frozen_modules, final_stream_configs, recon_stream_name

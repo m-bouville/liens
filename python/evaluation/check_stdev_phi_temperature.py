@@ -39,6 +39,7 @@ being on sys.path):
 """
 
 import argparse
+from training.datasets import report_save_step_distribution
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -95,6 +96,16 @@ def check_stdev_phi_temperature(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     run_dirs = load.enumerate_run_dirs_from_metadata(base_path, size, size)
+
+    # This diagnostic discovers runs directly, bypassing
+
+    # complete_run_dirs -- so it must ask for the save-step report itself.
+
+    # A sweep with runs regenerated to pass tau_down is a MIXTURE, and every
+
+    # count below pools populations evolved to different times.
+
+    report_save_step_distribution(run_dirs)
 
     temperatures, stdevs, theoretical_amplitudes = [], [], []
     # Per-RUN (not per-step) bookkeeping -- one entry per run, needed for

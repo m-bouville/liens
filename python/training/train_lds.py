@@ -36,6 +36,7 @@ from models.latent_streams import (
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, atomic_torch_save, clamp_grace_epochs,
 )
+from training.checkpoint_components import cross_check_ancestor_config
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss, compute_dt_decade_weights
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
@@ -646,6 +647,13 @@ def train_lds(
     # load must stay AFTER this measurement, or it would measure an
     # already-trained model's residual error instead of the raw,
     # pre-training dt-vs-error relationship this weighting needs.
+    # The AE ancestor must match the size this run was asked for. train_lds
+    # DOES take an explicit size (unlike stages 2 and 4/5), so a mismatch here
+    # would build the dataset at one size and the frozen encoder at another --
+    # it fails eventually on f_theta's flat_dim, but far from the cause and
+    # with a shape error that says nothing about the ancestor.
+    cross_check_ancestor_config(ae_config, {"size": size}, ae_checkpoint_path,
+                                 what="autoencoder ancestor")
     f_theta = LatentDynamics(latent_channels=ae_config["latent_channels"], n_theta=1,
                               latent_spatial=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,

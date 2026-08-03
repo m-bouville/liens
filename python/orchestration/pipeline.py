@@ -291,7 +291,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print("=" * 70)
             registry2_path = stage_dir(2) / "registry-stage2.csv"
             stage2_checkpoint = train_stage2(
-                base_path=base_path, resume_from=stage2_resume_from,
+                size=size, base_path=base_path, resume_from=stage2_resume_from,
                 checkpoint_path=stage_output_path(2), device=device,
                 loss_curve_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage_output_path(2).stem}-loss_curve.png",
                 on_checkpoint_saved=_make_checkpoint_callback(registry2_path, signature2),
@@ -582,7 +582,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 registry_path = stage_dir(stage_key) / f"registry-stage{stage_key}.csv"
                 common_args = dict(
-                    base_path=base_path, freeze_decoder=freeze_decoder,
+                    size=size, base_path=base_path, freeze_decoder=freeze_decoder,
                     checkpoint_path=stage_output_path(stage_key), device=device,
                     loss_curve_path=(
                         _PYTHON_ROOT.parent / "output" / f"stage{stage_key}"

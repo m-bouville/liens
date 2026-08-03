@@ -189,7 +189,31 @@ def cached_artifact(key, builder):
         else:
             base = _SWEEP_ROOT / f"artifact_{next(_ARTIFACT_SEQ):03d}"
             base.mkdir(parents=True, exist_ok=False)
-        _ARTIFACT_CACHE[key] = builder(base)
+        # RNG SAVED AND RESTORED AROUND THE BUILD. A cache must be INVISIBLE:
+        # a caller has to reach its own next step in the same state whether it
+        # built the artifact or got a hit. Building trains a model, which
+        # advances torch's global RNG -- so without this, only the FIRST caller
+        # pays that advance and every later one starts from a different state
+        # than it did before the cache existed.
+        #
+        # Not hypothetical: it broke
+        # test_deriv_target_centered_resume_skips_completed_warmup, which runs
+        # two stage-2 trainings on 12 windows and is sensitive to the RNG. It
+        # failed only under xdist, only on one worker, and only after this
+        # refactor -- surfacing as FileNotFoundError on a checkpoint that was
+        # never written, because nothing improved so nothing saved.
+        #
+        # Exactly the hazard the stage-1 reference row documents: an action
+        # taken for INFRASTRUCTURE must not perturb the sequence the real work
+        # depends on.
+        rng_state = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            _ARTIFACT_CACHE[key] = builder(base)
+        finally:
+            torch.set_rng_state(rng_state)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
     return _ARTIFACT_CACHE[key]
 
 

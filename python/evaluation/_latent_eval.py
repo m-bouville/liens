@@ -118,6 +118,7 @@ def _load_ae_f_theta_and_dataset(
     ae_stats_weight: float | None, hidden_dim: int, n_hidden_layers: int,
     condition_on_theta: bool | None, euler_only: bool | None, device: str | None,
     window_length_override: int | None = None, announce_euler_only: bool = True,
+    max_dt: float | None = None,
 ):
     """
     The MODEL/DATASET half of check_parameter_dependence()'s own setup
@@ -213,10 +214,24 @@ def _load_ae_f_theta_and_dataset(
     # is the correct fallback, not a KeyError.
     min_passing_steps = (min_passing_steps if min_passing_steps is not None
                           else data_config.get("min_passing_steps"))
+    # max_dt from the checkpoint too. Omitting it was a REPORTED bug with a
+    # large, silent effect: f_theta's contribution is f*dt^2/2, so evaluating a
+    # model trained with max_dt=200 across dt up to 25000 inflates that term by
+    # (25000/200)^2 = 15625. The diagnostic then reported "f_theta makes the
+    # prediction WORSE on 88% of windows" -- and the observed ratio of means,
+    # 35915, matched the extrapolation factor rather than anything about
+    # f_theta's quality. The same run at stage 3a (max_dt=150) gave 24315
+    # against a predicted 27778: two independent stages, both explained.
+    #
+    # Evaluating outside the trained dt range is a legitimate thing to WANT,
+    # which is why an explicit override still wins -- but it must be chosen,
+    # not inherited by omission.
+    max_dt = max_dt if max_dt is not None else data_config.get("max_dt")
     window_length = data_config["window_length"]
     if window_length_override is not None:
         window_length = window_length_override
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps} "
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps}"
+          f"{'' if max_dt is None else f'  max_dt={max_dt}'} "
           f"(from checkpoint's own data_config unless overridden above)")
 
     test_dirs = lds_checkpoint.get("test_dirs") or []
@@ -248,6 +263,13 @@ def _load_ae_f_theta_and_dataset(
         # dt_cap would silently evaluate as if dt_cap were still inf,
         # with no error or warning anywhere to indicate the mismatch.
         dt_cap=lds_config.get("dt_cap", float("inf")),
+        # n_substeps from the checkpoint too, and for a SHARPER reason than
+        # dt_cap: it changes what f_theta MEANS. Rebuilding a model trained
+        # at n_substeps=N as n_substeps=1 applies a POINTWISE z1_dot as a
+        # one-shot corrector over the whole dt -- the "NOT equivalent"
+        # direction train_lds warns about on resume. The weights load
+        # cleanly, so nothing else would catch it.
+        n_substeps=lds_config.get("n_substeps", 1),
     ).to(device)
     f_theta.load_state_dict(lds_checkpoint["model_state"])
     f_theta.eval()
@@ -255,7 +277,7 @@ def _load_ae_f_theta_and_dataset(
     dataset = MicrostructureEvolutionDataset(
         test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
         min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
-        encode_both_streams=True,
+        max_dt=max_dt, encode_both_streams=True,
     )
     print(f"Evaluating {len(dataset)} test windows...")
 

@@ -571,3 +571,57 @@ def build_ae_from_checkpoint(
 
     return ae, ae_encoder, checkpoint, stream_configs, recon_stream_name
 
+
+def cross_check_ancestor_config(checkpoint_config: dict, expected: dict,
+                                 checkpoint_path, what: str = "ancestor") -> None:
+    """
+    Refuse an ancestor checkpoint whose recorded settings disagree with the
+    ones this run was asked for. Reports EVERY mismatch at once, not the first.
+
+    `expected` maps a config key to the value the caller requires; keys absent
+    from the checkpoint are skipped (a checkpoint predating a field cannot be
+    said to disagree about it). Values compared with != after a float/int
+    normalisation, so 64 and 64.0 do not spuriously differ.
+
+    WHY THIS EXISTS, from a real incident. `train_stage2` derives
+    `size = model_cfg["size"]` from its ancestor and then uses that same size
+    to LOCATE THE DATASET (complete_run_dirs(base_path, size, size)). A params
+    file for 128x128 with a mistyped `resume_from` pointing at
+    64x64-stage2.pt therefore:
+
+      - built a 64x64 architecture (3 down-blocks, not 4),
+      - trained it on datasets/64x64,
+      - and wrote the result to checkpoints/stage2/128x128-stage2.pt,
+        because the OUTPUT name comes from the params file, not the model.
+
+    Every number it printed was internally consistent. Nothing failed. The
+    only reason it was recoverable is that the stage-2 backup fired and kept
+    the real 128x128 checkpoint.
+
+    That makes a size mismatch categorically worse than the dt_cap and
+    n_substeps cross-checks alongside it: those change what trained weights
+    MEAN, this changes WHICH DATA IS READ. Warning would not be enough.
+    """
+    mismatch = []
+    for key, want in expected.items():
+        if want is None or key not in checkpoint_config:
+            continue
+        got = checkpoint_config[key]
+        if isinstance(got, (int, float)) and isinstance(want, (int, float)):
+            if float(got) != float(want):
+                mismatch.append((key, got, want))
+        elif got != want:
+            mismatch.append((key, got, want))
+    if not mismatch:
+        return
+    details = ", ".join(f"{k}={old!r} (in the {what}) vs {new!r} (requested)"
+                         for k, old, new in mismatch)
+    raise ValueError(
+        f"{checkpoint_path}: {what} does not match this run: {details}.\n"
+        f"  A 'size' mismatch in particular means the ANCESTOR's size would decide which "
+        f"dataset is read and what architecture is built, while the output filename comes "
+        f"from the params file -- so the run would train the wrong model and save it under "
+        f"the right name. To warm-start ACROSS sizes use training/port_checkpoint.py; "
+        f"resume_from cannot cross a size boundary, because channels[-1] doubles with every "
+        f"added stage and the bottleneck/conditioners have the wrong shape."
+    )

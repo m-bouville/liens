@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from training.checkpoint_components import cross_check_ancestor_config
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
@@ -27,7 +28,7 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_r
 
 
 def train_refinement(
-    base_path: Path, freeze_decoder: bool,
+    base_path: Path, freeze_decoder: bool, size: int | None = None,
     ae_checkpoint_path: Path | None = None, lds_checkpoint_path: Path | None = None,
     resume_from: Path | None = None,
     rollout_weight: float = 1.0, recon0_weight: float = 0.0, stats0_weight: float = 0.0,
@@ -117,6 +118,13 @@ def train_refinement(
     ae, stats_head, f_theta, frozen_modules, stream_configs, recon_stream_name = build_models_from_components(
         components, device=device, freeze_decoder=freeze_decoder,
     )
+    # Same hazard as stage 2's: this `size` decides both the architecture and
+    # WHICH DATASET is read (complete_run_dirs(base_path, size, size) below),
+    # while the output filename comes from the params file. Stage 4/5 take TWO
+    # ancestors, so both are checked -- an E/D from one size and an f_theta
+    # from another is a mismatch nothing else would report.
+    cross_check_ancestor_config(components["encoder"].config, {"size": size},
+                                 ae_checkpoint_path or resume_from, what="encoder ancestor")
     size = components["encoder"].config["size"]
     print(f"Stage {'4' if freeze_decoder else '5'}: loaded {ancestor_note}")
     print(f"size={size}, latent_channels={components['encoder'].config['latent_channels']}, "

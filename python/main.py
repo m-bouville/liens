@@ -111,6 +111,7 @@ being on sys.path):
 
 import argparse
 import gc
+import sys
 from pathlib import Path
 
 import torch
@@ -142,7 +143,31 @@ def _free_vram(label: str) -> None:
     fit", and those two have opposite fixes -- restart the kernel versus
     lower the batch size.
     """
+    # Clear the LAST TRACEBACK first. Every frame of a failed call is pinned by
+    # sys.last_traceback -- its locals include the cached dataset, the
+    # DataLoader (and its persistent worker processes), and any CUDA tensors
+    # live at the moment of the exception. gc.collect() cannot touch them,
+    # because they are genuinely still referenced. Measured directly: a 50 MB
+    # object allocated inside a function that raises survives gc.collect() and
+    # is released only once sys.last_* is cleared.
+    #
+    # This is not hypothetical here: several exceptions have pinned entire
+    # training runs this session, and the memory came back only on a kernel
+    # restart -- which is exactly the reported symptom. In a one-shot
+    # `python main.py` it is a no-op; the whole benefit is in a persistent
+    # IPython/Spyder kernel.
+    #
+    # IPython additionally keeps the last three results as _, __, ___ and the
+    # whole Out[] history; those are the user's own outputs and are left alone.
+    for attr in ("last_traceback", "last_value", "last_type", "last_exc"):
+        if hasattr(sys, attr):
+            try:
+                setattr(sys, attr, None)
+            except (AttributeError, TypeError):
+                pass
+
     if not torch.cuda.is_available():
+        gc.collect()
         return
     gc.collect()
     torch.cuda.empty_cache()

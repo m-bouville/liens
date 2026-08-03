@@ -26,6 +26,7 @@ from models.latent_streams import cross_check_stream_configs_against_state_dict,
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save, clamp_grace_epochs,
 )
+from training.checkpoint_components import cross_check_ancestor_config
 from training.extend_encoder import extend_state_checkpoint_with_deriv_stream
 from training.datasets import VAL_DECORRELATED_AUG_INDICES, MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import ReconLoss, StatsLoss, centered_deriv_target, dt_weighted_deriv_loss
@@ -66,7 +67,7 @@ def _compact_loss(value: float, width: int = 7, precision: int = 4) -> str:
 
 
 def train_stage2(
-    base_path: Path, resume_from: Path,
+    base_path: Path, resume_from: Path, size: int | None = None,
     deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats0_weight: float = 0.0,
     stats1_weight: float = 0.0, z0_from_deriv_weight: float = 0.0,
     deriv_dt_weight_exponent: float = 0.0, deriv_target_centered: bool = False,
@@ -380,6 +381,13 @@ def train_stage2(
     # the same as this function's own stats0_weight parameter (the anchor
     # weight, which may be zero even though the ancestor's wasn't).
     ancestor_stats_weight = model_cfg["stats_weight"]
+    # BEFORE adopting the ancestor's size: if the caller stated one, they must
+    # agree. The ancestor's size decides both the architecture AND which
+    # dataset is read, while the output filename comes from the params file --
+    # so a mistyped resume_from trains the wrong model into the right name,
+    # silently. See cross_check_ancestor_config for the incident.
+    cross_check_ancestor_config(model_cfg, {"size": size}, resume_from,
+                                 what="stage-2 ancestor")
     size = model_cfg["size"]
     print(f"Resuming from {resume_from} (stat_names={stat_names}, "
           f"ancestor_stats_weight={ancestor_stats_weight}, this stage's stats0_weight={stats0_weight})")
@@ -1387,6 +1395,23 @@ def train_stage2(
     # question from parameter drift and shouldn't be conflated with it.
     # Compares the SAVED (best) checkpoint, not just the final epoch's
     # in-memory weights, since those may differ if early stopping fired.
+    if not Path(checkpoint_path).exists():
+        # Same failure train_lds already guards: the run finished without ever
+        # saving, and the drift report below then dies on a missing file with a
+        # bare FileNotFoundError that says nothing about why.
+        #
+        # It happens whenever no epoch ever beat the criterion -- most easily
+        # when a mid-run grace period (deriv_target_centered's switch) is
+        # followed by a val_loss that never falls below the EMA the grace
+        # window left behind. On a small dataset that is a plausible outcome,
+        # not a crash.
+        raise RuntimeError(
+            f"stage 2 finished without ever saving a checkpoint to {checkpoint_path}. "
+            f"No epoch's val criterion beat the running best, so nothing was written. "
+            f"If deriv_target_centered switched mid-run, the grace period leaves "
+            f"best_val_loss at the EMA reached during it -- a val_loss that then only "
+            f"rises never clears that bar. Check the loss curve at {loss_curve_path}."
+        )
     final_checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     final_state = final_checkpoint["model_state"]
     final_params = {k: final_state[k] for k in initial_params}

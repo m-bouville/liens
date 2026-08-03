@@ -68,6 +68,11 @@ def load_lds(checkpoint_path: Path, device: torch.device):
         # if dt_cap were still inf, with no error or warning anywhere
         # to indicate the mismatch.
         dt_cap=config.get("dt_cap", float("inf")),
+        # n_substeps likewise, and for a sharper reason: it changes what
+        # f_theta MEANS. This is the FOURTH separate LatentDynamics
+        # reconstruction in the codebase -- the comment just above already
+        # records that fixing dt_cap in the others did not fix it here.
+        n_substeps=config.get("n_substeps", 1),
     ).to(device)
     f_theta.load_state_dict(checkpoint["model_state"])
     f_theta.eval()
@@ -199,6 +204,9 @@ def compare_rollout_training(
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
+    plt.close(fig)  # a figure left open is held by pyplot's global
+    # registry forever -- in a persistent kernel that is a real leak, and
+    # every other check_*.py already closes its own.
     print(f"\nSaved comparison plot to {output_path}")
     return output_path
 

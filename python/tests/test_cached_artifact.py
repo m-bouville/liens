@@ -8,9 +8,9 @@ A shared mutable artifact corrupts later tests in a way that depends on
 execution order and disappears under `-k`. Both are worse than the slowness
 the cache removes, so both are asserted directly.
 """
-from pathlib import Path
 
 import pytest
+import torch
 
 from conftest import cached_artifact, copy_cached_files
 
@@ -125,3 +125,54 @@ def test_cached_paths_live_outside_any_single_test_tmp_path(tmp_path):
     cached = cached_artifact(("t_lifetime", "cfg"), builder)
     assert tmp_path not in cached.parents
     assert cached.exists()
+
+
+def test_building_a_cached_artifact_does_not_disturb_the_callers_rng():
+    """
+    THE regression. A cache must be INVISIBLE: a caller reaches its own next
+    step in the same RNG state whether it built the artifact or got a hit.
+    Building trains a model, which advances torch's global RNG, so without a
+    save/restore only the FIRST caller pays that advance.
+
+    This broke test_deriv_target_centered_resume_skips_completed_warmup --
+    two stage-2 trainings on 12 windows, sensitive to the RNG. It failed only
+    under xdist, only on one worker, and only after the caching refactor,
+    surfacing as FileNotFoundError on a checkpoint that was never written
+    because nothing improved so nothing saved.
+    """
+    def builder(d):
+        torch.manual_seed(0)
+        for _ in range(20):
+            torch.randn(8)
+        return d / "x"
+
+    torch.manual_seed(4242)
+    hit_key = ("t_rng", "prebuilt")
+    cached_artifact(hit_key, builder)          # build it once, elsewhere
+    torch.manual_seed(4242)
+    after_hit = torch.randn(3)                 # caller gets a CACHE HIT
+
+    torch.manual_seed(4242)
+    cached_artifact(("t_rng", "fresh"), builder)   # caller BUILDS it
+    after_miss = torch.randn(3)
+
+    assert torch.equal(after_hit, after_miss), (
+        "building the artifact advanced the caller's RNG -- a cache hit and a "
+        "cache miss must leave the caller in the same state"
+    )
+
+
+def test_the_rng_is_restored_even_if_the_builder_raises():
+    """GUARDS a save/restore that is not in a finally: a builder that fails
+    would leave the RNG advanced AND the cache empty, so the next attempt
+    starts somewhere different again."""
+    def bad(d):
+        torch.manual_seed(0)
+        torch.randn(16)
+        raise RuntimeError("builder failed")
+
+    torch.manual_seed(99)
+    before = torch.get_rng_state()
+    with pytest.raises(RuntimeError):
+        cached_artifact(("t_rng_raise", "x"), bad)
+    assert torch.equal(torch.get_rng_state(), before)

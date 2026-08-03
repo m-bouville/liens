@@ -74,6 +74,7 @@ being on sys.path):
 """
 
 import argparse
+from training.datasets import report_save_step_distribution
 from collections import defaultdict
 from pathlib import Path
 
@@ -892,6 +893,16 @@ def check_stdev_phi_time(
     aggregate = _AGGREGATORS[statistic]
 
     run_dirs = load.enumerate_run_dirs_from_metadata(base_path, size, size)
+
+    # This diagnostic discovers runs directly, bypassing
+
+    # complete_run_dirs -- so it must ask for the save-step report itself.
+
+    # A sweep with runs regenerated to pass tau_down is a MIXTURE, and every
+
+    # count below pools populations evolved to different times.
+
+    report_save_step_distribution(run_dirs)
 
     # (temperature, seed, step) -> [stdev_phi from each NOISE run].
     #
