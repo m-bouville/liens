@@ -29,6 +29,7 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_r
 
 def train_refinement(
     base_path: Path, freeze_decoder: bool, size: int | None = None,
+    max_dt: float | None = None, min_passing_steps: int | None = None,
     ae_checkpoint_path: Path | None = None, lds_checkpoint_path: Path | None = None,
     resume_from: Path | None = None,
     rollout_weight: float = 1.0, recon0_weight: float = 0.0, stats0_weight: float = 0.0,
@@ -153,6 +154,27 @@ def train_refinement(
                           f"check base_path/size, or that metadata.txt exists there")
     train_dirs, val_dirs, test_dirs = split_run_dirs(run_dirs, val_fraction, test_fraction, seed=seed)
 
+    # max_dt and min_passing_steps INHERITED from the f_theta being
+    # refined, unless the caller states otherwise. A stage that consumes
+    # f_theta must reproduce the window population f_theta was trained on:
+    # its correction goes as f*dt^2/2, so applying an f_theta fitted at
+    # dt <= 200 across dt up to 25000 inflates that term 15625x, z1 then
+    # propagates it through the sub-steps and the rollout chains it. The
+    # first stage-4 run without this reported val_loss = 2.7e29, with
+    # recon0 (0.21) and stats0 (25.1) sane beside it -- so nothing but the
+    # rollout term was wrong, and nothing said why.
+    #
+    # Same rule already applied to check_parameter_dependence and
+    # check_rollout. This was missed because stage 4 is a TRAINING stage,
+    # and the test enforcing the rule only covered diagnostics.
+    lds_data_config = components["lds"].provenance.get("data_config") or {}
+    max_dt = max_dt if max_dt is not None else lds_data_config.get("max_dt")
+    min_passing_steps = (min_passing_steps if min_passing_steps is not None
+                          else lds_data_config.get("min_passing_steps"))
+    if max_dt is not None:
+        print(f"max_dt={max_dt} inherited from f_theta's own training window "
+              f"population (pass max_dt explicitly to override)")
+
     if epochs == 0:
         # Ablation mode: no training happens (see the epoch loop
         # below), so train_set/train_loader would never be touched --
@@ -162,6 +184,7 @@ def train_refinement(
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
+            max_dt=max_dt, min_passing_steps=min_passing_steps,
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
               f"{len(test_dirs)} test dirs")
@@ -176,6 +199,7 @@ def train_refinement(
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
+            max_dt=max_dt, min_passing_steps=min_passing_steps,
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
               f"{len(test_dirs)} test dirs")
@@ -389,7 +413,12 @@ def train_refinement(
                     "recon_stream_name": recon_stream_name,
                 },
                 "lds_config": dict(components["lds"].config),
+                # max_dt/min_passing_steps recorded too, so stage 5 (and any
+                # diagnostic) inherits the same window population rather than
+                # rediscovering it -- the resolved values, not the arguments,
+                # since these may have come from f_theta's own data_config.
                 "data_config": {"min_step": min_step, "min_stdev_phi": min_stdev_phi,
+                                "min_passing_steps": min_passing_steps, "max_dt": max_dt,
                                 "window_length": window_length, "n_rollout_steps": n_rollout_steps},
                 "stats_config": (
                     {"stat_names": stat_names, "stats_mean": stats_loss_fn.mean.cpu(),
@@ -431,4 +460,20 @@ def train_refinement(
         title=f"Stage {'4' if freeze_decoder else '5'} loss components",
     )
 
+    if not Path(checkpoint_path).exists():
+        # Same guard as train_stage2/train_lds. Without it this returns a path
+        # that does not exist and the caller fails far from the cause -- the
+        # pipeline feeds stage 1's straight to check_reconstruction, and stage
+        # 4's to stage 5.
+        # NOT keyed on epochs==0 here, unlike stage 1: stage 4/5 DOES evaluate
+        # and save at epoch 0 even with epochs=0 (observed -- a real run wrote
+        # "0| ... -> saved"), so reaching this point means the epoch-0 save
+        # itself failed, which epochs=0 does not explain.
+        reason = "no epoch's val criterion beat the running best, and epoch 0 did not save"
+        raise RuntimeError(
+            f"stage 4/5 finished without ever saving a checkpoint to "
+            f"{checkpoint_path}: {reason}. An epochs=0 ablation cannot produce a "
+            f"checkpoint -- remove the stage from the params file rather than "
+            f"setting its epochs to 0, if anything downstream needs its output."
+        )
     return checkpoint_path

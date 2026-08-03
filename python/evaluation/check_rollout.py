@@ -286,6 +286,7 @@ def check_rollout(
     lds_checkpoint_path: Path, n_samples: int = 6, seed: int = 0,
     fixed_windows: list[str] | None = None,
     min_step: int | None = None, min_stdev_phi: float | None = None,
+    max_dt: float | None = None,
     output_path: Path | None = None, device: str | None = None,
 ) -> tuple[Path, list[str]]:
     """Saves a visual rollout-comparison figure and returns
@@ -381,6 +382,14 @@ def check_rollout(
             data_config = {"min_step": 0, "min_stdev_phi": None, "window_length": 2}
         min_step = min_step if min_step is not None else data_config["min_step"]
         min_stdev_phi = min_stdev_phi if min_stdev_phi is not None else data_config["min_stdev_phi"]
+        # max_dt from the checkpoint too. Without it this picks windows from
+        # the FULL dt range for a model trained on a restricted one, so the
+        # rollout panels show f_theta extrapolating far outside anything it
+        # saw -- its correction goes as f*dt^2/2, so at 125x the trained dt
+        # that term is ~15000x too large and the comparison says nothing about
+        # the model. Same defect that made check_parameter_dependence report
+        # "f_theta is worse on 88% of windows".
+        max_dt = max_dt if max_dt is not None else data_config.get("max_dt")
         window_length = data_config["window_length"]
 
         test_dirs = lds_checkpoint.get("test_dirs") or []
@@ -396,6 +405,7 @@ def check_rollout(
         # the real work fresh, independent of this dataset object.
         dataset = MicrostructureEvolutionDataset(
             test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
+            max_dt=max_dt,
             min_step=min_step, min_stdev_phi=min_stdev_phi,
         )
         if len(dataset) == 0:

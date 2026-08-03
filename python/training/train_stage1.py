@@ -711,6 +711,20 @@ def train_autoencoder(
             title="Stage 1 loss components",
         )
 
+    if not Path(checkpoint_path).exists():
+        # Same guard as train_stage2/train_lds. Without it this returns a path
+        # that does not exist and the caller fails far from the cause -- the
+        # pipeline feeds stage 1's straight to check_reconstruction, and stage
+        # 4's to stage 5.
+        reason = ("epochs=0, so the epoch loop never ran and nothing was saved"
+                  if epochs == 0 else
+                  "no epoch's val criterion beat the running best")
+        raise RuntimeError(
+            f"stage 1 finished without ever saving a checkpoint to "
+            f"{checkpoint_path}: {reason}. An epochs=0 ablation cannot produce a "
+            f"checkpoint -- remove the stage from the params file rather than "
+            f"setting its epochs to 0, if anything downstream needs its output."
+        )
     return checkpoint_path
 
 

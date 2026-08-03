@@ -19,6 +19,8 @@ import pathlib
 
 import pytest
 
+from conftest import source_without_comments
+
 from training.checkpoint_components import cross_check_ancestor_config
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -95,7 +97,7 @@ def test_stage_accepts_an_explicit_size(module_path, func_name):
 
 @pytest.mark.parametrize("module_path", list(_STAGES))
 def test_stage_actually_calls_the_check(module_path):
-    src = (_ROOT / module_path).read_text(encoding="utf-8")
+    src = source_without_comments(_ROOT / module_path)
     assert "cross_check_ancestor_config(" in src, (
         f"{module_path} adopts an ancestor's config without checking it"
     )
@@ -107,7 +109,7 @@ def test_the_check_precedes_adopting_the_size(module_path):
     GUARDS checking AFTER `size = <ancestor>["size"]`, which would compare the
     ancestor against itself and always pass.
     """
-    src = (_ROOT / module_path).read_text(encoding="utf-8")
+    src = source_without_comments(_ROOT / module_path)
     check_at = src.index("cross_check_ancestor_config(")
     for adopt in ('size = model_cfg["size"]', 'size = components["encoder"].config["size"]'):
         if adopt in src:
@@ -122,7 +124,7 @@ def test_the_pipeline_passes_size_to_every_stage():
     stage 3 already passed size; stages 2 and 4/5 did not, which is why the
     64x64 ancestor went unnoticed.
     """
-    src = (_ROOT / "orchestration/pipeline.py").read_text(encoding="utf-8")
+    src = source_without_comments(_ROOT / "orchestration/pipeline.py")
     for call, marker in (("train_stage2", "size=size, base_path=base_path, resume_from="),
                           ("train_refinement", "size=size, base_path=base_path, freeze_decoder=")):
         assert marker in src, f"pipeline does not pass size to {call}"

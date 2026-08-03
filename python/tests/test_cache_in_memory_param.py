@@ -372,6 +372,23 @@ def test_no_epoch_inside_the_warmup_window_can_save(tmp_path, capsys):
     train_autoencoder(base_path=base_path, checkpoint_path=tmp_path / "w.pt",
                        loss_curve_path=tmp_path / "w.png", resume_from=first, **config)
 
+    # THE CHECKPOINT, not the console. This assertion was originally a parse
+    # of stdout for "-> saved" lines, and it failed ONCE in a full-suite run
+    # while passing alone, in-file, and on two subsequent full runs -- i.e. it
+    # was flaky, and the only plausible source of the flake was stray output
+    # reaching the capture between the readouterr() above and the parse.
+    #
+    # The saved checkpoint records the epoch it was written at, which is the
+    # same fact without an interference channel. It is also STRICTLY stronger
+    # for what matters here: if any epoch inside the grace window had saved,
+    # the file would exist with that epoch, and a later save can only replace
+    # it with a LATER one.
+    saved = torch.load(tmp_path / "w.pt", map_location="cpu", weights_only=True)
+    assert saved["epoch"] > warmup, (
+        f"the saved checkpoint is from epoch {saved['epoch']}, inside the "
+        f"{warmup}-epoch warmup window -- the grace period is not suppressing saves"
+    )
+    # And the console agrees, as a cross-check on the checkpoint's own bookkeeping.
     saved_epochs = []
     for line in capsys.readouterr().out.splitlines():
         head = line.split("|")[0].strip()
@@ -379,5 +396,5 @@ def test_no_epoch_inside_the_warmup_window_can_save(tmp_path, capsys):
             saved_epochs.append(int(head))
     assert all(e > warmup for e in saved_epochs), (
         f"epoch(s) {[e for e in saved_epochs if e <= warmup]} saved inside the "
-        f"{warmup}-epoch warmup window -- the grace period is not suppressing saves"
+        f"{warmup}-epoch warmup window"
     )

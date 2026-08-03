@@ -206,3 +206,182 @@ def test_a_single_finite_point_still_gets_log_scale(tmp_path):
     src = inspect.getsource(plots.loss_curve)
     assert "if math.isfinite(v)" in src, "non-finite values must be filtered, not tolerated"
     assert "and bool(all_values)" in src, "the x-axis must stand down with the y-axis"
+
+
+# --------------------------------------------------------------------
+# non-finite components must not kill the run
+# --------------------------------------------------------------------
+
+@pytest.mark.parametrize("label,train,val", [
+    ("epochs=0 ablation: train never iterated", [float("nan")], [0.5]),
+    ("every component non-finite", [float("nan")], [float("nan")]),
+    ("inf in train", [float("inf"), 0.8], [0.9, 0.7]),
+    ("all components exactly zero", [0.0], [0.0]),
+    ("normal", [1.0, 0.8], [0.9, 0.7]),
+])
+def test_loss_component_scatter_survives_non_finite_components(tmp_path, label, train, val):
+    """
+    GUARDS killing a training run from inside its own diagnostic figure.
+
+    Reported: an `epochs = 0` stage-4 ablation. The train set is deliberately
+    never iterated, so every train component is NaN. `v > 0` already excludes
+    NaN from the positive-value list, so the code fell into the linear-axis
+    fallback -- which read ax.get_xlim() from an axes whose only scattered
+    points were NaN. matplotlib reports those limits as non-finite, and feeding
+    them back into set_xlim raised "Axis limits cannot be NaN or Inf".
+
+    Same class as loss_curve's non-finite failure, in the function that was
+    NOT hardened at the time -- it was flagged then and left, and this is the
+    run that paid for it.
+    """
+    from utils.plots import loss_component_scatter
+    histories = {name: {"train": train, "val": val, "best_so_far": val}
+                 for name in ("rollout", "recon0", "stats0")}
+    out = loss_component_scatter(list(range(len(train))), histories,
+                                  tmp_path / f"{abs(hash(label))}.png", title="t")
+    assert out is None or Path(out).exists()
+
+
+def test_all_zero_components_do_not_produce_singular_axis_limits(tmp_path, recwarn):
+    """
+    GUARDS max(all_x)*1.1 as the fallback upper limit: with every component at
+    exactly 0 that is 0, and set_xlim(0, 0) is singular. Not fatal, but it
+    warns on every figure write for the whole run.
+    """
+    from utils.plots import loss_component_scatter
+    histories = {name: {"train": [0.0], "val": [0.0], "best_so_far": [0.0]}
+                 for name in ("rollout", "recon0")}
+    loss_component_scatter([0], histories, tmp_path / "zeros.png", title="t")
+    singular = [w for w in recwarn if "singular" in str(w.message)]
+    assert not singular, [str(w.message) for w in singular]
+
+
+# --------------------------------------------------------------------
+# epochs=0 ablation: every train component is NaN
+# --------------------------------------------------------------------
+
+@pytest.mark.parametrize("label,hist", [
+    ("all components NaN", {
+        "rollout": {"train": [float("nan")], "val": [float("nan")],
+                     "best_so_far": [float("nan")]},
+        "recon0": {"train": [float("nan")], "val": [float("nan")],
+                    "best_so_far": [float("nan")]},
+        "stats0": {"train": [float("nan")], "val": [float("nan")],
+                    "best_so_far": [float("nan")]}}),
+    ("train NaN, val real", {
+        "rollout": {"train": [float("nan")], "val": [2.0], "best_so_far": [2.0]},
+        "recon0": {"train": [float("nan")], "val": [0.5], "best_so_far": [0.5]},
+        "stats0": {"train": [float("nan")], "val": [float("nan")],
+                    "best_so_far": [float("nan")]}}),
+    ("a component pinned at exactly 0", {
+        "rollout": {"train": [1.0], "val": [2.0], "best_so_far": [2.0]},
+        "recon0": {"train": [0.0], "val": [0.0], "best_so_far": [0.0]},
+        "stats0": {"train": [0.3], "val": [0.4], "best_so_far": [0.4]}}),
+])
+def test_scatter_survives_a_zero_epoch_ablation(tmp_path, label, hist):
+    """
+    GUARDS killing a RUN from inside its own diagnostic figure.
+
+    Stage 4/5 with `epochs = 0` never iterates the train set, so every train
+    component is NaN. Reported as:
+
+        ax.set_xlim(xlo if xlo else 0, xmax)
+        ValueError: Axis limits cannot be NaN or Inf
+
+    The subtlety is that `v > 0` already excludes NaN from `positive_x`, so
+    the log branch is skipped correctly -- but the FALLBACK branch then read
+    ax.get_xlim() from an axes whose only scattered points were NaN, which
+    matplotlib reports as non-finite. Filtering the inputs is not enough; the
+    fallback limits must be constants.
+
+    The third case is not a NaN at all: a component legitimately pinned at 0
+    (an inactive term, e.g. stats1_weight=0) has no representable point on a
+    log axis, which is the other way `positive_*` ends up empty.
+    """
+    from utils.plots import loss_component_scatter
+    out = loss_component_scatter([0], hist, tmp_path / f"{label.replace(' ', '_')}.png",
+                                  title="Stage 4 loss components")
+    assert out is None or Path(out).exists()
+
+
+def test_the_fallback_limits_are_constants_not_read_back_from_the_axes():
+    """
+    GUARDS `xmax = ax.get_xlim()[1]` in the non-log fallback.
+
+    Asserted on the SOURCE because the behaviour is matplotlib-version
+    dependent: on some versions an axes whose only scattered points are NaN
+    reports (0, 1) from get_xlim() and everything works, on others it reports
+    non-finite and set_xlim raises "Axis limits cannot be NaN or Inf". The
+    reported failure came from a version in the second group, and a purely
+    behavioural test passes on the first no matter how wrong the code is --
+    verified: mutating this back to get_xlim() left all 27 tests green here.
+
+    The limits must therefore not depend on what the axes reports at all.
+    """
+    import inspect
+    from utils import plots
+    src = inspect.getsource(plots.loss_component_scatter)
+    fallback = src[src.index("            ax.set_xlim(left=0)"):]
+    fallback = fallback[:fallback.index("for c in _iso_total_levels")]
+    # CODE only. The comment right there explains that get_xlim() is what NOT
+    # to use, so matching raw source matches the explanation and fails on
+    # correct code -- which is exactly what happened when this was written.
+    fallback = "\n".join(l for l in fallback.splitlines()
+                          if not l.strip().startswith("#"))
+    for forbidden in ("ax.get_xlim()", "ax.get_ylim()"):
+        assert forbidden not in fallback, (
+            f"the fallback limits must be constants -- {forbidden} returns non-finite "
+            f"on some matplotlib versions when every scattered point is NaN"
+        )
+    assert "or 1.0" in fallback, "the fallback needs a non-zero default extent"
+
+
+# --------------------------------------------------------------------
+# loss_component_scatter must survive non-finite components
+# --------------------------------------------------------------------
+
+@pytest.mark.parametrize("label,train,val,best", [
+    ("epochs=0 ablation: train_sum/0 = nan, nothing saved so best = inf",
+     [float("nan")], [1.4], [float("inf")]),
+    ("every series non-finite", [float("nan")], [float("nan")], [float("inf")]),
+    ("inf only (a component that never improved)", [1.2], [1.4], [float("inf")]),
+    ("all finite", [1.2], [1.4], [1.3]),
+])
+def test_scatter_survives_non_finite_components(tmp_path, label, train, val, best):
+    """
+    GUARDS crashing the TRAINING RUN from inside the component figure -- the
+    same trade loss_curve already lost once. Reported from a stage-4
+    `epochs = 0` ablation:
+
+        ValueError: Axis limits cannot be NaN or Inf
+
+    Two independent non-finite sources meet there, and each defeats a
+    different half of a naive guard:
+
+      * `nan` from `train_sum / n_train` when the train set is never iterated.
+        A `v > 0` filter DROPS it (nan > 0 is False), so the linear fallback
+        branch runs -- and there `max(all_x)` is nan, `nan * 1.1` is nan, and
+        `nan or 1.0` KEEPS nan, because nan is truthy.
+      * `inf` from the criterion tracker's initial best, when no epoch has
+        improved yet. A `v > 0` filter KEEPS it (inf > 0 is True), so it flows
+        straight into `max(...) * 1.6`.
+
+    Only `math.isfinite` handles both.
+    """
+    from utils.plots import loss_component_scatter
+    hist = {n: {"train": list(train), "val": list(val), "best_so_far": list(best)}
+            for n in ("rollout", "recon0", "stats0")}
+    out = loss_component_scatter([0], hist, tmp_path / "s.png",
+                                  title="Stage 4 loss components")
+    assert out is None or Path(out).exists()
+
+
+def test_the_scatter_filters_on_isfinite_not_on_positivity():
+    """Pins the mechanism, since `v > 0` looks like it would do the job and
+    silently handles only one of the two cases above."""
+    import inspect
+    from utils import plots
+    src = inspect.getsource(plots.loss_component_scatter)
+    assert src.count("math.isfinite(v)") >= 2, (
+        "both all_x and all_y must be filtered to finite values"
+    )

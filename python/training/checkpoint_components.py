@@ -227,6 +227,16 @@ def load_lds_component(checkpoint_path: str | Path, device: str | None = None) -
             "epoch": checkpoint["epoch"],
             "val_loss": checkpoint["val_loss"],
             "ae_checkpoint": checkpoint.get("ae_checkpoint"),
+            # The WINDOW POPULATION f_theta was trained on, carried forward so
+            # stage 4/5 can reproduce it. Without this, stage 4 built its
+            # dataset with no max_dt at all and applied an f_theta fitted at
+            # dt <= 200 across dt up to 25000: dt^2/2 is 15625x beyond
+            # anything it saw, z1 propagates that through the sub-steps, the
+            # rollout chains it twice, and the reported val_loss was 2.7e29
+            # -- with recon0 (0.21) and stats0 (25.1) both perfectly sane
+            # beside it. Informational-only like the rest of provenance; the
+            # caller decides whether to honour it.
+            "data_config": dict(checkpoint.get("data_config") or {}),
         },
     )
 

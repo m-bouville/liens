@@ -17,6 +17,8 @@ import re
 
 import pytest
 
+from conftest import source_without_comments
+
 import training.datasets as datasets
 from training.datasets import complete_run_dirs
 
@@ -167,7 +169,7 @@ def _modules_that_discover_runs():
             continue
         if path.name.startswith("test_") or path.name.endswith("_UPSTREAM.py"):
             continue
-        src = path.read_text(encoding="utf-8")
+        src = source_without_comments(path)
         if "enumerate_run_dirs_from_metadata(" in src and "def enumerate_run_dirs" not in src:
             found.append((path, src))
     return found

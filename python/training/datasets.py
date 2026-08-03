@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+import training.latent_cache as latent_cache
 from models.constants import LATENT_SPATIAL_SIZE as _LATENT_SPATIAL_SIZE
 from models.latent_streams import DEFAULT_STREAM_NAME
 from utils import load_datasets as load
@@ -747,6 +748,43 @@ class MicrostructureSnapshotDataset(Dataset):
         return mean, std
 
 
+def _truncate_to_max_dt(kept_steps, metadata, max_dt, window_length):
+    """Drop the tail of `kept_steps` that no surviving window can reach.
+
+    The max_dt window filter runs AFTER encoding, so without this every run
+    has its whole trajectory encoded to keep a short prefix. Measured on the
+    128x128 test set at max_dt=150: 1802 windows kept against 11587 dropped,
+    i.e. ~90% of the encode discarded.
+
+    The saved steps' gaps are non-decreasing after min_step, so once a
+    transition exceeds max_dt every later one does too and everything beyond
+    it is unreachable. But this works from the ACTUAL kept_steps gaps rather
+    than assuming that: kept_steps is the schedule after min_stdev_phi
+    filtering, and dropping an INTERIOR step merges two gaps into a larger
+    one, which can break monotonicity. Dropping a prefix -- the usual case,
+    early frames not yet phase-separated -- preserves it.
+
+    So: scan forward, stop at the first transition exceeding max_dt. That is
+    correct whether or not the gaps are monotonic, because a window starting
+    after that point would have to cross it. It is CONSERVATIVE if
+    monotonicity is broken (a later short gap is discarded along with the
+    reachable window it might have supported), which costs a few windows and
+    never keeps an invalid one -- the safe direction, and the window filter
+    downstream is unchanged and still authoritative.
+
+    `dt > max_dt` to cut, matching the window filter exactly: a transition of
+    exactly max_dt is KEPT.
+    """
+    if max_dt is None or len(kept_steps) < 2:
+        return kept_steps
+    for i in range(len(kept_steps) - 1):
+        if (kept_steps[i + 1] - kept_steps[i]) * metadata.dt > max_dt:
+            # steps[0..i] remain reachable: the transition i -> i+1 is the
+            # first that no window may cross.
+            return kept_steps[:i + 1]
+    return kept_steps
+
+
 class MicrostructureEvolutionDataset(Dataset):
     """
     Sequences of consecutive frames for LDS-family training. Two modes,
@@ -839,7 +877,7 @@ class MicrostructureEvolutionDataset(Dataset):
                  good_steps: dict[Path, list[int]] | None = None,
                  stat_names: list[str] | None = None, augment: bool = False,
                  min_std_deriv: float | None = None, encode_both_streams: bool = False,
-                 max_dt: float | None = None,
+                 max_dt: float | None = None, latent_cache_dir: Path | str | None = None,
                  stats_frame_index: int = 0,
                  fixed_aug_indices: tuple[int, ...] | list[int] | None = None,
                  read_workers: int = 16):
@@ -1050,6 +1088,20 @@ class MicrostructureEvolutionDataset(Dataset):
         self.augment = augment
         self.min_std_deriv = min_std_deriv
         self.max_dt = max_dt
+        # Latent cache. Only meaningful with a FROZEN encoder, which is what
+        # stage 3 has by construction -- 3a and 3b load the same stage-2
+        # checkpoint, and each diagnostic then encodes the test set again.
+        # The key holds a hash of the encoder's WEIGHTS, not its checkpoint
+        # path: paths get reused (stage 2 retrains in place, force=True
+        # overwrites) and mtimes survive a copy, so neither says anything
+        # about what the weights are, and a stale hit would train on latents
+        # from a different encoder with no error anywhere.
+        self._latent_cache_root = Path(latent_cache_dir) if latent_cache_dir else None
+        self._encoder_fingerprint = (
+            latent_cache.encoder_fingerprint(encoder)
+            if self._latent_cache_root is not None and encoder is not None else None)
+        if self._latent_cache_root is not None and encoder is None:
+            self._latent_cache_root = None  # nothing to cache: frames are returned raw
         # Which frame IN the window true_stats (and its own NaN guard)
         # refers to. 0 (default) is the long-standing behavior every
         # existing caller relies on: window[0], the window's own
@@ -1183,8 +1235,15 @@ class MicrostructureEvolutionDataset(Dataset):
         n_windowless_runs = 0
 
         pending_meta = []       # (run_dir, metadata, kept_steps), one per run that passed the length check
-        run_data_list = []      # filled in incrementally, ends up aligned index-for-index with pending_meta
-        run_data_deriv_list = []  # ditto -- entries are None unless encode_both_streams
+        # Keyed by POSITION in pending_meta rather than appended in flush
+        # order. A cache hit skips the encode buffer entirely, so it would
+        # otherwise land wherever the next flush happened to reach -- pairing
+        # one run's latents with another run's steps, which no shape check
+        # would catch.
+        run_data_by_index = {}
+        run_deriv_by_index = {}
+        buffer_run_indices = []   # pending_meta positions for the frames currently buffered
+        n_cache_hits = 0
 
         # Bounded-memory streaming buffer for cross-run batched encoding.
         # An EARLIER version of this accumulated every run's raw frames
@@ -1277,6 +1336,12 @@ class MicrostructureEvolutionDataset(Dataset):
             for run_dir in run_dirs:
                 metadata = load.read_metadata(run_dir / "metadata.txt")
                 kept_steps = good_steps[run_dir]
+                # BEFORE the read/encode below, not after: the window-level
+                # max_dt filter further down runs on already-encoded frames,
+                # so without this every run pays to encode a tail no surviving
+                # window can reach.
+                kept_steps = _truncate_to_max_dt(kept_steps, metadata, self.max_dt,
+                                                  window_length)
 
                 if len(kept_steps) < window_length:
                     n_windowless_runs += 1
@@ -1296,6 +1361,21 @@ class MicrostructureEvolutionDataset(Dataset):
                 # (like the plain list comprehension it replaces) even
                 # though the underlying reads complete out of order --
                 # window construction below depends on that ordering.
+                run_index = len(pending_meta)
+                if self._latent_cache_root is not None:
+                    cached = latent_cache.load_cached(
+                        latent_cache.cache_path_for_run(
+                            self._latent_cache_root, self._encoder_fingerprint, run_dir,
+                            kept_steps, self.encode_both_streams))
+                    if cached is not None:
+                        # Skips the READ as well as the encode -- at 128x128 a
+                        # frame is 32 KB against a 2 KB latent, so the disk
+                        # traffic saved exceeds the compute saved.
+                        pending_meta.append((run_dir, metadata, kept_steps))
+                        run_data_by_index[run_index] = cached[0]
+                        run_deriv_by_index[run_index] = cached[1]
+                        n_cache_hits += 1
+                        continue
                 snapshot_paths = [run_dir / load.snapshot_filename(step) for step in kept_steps]
                 frames = torch.stack([
                     torch.from_numpy(arr).unsqueeze(0)
@@ -1304,6 +1384,7 @@ class MicrostructureEvolutionDataset(Dataset):
                     )
                 ])  # (n_kept, 1, ny, nx)
                 pending_meta.append((run_dir, metadata, kept_steps))
+                buffer_run_indices.append(run_index)
 
                 if self.encoder_given:
                     buffer_frames.append(frames)
@@ -1324,16 +1405,37 @@ class MicrostructureEvolutionDataset(Dataset):
                         buffer_thetas.append(run_theta.unsqueeze(0).expand(frames.size(0), -1))
                     if buffer_total >= encode_batch_size:
                         flushed, flushed_deriv = _flush_buffer()
-                        run_data_list.extend(flushed)
-                        run_data_deriv_list.extend(flushed_deriv)
+                        for pos, latents, deriv in zip(buffer_run_indices, flushed,
+                                                        flushed_deriv, strict=True):
+                            run_data_by_index[pos] = latents
+                            run_deriv_by_index[pos] = deriv
+                            if self._latent_cache_root is not None:
+                                latent_cache.store_cached(
+                                    latent_cache.cache_path_for_run(
+                                        self._latent_cache_root, self._encoder_fingerprint,
+                                        pending_meta[pos][0], pending_meta[pos][2],
+                                        self.encode_both_streams),
+                                    latents, deriv)
+                        buffer_run_indices = []
                 else:
-                    run_data_list.append(frames)  # (n_kept, 1, ny, nx) -- encoding deferred to the training loop
-                    run_data_deriv_list.append(None)
+                    # encoding deferred to the training loop
+                    run_data_by_index[run_index] = frames  # (n_kept, 1, ny, nx)
+                    run_deriv_by_index[run_index] = None
 
             if self.encoder_given:
                 flushed, flushed_deriv = _flush_buffer()  # final, possibly-partial buffer
-                run_data_list.extend(flushed)
-                run_data_deriv_list.extend(flushed_deriv)
+                for pos, latents, deriv in zip(buffer_run_indices, flushed,
+                                                flushed_deriv, strict=True):
+                    run_data_by_index[pos] = latents
+                    run_deriv_by_index[pos] = deriv
+                    if self._latent_cache_root is not None:
+                        latent_cache.store_cached(
+                            latent_cache.cache_path_for_run(
+                                self._latent_cache_root, self._encoder_fingerprint,
+                                pending_meta[pos][0], pending_meta[pos][2],
+                                self.encode_both_streams),
+                            latents, deriv)
+                buffer_run_indices = []
 
         if self.encoder_given and torch.device(device).type == "cuda":
             # Returns the encoder's peak VRAM usage back to the CUDA
@@ -1350,11 +1452,36 @@ class MicrostructureEvolutionDataset(Dataset):
             torch.cuda.empty_cache()
 
         if n_windowless_runs:
+            # The max_dt case is called out separately because the generic
+            # advice ("shorter window_length or looser filtering") is actively
+            # misleading for it: those runs are not badly filtered, they simply
+            # have no transition short enough to be usable, and the count jumps
+            # sharply once max_dt truncation is on -- 74/2466 to 1297/2594 on
+            # the same sweep. Reading that as a filtering problem would send
+            # someone to loosen min_stdev_phi for no reason.
+            cause = (f"kept steps (after max_dt={self.max_dt} truncated each run to the "
+                     f"prefix its own transitions can reach)" if self.max_dt is not None
+                     else "kept steps")
+            advice = ("expected when max_dt is well below the sweep's later dt values"
+                      if self.max_dt is not None
+                      else "consider a shorter window_length or looser filtering if this "
+                           "is a large fraction")
             print(f"MicrostructureEvolutionDataset: {n_windowless_runs}/{len(run_dirs)} runs "
-                  f"had fewer than window_length={window_length} kept steps and were skipped "
-                  f"entirely (consider a shorter window_length or looser filtering if this "
-                  f"is a large fraction)")
+                  f"had fewer than window_length={window_length} {cause} and were skipped "
+                  f"entirely ({advice})")
 
+        # Assembled in pending_meta order, the alignment every consumer
+        # assumes. Asserted rather than assumed: a missing index means a run
+        # reached pending_meta without its data ever being filled -- from the
+        # cache, the buffer or the deferred path -- and a silently shorter
+        # list would misalign every run after it.
+        missing = set(range(len(pending_meta))) - set(run_data_by_index)
+        assert not missing, f"run data missing for pending_meta indices {sorted(missing)}"
+        run_data_list = [run_data_by_index[i] for i in range(len(pending_meta))]
+        run_data_deriv_list = [run_deriv_by_index[i] for i in range(len(pending_meta))]
+        if n_cache_hits:
+            print(f"MicrostructureEvolutionDataset: {n_cache_hits}/{len(pending_meta)} run(s) "
+                  f"read from the latent cache")
         return pending_meta, run_data_list, run_data_deriv_list
 
 

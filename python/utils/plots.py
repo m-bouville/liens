@@ -299,8 +299,16 @@ def loss_component_scatter(
                 ax.scatter([x[-1]], [y[-1]], s=90, marker="*", color=color,
                            edgecolors="black", linewidths=0.5, zorder=5)
 
-        all_x = cx["train"] + cx["val"] + cx["best_so_far"]
-        all_y = cy["train"] + cy["val"] + cy["best_so_far"]
+        # FINITE values only, everywhere below. An epochs=0 ablation never
+        # iterates the train set, so every train component is NaN -- and while
+        # `v > 0` already excludes NaN from `positive_x`, the fallback branch
+        # then read ax.get_xlim() from an axes whose only scattered points were
+        # NaN, which matplotlib reports as non-finite. That reached set_xlim as
+        # "Axis limits cannot be NaN or Inf" and killed the run from inside its
+        # own diagnostic figure -- the same class of failure as loss_curve's,
+        # which was hardened while this function was not.
+        all_x = [v for v in cx["train"] + cx["val"] + cx["best_so_far"] if math.isfinite(v)]
+        all_y = [v for v in cy["train"] + cy["val"] + cy["best_so_far"] if math.isfinite(v)]
 
         # LOG-LOG. These components span more than a decade within a single
         # run -- stage 2's deriv went 0.79 -> 0.09 while recon0 went 8.5 -> 3.2
@@ -323,7 +331,13 @@ def loss_component_scatter(
             ax.set_xlim(left=0)
             ax.set_ylim(bottom=0)
             xlo, ylo = 0.0, 0.0
-            xmax, ymax = ax.get_xlim()[1], ax.get_ylim()[1]
+            # (0, 1) rather than ax.get_xlim() when there is nothing finite to
+            # scale to: an axes holding only NaN points reports non-finite
+            # limits, and feeding those straight back into set_xlim raises.
+            # `or 1.0` covers all-zero components too (every term inactive):
+            # max()*1.1 is then 0, and set_xlim(0, 0) is singular.
+            xmax = (max(all_x) * 1.1 if all_x else 0.0) or 1.0
+            ymax = (max(all_y) * 1.1 if all_y else 0.0) or 1.0
 
         for c in _iso_total_levels(all_x, all_y):
             if ax.get_xscale() == "log":

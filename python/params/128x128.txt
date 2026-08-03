@@ -73,54 +73,56 @@ batches 	  = same
 
 val_aug_averaging= True
 
-force 	      = True
+# force 	      = True
 
 
 
 # Stage 3a
 #   latent dynamics surrogate (1step)
-n_rollout_steps= 1
-n_substeps     = 1
-z1_resync      = True
+n_rollout_steps= 1			# always 1 for 3a
+n_substeps     = 1			# always 1 for 3a
+z1_resync      = True		# always True for 3a
 
-ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
+ae_stats_weight= 1.
 
-use_dt_decade_weights = True  # was (de facto) False
+use_dt_decade_weights = True
 
-epochs 		  =1500
-patience 	  = 100
+epochs 		  =2500
+patience 	  = 200
 
 num_workers	  =   8   # was 8
 batches		  = 2048
 
-lr 			  = 0.4e-3  # was 20e-6,  default: 0.001
+lr 			  = 0.2e-3  # default: 1.e-3
 z0_noise_scale=   0.175
 
 dt_cap		  = inf   # 125/0.05 = 2500 time steps
 max_dt        = 200
 
-force 	      = True
+# force 	      = True
 
 
 
 # Stage 3b
 #   latent dynamics surrogate (rollout)
-n_rollout_steps= 2
+n_rollout_steps= 2			# always > 1 for 3b
 n_substeps     = 3
-z1_resync      = False
+z1_resync      = False		# always False for 3b
 
-ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
+resume_from = checkpoints/stage3b/128x128-stage3b-z1_resync_False-n_substeps_3.pt
+
+ae_stats_weight= 1.
 one_step_weight= 0.5
 
-use_dt_decade_weights = True  # was (de facto) False
+use_dt_decade_weights = True
 
-epochs 		  =1000
-patience 	  =  50
+epochs 		  =4000
+patience 	  = 400
 
 num_workers	  = same
 batches		  = same
 
-lr 			  =   0.2e-3  # default: 0.001
+lr 			  =   0.1e-3  	# default: 1.e-3
 z0_noise_scale=   0.1
 
 dt_cap		  = same		# must be
@@ -139,8 +141,10 @@ stats0_weight   = 1  # was 0.01
 n_rollout_steps= same
 
 batches		  = 128
-epochs 		  =   0		# 50
+epochs 		  =  50
 patience 	  =   5 	# tends to shoot up: patience won't pay
+
+max_dt        = same
 
 force 	      = True
 
@@ -155,7 +159,9 @@ stats0_weight   = 1  # was 0.01
 n_rollout_steps= same      # match stage 4's -- same reasoning as before
 
 batches        = 128
-epochs         =  0		# 30
+epochs         =  30
 patience       =   5
+
+max_dt         = same
 
 force 	       = True

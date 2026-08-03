@@ -26,6 +26,8 @@ import itertools
 import shutil
 import tempfile
 
+import inspect
+
 import pytest
 
 from models.constants import LATENT_SPATIAL_SIZE
@@ -300,6 +302,57 @@ def _limit_torch_threads_under_xdist():
         yield
 
 
+def source_without_comments(target) -> str:
+    """Source of `target` with COMMENTS AND DOCSTRINGS removed.
+
+    For tests that assert a piece of production code exists by matching its
+    text. Matching raw source also matches the prose ABOUT that code -- and
+    the prose necessarily names the very thing being checked, because that is
+    what makes it a useful comment.
+
+    Not hypothetical: it happened three times in one session (a forwarding
+    test hit a docstring mention of `f_theta.rollout(`; a _free_vram test hit
+    the comment explaining `last_traceback`; a scatter test hit the comment
+    saying NOT to use `ax.get_xlim()`, so it failed on correct code). An audit
+    afterwards found three MORE tests where commenting out the implementation,
+    leaving the comment behind, kept them green.
+
+    tokenize rather than a line-based startswith("#"): it strips trailing
+    comments too, and will not mistake a '#' inside a string for one.
+
+    `target` may be a module, a function/class, or a Path.
+    """
+    import io
+    import tokenize as _tok
+
+    if isinstance(target, (str, Path)):
+        src = Path(target).read_text(encoding="utf-8")
+    else:
+        src = inspect.getsource(target)
+    try:
+        tokens = list(_tok.generate_tokens(io.StringIO(src).readline))
+    except (_tok.TokenError, IndentationError):
+        return src          # unparseable fragment: raw is better than nothing
+    kept = []
+    for tok in tokens:
+        if tok.type == _tok.COMMENT:
+            continue
+        # A STRING whose own line STARTS with a triple quote is a docstring
+        # (or a standalone block string). Comparing against the PREVIOUS
+        # token's line does not work: INDENT sits on the same line as the
+        # docstring it precedes, so the docstring never looks like the first
+        # token on its line -- which is why the first version of this left
+        # every docstring in place.
+        if tok.type == _tok.STRING and tok.line.lstrip().startswith(('"""', "'''",
+                                                                      'r"""', "r'''")):
+            continue
+        kept.append(tok)
+    try:
+        return _tok.untokenize(kept)
+    except (ValueError, IndexError):
+        return src
+
+
 def assert_figure_was_really_written(output_path, min_kb: float = 5.0):
     """The figure exists and is not empty or truncated.
 
@@ -495,7 +548,33 @@ def isolated_project_root(tmp_path, monkeypatch):
     # _PYTHON_ROOT copies already handled below.
     import orchestration.checkpoint_registry as orch_registry
 
-    for module in (train_stage1, train_stage2, train_lds, train_refinement, orch_paths, orch_pipeline):
+    # EVERY evaluation script too, not just the training/orchestration ones.
+    # This fixture's docstring used to claim the evaluation modules touch
+    # _PYTHON_ROOT "only ever for CLI argument defaults ... never when called
+    # programmatically". That is false for twelve of them: check_f_theta,
+    # check_rollout, check_reconstruction and others compute a default
+    # output_path from _PYTHON_ROOT INSIDE the function, which is exactly the
+    # path a test of the default-folder logic has to take -- and a stray
+    # 64x64-stage3b-f_theta_diagnostic.png duly appeared in the real
+    # output/stage3b/ during an unrelated 128x128 run.
+    #
+    # Discovered by import rather than listed: a hand-maintained list is what
+    # let this drift in the first place, and a new script with a default path
+    # would not be added to it.
+    import importlib
+    import pkgutil
+    evaluation_modules = []
+    for info in pkgutil.iter_modules([str(Path(__file__).resolve().parent.parent
+                                           / "evaluation")]):
+        try:
+            mod = importlib.import_module(f"evaluation.{info.name}")
+        except Exception:  # noqa: BLE001 - a broken script must not break the fixture
+            continue
+        if hasattr(mod, "_PYTHON_ROOT"):
+            evaluation_modules.append(mod)
+
+    for module in (train_stage1, train_stage2, train_lds, train_refinement, orch_paths,
+                    orch_pipeline, *evaluation_modules):
         monkeypatch.setattr(module, "_PYTHON_ROOT", root, raising=True)
     for module in (orch_paths, orch_pipeline, orch_registry):
         monkeypatch.setattr(module, "_STAGE_DIRS", stage_dirs, raising=True)
@@ -503,3 +582,55 @@ def isolated_project_root(tmp_path, monkeypatch):
         monkeypatch.setattr(module, "_CHECKPOINTS_ROOT", root / "checkpoints", raising=True)
 
     return root
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fail_on_writes_to_the_real_project_tree():
+    """Fail the session if any test writes into the REAL output/ or checkpoints/.
+
+    Every module anchors its default paths to
+    `_PYTHON_ROOT = Path(__file__).resolve().parent.parent`, so a test that
+    does not override them writes into the working project the person is
+    actually using -- files they then have to recognise as junk and delete by
+    hand. Reported after a stray `64x64-stage3b-f_theta_diagnostic.png`
+    appeared in output/stage3b/ during a 128x128 run.
+
+    `isolated_project_root` exists for this, but its docstring asserted that
+    the evaluation/*.py scripts use _PYTHON_ROOT "only ever for CLI argument
+    defaults ... never when called programmatically". That is false for TWELVE
+    of them: check_f_theta computes its default output_path from _PYTHON_ROOT
+    inside the function, which is exactly the path a test exercising the
+    default-folder logic must take.
+
+    A detector rather than a longer patch list: the list would drift the next
+    time a script gains a default, and this catches whatever leaks by whatever
+    route -- including one the fixture was never told about.
+    """
+    root = Path(__file__).resolve().parent.parent
+    watched = [root.parent / "output", root / "checkpoints"]
+
+    def snapshot():
+        seen = set()
+        for base in watched:
+            if base.exists():
+                seen |= {p for p in base.rglob("*") if p.is_file()}
+        return seen
+
+    before = snapshot()
+    yield
+    added = sorted(snapshot() - before)
+    # The latent cache is a deliberate, self-invalidating artifact keyed on
+    # encoder weights, so a test that populates it is not leaking state a
+    # person has to reason about.
+    added = [p for p in added if "latent_cache" not in p.parts]
+    if added:
+        listing = "\n  ".join(str(p.relative_to(root.parent)) for p in added[:20])
+        more = f"\n  ... and {len(added) - 20} more" if len(added) > 20 else ""
+        pytest.fail(
+            f"{len(added)} file(s) were written into the REAL project tree by the test "
+            f"suite:\n  {listing}{more}\n"
+            f"A test is using a default path anchored to _PYTHON_ROOT. Either pass an "
+            f"explicit output_path/checkpoint_path, or add the module to "
+            f"isolated_project_root -- and note that fixture does NOT currently cover "
+            f"the evaluation/*.py scripts."
+        )

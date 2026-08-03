@@ -85,7 +85,9 @@ def test_check_reconstruction_loads_flat_stage4_checkpoint(tmp_path, capsys):
     assert (tmp_path / "recon.png").exists()
 
 
-def test_check_reconstruction_loads_a_real_train_refinement_checkpoint(tmp_path):
+def test_check_reconstruction_loads_a_real_train_refinement_checkpoint(
+    tmp_path, isolated_project_root,
+):
     """Regression test for a real, reported bug: train_refinement.py's
     own checkpoint saves the AE's state under "ae_state" (not
     "model_state" -- that key is reserved for Stage 1/1b/2's own,
@@ -159,6 +161,11 @@ def test_check_reconstruction_loads_a_real_train_refinement_checkpoint(tmp_path)
         epochs=1, batch_size=4, n_rollout_steps=1, min_step=0, min_stdev_phi=None,
         val_fraction=0.3, test_fraction=0.2, num_workers=0, checkpoint_path=stage4_path,
         device="cpu", seed=0, log_every_epoch=False,
+        # Explicit, and isolated_project_root above as a second line of
+        # defence. Without either, train_refinement's default loss_curve_path
+        # is anchored to _PYTHON_ROOT and the figure lands in the REAL
+        # output/stage4/ -- junk in the working tree of whoever runs the suite.
+        loss_curve_path=tmp_path / "stage4-loss_curve.png",
     )
     assert stage4_path.exists()
 

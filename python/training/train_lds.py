@@ -386,6 +386,7 @@ def train_lds(
     use_dt_decade_weights: bool = False,
     z0_noise_scale: float = 0.0,
     dt_cap: float = float("inf"), n_substeps: int = 1, z1_resync: bool = True,
+    latent_cache_dir: Path | str | None = None,
 ) -> Path:
     """
     Stage 3. Returns the path of the best checkpoint saved. Either give
@@ -427,6 +428,15 @@ def train_lds(
     point; there's no settled answer here yet on which direction is
     actually better in practice, just this tension to be aware of
     before picking one.
+
+    latent_cache_dir: reuse encoded latents across runs that share the
+    SAME frozen encoder. Stage 3a and 3b load the same stage-2 checkpoint,
+    and each stage-3 diagnostic encodes the test set again -- so 3b and
+    every diagnostic after it are recomputing a value that cannot have
+    changed. Keyed on a hash of the encoder's WEIGHTS, not its path (see
+    training/latent_cache.py: paths get reused, and a stale hit would train
+    on latents from a different encoder with no error anywhere). None
+    disables it entirely; nothing is written and nothing is read.
 
     n_substeps: integration steps taken BETWEEN two real frames
     (default 1 = today's behaviour exactly). Recorded in the checkpoint
@@ -613,7 +623,7 @@ def train_lds(
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
-            encode_both_streams=True,
+            encode_both_streams=True, latent_cache_dir=latent_cache_dir,
         )
         print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
               f"{len(val_set)} val windows (n_rollout_steps={n_rollout_steps}, "
@@ -624,14 +634,14 @@ def train_lds(
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
-            encode_both_streams=True,
+            encode_both_streams=True, latent_cache_dir=latent_cache_dir,
         )
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
-            encode_both_streams=True,
+            encode_both_streams=True, latent_cache_dir=latent_cache_dir,
         )
         print(f"{len(train_set)} train windows, {len(val_set)} val windows "
               f"(n_rollout_steps={n_rollout_steps}, window_length={window_length})\n")
@@ -1009,6 +1019,9 @@ def train_lds(
         )
         raise RuntimeError(
             f"stage 3 finished without ever saving a checkpoint to {checkpoint_path}. "
+            f"An epochs=0 ablation cannot produce a checkpoint -- remove the stage from "
+            f"the params file rather than setting its epochs to 0, if anything "
+            f"downstream needs its output. "
             f"{diagnosis} Loss curve written to {loss_curve_path}."
         )
 

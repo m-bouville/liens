@@ -16,6 +16,46 @@ fitter and one declared basis is the fix; this module is where it lives.
 import numpy as np
 
 
+def _stderr_from_normal_equations(XtWX: np.ndarray, sigma2: float, n_params: int,
+                                   label: str = "") -> np.ndarray:
+    """Coefficient standard errors from a weighted normal-equations matrix.
+
+    Shared by BOTH robust fits in this module. They had independent copies of
+    this block and only one was ever hardened -- the second still emitted
+    "RuntimeWarning: invalid value encountered in sqrt" from the joint Taylor
+    fit. Same defect, same file, one fix away from each other.
+
+    Two failure modes, and the obvious try/except only catches the rarer one:
+
+      * EXACTLY singular -> np.linalg.inv raises. pinv instead: the least-norm
+        solution's covariance is finite and honestly enormous along the
+        unidentifiable directions, which says more than an all-NaN row.
+      * NEAR singular -> inv() SUCCEEDS and returns a matrix that is not
+        positive semi-definite, so a variance comes back negative. sqrt then
+        warns and yields NaN: an error bar that quietly vanishes from the
+        report while the coefficient beside it still looks authoritative.
+
+    Checked explicitly so a NaN is a decision rather than a by-product, and so
+    the condition number is reported -- the usual cause is a dt range too
+    narrow to separate the basis terms.
+    """
+    try:
+        cov = sigma2 * np.linalg.inv(XtWX)
+    except np.linalg.LinAlgError:
+        cov = sigma2 * np.linalg.pinv(XtWX)
+    variances = np.diag(cov)
+    stderr = np.where(variances >= 0, np.sqrt(np.abs(variances)), np.nan)
+    if not np.all(np.isfinite(stderr)):
+        where = f" [{label}]" if label else ""
+        print(f"    NOTE{where}: {int(np.sum(~np.isfinite(stderr)))}/{n_params} coefficient "
+              f"standard error(s) are undefined -- the weighted design matrix is "
+              f"near-singular (condition number {np.linalg.cond(XtWX):.2e}). The "
+              f"COEFFICIENTS are still the least-squares solution, but nothing here says "
+              f"how well determined they are; usually the dt range is too narrow to "
+              f"separate the basis terms.")
+    return stderr
+
+
 def robust_polynomial_fit(x: np.ndarray, y: np.ndarray, basis_funcs: list,
                            n_iter: int = 10, huber_delta_scale: float = 1.345):
     """
@@ -65,11 +105,7 @@ def robust_polynomial_fit(x: np.ndarray, y: np.ndarray, basis_funcs: list,
     XtWX = X.T @ (weights[:, None] * X)
     dof = max(n - p, 1)
     sigma2 = np.sum(weights * residuals ** 2) / dof
-    try:
-        cov = sigma2 * np.linalg.inv(XtWX)
-        coef_stderr = np.sqrt(np.diag(cov))
-    except np.linalg.LinAlgError:
-        coef_stderr = np.full(p, np.nan)  # near-singular design (e.g. dt range too narrow) -- be honest, not silent
+    coef_stderr = _stderr_from_normal_equations(XtWX, sigma2, p)
     return coefs, coef_stderr
 
 
@@ -281,11 +317,8 @@ def fit_taylor_residual_coefficients(dts: np.ndarray, euler_losses_signed: np.nd
     XtWX = X.T @ (weights[:, None] * X)
     dof = max(len(y) - X.shape[1], 1)
     sigma2 = np.sum(weights * residuals ** 2) / dof
-    try:
-        cov = sigma2 * np.linalg.inv(XtWX)
-        coef_stderr_u = np.sqrt(np.diag(cov))
-    except np.linalg.LinAlgError:
-        coef_stderr_u = np.full(X.shape[1], np.nan)
+    coef_stderr_u = _stderr_from_normal_equations(XtWX, sigma2, X.shape[1],
+                                                   label=label or "joint fit")
 
     unscale5 = np.array([1.0, dt_scale, dt_scale ** 2, dt_scale ** 2, dt_scale ** 3])
     coefs_phys = coefs / unscale5

@@ -428,6 +428,11 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 registry_path = stage_dir(stage_key) / f"registry-stage{stage_key}.csv"
                 checkpoint = train_lds(
                     size=size, base_path=base_path, ae_checkpoint_path=stage2_checkpoint,
+                    # ONE cache root for the whole params file, so 3b reads
+                    # what 3a wrote. Under checkpoints/ rather than output/
+                    # because it derives from a checkpoint's weights and is
+                    # invalidated by them, not by anything a user edits.
+                    latent_cache_dir=_PYTHON_ROOT / "checkpoints" / "latent_cache",
                     checkpoint_path=stage_output_path(stage_key), device=device,
                     loss_curve_path=(
                         _PYTHON_ROOT.parent / "output" / f"stage{stage_key}"

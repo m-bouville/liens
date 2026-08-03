@@ -21,6 +21,8 @@ import pathlib
 
 import pytest
 
+from conftest import source_without_comments
+
 _SITES = [
     "evaluation/_latent_eval.py",
     "evaluation/check_rollout.py",
@@ -77,7 +79,7 @@ def test_restored_with_a_historical_default_not_a_bare_lookup(site):
     .get(key, <the value that reproduces the old behaviour>) -- inf for dt_cap,
     1 for n_substeps.
     """
-    src = (_ROOT / site).read_text(encoding="utf-8")
+    src = source_without_comments(_ROOT / site)
     for param, default in (("dt_cap", 'float("inf")'), ("n_substeps", "1")):
         assert f'.get("{param}", {default})' in src, (
             f"{site} must use .get(\"{param}\", {default}) so pre-{param} checkpoints "
@@ -97,7 +99,7 @@ def test_the_known_broken_site_really_is_broken():
     """If compare_integrators is ever fixed, this fails and forces it into
     _SITES rather than letting it quietly rejoin the codebase unchecked."""
     from models.latent_dynamics import LatentDynamics
-    src = (_ROOT / "evaluation/compare_integrators.py").read_text(encoding="utf-8")
+    src = source_without_comments(_ROOT / "evaluation/compare_integrators.py")
     assert "forward_ab2" in src
     assert not hasattr(LatentDynamics, "forward_ab2"), (
         "compare_integrators.py now runs -- add it to _SITES so its LatentDynamics "
@@ -118,7 +120,7 @@ def test_the_site_list_is_complete():
         if "test" in path.parts or path.name.startswith("test_"):
             continue
         try:
-            src = path.read_text(encoding="utf-8")
+            src = source_without_comments(path)
         except (UnicodeDecodeError, OSError):
             continue
         if "LatentDynamics(" not in src or "class LatentDynamics" in src:

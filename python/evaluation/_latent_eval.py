@@ -284,6 +284,36 @@ def _load_ae_f_theta_and_dataset(
     return (device, euler_only, lds_checkpoint_path, ae_config, dataset, ae_decoder, f_theta)
 
 
+def _grid_size_for_dataset_filename(size, lds_checkpoint_path) -> str:
+    """The `{size}x{size}` part of a dataset-level figure name.
+
+    `size` is a CLI argument, and it is OPTIONAL -- running
+
+        python -m evaluation.check_parameter_dependence --lds-checkpoint ... \\
+               --base-path ../datasets
+
+    leaves it None, and the f-string then produced a file literally called
+    `NonexNone-dz0dt.png` in output/datasets/. Reported.
+
+    The size is not in the LDS checkpoint's own config (that records
+    latent_channels/latent_spatial_size/hidden_dim, not the grid), and the AE
+    checkpoint is not loaded yet where this path is built. But the checkpoint
+    STEM carries it -- `128x128-stage3a` -- which is the same source
+    _stage_folder_from_checkpoint_stem already reads.
+
+    If the stem does not carry one either, falls back to the stem itself
+    rather than inventing a size: a figure named after the checkpoint that
+    produced it is worse-grouped but not WRONG, whereas `NonexNone` is a
+    filename that will be mistaken for a bug in the physics.
+    """
+    if size is not None:
+        return f"{size}x{size}"
+    match = re.match(r"^(\d+)x(\d+)", Path(lds_checkpoint_path).stem)
+    if match:
+        return f"{match.group(1)}x{match.group(2)}"
+    return Path(lds_checkpoint_path).stem
+
+
 def _stage_folder_from_checkpoint_stem(checkpoint_path: Path) -> str:
     """
     Stage folder derived from the checkpoint's own stem (e.g.
@@ -357,7 +387,8 @@ def _load_models_and_dataset(
         # file and the later run overwrites the earlier. Pass
         # dz0dt_output_path explicitly to keep both.
         dz0dt_output_path = ((_PYTHON_ROOT.parent / "output" / "datasets"
-                               / f"{size}x{size}-dz0dt.png") if output_path_defaulted
+                               / f"{_grid_size_for_dataset_filename(size, lds_checkpoint_path)}"
+                                 f"-dz0dt.png") if output_path_defaulted
                               else output_path.parent / f"{lds_checkpoint_path.stem}-dz0dt.png")
     dz0dt_output_path.parent.mkdir(parents=True, exist_ok=True)
     if dt_dependence_output_path is None:

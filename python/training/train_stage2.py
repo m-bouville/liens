@@ -1407,6 +1407,9 @@ def train_stage2(
         # not a crash.
         raise RuntimeError(
             f"stage 2 finished without ever saving a checkpoint to {checkpoint_path}. "
+            f"An epochs=0 ablation cannot produce a checkpoint -- remove the stage from "
+            f"the params file rather than setting its epochs to 0, if anything "
+            f"downstream needs its output. "
             f"No epoch's val criterion beat the running best, so nothing was written. "
             f"If deriv_target_centered switched mid-run, the grace period leaves "
             f"best_val_loss at the EMA reached during it -- a val_loss that then only "
