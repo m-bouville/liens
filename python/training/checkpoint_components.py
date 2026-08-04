@@ -149,6 +149,13 @@ def load_ae_components(checkpoint_path: str | Path,
         "source_checkpoint": str(checkpoint_path.resolve()),
         "epoch": checkpoint["epoch"],
         "val_loss": checkpoint["val_loss"],
+        # The WINDOW POPULATION, carried across the 4 -> 5 handoff.
+        # load_lds_component already does this for 3b -> 4; this loader is the
+        # other half of the same chain and did not, so stage 5 resumed stage 4
+        # with max_dt=None and trained on the FULL dt range -- the same defect
+        # that gave stage 4 a val_loss of 2.7e29 when it had no max_dt either.
+        # Stage 4 SAVES data_config correctly; nothing was reading it back.
+        "data_config": dict(checkpoint.get("data_config") or {}),
     }
     ae_component_config = {
         "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],
@@ -328,6 +335,13 @@ def load_joint_refinement_checkpoint(checkpoint_path: str | Path,
         "source_checkpoint": str(checkpoint_path.resolve()),
         "epoch": checkpoint["epoch"],
         "val_loss": checkpoint["val_loss"],
+        # The WINDOW POPULATION, carried across the 4 -> 5 handoff.
+        # load_lds_component already does this for 3b -> 4; this loader is the
+        # other half of the same chain and did not, so stage 5 resumed stage 4
+        # with max_dt=None and trained on the FULL dt range -- the same defect
+        # that gave stage 4 a val_loss of 2.7e29 when it had no max_dt either.
+        # Stage 4 SAVES data_config correctly; nothing was reading it back.
+        "data_config": dict(checkpoint.get("data_config") or {}),
     }
     ae_component_config = {
         "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],

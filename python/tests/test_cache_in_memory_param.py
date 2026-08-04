@@ -216,15 +216,42 @@ def test_no_reference_row_without_a_resume(tmp_path, capsys):
     assert " ref|" not in capsys.readouterr().out
 
 
-def test_reference_row_does_not_change_the_training_trajectory(tmp_path):
+def test_reference_row_does_not_change_the_training_trajectory(tmp_path, capsys):
     """
     GUARDS omitting the RNG save/restore. The reference pass advances torch's
     global RNG, which reorders train_loader's shuffle at epoch 1 -- so a
     purely diagnostic row would silently change what the run actually trains
     on. train_stage2 documents having hit exactly this.
 
-    Compared on WEIGHTS, not on the printed loss: a shuffle difference changes
-    the trajectory, which is the thing that must not happen.
+    Compared on the epoch-1 TRAIN LOSS, which is what a shuffle difference
+    would change, rather than on the saved checkpoint's weights.
+
+    NOT on weights, because the reference row acquired a SECOND, intended
+    effect: it supplies tracker.reference_val_loss, the ceiling that stops a
+    resumed run saving something worse than its ancestor. Suppressing the row
+    therefore suppresses the ceiling too, so the two arms differ in SAVE POLICY
+    rather than trajectory:
+
+        with ref:    "no epoch improved on the ancestor ... kept as w.pt"
+                      -> w.pt holds the ANCESTOR
+        without ref: "1| ... -> saved"
+                      -> n.pt holds this run's epoch-1 weights
+
+    Different by construction, whatever the RNG did. Comparing weights reported
+    "the reference row changed the training trajectory -- RNG not restored",
+    which was the wrong diagnosis of a real difference.
+
+    It used to compare weights, and that stopped working once the reference
+    row began seeding the tracker's ceiling: the ref-row arm then declines to
+    save an epoch worse than its ancestor while the no-ref arm always saves
+    epoch 1, so the two arms legitimately hold DIFFERENT checkpoints. Whether
+    they did was data-dependent -- this test passed on one machine and failed
+    on another.
+
+    The underlying property is unchanged and is still what is asserted: the
+    reference pass must not perturb the RNG, so the training trajectory must
+    be identical. Only the observable had to move off the checkpoint, which is
+    now a function of the criterion as well as of the trajectory.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -235,14 +262,24 @@ def test_reference_row_does_not_change_the_training_trajectory(tmp_path):
     common = dict(size=32, base_path=base_path, epochs=1, batch_size=4, base_channels=4,
                    latent_channels=4, val_fraction=0.34, test_fraction=0.17, num_workers=0,
                    min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-                   device="cpu", seed=0, log_every_epoch=False)
+                   # log_every_epoch=True: the observable here is the epoch-1
+                   # TRAIN LOSS, and with False only SAVED epochs print. Once
+                   # the reference ceiling stopped epoch 1 saving on a resume,
+                   # the row vanished and the parser found nothing to compare.
+                   device="cpu", seed=0, log_every_epoch=True)
     ancestor = train_autoencoder(checkpoint_path=tmp_path / "anc.pt",
                                   loss_curve_path=tmp_path / "anc.png", **common)
 
+    # CLEARED before the measured run: the ancestor above prints its own
+    # epoch-1 row, and parsing the FIRST such row in the capture picked that
+    # up instead -- comparing the ancestor against the no-ref arm and
+    # reporting a trajectory difference that did not exist.
+    capsys.readouterr()
     with_ref = train_autoencoder(checkpoint_path=tmp_path / "w.pt",
                                   loss_curve_path=tmp_path / "w.png",
                                   resume_from=ancestor, **common)
-    a = torch.load(with_ref, map_location="cpu", weights_only=True)["model_state"]
+    del with_ref  # the checkpoint is no longer the observable -- see the docstring
+    out_with_ref = capsys.readouterr().out
 
     # same run, reference row suppressed
     src = inspect.getsource(mod)
@@ -259,10 +296,25 @@ def test_reference_row_does_not_change_the_training_trajectory(tmp_path):
             resume_from=ancestor, **common)
     finally:
         mod.train_autoencoder = original
-    b = torch.load(without_ref, map_location="cpu", weights_only=True)["model_state"]
+    del without_ref
+    out_without_ref = capsys.readouterr().out
 
-    assert all(torch.equal(a[k], b[k]) for k in a), (
-        "the reference row changed the training trajectory -- RNG not restored"
+    # Epoch-1 TRAIN loss from each arm. A reordered shuffle changes which
+    # samples land in which batch, so the epoch average moves -- that is the
+    # observable, and unlike the saved checkpoint it does not depend on
+    # whether the criterion chose to save.
+    def _epoch1_train_loss(text):
+        for line in text.splitlines():
+            head = line.split("|")[0].strip()
+            if head == "1":
+                return float(line.split("|")[1].split("=")[0].strip())
+        raise AssertionError(f"no epoch-1 row found in:\n{text[-600:]}")
+
+    with_ref_loss = _epoch1_train_loss(out_with_ref)
+    without_ref_loss = _epoch1_train_loss(out_without_ref)
+    assert with_ref_loss == without_ref_loss, (
+        f"the reference row changed the training trajectory -- RNG not restored "
+        f"({with_ref_loss} with the row, {without_ref_loss} without)"
     )
 
 
@@ -384,6 +436,14 @@ def test_no_epoch_inside_the_warmup_window_can_save(tmp_path, capsys):
         assert "without ever saving" in str(exc), exc
         assert not checkpoint_path.exists()
         return          # nothing saved at all -- vacuously inside no window
+
+    # The output file may be the ANCESTOR, copied forward because nothing beat
+    # it -- a third legitimate outcome, added when the reference ceiling made
+    # "no improvement" common. Its epoch belongs to the PREVIOUS run's
+    # numbering and says nothing about this run's grace period, so compare the
+    # bytes rather than trusting the epoch field.
+    if checkpoint_path.read_bytes() == Path(first).read_bytes():
+        return          # nothing this run produced was better; nothing to check
 
     saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     assert saved["epoch"] > warmup, (

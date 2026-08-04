@@ -63,6 +63,24 @@ class CheckpointCriterionTracker:
     """
     ema_warmup_epochs: int = 0
     val_ema_decay: float = 0.7
+    # The ANCESTOR's val_loss under THIS run's objective, if known: a CEILING
+    # on best_val_loss, so a resumed run can never save something worse than
+    # what it started from.
+    #
+    # Without it best_val_loss starts at inf, so epoch 1 always saves. Observed
+    # on a real stage-2 resume: the reference row read 3.9054 and epoch 1
+    # saved at 4.0149 -- a worse checkpoint written over a better one, and only
+    # recoverable because the backup had fired. Epochs 2 and 3 were worse still
+    # (4.35, 4.80) before epoch 4 finally beat the ancestor.
+    #
+    # A ceiling rather than an initial value, because both the grace branch and
+    # the just_left_warmup branch RESET best_val_loss and would discard a plain
+    # assignment.
+    #
+    # Costs nothing to obtain where a reference row is already printed -- that
+    # row IS a full validation pass, and its value was previously computed and
+    # thrown away.
+    reference_val_loss: float | None = None
     best_val_loss: float = field(default=float("inf"), init=False)
     val_ema: float | None = field(default=None, init=False)
     in_grace_period: bool = field(default=False, init=False)
@@ -72,7 +90,8 @@ class CheckpointCriterionTracker:
         self._grace_remaining = self.ema_warmup_epochs
         self.in_grace_period = self._grace_remaining > 0
 
-    def reset_with_grace(self, grace_epochs: int) -> None:
+    def reset_with_grace(self, grace_epochs: int,
+                          reference_val_loss: float | None = None) -> None:
         """
         Resets the tracker as if freshly constructed with
         ema_warmup_epochs=grace_epochs -- for a MID-RUN reset where
@@ -121,7 +140,14 @@ class CheckpointCriterionTracker:
         finished absorbing yet.
         """
         self.val_ema = None
-        self.best_val_loss = float("inf")
+        # The OLD reference is discarded, not carried over: a reset happens
+        # precisely because the objective changed, so a bar measured under the
+        # superseded one is exactly what must not be reused. A caller that can
+        # re-measure under the NEW objective passes the fresh value; one that
+        # cannot passes nothing and gets the historical inf.
+        self.reference_val_loss = reference_val_loss
+        self.best_val_loss = (float("inf") if reference_val_loss is None
+                               else reference_val_loss)
         self._grace_remaining = grace_epochs
         self.in_grace_period = grace_epochs > 0
 
@@ -141,7 +167,11 @@ class CheckpointCriterionTracker:
             # but this is NEVER what should_save is decided against
             # below; grace's whole point is that nothing is compared
             # against it while it's still this fresh.
-            self.best_val_loss = self.val_ema
+            # min: a grace period must not RAISE the bar above the ancestor.
+            # Its job is to stop a lucky early epoch planting a flag, not to
+            # license saving something worse than the run started from.
+            self.best_val_loss = (self.val_ema if self.reference_val_loss is None
+                                   else min(self.val_ema, self.reference_val_loss))
             self._grace_remaining -= 1
             self.in_grace_period = self._grace_remaining > 0
             return self.val_ema, False
@@ -157,7 +187,8 @@ class CheckpointCriterionTracker:
             # period (above) already seeded best_val_loss from a
             # smoothed value when it ended, so just_left_warmup is
             # never True there.
-            self.best_val_loss = float("inf")
+            self.best_val_loss = (float("inf") if self.reference_val_loss is None
+                                   else self.reference_val_loss)
 
         should_save = criterion < self.best_val_loss
         if should_save:

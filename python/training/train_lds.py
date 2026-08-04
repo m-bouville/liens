@@ -1019,9 +1019,9 @@ def train_lds(
         )
         raise RuntimeError(
             f"stage 3 finished without ever saving a checkpoint to {checkpoint_path}. "
-            f"An epochs=0 ablation cannot produce a checkpoint -- remove the stage from "
-            f"the params file rather than setting its epochs to 0, if anything "
-            f"downstream needs its output. "
+            f"{'An epochs=0 ablation cannot produce a checkpoint -- remove the stage from '
+               'the params file rather than setting its epochs to 0, if anything downstream '
+               'needs its output. ' if epochs == 0 else ''}"
             f"{diagnosis} Loss curve written to {loss_curve_path}."
         )
 

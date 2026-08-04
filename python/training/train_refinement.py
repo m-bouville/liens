@@ -17,6 +17,7 @@ from training.checkpoint_components import cross_check_ancestor_config
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
+    clamp_grace_epochs,
 )
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import StatsLoss
@@ -220,6 +221,20 @@ def train_refinement(
     if max_dt is not None:
         print(f"max_dt={max_dt} inherited from f_theta's own training window "
               f"population (pass max_dt explicitly to override)")
+    # min_step / min_stdev_phi are NOT inherited -- they come from the params
+    # file at every stage, deliberately: unlike max_dt a mismatch is mild (a
+    # different slice of eligible frames) rather than catastrophic (f_theta
+    # applied where f*dt^2/2 is orders of magnitude beyond anything it saw).
+    # But nothing checked them either, so a per-stage override would silently
+    # refine the encoder against a different population than f_theta trained
+    # on. Reported, not enforced.
+    for _field, _here in (("min_step", min_step), ("min_stdev_phi", min_stdev_phi)):
+        _there = lds_data_config.get(_field, "<absent>")
+        if _there != "<absent>" and _there != _here:
+            print(f"NOTE: {_field}={_here} differs from f_theta's own {_there}. Not an error "
+                  f"-- unlike max_dt this only shifts which frames are eligible, not how far "
+                  f"f_theta is extrapolated -- but the encoder is being refined against a "
+                  f"different window population than f_theta was trained on.")
 
     if epochs == 0:
         # Ablation mode: no training happens (see the epoch loop
@@ -276,6 +291,8 @@ def train_refinement(
         loss_curve_path = _PYTHON_ROOT.parent / "output" / stage_dir / "loss_curve.png"
     loss_components_path = loss_curve_path.with_name(
         loss_curve_path.stem + "-components" + loss_curve_path.suffix)
+
+    loss_curve_events = []
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
@@ -394,6 +411,47 @@ def train_refinement(
         effective_rollout_weight = geometric_warmup_weight(
             epoch, rollout_weight, rollout_weight_warmup_epochs, rollout_weight_warmup_start)
 
+        # THE END OF THE RAMP RESETS THE SAVE CRITERION.
+        #
+        # val_loss is deliberately never ramped (see the step() call below):
+        # it must stay comparable across epochs and against runs with no
+        # warmup. The consequence is that DURING the ramp the model is not yet
+        # optimising the full objective, so its val_loss under that objective
+        # is legitimately terrible -- and feeding those values to the tracker
+        # leaves it descending from a number describing a model that no longer
+        # exists.
+        #
+        # Observed on a real run: epoch 1's val_loss was 33.86 (a ramp
+        # transient), and by epoch 13 the EMA was still at 0.656 -- still
+        # mostly forgetting that transient -- while the actual val_loss had
+        # stopped improving at epoch 11 and was oscillating in 0.10-0.12. Every
+        # epoch cleared the descending bar and saved, so the criterion was
+        # blind and early stopping could not fire either.
+        #
+        # Exactly the situation reset_with_grace exists for: stage 2 calls it
+        # when deriv_target_centered switches, because "val_loss computed under
+        # the OLD target isn't a fair bar for the NEW target's own val_loss to
+        # clear". A weight ramp is the same change spread over several epochs.
+        if (rollout_weight_warmup_epochs > 0
+                and epoch == rollout_weight_warmup_epochs):
+            # max(2, ...) not max(1, ...): a single-epoch grace is
+            # mathematically identical to no grace at all, since best_val_loss
+            # then ends up as that one epoch's own raw value, lucky or not.
+            # Same derivation as stage 2's, from val_ema_decay's own averaging
+            # window.
+            grace = max(2, round(1 / (1 - val_ema_decay))) if val_ema_decay < 1 else 2
+            grace = clamp_grace_epochs(grace, epochs - epoch + 1)
+            if grace > 0:
+                print(f"  [epoch {epoch}: rollout_weight has reached full strength -- giving "
+                      f"the tracker a {grace}-epoch grace period before comparing again, since "
+                      f"val_loss recorded DURING the ramp described a model trained on a "
+                      f"different objective and is not a fair bar for the full one to clear]")
+            # Same marking as stage 2's target switch: the criterion reset
+            # makes "best EMA so far" jump discontinuously, and the ramp
+            # completing changes what the TRAIN column measures.
+            loss_curve_events.append((epoch - 0.5, "rollout ramp complete"))
+            tracker.reset_with_grace(grace)
+
         train_loss_sum = torch.zeros((), device=device)
         train_rollout_sum = torch.zeros((), device=device)
         train_recon0_sum = torch.zeros((), device=device)
@@ -448,6 +506,7 @@ def train_refinement(
             loss_curve(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                 loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
+                event_epochs=loss_curve_events,
             )
 
         current_val_components = {
@@ -487,7 +546,13 @@ def train_refinement(
                + (f"  [rollout_weight {effective_rollout_weight:.3g}/{rollout_weight:g}]"
                   if effective_rollout_weight < rollout_weight else ""))
 
-        if epoch == 1:
+        # AFTER the ramp, not at epoch 1. During a warmup the imbalance is
+        # deliberate -- the whole point is that rollout contributes almost
+        # nothing yet -- so an epoch-1 reading describes the transient, not the
+        # scales. On a real run it fired at epoch 1 reporting raw rollout=168
+        # and recommending rollout_scale~168, when the CONVERGED value was
+        # 0.053: acting on it would have undone the ramp that had just worked.
+        if epoch == max(1, rollout_weight_warmup_epochs):
             # ONE component dominating the loss means the *_scale values are
             # mis-calibrated for THIS stage, and the weights beside them mean
             # nothing. Reported once, at the first epoch, because that is when
@@ -587,6 +652,7 @@ def train_refinement(
     loss_curve(
         epoch_history, train_loss_history, val_loss_history, best_so_far_history,
         loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
+        event_epochs=loss_curve_events,
     )
     loss_component_scatter(
         epoch_history, component_histories, loss_components_path,

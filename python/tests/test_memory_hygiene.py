@@ -21,6 +21,8 @@ import sys
 
 import pytest
 
+from conftest import source_without_comments
+
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
@@ -176,3 +178,82 @@ def test_every_saved_figure_is_closed(path):
         f"{path.name}: {saves} savefig call(s) but only {closes} plt.close() -- "
         f"an unclosed figure leaks for the life of a persistent kernel"
     )
+
+
+# --------------------------------------------------------------------
+# the leak detector must not mistake a MOVE for a write
+# --------------------------------------------------------------------
+
+# The PRODUCTION functions, imported -- not re-implementations. An earlier
+# version of this file reimplemented both, so dropping the move check in the
+# fixture left every test here green: they were checking their own arithmetic.
+# That is why the rule is a module-level function rather than logic inline in
+# the fixture.
+from conftest import files_written_between, snapshot_files  # noqa: E402
+
+
+def _snapshot(bases):
+    return snapshot_files(bases)
+
+
+def _leaked(before, after):
+    return [p.name for p in files_written_between(before, after)]
+
+
+def test_moving_a_file_within_the_tree_is_not_a_leak(tmp_path):
+    """
+    REGRESSION. The detector compared PATHS, so tidying old backups into
+    checkpoints/stage2/_archives/ during a session showed up as four
+    brand-new files and failed the suite -- when nothing had been written at
+    all.
+
+    Identity is (size, mtime_ns): shutil.move and copy2 both preserve mtime,
+    so a new path whose identity matches something that DISAPPEARED is a move.
+    """
+    import os
+    import shutil
+
+    stage = tmp_path / "checkpoints" / "stage2"
+    (stage / "_archives").mkdir(parents=True)
+    f = stage / "128x128-stage2-20260802_09h40.pt"
+    f.write_bytes(b"x" * 100)
+    os.utime(f, (1_700_000_000, 1_700_000_000))
+
+    before = _snapshot([stage])
+    shutil.move(str(f), str(stage / "_archives" / f.name))
+    assert _leaked(before, _snapshot([stage])) == []
+
+
+def test_a_real_write_is_still_caught(tmp_path):
+    """GUARDS making the detector so permissive it stops detecting."""
+    stage = tmp_path / "checkpoints" / "stage2"
+    stage.mkdir(parents=True)
+    (stage / "old.pt").write_bytes(b"x" * 100)
+    before = _snapshot([stage])
+    (stage / "written-by-a-test.png").write_bytes(b"y" * 50)
+    assert _leaked(before, _snapshot([stage])) == ["written-by-a-test.png"]
+
+
+def test_a_COPY_is_still_caught_even_though_mtime_is_preserved(tmp_path):
+    """
+    copy2 preserves mtime too, but the source does NOT disappear -- so its
+    identity is not in `vanished` and the new file is correctly reported.
+    That distinction is the whole reason the check is on vanished entries
+    rather than on mtime alone.
+    """
+    import shutil
+
+    stage = tmp_path / "checkpoints" / "stage2"
+    stage.mkdir(parents=True)
+    src = stage / "orig.pt"
+    src.write_bytes(b"x" * 100)
+    before = _snapshot([stage])
+    shutil.copy2(src, stage / "copy.pt")
+    assert _leaked(before, _snapshot([stage])) == ["copy.pt"]
+
+
+def test_the_detector_uses_identity_not_bare_paths():
+    """The conftest fixture must use the same scheme these tests describe."""
+    src = source_without_comments(_ROOT / "tests/conftest.py")
+    assert "st.st_mtime_ns" in src, "the snapshot must record identity, not just paths"
+    assert "vanished" in src, "moves must be recognised by matching a disappeared file"

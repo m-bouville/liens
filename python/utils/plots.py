@@ -58,6 +58,7 @@ def loss_curve(
     best_so_far: list[float], output_path: Path, title: str = "",
     secondary_train: list[float] | None = None, secondary_val: list[float] | None = None,
     secondary_label: str = "1step",
+    event_epochs: list[tuple[float, str]] | None = None,
 ) -> Path:
     """
     Called from every stage's epoch loop (see train_stage1.py/
@@ -110,6 +111,17 @@ def loss_curve(
     ax.plot(epochs, train_loss, label="train", color="tab:blue", alpha=0.8)
     ax.plot(epochs, val_loss, label="valid", color="tab:orange", alpha=0.8)
     ax.plot(epochs, best_so_far, label="best EMA so far", color="tab:green", linewidth=2)
+
+    # Mid-run events (objective switches, ramp completions, criterion resets)
+    # drawn as labelled vertical lines. Without them the curve shows a
+    # discontinuity that reads as a learning event: stage 2's centered-target
+    # switch drops val_loss sharply in one epoch because the QUANTITY changed,
+    # not the model -- and on a log-log axis that cliff is the most prominent
+    # feature of the whole figure. The label goes in the legend rather than as
+    # rotated text on the line, which collides with the curves at small sizes.
+    for event_x, event_label in (event_epochs or []):
+        ax.axvline(event_x, color="tab:red", linestyle=":", linewidth=1.2,
+                    alpha=0.8, label=event_label)
 
     if secondary_train is not None:
         ax.plot(epochs, secondary_train, label=f"train ({secondary_label})",

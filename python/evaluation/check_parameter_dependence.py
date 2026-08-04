@@ -1895,7 +1895,7 @@ def _build_and_save_figures(
 
 def check_parameter_dependence(
     lds_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
-    min_passing_steps: int | None = None,
+    min_passing_steps: int | None = None, max_dt: float | None = None,
     base_path: Path | None = None, size: int | None = None,
     ae_stats_weight: float | None = None, hidden_dim: int = 256, n_hidden_layers: int = 2,
     condition_on_theta: bool | None = None,
@@ -1944,6 +1944,7 @@ def check_parameter_dependence(
         lds_checkpoint_path, min_step, min_stdev_phi, min_passing_steps, base_path, size,
         ae_stats_weight, hidden_dim, n_hidden_layers, condition_on_theta, euler_only,
         output_path, dz0dt_output_path, dt_dependence_output_path, device,
+        max_dt=max_dt,
     )
     results = _evaluate_windows(ctx.dataset, ctx.f_theta, ctx.ae_decoder, ctx.device,
                                  decode, ctx.euler_only)
@@ -2017,6 +2018,15 @@ def main():
     # Accepted only so that passing it gives an EXPLANATION rather than
     # argparse's bare "unrecognized arguments". The flag is meaningful in
     # check_rollout and nowhere else.
+    parser.add_argument("--max-dt", type=float, default=None,
+                         help="OVERRIDE the checkpoint's own max_dt for this evaluation. "
+                              "Without it the diagnostic inherits f_theta's training value "
+                              "and can only ever look INSIDE the range it was trained on -- "
+                              "so it cannot answer whether that range was set too tightly. "
+                              "Pass a larger value (or inf) to see how the error actually "
+                              "behaves beyond it. Note this is deliberately OFF-DISTRIBUTION: "
+                              "the point is to measure the extrapolation, not to pretend it "
+                              "is in-distribution")
     parser.add_argument("--z1-resync", action=argparse.BooleanOptionalAction, default=None,
                          help="NOT SUPPORTED here -- use check_rollout. This diagnostic "
                               "evaluates a SINGLE forward() step with the real z1 supplied, so "
@@ -2038,6 +2048,7 @@ def main():
     check_parameter_dependence(
         lds_checkpoint_path=args.lds_checkpoint, min_step=args.min_step,
         min_stdev_phi=args.min_stdev_phi, min_passing_steps=args.min_passing_steps,
+        max_dt=args.max_dt,
         base_path=args.base_path, size=args.size, ae_stats_weight=args.ae_stats_weight,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         condition_on_theta=args.condition_on_theta, euler_only=args.euler_only,

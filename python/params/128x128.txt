@@ -65,8 +65,8 @@ deriv_target_centered=True
 resume_from	  = checkpoints/stage2/128x128-stage2.pt
 
 epochs 		  = 100
-patience 	  =  25
-deriv_weight_warmup_epochs= 15  # also switches to symmetric definition of derivative
+patience 	  =  15
+deriv_weight_warmup_epochs= 10  # also switches to symmetric definition of derivative
 
 batches 	  = same
 
@@ -87,19 +87,19 @@ ae_stats_weight= 1.
 
 use_dt_decade_weights = True
 
-epochs 		  =2500
-patience 	  = 200
+epochs 		  =5000
+patience 	  = 500
 
 num_workers	  =   8   # was 8
 batches		  = 2048
 
 lr 			  = 0.2e-3  # default: 1.e-3
-z0_noise_scale=   0.175
+z0_noise_scale=   0.1	# was 0.175
 
 dt_cap		  = inf   # 125/0.05 = 2500 time steps
 max_dt        = 200
 
-# force 	      = True
+force 	      = True
 
 
 
@@ -129,7 +129,7 @@ z0_noise_scale=   0.1
 dt_cap		  = same		# must be
 max_dt        = same
 
-# force 	      = True
+force 	      = True
 
 
 
@@ -144,9 +144,9 @@ n_rollout_steps= same
 recon0_scale    =   1.e-3
 stats0_scale    =   0.1
 
-rollout_scale   =   5.
+rollout_scale   =   100.
 rollout_weight_warmup_epochs= 10
-rollout_weight_warmup_start = 1e-6  # geometric warmup
+rollout_weight_warmup_start = 1e-5  # geometric warmup
 
 lr 			  =   0.2e-4  	# default: 1.e-3
 

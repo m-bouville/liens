@@ -500,6 +500,12 @@ def train_autoencoder(
                 _ref_stats0 += stats0 * bs
         _n = len(val_set)
         _r_total = (_ref_total / _n).item()
+        # Same as stage 2's: this pass has just measured the ancestor's
+        # val_loss under THIS run's objective, so hand it to the tracker as a
+        # ceiling rather than printing and discarding it. Without it
+        # best_val_loss starts at inf and epoch 1 always saves, which on a
+        # resume can overwrite a better checkpoint with a worse one.
+        tracker.reference_val_loss = _r_total
         _r_recon0 = (_ref_recon0 / _n).item()
         _r_stats0 = (_ref_stats0 / _n).item()
         # SCALED exactly as the epoch rows are (see the msg built below):
@@ -711,7 +717,33 @@ def train_autoencoder(
             title="Stage 1 loss components",
         )
 
-    if not Path(checkpoint_path).exists():
+    if not Path(checkpoint_path).exists() and resume_from is not None:
+        # NOTHING BEAT THE ANCESTOR. Keyed on resume_from, NOT on
+        # tracker.reference_val_loss still being set: reset_with_grace clears
+        # the reference when the objective changes mid-run (the
+        # deriv_target_centered switch), so a run that switched would fall
+        # through to the raise -- which is exactly the run most likely not to
+        # improve, since its criterion restarted from the post-grace EMA.
+        #
+        # That is not a failure: the reference
+        # ceiling exists precisely so a resumed run cannot save something worse
+        # than it started from, and the honest outcome when nothing improves is
+        # that the ANCESTOR is the best model available.
+        #
+        # Copying it to the output path keeps the contract every caller relies
+        # on -- a returned path that exists -- without pretending a worse model
+        # was an improvement. Raising instead made a short resumed run fail
+        # whenever it happened not to improve, which is data-dependent: two
+        # tests passed on one machine and failed on another for exactly this.
+        import shutil as _shutil
+        if Path(resume_from).resolve() != Path(checkpoint_path).resolve():
+            Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copy2(resume_from, checkpoint_path)
+        print(f"\nstage 1: no epoch improved on the ancestor "
+              f"(reference val_loss {tracker.reference_val_loss if tracker.reference_val_loss is not None else float('nan'):.6f}), so the ancestor "
+              f"remains the best model and has been kept as {checkpoint_path}. This is a "
+              f"real outcome, not an error -- the run simply found nothing better.")
+    elif not Path(checkpoint_path).exists():
         # Same guard as train_stage2/train_lds. Without it this returns a path
         # that does not exist and the caller fails far from the cause -- the
         # pipeline feeds stage 1's straight to check_reconstruction, and stage

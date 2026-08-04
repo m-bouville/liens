@@ -530,3 +530,50 @@ def test_reference_row_keeps_its_column_width_on_a_huge_untrained_component():
     big = _compact_loss(40613.3085)
     assert len(big) < len(f"{40613.3085:7.4f}"), "must be shorter than the fixed-point form"
     assert big.strip() == "4.061e+04", big
+
+
+def test_the_switch_message_agrees_with_the_switch_CONDITION():
+    """
+    deriv_switch_epoch counts CUMULATIVE epochs -- the condition is
+    `prior_stage2_epochs + epoch >= deriv_switch_epoch` -- so it is not this
+    run's own epoch number when resuming.
+
+    The message printed it as if it were, contradicting the very next clause
+    of the same sentence, which correctly derived the count of one-sided
+    epochs. Observed with switch=10, prior=2:
+
+        "switching ... at epoch 10 of this run's own numbering
+         (prior_stage2_epochs=2, so this run spends its first 7 epoch(s) ...)"
+
+    7 + 1 = 8, not 10. A reader watching for the switch would have looked two
+    epochs too late.
+    """
+    from conftest import source_without_comments
+    import training.train_stage2 as mod
+
+    src = source_without_comments(mod)
+    assert "own_switch_epoch = max(1, deriv_switch_epoch - prior_stage2_epochs)" in src, (
+        "the message must convert to this run's own numbering"
+    )
+    assert "{own_switch_epoch} of this run's own numbering" in src
+    assert "cumulative epoch {deriv_switch_epoch}" in src, (
+        "the cumulative number is still worth showing -- it is what the condition uses"
+    )
+
+
+def test_the_two_halves_of_the_message_are_consistent():
+    """
+    The printed switch epoch and the printed one-sided count must satisfy
+    count + 1 == switch_epoch, for every resume position. Computed from the
+    same expressions the code uses, so a change to either half fails here.
+    """
+    for switch, prior, epochs in ((10, 2, 100), (15, 0, 50), (3, 10, 20), (1, 0, 5)):
+        own = max(1, switch - prior)
+        already_past = prior + 1 >= switch
+        if already_past:
+            continue
+        count = min(switch - prior - 1, epochs)
+        assert count + 1 == own, (
+            f"switch={switch} prior={prior}: message would say 'epoch {own}' and "
+            f"'first {count} epochs', which disagree"
+        )

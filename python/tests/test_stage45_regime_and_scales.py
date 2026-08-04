@@ -81,7 +81,11 @@ def test_stage45_warns_when_one_component_dominates():
     src = source_without_comments(_ROOT / "training/train_refinement.py")
     assert "share > 0.99" in src, "no dominance check"
     assert "WARNING" in src
-    assert "epoch == 1" in src, "must report at the FIRST epoch, when it is cheap to act on"
+    # Reported once the ramp completes, not at epoch 1 -- during a warmup the
+    # imbalance is deliberate. See test_the_dominance_warning_waits_for_the_ramp.
+    assert "epoch == max(1, rollout_weight_warmup_epochs)" in src, (
+        "must report exactly once, at the first epoch the full objective is in effect"
+    )
 
 
 def test_the_dominance_warning_names_the_raw_magnitudes():
@@ -232,3 +236,125 @@ def test_the_printed_train_component_uses_the_EFFECTIVE_weight():
     assert re.search(r"(?<!effective_)rollout_weight\*val_rollout/rollout_scale", src), (
         "the validation column must use the unramped rollout_weight"
     )
+
+
+# --------------------------------------------------------------------
+# the ramp's interaction with the save criterion
+# --------------------------------------------------------------------
+
+def test_the_criterion_is_reset_when_the_ramp_completes():
+    """
+    val_loss is deliberately never ramped, so DURING the warmup it measures
+    the full objective against a model not yet trained on it -- legitimately
+    terrible numbers that then dominate the EMA for many epochs.
+
+    Observed: epoch 1 val_loss 33.86 (a ramp transient); at epoch 13 the EMA
+    was still 0.656, still forgetting it, while val_loss had stopped improving
+    at epoch 11 and was oscillating in 0.10-0.12. Every epoch cleared the
+    descending bar and saved, so the criterion was BLIND and early stopping
+    could not fire -- the run would have kept whichever epoch happened to be
+    last rather than the best.
+
+    Same situation stage 2 handles with reset_with_grace when
+    deriv_target_centered switches.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "tracker.reset_with_grace(grace)" in src
+    assert "epoch == rollout_weight_warmup_epochs" in src, (
+        "the reset must happen exactly when the ramp completes"
+    )
+
+
+def test_the_reset_grace_is_at_least_two_epochs():
+    """
+    GUARDS max(1, ...). A single-epoch grace is mathematically IDENTICAL to no
+    grace: with only one epoch there is no second value for the EMA to blend
+    with, so best_val_loss ends up as that epoch's own raw value, lucky or
+    not. Stage 2 records the same derivation.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "max(2, round(1 / (1 - val_ema_decay)))" in src
+
+
+def test_the_reset_is_clamped_against_the_remaining_epochs():
+    """A grace covering every remaining epoch means NO checkpoint is written
+    after the reset -- a missing file rather than a worse one."""
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "clamp_grace_epochs(grace, epochs - epoch + 1)" in src
+
+
+def test_no_reset_when_there_is_no_warmup():
+    """GUARDS resetting unconditionally, which would discard a perfectly good
+    criterion history for every existing run."""
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    guard = src[src.index("if (rollout_weight_warmup_epochs > 0"):]
+    guard = guard[:guard.index("tracker.reset_with_grace")]
+    assert "rollout_weight_warmup_epochs > 0" in guard
+
+
+def test_the_dominance_warning_waits_for_the_ramp():
+    """
+    GUARDS reporting at epoch 1. During a warmup the imbalance is DELIBERATE,
+    so an epoch-1 reading describes the transient rather than the scales: on a
+    real run it reported raw rollout=168 and implied rollout_scale~168 when the
+    converged value was 0.053. Acting on that would have undone the ramp.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "epoch == max(1, rollout_weight_warmup_epochs)" in src
+    assert "if epoch == 1:" not in src, "the warning must not fire during the ramp"
+
+
+# --------------------------------------------------------------------
+# the 2 -> 3a -> 3b -> 4 -> 5 chain
+# --------------------------------------------------------------------
+
+def test_the_joint_loader_carries_data_config_for_stage5():
+    """
+    REGRESSION at the 4 -> 5 handoff, the other half of a chain whose first
+    half was already fixed.
+
+    load_lds_component carries data_config so stage 4 can inherit f_theta's
+    max_dt. load_joint_refinement_checkpoint -- which stage 5 uses when it
+    RESUMES stage 4 -- did not, so stage 5 got max_dt=None and trained on the
+    full dt range. That is exactly the defect that gave stage 4 a val_loss of
+    2.7e29 before max_dt was inherited there.
+
+    Stage 4 saved data_config correctly all along; nothing was reading it back.
+    """
+    from training.checkpoint_components import (
+        load_joint_refinement_checkpoint, load_lds_component,
+    )
+    for loader in (load_lds_component, load_joint_refinement_checkpoint):
+        src = source_without_comments(loader)
+        assert '"data_config"' in src, (
+            f"{loader.__name__} drops data_config -- the stage that consumes its output "
+            f"cannot then reproduce the window population f_theta was trained on"
+        )
+
+
+def test_both_halves_of_the_chain_use_the_same_key():
+    """
+    GUARDS the two loaders diverging on where they put it. train_refinement
+    reads exactly one path -- components["lds"].provenance["data_config"] --
+    so both loaders must populate that same place.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert 'provenance.get("data_config")' in src
+    for name in ("load_lds_component", "load_joint_refinement_checkpoint"):
+        loader_src = source_without_comments(_ROOT / "training/checkpoint_components.py")
+        block = loader_src[loader_src.index(f"def {name}"):]
+        block = block[:block.index("\ndef ") if "\ndef " in block[1:] else len(block)]
+        assert "provenance" in block and '"data_config"' in block, name
+
+
+def test_non_inherited_population_filters_are_at_least_reported():
+    """
+    min_step/min_stdev_phi are params-supplied at every stage, never
+    inherited -- deliberately, since unlike max_dt a mismatch only shifts
+    which frames are eligible rather than how far f_theta is extrapolated.
+    But a silent difference still means the encoder is refined against a
+    different population than f_theta saw.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert 'lds_data_config.get(_field, "<absent>")' in src
+    assert "min_step" in src and "min_stdev_phi" in src

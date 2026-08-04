@@ -230,9 +230,19 @@ def _load_ae_f_theta_and_dataset(
     window_length = data_config["window_length"]
     if window_length_override is not None:
         window_length = window_length_override
+    # Say plainly whether the checkpoint's own value is in force. The old
+    # wording, "unless overridden above", promised an override that did not
+    # exist -- check_parameter_dependence had no max_dt parameter at all, so
+    # the diagnostic could only ever look INSIDE the range f_theta was trained
+    # on and therefore could not answer whether that range was set too tightly.
+    _own = data_config.get("max_dt")
+    _max_dt_provenance = (
+        "(from the checkpoint's own data_config)" if max_dt == _own
+        else f"(OVERRIDDEN -- the checkpoint's own is {_own}, so this evaluation is "
+             f"deliberately OFF-DISTRIBUTION and is measuring the extrapolation)")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps}"
           f"{'' if max_dt is None else f'  max_dt={max_dt}'} "
-          f"(from checkpoint's own data_config unless overridden above)")
+          f"{_max_dt_provenance}")
 
     test_dirs = lds_checkpoint.get("test_dirs") or []
     if not test_dirs:
@@ -339,6 +349,7 @@ def _load_models_and_dataset(
     condition_on_theta: bool | None, euler_only: bool | None,
     output_path: Path | None, dz0dt_output_path: Path | None,
     dt_dependence_output_path: Path | None, device: str | None,
+    max_dt: float | None = None,
 ) -> _LoadedContext:
     """check_parameter_dependence()'s own setup phase -- resolves this
     function's own three output paths, then delegates model/dataset
@@ -399,6 +410,7 @@ def _load_models_and_dataset(
         _load_ae_f_theta_and_dataset(
             lds_checkpoint_path, min_step, min_stdev_phi, min_passing_steps, base_path, size,
             ae_stats_weight, hidden_dim, n_hidden_layers, condition_on_theta, euler_only, device,
+            max_dt=max_dt,
         )
     )
 

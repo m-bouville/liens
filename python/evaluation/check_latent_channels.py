@@ -249,7 +249,6 @@ def check_latent_channels(
     other_stream_names = sorted(n for n in stream_configs if n != recon_stream_name)
     stream_order = [recon_stream_name] + other_stream_names
     channels_per_stream = {name: stream_configs[name].channels for name in stream_order}
-    latent_channels = channels_per_stream[recon_stream_name]  # kept for the final print's wording
 
     # Test dataset built regardless of whether --fixed-frames was given
     # -- fixed_frames only decides which frames get VISUALIZED; ablation

@@ -584,6 +584,44 @@ def isolated_project_root(tmp_path, monkeypatch):
     return root
 
 
+def snapshot_files(bases) -> dict:
+    """path -> (size, mtime_ns) for every file under `bases`.
+
+    Identity, not just path, so a MOVE can be told apart from a write.
+    """
+    seen = {}
+    for base in bases:
+        if not base.exists():
+            continue
+        for f in base.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            seen[f] = (st.st_size, st.st_mtime_ns)
+    return seen
+
+
+def files_written_between(before: dict, after: dict) -> list:
+    """Paths that appeared and were not merely MOVED there.
+
+    A module-level function rather than logic inline in the fixture, so a test
+    can exercise the ACTUAL rule. An inline version forced the tests to
+    re-implement it, and dropping the move check in the fixture then left them
+    all green -- they were checking their own arithmetic.
+
+    A new path whose (size, mtime_ns) matches something that DISAPPEARED is a
+    move: shutil.move and copy2 both preserve mtime. A COPY is still reported,
+    because its source does not disappear, so its identity is not in
+    `vanished` -- which is why the check is on vanished entries rather than on
+    mtime alone.
+    """
+    vanished = {v for k, v in before.items() if k not in after}
+    return sorted(p for p in set(after) - set(before) if after[p] not in vanished)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _fail_on_writes_to_the_real_project_tree():
     """Fail the session if any test writes into the REAL output/ or checkpoints/.
@@ -609,16 +647,9 @@ def _fail_on_writes_to_the_real_project_tree():
     root = Path(__file__).resolve().parent.parent
     watched = [root.parent / "output", root / "checkpoints"]
 
-    def snapshot():
-        seen = set()
-        for base in watched:
-            if base.exists():
-                seen |= {p for p in base.rglob("*") if p.is_file()}
-        return seen
-
-    before = snapshot()
+    before = snapshot_files(watched)
     yield
-    added = sorted(snapshot() - before)
+    added = files_written_between(before, snapshot_files(watched))
     # The latent cache is a deliberate, self-invalidating artifact keyed on
     # encoder weights, so a test that populates it is not leaking state a
     # person has to reason about.

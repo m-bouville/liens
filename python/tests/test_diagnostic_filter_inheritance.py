@@ -262,3 +262,57 @@ def test_the_single_step_claim_is_true():
         "_latent_eval now rolls out -- z1_resync has become meaningful there and "
         "check_parameter_dependence should stop refusing it"
     )
+
+
+# --------------------------------------------------------------------
+# max_dt must be OVERRIDABLE, or it cannot be evaluated
+# --------------------------------------------------------------------
+
+def test_check_parameter_dependence_accepts_a_max_dt_override():
+    """
+    max_dt is inherited from the checkpoint so the diagnostic reproduces the
+    window population f_theta trained on -- correct, and the fix for a real
+    bug. But with NO way to override it, the diagnostic can only ever look
+    INSIDE that range, so it cannot answer whether the range was set too
+    tightly. max_dt broke its own evaluation.
+
+    Concretely: under max_dt=200 only three dt bins survive, which is why every
+    Taylor coefficient came back consistent with zero, and within those bins
+    the NORMALISED error FALLS with dt (2.15e-3 -> 0.80e-3 from dt=72 to 130)
+    -- the opposite of an extrapolation limit, and a hint the cap is too low.
+    Testing that hint requires looking outside.
+    """
+    from evaluation.check_parameter_dependence import check_parameter_dependence
+    assert "max_dt" in inspect.signature(check_parameter_dependence).parameters
+    src = source_without_comments(_ROOT / "evaluation/check_parameter_dependence.py")
+    assert '"--max-dt"' in src, "no CLI flag"
+    assert "max_dt=args.max_dt" in src, "the flag does not reach the function"
+
+
+def test_the_override_still_defaults_to_inheriting():
+    """
+    GUARDS turning the override into a new default. Inheriting is right for
+    every ordinary run -- the override exists for the deliberate, off-
+    distribution question.
+    """
+    from evaluation.check_parameter_dependence import check_parameter_dependence
+    assert (inspect.signature(check_parameter_dependence)
+            .parameters["max_dt"].default is None)
+    src = source_without_comments(_ROOT / "evaluation/_latent_eval.py")
+    assert 'max_dt = max_dt if max_dt is not None else data_config.get("max_dt")' in src
+
+
+def test_the_header_says_whether_an_override_is_in_force():
+    """
+    The old header read "(from checkpoint's own data_config unless overridden
+    above)" -- promising an override that did not exist. Worse than silence:
+    a reader would assume the range shown was a choice rather than a ceiling
+    they could not lift.
+    """
+    src = source_without_comments(_ROOT / "evaluation/_latent_eval.py")
+    assert "unless overridden above" not in src
+    assert "_max_dt_provenance" in src
+    assert "OFF-DISTRIBUTION" in src, (
+        "an overridden run must say so -- its numbers are not comparable to an "
+        "inherited one"
+    )

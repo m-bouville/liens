@@ -610,6 +610,7 @@ def train_stage2(
         loss_curve_path.stem + "-components" + loss_curve_path.suffix)
 
     epoch_history: list[int] = []
+    loss_curve_events: list[tuple[float, str]] = []
     train_loss_history: list[float] = []
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
@@ -643,8 +644,16 @@ def train_stage2(
     prior_stage2_epochs = prev["epoch"] if resumed_from_stage2 else 0
     if deriv_target_centered:
         already_past_switch = prior_stage2_epochs + 1 >= deriv_switch_epoch
+        # deriv_switch_epoch counts CUMULATIVE epochs (the condition below is
+        # `prior_stage2_epochs + epoch >= deriv_switch_epoch`), so it is not
+        # this run's own epoch number when resuming. Printing it as if it were
+        # contradicted the very next clause, which correctly derived the count
+        # of one-sided epochs: with switch=10 and prior=2 the message read
+        # "at epoch 10 ... spends its first 7 epoch(s)", where 7+1 = 8.
+        own_switch_epoch = max(1, deriv_switch_epoch - prior_stage2_epochs)
         print(f"deriv_target_centered=True: switching to the centered L_deriv target at "
-              f"epoch {deriv_switch_epoch} of this run's own numbering "
+              f"epoch {own_switch_epoch} of this run's own numbering "
+              f"(cumulative epoch {deriv_switch_epoch}) "
               f"(prior_stage2_epochs={prior_stage2_epochs}, so this run "
               f"{'starts already past that point -- centered from epoch 1' if already_past_switch else f'spends its first {min(deriv_switch_epoch - prior_stage2_epochs - 1, epochs)} epoch(s) in the cheaper, one-sided phase'}).")
 
@@ -1040,6 +1049,32 @@ def train_stage2(
                 ref_stats1_sum += stats1 * bs
                 ref_deriv_sum += deriv * bs
         ref_total = (ref_total_sum / n_val).item()
+        # The reference IS the ancestor's val_loss under this run's own
+        # objective, and this pass has just measured it -- previously it was
+        # printed and thrown away. Handing it to the tracker as a ceiling means
+        # a resumed run can never save something WORSE than it started from.
+        #
+        # Observed without it: reference 3.9054, then epoch 1 saved at 4.0149
+        # and epochs 2-3 were worse still (4.35, 4.80) before epoch 4 finally
+        # beat the ancestor. The better checkpoint had already been overwritten
+        # and survived only because the backup fired.
+        #
+        # Note this bar is superseded at the deriv_target_centered switch,
+        # which calls reset_with_grace -- correctly, since a reference measured
+        # under the one-sided target is not a fair bar for the centered one.
+        # ONLY when the ancestor is itself a stage-2 checkpoint. The ceiling
+        # exists to stop a resumed run overwriting a BETTER checkpoint with a
+        # worse one -- and when the ancestor is a single-stream stage-1a
+        # checkpoint there is nothing to overwrite: the output is a new file in
+        # a different format ("encoders.shared.*" vs "encoder.*"), so no
+        # earlier stage-2 result is at risk.
+        #
+        # Applying it there anyway blocked saving without providing any
+        # fallback, so a short run that did not improve produced NO checkpoint
+        # at all -- observed as a stage-2 RuntimeError in a test whose ancestor
+        # was a stage-1a checkpoint.
+        if resumed_from_stage2:
+            tracker.reference_val_loss = ref_total
         ref_recon = (ref_recon_sum / n_val).item()
         ref_stats = (ref_stats_sum / n_val).item()
         ref_stats1 = (ref_stats1_sum / n_val).item()
@@ -1121,6 +1156,12 @@ def train_stage2(
         just_switched = use_centered_this_epoch and not _prev_use_centered
         _prev_use_centered = use_centered_this_epoch
         if just_switched:
+            # Remembered for the loss curve: the switch drops val_loss sharply
+            # in ONE epoch because the measured QUANTITY changed, not the
+            # model. Unmarked, that cliff is the most prominent feature of the
+            # figure and reads as a learning event. x at epoch-0.5 so the line
+            # sits BETWEEN the last old-target point and the first new one.
+            loss_curve_events.append((epoch - 0.5, "centered L_deriv target"))
             # grace_epochs derived from val_ema_decay's own effective
             # averaging window (1/(1-decay)) -- max(2, ...) specifically,
             # not max(1, ...): confirmed directly that a single-epoch
@@ -1260,7 +1301,7 @@ def train_stage2(
         if should_write_loss_figure(epoch, log_every_epoch):
             loss_curve(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-                loss_curve_path, title="Stage 2 loss",
+                loss_curve_path, title="Stage 2 loss", event_epochs=loss_curve_events,
             )
 
         # loss_component_scatter: recon0 (always present, weight 1) plus
@@ -1395,7 +1436,42 @@ def train_stage2(
     # question from parameter drift and shouldn't be conflated with it.
     # Compares the SAVED (best) checkpoint, not just the final epoch's
     # in-memory weights, since those may differ if early stopping fired.
-    if not Path(checkpoint_path).exists():
+    if not Path(checkpoint_path).exists() and resume_from is not None:
+        # `resumed_from_stage2` is required, not just a reference: stage 2's
+        # ancestor may be a SINGLE-STREAM stage-1 checkpoint (keys "encoder.*")
+        # while its own output must be multi-stream ("encoders.shared.*").
+        # Copying one verbatim produces a file that loads nowhere -- caught by
+        # a test failing with KeyError on
+        # 'encoders.shared.down_blocks.0.conv.block.0.weight'.
+        #
+        # When the ancestor IS a stage-2 checkpoint the formats match and
+        # keeping it is exactly right.
+        # NOTHING BEAT THE ANCESTOR. Keyed on resume_from, NOT on
+        # tracker.reference_val_loss still being set: reset_with_grace clears
+        # the reference when the objective changes mid-run (the
+        # deriv_target_centered switch), so a run that switched would fall
+        # through to the raise -- which is exactly the run most likely not to
+        # improve, since its criterion restarted from the post-grace EMA.
+        #
+        # That is not a failure: the reference
+        # ceiling exists precisely so a resumed run cannot save something worse
+        # than it started from, and the honest outcome when nothing improves is
+        # that the ANCESTOR is the best model available.
+        #
+        # Copying it to the output path keeps the contract every caller relies
+        # on -- a returned path that exists -- without pretending a worse model
+        # was an improvement. Raising instead made a short resumed run fail
+        # whenever it happened not to improve, which is data-dependent: two
+        # tests passed on one machine and failed on another for exactly this.
+        import shutil as _shutil
+        if Path(resume_from).resolve() != Path(checkpoint_path).resolve():
+            Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copy2(resume_from, checkpoint_path)
+        print(f"\nstage 2: no epoch improved on the ancestor "
+              f"(reference val_loss {tracker.reference_val_loss if tracker.reference_val_loss is not None else float('nan'):.6f}), so the ancestor "
+              f"remains the best model and has been kept as {checkpoint_path}. This is a "
+              f"real outcome, not an error -- the run simply found nothing better.")
+    elif not Path(checkpoint_path).exists():
         # Same failure train_lds already guards: the run finished without ever
         # saving, and the drift report below then dies on a missing file with a
         # bare FileNotFoundError that says nothing about why.
@@ -1407,9 +1483,9 @@ def train_stage2(
         # not a crash.
         raise RuntimeError(
             f"stage 2 finished without ever saving a checkpoint to {checkpoint_path}. "
-            f"An epochs=0 ablation cannot produce a checkpoint -- remove the stage from "
-            f"the params file rather than setting its epochs to 0, if anything "
-            f"downstream needs its output. "
+            f"{'An epochs=0 ablation cannot produce a checkpoint -- remove the stage from '
+               'the params file rather than setting its epochs to 0, if anything downstream '
+               'needs its output. ' if epochs == 0 else ''}"
             f"No epoch's val criterion beat the running best, so nothing was written. "
             f"If deriv_target_centered switched mid-run, the grace period leaves "
             f"best_val_loss at the EMA reached during it -- a val_loss that then only "
@@ -1430,7 +1506,7 @@ def train_stage2(
     # state a finished run gets judged from.
     loss_curve(
         epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-        loss_curve_path, title="Stage 2 loss",
+        loss_curve_path, title="Stage 2 loss", event_epochs=loss_curve_events,
     )
     loss_component_scatter(
         epoch_history, component_histories, loss_components_path,

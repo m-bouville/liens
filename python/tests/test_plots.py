@@ -216,3 +216,73 @@ def test_x_axis_also_log_scale(tmp_path, monkeypatch):
     ax = captured_axes["ax"]
     assert ax.get_xscale() == "log"
     assert ax.get_yscale() == "log"
+
+
+# --------------------------------------------------------------------
+# event markers on the loss curve
+# --------------------------------------------------------------------
+
+def test_event_lines_are_drawn_and_labelled(tmp_path):
+    """
+    Stage 2's centered-target switch drops val_loss sharply in ONE epoch
+    because the measured QUANTITY changed, not the model. On the log-log axes
+    that cliff is the most prominent feature of the figure, and unmarked it
+    reads as a learning event. Reported from a real curve.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+
+    from utils.plots import loss_curve
+
+    out = loss_curve(
+        list(range(1, 10)),
+        [3.5 - 0.02 * e for e in range(1, 10)],
+        [4.0 if e < 8 else 3.0 for e in range(1, 10)],
+        [4.0] * 7 + [3.03, 3.03],
+        tmp_path / "c.png", title="t",
+        event_epochs=[(7.5, "centered L_deriv target")],
+    )
+    assert out is None or (tmp_path / "c.png").exists()
+    # The line's PRESENCE is asserted structurally: re-render into a figure we
+    # hold, and count vertical lines at x=7.5.
+    import matplotlib.pyplot as _plt
+    from unittest.mock import patch
+    lines = []
+    orig = _plt.Axes.axvline
+    def spy(self, x, *a, **k):
+        lines.append((x, k.get("label")))
+        return orig(self, x, *a, **k)
+    with patch.object(_plt.Axes, "axvline", spy):
+        loss_curve([1, 2, 3], [1.0, 0.9, 0.8], [1.1, 1.0, 0.9], [1.1, 1.0, 0.9],
+                    tmp_path / "c2.png", title="t",
+                    event_epochs=[(7.5, "centered L_deriv target")])
+    assert (7.5, "centered L_deriv target") in lines, lines
+    _plt.close("all")
+
+
+def test_event_epochs_defaults_to_none_and_changes_nothing(tmp_path):
+    """GUARDS making the parameter required or drawing spurious lines."""
+    import inspect
+
+    from utils.plots import loss_curve
+    assert inspect.signature(loss_curve).parameters["event_epochs"].default is None
+    loss_curve([1, 2], [1.0, 0.9], [1.1, 1.0], [1.1, 1.0], tmp_path / "p.png", title="t")
+    assert (tmp_path / "p.png").exists()
+
+
+def test_the_switch_records_an_event_between_the_two_epochs():
+    import pathlib as _pl
+    _ROOT = _pl.Path(__file__).resolve().parent.parent
+    """
+    x = epoch - 0.5, so the line sits BETWEEN the last old-target point and
+    the first new one -- on either epoch it would overplot a real data point
+    and imply the discontinuity belongs to that epoch's model.
+    """
+    from conftest import source_without_comments
+    src = source_without_comments(_ROOT / "training/train_stage2.py")
+    assert 'loss_curve_events.append((epoch - 0.5, "centered L_deriv target"))' in src
+    assert "event_epochs=loss_curve_events" in src
+
+    src45 = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert 'loss_curve_events.append((epoch - 0.5, "rollout ramp complete"))' in src45
+    assert "event_epochs=loss_curve_events" in src45

@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 
 from .blocks import DownBlock
-from .constants import LATENT_SPATIAL_SIZE
 from .latent_streams import LatentStreamConfig
 
 
