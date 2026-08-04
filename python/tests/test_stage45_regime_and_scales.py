@@ -79,7 +79,7 @@ def test_stage45_warns_when_one_component_dominates():
     around, and it is invisible without undoing the scale arithmetic by hand.
     """
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "share > 0.99" in src, "no dominance check"
+    assert "sh > 0.99" in src, "no dominance check"
     assert "WARNING" in src
     # Reported once the ramp completes, not at epoch 1 -- during a warmup the
     # imbalance is deliberate. See test_the_dominance_warning_waits_for_the_ramp.
@@ -94,10 +94,12 @@ def test_the_dominance_warning_names_the_raw_magnitudes():
     are exactly the numbers a corrected *_scale should equal.
     """
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    warning = src[src.index("share > 0.99"):]
+    warning = src[src.index("sh > 0.99"):]
     warning = warning[:warning.index("if saved_this_epoch")]
     assert "Raw values" in warning
-    assert "val_rollout" in warning and "val_recon0" in warning and "val_stats0" in warning
+    assert "_raw_str" in warning and "_suggest" in warning, (
+        "the report must name the raw magnitudes AND the scale they imply"
+    )
 
 
 @pytest.mark.parametrize("scale", ["rollout_scale", "recon0_scale", "stats0_scale"])
@@ -358,3 +360,115 @@ def test_non_inherited_population_filters_are_at_least_reported():
     src = source_without_comments(_ROOT / "training/train_refinement.py")
     assert 'lds_data_config.get(_field, "<absent>")' in src
     assert "min_step" in src and "min_stdev_phi" in src
+
+
+# --------------------------------------------------------------------
+# the scale check must be TWO-SIDED
+# --------------------------------------------------------------------
+
+def test_the_check_catches_a_STARVED_component_too():
+    """
+    The original check fired only on a component DOMINATING (>99%), and stage 4
+    then hit the opposite end just as hard: rollout_scale=100 against a
+    converged raw of 0.04 left L_rollout at 0.46% of the validation loss, and
+    the warning stayed silent while the term stage 4 exists to balance had
+    effectively left the objective.
+
+    Both are the same defect -- a scale that is not the raw magnitude of its
+    own component -- so both must report.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "sh > 0.99" in src, "the dominance branch is gone"
+    assert "sh < 0.01" in src, "no starvation branch"
+    assert "effectively OUT of the objective" in src
+
+
+def test_starvation_is_keyed_on_a_NONZERO_weight():
+    """
+    GUARDS warning about a term the user deliberately switched off. Stage 5
+    runs recon0_weight=1 with rollout_weight small; a weight of exactly 0 is a
+    choice, not a mis-scaled component, and reporting it would train the
+    reader to ignore the warning.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    starved = src[src.index("starved = ["):]
+    starved = starved[:starved.index("\n\n")]
+    assert "weights.get(k, 0.0) != 0.0" in starved
+
+
+def test_the_report_suggests_the_scale_to_USE():
+    """
+    A percentage says something is wrong; the raw magnitude says what to set.
+    Both ends of this took manual arithmetic to convert into a params change,
+    twice -- the second time after the first had already been diagnosed.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "_scale~" in src, "the suggestion is not computed at all"
+    # Scoped to the PRINTED message, not the file: an earlier version matched
+    # the _suggest DEFINITION, so deleting it from the print left the test
+    # green -- verified.
+    block = src[src.index("if dominant:"):src.index("if saved_this_epoch")]
+    assert block.count("Suggested: {_suggest}") == 2, (
+        "both branches must print the suggested scales, not just compute them"
+    )
+
+
+def test_dominance_takes_priority_over_starvation():
+    """
+    With one component at 99.9%, the others are necessarily under 1% -- both
+    branches would fire and say contradictory things about the same imbalance.
+    The dominant reading is the useful one, so it wins.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "if dominant:" in src and "elif starved:" in src, (
+        "the branches must be exclusive, dominance first"
+    )
+
+
+def test_n_rollout_steps_is_inherited_from_f_theta():
+    """
+    The regime f_theta was tuned in, not a free choice -- same class as max_dt
+    and z1_resync, which are already inherited.
+
+    Found by running the WHOLE chain end to end: 3b recorded
+    n_rollout_steps=2, stage 4 silently used 1 (the old signature default), and
+    at one step z1_resync has nothing to propagate, so the inherited
+    z1_resync=False went inert too. The encoder was refined in a regime f_theta
+    was never tuned for, with no message at all. No unit test could see this:
+    every one passes n_rollout_steps explicitly.
+    """
+    import inspect
+
+    from training.train_refinement import train_refinement
+    default = inspect.signature(train_refinement).parameters["n_rollout_steps"].default
+    assert default is None, (
+        "1 as the default silently overrides the ancestor; None means 'unspecified'"
+    )
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert '_inherited_rollout = lds_data_config.get("n_rollout_steps")' in src
+    # Contiguous substring only: the message is split across two f-string
+    # lines, so the full phrase never appears in the source as written.
+    assert "inherited from f_theta's own training \"" in src
+
+
+def test_an_explicit_n_rollout_steps_still_overrides_and_is_flagged():
+    """
+    GUARDS turning inheritance into a lock. 1 is a meaningful explicit value
+    and must stay settable -- but a mismatch with f_theta's own regime should
+    say so rather than pass silently.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    block = src[src.index("_inherited_rollout ="):]
+    block = block[:block.index("window_length")]
+    assert "elif _inherited_rollout is not None and n_rollout_steps != _inherited_rollout:" in block
+    assert "but f_theta was" in block
+
+
+def test_window_length_is_computed_AFTER_the_resolution():
+    """
+    GUARDS the ordering. window_length = n_rollout_steps + 1 sat ~35 lines
+    before the resolution, so the None sentinel was an immediate TypeError --
+    caught only because a test actually ran the stage.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert src.index("_inherited_rollout =") < src.index("window_length = n_rollout_steps + 1")

@@ -42,7 +42,46 @@ from utils import load_datasets as load
 # place" bug hit repeatedly on this project. Path(__file__) is anchored
 # to THIS FILE's own on-disk location instead, which is invariant
 # regardless of how/from-where the process was launched.
+from orchestration.paths import default_latent_cache_dir
+
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/
+
+# Sentinel: None is a MEANINGFUL value (caching off), so it cannot double as
+# "not specified". Without this, a caller could not turn the cache off.
+_UNSET_CACHE = object()
+
+
+def _log_scale_if_positive(ax, which: str = "y") -> bool:
+    """set_{x,y}scale("log") only when the axis HAS positive data.
+
+    matplotlib raises "Data has no positive values, and therefore cannot be
+    log-scaled" from inside tight_layout() -- not from set_yscale() -- so an
+    all-zero or all-negative panel kills the whole figure at save time, with a
+    traceback pointing at the layout engine rather than at the panel.
+
+    Degenerate populations reach here legitimately: a tiny run set, a
+    diagnostic on an untrained f_theta whose residuals are identically zero, a
+    single-dt slice. Losing one panel's log scaling beats losing the figure.
+
+    Returns whether log scale was applied, so a caller can say so.
+    """
+    lines = list(ax.get_lines())
+    data = []
+    for ln in lines:
+        arr = ln.get_ydata() if which == "y" else ln.get_xdata()
+        data.append(np.asarray(arr, dtype=float))
+    for coll in ax.collections:            # scatter() lands here, not in lines
+        off = coll.get_offsets()
+        if off is not None and len(off):
+            off = np.asarray(off, dtype=float)
+            data.append(off[:, 1] if which == "y" else off[:, 0])
+    if not data:
+        return False
+    allv = np.concatenate(data) if len(data) > 1 else data[0]
+    if not np.any(np.isfinite(allv) & (allv > 0)):
+        return False
+    ax.set_yscale("log") if which == "y" else ax.set_xscale("log")
+    return True
 
 
 def max_autocorr_dist(nx: int, ny: int) -> int:
@@ -783,7 +822,7 @@ def _boxplot_by_x(ax, x_values: np.ndarray, y_values: np.ndarray, log_x: bool = 
         ax.set_xlim(unique_x.min() - pad, unique_x.max() + pad)
 
     if log_x:
-        ax.set_xscale("log")
+        _log_scale_if_positive(ax, "x")
         return
 
     # Value-evenly-spaced tick TARGETS, nearest-snapped to real data --
@@ -1281,7 +1320,7 @@ def _build_and_save_figures(
         # computed pixel-space quantity.
         ax = axes_dt[1, 1]
         _boxplot_by_x(ax, _px(_dt_x), results.pixel_losses, log_x=True)
-        ax.set_yscale("log")
+        _log_scale_if_positive(ax, "y")
         ax.set_xlabel(_dt_label)
         ax.set_xlim(left=_x_left)
         ax.set_ylabel(f"pixel-space{_euler_tag}: decode(z0(t+dt)): mean|pred - true|")
@@ -1537,7 +1576,7 @@ def _build_and_save_figures(
                         label="oracle dz0/dt (sees future)")
     # log scale, NOT set_ylim(bottom=0) -- 0 is not representable on a log
     # axis, and matplotlib would silently clip to its own positive floor.
-    ax_abs.set_yscale("log")
+    _log_scale_if_positive(ax_abs, "y")
 
     # Regression curves, SIGNED panel only -- still no equivalent shown
     # on the absolute panel; abs() of this same curve tracks E[signed
@@ -1579,7 +1618,7 @@ def _build_and_save_figures(
     # z1(t) + [z0(t)-z0(t+dt)]/dt = z1(t) - dz0/dt, exactly.
     for ax, name, title in [(ax_signed, "error", "error (mean, signed)\nerror = (z0_pred(t+dt)-z0_true(t+dt))/dt"),
                              (ax_abs, "|error|", "|error| (mean, absolute)\nerror = (z0_pred(t+dt)-z0_true(t+dt))/dt")]:
-        ax.set_xscale("log")
+        _log_scale_if_positive(ax, "x")
         ax.set_xlabel(_dt_label)
         ax.set_xlim(left=_x_left)
         ax.set_ylabel(f"mean({name}) [1e-3]" if name == "error" else f"mean{name} [1e-3]")
@@ -1762,7 +1801,7 @@ def _build_and_save_figures(
     twin7 = ax7.twinx()
     ax7.plot(dt_x7, dz0_abs_by_dt, "o-", color="tab:orange", label="mean|dz0|")
     twin7.plot(dt_x7, dz0dt_abs_by_dt, "o-", color="tab:red", label="mean|dz0/dt|")
-    ax7.set_xscale("log")
+    _log_scale_if_positive(ax7, "x")
     ax7.set_xlabel(_dt_label)
     ax7.set_xlim(left=_x_left)
     ax7.set_ylabel("mean|dz0| [1e-3]", color="tab:orange")
@@ -1839,7 +1878,7 @@ def _build_and_save_figures(
         ax_t.tick_params(axis="y", labelcolor="tab:blue")
         twin_t.tick_params(axis="y", labelcolor="tab:orange")
         ax_t.set_title(f"real {name} vs t")
-        ax_t.set_xscale("log")
+        _log_scale_if_positive(ax_t, "x")
         # Starts at 1000, not the data's own minimum -- requested
         # explicitly, presumably to crop out the smallest-t region
         # (sparse, few windows this early relative to min_step) rather
@@ -1859,7 +1898,7 @@ def _build_and_save_figures(
         ax_dt.tick_params(axis="y", labelcolor="tab:blue")
         twin_dt.tick_params(axis="y", labelcolor="tab:orange")
         ax_dt.set_title(f"real {name} vs dt")
-        ax_dt.set_xscale("log")
+        _log_scale_if_positive(ax_dt, "x")
         ax_dt.set_xlim(left=_x_left)
         lines1, labels1 = ax_dt.get_legend_handles_labels()
         lines2, labels2 = twin_dt.get_legend_handles_labels()
@@ -1896,6 +1935,7 @@ def _build_and_save_figures(
 def check_parameter_dependence(
     lds_checkpoint_path: Path, min_step: int | None = None, min_stdev_phi: float | None = None,
     min_passing_steps: int | None = None, max_dt: float | None = None,
+    latent_cache_dir: Path | str | None = _UNSET_CACHE,
     base_path: Path | None = None, size: int | None = None,
     ae_stats_weight: float | None = None, hidden_dim: int = 256, n_hidden_layers: int = 2,
     condition_on_theta: bool | None = None,
@@ -1945,6 +1985,8 @@ def check_parameter_dependence(
         ae_stats_weight, hidden_dim, n_hidden_layers, condition_on_theta, euler_only,
         output_path, dz0dt_output_path, dt_dependence_output_path, device,
         max_dt=max_dt,
+        latent_cache_dir=(default_latent_cache_dir(_PYTHON_ROOT)
+                           if latent_cache_dir is _UNSET_CACHE else latent_cache_dir),
     )
     results = _evaluate_windows(ctx.dataset, ctx.f_theta, ctx.ae_decoder, ctx.device,
                                  decode, ctx.euler_only)
@@ -2018,6 +2060,12 @@ def main():
     # Accepted only so that passing it gives an EXPLANATION rather than
     # argparse's bare "unrecognized arguments". The flag is meaningful in
     # check_rollout and nowhere else.
+    parser.add_argument("--no-latent-cache", action="store_true",
+                         help="disable the shared latent cache for this run. On by default: "
+                              "the cache key is the ENCODER's own fingerprint plus the run and "
+                              "step list, so a diagnostic reusing a checkpoint's frozen encoder "
+                              "hits entries the trainer already wrote. Use this to force a "
+                              "recompute, e.g. when debugging the encoder path itself")
     parser.add_argument("--max-dt", type=float, default=None,
                          help="OVERRIDE the checkpoint's own max_dt for this evaluation. "
                               "Without it the diagnostic inherits f_theta's training value "
@@ -2049,6 +2097,7 @@ def main():
         lds_checkpoint_path=args.lds_checkpoint, min_step=args.min_step,
         min_stdev_phi=args.min_stdev_phi, min_passing_steps=args.min_passing_steps,
         max_dt=args.max_dt,
+        latent_cache_dir=None if args.no_latent_cache else _UNSET_CACHE,
         base_path=args.base_path, size=args.size, ae_stats_weight=args.ae_stats_weight,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         condition_on_theta=args.condition_on_theta, euler_only=args.euler_only,

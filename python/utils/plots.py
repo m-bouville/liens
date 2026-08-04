@@ -53,6 +53,43 @@ def should_write_loss_figure(epoch: int, log_every_epoch: bool, every: int = LOS
     return epoch % every == 0
 
 
+def write_loss_history(output_path: Path, epochs: list[int], train_loss: list[float],
+                        val_loss: list[float], best_so_far: list[float],
+                        secondary_train: list[float] | None = None,
+                        secondary_val: list[float] | None = None,
+                        secondary_label: str = "1step") -> Path:
+    """Dump the per-epoch history beside the loss curve, as CSV.
+
+    Until this existed the history survived ONLY as pixels: it lives in memory
+    during the run, is drawn into the PNG, and is discarded. The console log is
+    no substitute -- it is throttled to saved epochs, so a run that spikes and
+    stops improving prints nothing for its final hundreds of epochs.
+
+    That combination cost a real diagnosis: 128x128 stage 3a spiked at epoch
+    3568, and the only evidence was a vertical line on a plot. Answering "how
+    big, how long, did it recover" meant reading pixels.
+
+    Written next to output_path with a .csv suffix, rewritten each time the
+    figure is, so it is current even if the run is killed.
+    """
+    csv_path = Path(output_path).with_suffix(".csv")
+    cols = ["epoch", "train_loss", "val_loss", "best_ema_so_far"]
+    data = [epochs, train_loss, val_loss, best_so_far]
+    if secondary_train is not None:
+        cols.append(f"train_{secondary_label}")
+        data.append(secondary_train)
+    if secondary_val is not None:
+        cols.append(f"val_{secondary_label}")
+        data.append(secondary_val)
+    tmp = csv_path.with_suffix(".csv.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(",".join(cols) + "\n")
+        for row in zip(*data):
+            fh.write(",".join("" if v is None else repr(v) for v in row) + "\n")
+    tmp.replace(csv_path)          # atomic: never a half-written file
+    return csv_path
+
+
 def loss_curve(
     epochs: list[int], train_loss: list[float], val_loss: list[float],
     best_so_far: list[float], output_path: Path, title: str = "",

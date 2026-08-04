@@ -334,7 +334,8 @@ def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_pr
     assert "[epoch 2: switching to the centered L_deriv target now" in printed
 
 
-def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_project_root):
+def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, capsys,
+                                                            isolated_project_root):
     """REGRESSION: resuming a stage-2 checkpoint that's already well
     past deriv_weight_warmup_epochs must start the NEW run directly in
     the centered phase, at full deriv_weight, from ITS OWN epoch 1 --
@@ -379,11 +380,32 @@ def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, isolated_
         deriv_target_centered=True,
     )
 
-    saved = torch.load(stage2_resumed_path, map_location="cpu", weights_only=True)
-    assert saved["stage2_config"]["use_centered_at_save"] is True, (
+    # ASSERTED ON THE SWITCH ITSELF, not on the saved checkpoint.
+    #
+    # use_centered_at_save was only ever a proxy, and it disappears whenever the
+    # run legitimately fails to improve: the switch resets the criterion with a
+    # grace period, nothing saves during it, and if no later epoch beats the
+    # post-grace bar the no-improvement fallback copies the ANCESTOR forward --
+    # which was trained with deriv_target_centered=False, so the field reads
+    # False for a run that switched perfectly correctly at epoch 1.
+    #
+    # The BRACKETED in-loop message is the right observable: `just_switched`
+    # emits it from the actual condition. The header line is NOT -- it computes
+    # own_switch_epoch separately and still reads "epoch 1" even when the
+    # condition ignores prior_stage2_epochs entirely (verified: that mutation
+    # passed against the header and fails against this).
+    out = capsys.readouterr().out
+    assert "[epoch 1: switching to the centered L_deriv target now" in out, (
         "resuming a stage-2 checkpoint already well past deriv_weight_warmup_epochs "
-        "must be centered from this run's own epoch 1, not stuck re-running the cheap phase"
+        "must be centered from this run's own epoch 1, not stuck re-running the cheap "
+        f"phase. Log said:\n{out[-1200:]}"
     )
+
+    saved = torch.load(stage2_resumed_path, map_location="cpu", weights_only=True)
+    ancestor = torch.load(stage2_ancestor_path, map_location="cpu", weights_only=True)
+    if saved["epoch"] != ancestor["epoch"]:
+        # A real save happened, so the field IS meaningful here.
+        assert saved["stage2_config"]["use_centered_at_save"] is True
 
 
 def _build_sweep(tmp_path, *args, **kwargs):

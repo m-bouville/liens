@@ -28,6 +28,10 @@ import tempfile
 
 import inspect
 
+import time
+
+import re
+
 import pytest
 
 from models.constants import LATENT_SPATIAL_SIZE
@@ -584,6 +588,31 @@ def isolated_project_root(tmp_path, monkeypatch):
     return root
 
 
+# Grid sizes the test suite ever builds a sweep at. Declared, not inferred, and
+# enforced by test_no_test_builds_a_sweep_outside_TEST_GRID_SIZES.
+#
+# The leak detector uses it to attribute a file: `128x128-stage4-...` cannot
+# have come from a test, because no test ever creates a 128x128 sweep. That is
+# a stronger discriminator than timing, which cannot separate "a training run
+# that FINISHED during the session" from "a test wrote it" -- and a real stage-4
+# run finishing mid-session is exactly the case that defeated the timing check.
+TEST_GRID_SIZES = frozenset({8, 16, 32, 64})
+
+
+def _looks_like_a_test_artifact(path) -> bool:
+    """True when the filename's <N>x<N> prefix is a size the tests use.
+
+    Unrecognised names are treated as OURS (conservative): a genuine leak with
+    an unexpected name must still be reported. Only a clear, non-test grid size
+    exonerates a file.
+    """
+    import re as _re
+    m = _re.match(r"(\d+)x(\d+)[-_.]", path.name)
+    if not m:
+        return True                      # cannot tell -> report it
+    return int(m.group(1)) in TEST_GRID_SIZES
+
+
 def snapshot_files(bases) -> dict:
     """path -> (size, mtime_ns) for every file under `bases`.
 
@@ -605,7 +634,7 @@ def snapshot_files(bases) -> dict:
 
 
 def files_written_between(before: dict, after: dict) -> list:
-    """Paths that appeared and were not merely MOVED there.
+    """Paths a test WROTE: newly appeared, or modified in place.
 
     A module-level function rather than logic inline in the fixture, so a test
     can exercise the ACTUAL rule. An inline version forced the tests to
@@ -619,7 +648,15 @@ def files_written_between(before: dict, after: dict) -> list:
     mtime alone.
     """
     vanished = {v for k, v in before.items() if k not in after}
-    return sorted(p for p in set(after) - set(before) if after[p] not in vanished)
+    appeared = [p for p in set(after) - set(before) if after[p] not in vanished]
+    # MODIFIED IN PLACE, not just appeared. Reporting only new paths meant a
+    # leak was caught the FIRST time and invisible ever after, because the file
+    # already existed. Tests had been overwriting real output/*.png for a long
+    # time unseen; adding a .csv beside those PNGs created a genuinely new path
+    # and finally surfaced it. Same write, same test -- only the visibility
+    # changed.
+    modified = [p for p in set(after) & set(before) if after[p] != before[p]]
+    return sorted(appeared + modified)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -649,19 +686,85 @@ def _fail_on_writes_to_the_real_project_tree():
 
     before = snapshot_files(watched)
     yield
-    added = files_written_between(before, snapshot_files(watched))
+
+    # A FILE STILL CHANGING AFTER THE TESTS HAVE FINISHED WAS NOT WRITTEN BY
+    # THEM. Two snapshots a second apart at teardown separate a live external
+    # writer -- a training run the person left going -- from a test leak,
+    # whose writes are complete by the time the session ends.
+    #
+    # This detector fired four times on
+    # output/stage3b/128x128-stage3b-loss_curve.png, and the four xdist workers
+    # reported mtimes of 22:09:37, :47, :47 and :52 for it: still advancing,
+    # long after any test had touched anything. Meanwhile the checkpoint and
+    # registry beside it sat fixed at 22:09:33, a single save. Asking the
+    # person to reason about that is a worse answer than measuring it.
+    after = snapshot_files(watched)
+    time.sleep(1.0)
+    still_changing = {k for k, v in snapshot_files(watched).items()
+                      if k in after and after[k] != v}
+    added = files_written_between(before, after)
+    if still_changing:
+        _live = sorted(str(p.name) for p in still_changing)[:3]
+        print(f"\n[leak detector: ignoring {len(still_changing)} file(s) still being "
+              f"written after the session ended -- a concurrent training run, not a "
+              f"test leak: {', '.join(_live)}]")
+        added = [p for p in added if p not in still_changing]
     # The latent cache is a deliberate, self-invalidating artifact keyed on
     # encoder weights, so a test that populates it is not leaking state a
     # person has to reason about.
     added = [p for p in added if "latent_cache" not in p.parts]
+    # ATTRIBUTION BY GRID SIZE. See TEST_GRID_SIZES: no test builds a 128x128
+    # sweep, so 128x128-stage4-* is the person's own run whether or not it
+    # happened to still be changing at teardown -- which is the case timing
+    # cannot decide, since a real stage-4 run that FINISHED mid-session is
+    # changing nothing by the time the session ends.
+    #
+    # Nameless siblings inherit: registry-stage4.csv carries no <N>x<N> prefix,
+    # but the same run_lds_stage call wrote 128x128-stage4.pt beside it, so
+    # attributing one and reporting the other would be incoherent. Only
+    # NAMELESS files inherit; anything carrying a test grid size is still
+    # reported on its own name.
+    _theirs = [p for p in added if not _looks_like_a_test_artifact(p)]
+    _their_dirs = {q.parent for q in _theirs}
+    _theirs += [p for p in added
+                 if p not in _theirs and p.parent in _their_dirs
+                 and not re.match(r"\d+x\d+[-_.]", p.name)]
+    if _theirs:
+        print(f"\n[leak detector: ignoring {len(_theirs)} file(s) whose grid size is not one "
+              f"the tests use ({sorted(TEST_GRID_SIZES)}) -- your own training run: "
+              f"{', '.join(sorted(q.name for q in _theirs)[:3])}]")
+        added = [p for p in added if p not in _theirs]
     if added:
-        listing = "\n  ".join(str(p.relative_to(root.parent)) for p in added[:20])
+        # mtimes included, and BOTH causes offered. The message used to assert
+        # "A test is using a default path anchored to _PYTHON_ROOT", which was
+        # simply false the first time it fired for real: the four files were
+        # output/stage3b/128x128-stage3b-loss_curve.{png,csv},
+        # checkpoints/stage3b/128x128-stage3b.pt and registry-stage3b.csv --
+        # size 128, which NO test uses (they use 32, 64, and 8). They were the
+        # person's own training run writing while the suite happened to be
+        # running. A detector that names the wrong culprit sends the reader
+        # hunting through tests for a bug that is not there.
+        import datetime as _dt
+
+        def _describe(path):
+            try:
+                when = _dt.datetime.fromtimestamp(path.stat().st_mtime).strftime("%H:%M:%S")
+            except OSError:
+                when = "??:??:??"
+            return f"{path.relative_to(root.parent)}  (modified {when})"
+
+        listing = "\n  ".join(_describe(p) for p in added[:20])
         more = f"\n  ... and {len(added) - 20} more" if len(added) > 20 else ""
         pytest.fail(
-            f"{len(added)} file(s) were written into the REAL project tree by the test "
-            f"suite:\n  {listing}{more}\n"
-            f"A test is using a default path anchored to _PYTHON_ROOT. Either pass an "
-            f"explicit output_path/checkpoint_path, or add the module to "
-            f"isolated_project_root -- and note that fixture does NOT currently cover "
-            f"the evaluation/*.py scripts."
+            f"{len(added)} file(s) appeared or changed in the REAL project tree during "
+            f"this test session:\n  {listing}{more}\n"
+            f"TWO possible causes -- check the timestamps and the SIZE in the "
+            f"filenames first:\n"
+            f"  (a) a concurrent TRAINING RUN of your own. The tests only ever use "
+            f"size 4/8/32/64, so anything named 128x128 or larger, or any "
+            f"registry-stage*.csv, is almost certainly yours and not a leak.\n"
+            f"  (b) a genuine leak: a test using a default path anchored to "
+            f"_PYTHON_ROOT. Pass an explicit output_path/checkpoint_path, or add "
+            f"the module to isolated_project_root -- and note that fixture does "
+            f"NOT cover the evaluation/*.py scripts."
         )

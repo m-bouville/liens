@@ -65,7 +65,7 @@ deriv_target_centered=True
 resume_from	  = checkpoints/stage2/128x128-stage2.pt
 
 epochs 		  = 100
-patience 	  =  15
+patience 	  =  10
 deriv_weight_warmup_epochs= 10  # also switches to symmetric definition of derivative
 
 batches 	  = same
@@ -82,6 +82,8 @@ n_rollout_steps= 1			# always 1 for 3a
 n_substeps     = 1			# always 1 for 3a
 z1_resync      = True		# always True for 3a
 
+resume_from = checkpoints/stage3a/128x128-stage3a-20260804_20h08.pt
+
 rollout_scale = 1e-6
 ae_stats_weight= 1.
 
@@ -92,8 +94,9 @@ patience 	  = 500
 
 num_workers	  =   8   # was 8
 batches		  = 2048
+spike_skip_factor= 5
 
-lr 			  = 0.2e-3  # default: 1.e-3
+lr 			  = 0.5e-3  # was 0.2e-3; default: 1.e-3
 z0_noise_scale=   0.1	# was 0.175
 
 dt_cap		  = inf   # 125/0.05 = 2500 time steps
@@ -122,8 +125,9 @@ patience 	  = 500
 
 num_workers	  = same
 batches		  = same
+spike_skip_factor= same
 
-lr 			  =   0.5e-4  	# default: 1.e-3
+lr 			  =   0.1e-3  	# was 0.5e-4; default: 1.e-3
 z0_noise_scale=   0.1
 
 dt_cap		  = same		# must be
@@ -142,9 +146,9 @@ stats0_weight   = 0.2
 n_rollout_steps= same
 
 recon0_scale    =   1.e-3
-stats0_scale    =   0.1
+stats0_scale    =   0.025
 
-rollout_scale   =   100.
+rollout_scale   =   0.1
 rollout_weight_warmup_epochs= 10
 rollout_weight_warmup_start = 1e-5  # geometric warmup
 
@@ -169,6 +173,7 @@ recon0_weight   = 1  # was 1.0        # now primary, per the original design int
 stats0_weight   = 0.25
 
 n_rollout_steps= same      # match stage 4's -- same reasoning as before
+rollout_scale  = 100.
 
 epochs         =  50
 patience       =  10

@@ -23,7 +23,7 @@ from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs,
 from training.losses import StatsLoss
 from training.model_assembly import build_models_from_components
 from training.refinement_loss import compute_stage45_loss
-from utils.plots import loss_component_scatter, loss_curve, should_write_loss_figure
+from utils.plots import loss_component_scatter, loss_curve, write_loss_history, should_write_loss_figure
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
 
@@ -67,7 +67,7 @@ def train_refinement(
     rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-4,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
-    n_rollout_steps: int = 1, min_step: int | None = None, min_stdev_phi: float | None = None,
+    n_rollout_steps: int | None = None, min_step: int | None = None, min_stdev_phi: float | None = None,
     val_ema_decay: float = 0.7, ema_warmup_epochs: int = 0,
     early_stopping_patience: int | None = None, grad_clip: float = 1.0,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
@@ -190,7 +190,6 @@ def train_refinement(
             stats_loss_fn = StatsLoss(sh.provenance["stats_mean"], sh.provenance["stats_std"],
                                        stat_names=stat_names).to(device)
 
-    window_length = n_rollout_steps + 1
     run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
         raise ValueError(f"No complete runs found under {base_path}/{size}x{size} -- "
@@ -215,6 +214,31 @@ def train_refinement(
     # z1_resync=False expects z1 to be propagated, not reset at each real
     # frame; applying it teacher-forced is the "NOT equivalent" direction.
     lds_z1_resync = components["lds"].config.get("z1_resync", True)
+    # n_rollout_steps INHERITED too, and for the same reason as max_dt and
+    # z1_resync: it is the regime f_theta was tuned in, not a free choice.
+    #
+    # It used to default to 1 no matter what the ancestor trained at. Measured
+    # on a full-chain run: 3b recorded n_rollout_steps=2 and stage 4 silently
+    # used 1 -- and at ONE step there is nothing to propagate, so the inherited
+    # z1_resync=False went inert as well. The encoder was refined in a regime
+    # f_theta was never tuned for, with no message at all.
+    #
+    # None (not 1) is the "unspecified" sentinel: 1 is a meaningful explicit
+    # value and must stay overridable.
+    _inherited_rollout = lds_data_config.get("n_rollout_steps")
+    if n_rollout_steps is None:
+        n_rollout_steps = _inherited_rollout if _inherited_rollout is not None else 1
+        if _inherited_rollout is not None:
+            print(f"n_rollout_steps={n_rollout_steps} inherited from f_theta's own training "
+                  f"regime (pass n_rollout_steps explicitly to override)")
+    elif _inherited_rollout is not None and n_rollout_steps != _inherited_rollout:
+        print(f"NOTE: this stage runs n_rollout_steps={n_rollout_steps} but f_theta was "
+              f"trained at {_inherited_rollout}. Deliberate is fine -- but at 1 step "
+              f"z1_resync has nothing to propagate, so a rollout-trained f_theta is being "
+              f"applied outside its own regime.")
+    # Computed HERE, after n_rollout_steps is resolved -- it used to sit ~35
+    # lines earlier, which made the None sentinel a TypeError.
+    window_length = n_rollout_steps + 1
     max_dt = max_dt if max_dt is not None else lds_data_config.get("max_dt")
     min_passing_steps = (min_passing_steps if min_passing_steps is not None
                           else lds_data_config.get("min_passing_steps"))
@@ -508,6 +532,7 @@ def train_refinement(
                 loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
                 event_epochs=loss_curve_events,
             )
+            write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
 
         current_val_components = {
             "rollout": rollout_weight * val_rollout / rollout_scale,
@@ -572,21 +597,49 @@ def train_refinement(
                 "stats0": stats0_weight * val_stats0 / stats0_scale,
             }
             total = sum(abs(v) for v in contributions.values())
+            raw = {"rollout": val_rollout, "recon0": val_recon0, "stats0": val_stats0}
+            weights = {"rollout": rollout_weight, "recon0": recon0_weight,
+                        "stats0": stats0_weight}
+            scales = {"rollout": rollout_scale, "recon0": recon0_scale,
+                       "stats0": stats0_scale}
             if total > 0:
-                worst, share = max(((k, abs(v) / total) for k, v in contributions.items()),
-                                    key=lambda kv: kv[1])
-                if share > 0.99:
-                    others = ", ".join(f"{k} {100 * abs(v) / total:.4f}%"
-                                        for k, v in contributions.items() if k != worst)
-                    print(f"\n  WARNING: '{worst}' is {100 * share:.4f}% of the validation "
+                shares = {k: abs(v) / total for k, v in contributions.items()}
+                _raw_str = ", ".join(f"{k}={raw[k]:.3e}" for k in shares)
+                _suggest = ", ".join(
+                    f"{k}_scale~{raw[k]:.3g}" for k in shares if raw[k] > 0)
+
+                # TWO-SIDED. The original check only caught a component
+                # DOMINATING, and stage 4 has since hit the opposite end just
+                # as hard: with rollout_scale=100 against a converged raw of
+                # 0.04, L_rollout fell to 0.46% of the validation loss and the
+                # warning stayed silent -- while the term stage 4 exists to
+                # balance had effectively left the objective. Both failures are
+                # the same defect (a scale that is not the raw magnitude of its
+                # own component) and both deserve the same report.
+                dominant = [k for k, sh in shares.items() if sh > 0.99]
+                # "starved" is keyed on a NONZERO weight: a component the user
+                # deliberately switched off must not be reported as a problem.
+                starved = [k for k, sh in shares.items()
+                            if sh < 0.01 and weights.get(k, 0.0) != 0.0]
+
+                if dominant:
+                    k = dominant[0]
+                    others = ", ".join(f"{n} {100 * shares[n]:.4f}%"
+                                        for n in shares if n != k)
+                    print(f"\n  WARNING: '{k}' is {100 * shares[k]:.4f}% of the validation "
                           f"loss ({others}). The *_scale values are calibrated for a "
                           f"different stage -- each scale should be the RAW magnitude of its "
                           f"own component here, so the weights beside them mean what they say. "
-                          f"Raw values this epoch: "
-                          + ", ".join(f"{k}={w * v / sc:.3e}" for k, (w, v, sc) in {
-                              "rollout": (1.0, val_rollout, 1.0),
-                              "recon0": (1.0, val_recon0, 1.0),
-                              "stats0": (1.0, val_stats0, 1.0)}.items()) + "\n")
+                          f"Raw values this epoch: {_raw_str}. Suggested: {_suggest}\n")
+                elif starved:
+                    detail = ", ".join(
+                        f"'{k}' {100 * shares[k]:.4f}% (weight {weights[k]:g}, "
+                        f"scale {scales[k]:g})" for k in starved)
+                    print(f"\n  WARNING: {detail} of the validation loss, despite a nonzero "
+                          f"weight -- that term is effectively OUT of the objective, so this "
+                          f"stage is not balancing what it exists to balance. Its scale is far "
+                          f"above its own raw magnitude. Raw values this epoch: {_raw_str}. "
+                          f"Suggested: {_suggest}\n")
 
         if saved_this_epoch:
             epochs_since_improvement = 0
@@ -654,6 +707,7 @@ def train_refinement(
         loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
         event_epochs=loss_curve_events,
     )
+    write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
     loss_component_scatter(
         epoch_history, component_histories, loss_components_path,
         title=f"Stage {'4' if freeze_decoder else '5'} loss components",

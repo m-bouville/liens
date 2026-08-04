@@ -316,3 +316,124 @@ def test_the_header_says_whether_an_override_is_in_force():
         "an overridden run must say so -- its numbers are not comparable to an "
         "inherited one"
     )
+
+
+# --------------------------------------------------------------------
+# the diagnostics must use the shared latent cache
+# --------------------------------------------------------------------
+
+def test_the_shared_loader_passes_latent_cache_dir_to_the_dataset():
+    """
+    The trainers had been caching latents since the feature landed; the
+    DIAGNOSTICS re-encoded their whole population on every run. Nothing about
+    the cache is training-specific -- the key is the encoder's own fingerprint
+    plus the run and step list -- and a diagnostic uses a frozen encoder
+    straight out of a checkpoint, usually the one the trainer just wrote.
+
+    Worst on an off-distribution run: --max-dt large disables the prefix
+    truncation, so every frame of every run is encoded. That is the "unusually
+    slow" the max_dt=2000 sweep reported.
+    """
+    import inspect
+
+    from evaluation._latent_eval import _load_ae_f_theta_and_dataset
+    assert "latent_cache_dir" in inspect.signature(_load_ae_f_theta_and_dataset).parameters
+    # Scoped to the DATASET CONSTRUCTION, not the file: the same kwarg also
+    # appears where _load_models_and_dataset forwards it, so a file-level
+    # substring check passed even with the dataset call stripped -- verified.
+    src = source_without_comments(_ROOT / "evaluation/_latent_eval.py")
+    call = src[src.index("MicrostructureEvolutionDataset("):]
+    call = call[:call.index(")\n")]
+    assert "latent_cache_dir=latent_cache_dir" in call, (
+        "the parameter must reach MicrostructureEvolutionDataset itself"
+    )
+
+
+def test_the_cache_root_has_ONE_definition():
+    """
+    GUARDS a second literal path. Trainer and diagnostic must land in the SAME
+    cache or the sharing is theoretical -- and the pipeline had the only copy,
+    written inline.
+    """
+    from orchestration.paths import default_latent_cache_dir
+    root = _ROOT
+    assert default_latent_cache_dir(root) == root / "checkpoints" / "latent_cache"
+    pipeline_src = source_without_comments(_ROOT / "orchestration/pipeline.py")
+    assert "default_latent_cache_dir(_PYTHON_ROOT)" in pipeline_src, (
+        "pipeline must call the shared helper"
+    )
+    assert '"checkpoints" / "latent_cache"' not in pipeline_src, (
+        "pipeline still builds the path inline -- a second definition to drift"
+    )
+
+
+def test_none_can_still_turn_the_cache_OFF():
+    """
+    GUARDS defaulting with `latent_cache_dir or default(...)`: None is a
+    MEANINGFUL value (caching disabled), so it cannot double as "not
+    specified". A sentinel is required, and --no-latent-cache depends on it.
+    """
+    import inspect
+
+    from evaluation.check_parameter_dependence import check_parameter_dependence
+    default = inspect.signature(check_parameter_dependence).parameters["latent_cache_dir"].default
+    assert default is not None, "None as the default would make the cache unturnoffable"
+    src = source_without_comments(_ROOT / "evaluation/check_parameter_dependence.py")
+    assert "_UNSET_CACHE" in src
+    assert '"--no-latent-cache"' in src
+    assert "None if args.no_latent_cache else _UNSET_CACHE" in src
+
+
+# --------------------------------------------------------------------
+# the ephemeral stage-3 wrapper must not encode a full val set
+# --------------------------------------------------------------------
+
+def test_the_ephemeral_wrapper_forces_a_minimal_val_set():
+    """
+    Converting an AE-family checkpoint runs train_lds with epochs=0. That
+    already skips the TRAIN set (never iterated), but the VAL set was still
+    built and fully ENCODED -- ~30,000 windows on the 128 sweep, each pushed
+    through the frozen AE's forward pass -- to produce one val_loss that
+    ensure_lds_checkpoint's own NOTE calls uninformative.
+
+    It was the dominant cost of every diagnostic run against a stage-1/2
+    checkpoint.
+    """
+    src = source_without_comments(_ROOT / "orchestration/checkpoint_identification.py")
+    assert '_ephemeral_kwargs["val_fraction"] = 1e-9' in src
+    assert "**_ephemeral_kwargs," in src, "the override must actually be passed"
+
+
+def test_shrinking_val_does_not_move_the_TEST_dirs():
+    """
+    The safety argument, exercised rather than asserted in prose: the
+    diagnostic evaluates TEST windows, so a change to val_fraction would be
+    silently corrupting if it repartitioned them.
+
+    split_run_dirs carves test FIRST (perm[:n_test]), so val shrinks into
+    train -- which epochs=0 skips anyway.
+    """
+    from pathlib import Path
+
+    from training.datasets import split_run_dirs
+
+    dirs = [Path(f"r{i}") for i in range(4277)]
+    _, val_big, test_big = split_run_dirs(dirs, val_fraction=0.2, test_fraction=0.1, seed=0)
+    _, val_small, test_small = split_run_dirs(dirs, val_fraction=1e-9, test_fraction=0.1, seed=0)
+
+    assert test_big == test_small, "shrinking val repartitioned the TEST set"
+    assert len(val_small) == 1 and len(val_big) > 100
+
+
+def test_val_fraction_is_not_zero():
+    """
+    GUARDS 1e-9 -> 0. The epoch-0 evaluation still runs, and an empty val set
+    divides by zero. One dir is enough for the structurally valid checkpoint
+    the wrapper exists to produce.
+    """
+    from pathlib import Path
+
+    from training.datasets import split_run_dirs
+    _, val, _ = split_run_dirs([Path(f"r{i}") for i in range(4277)],
+                                val_fraction=1e-9, test_fraction=0.1, seed=0)
+    assert len(val) >= 1

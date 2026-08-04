@@ -33,7 +33,7 @@ from training.losses import ReconLoss, StatsLoss, centered_deriv_target, dt_weig
 from training.stats_head import StatsHead
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
-from utils.plots import loss_component_scatter, loss_curve, should_write_loss_figure
+from utils.plots import loss_component_scatter, loss_curve, write_loss_history, should_write_loss_figure
 from evaluation.check_interpolation import check_interpolation
 from evaluation.check_perturbation import check_perturbation
 
@@ -1303,6 +1303,7 @@ def train_stage2(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                 loss_curve_path, title="Stage 2 loss", event_epochs=loss_curve_events,
             )
+            write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
 
         # loss_component_scatter: recon0 (always present, weight 1) plus
         # whichever of stats0/stats1/deriv are actually active this run
@@ -1481,11 +1482,20 @@ def train_stage2(
         # followed by a val_loss that never falls below the EMA the grace
         # window left behind. On a small dataset that is a plausible outcome,
         # not a crash.
+        # Built as an ordinary variable rather than a multi-line conditional
+        # inside an f-string replacement field. That construct is legal from
+        # 3.12 (PEP 701) but implicit concatenation across lines INSIDE {...}
+        # is exactly the corner that tooling handles inconsistently -- it
+        # raised "unterminated string literal" on a user's 3.13 run while
+        # parsing fine here. Nothing is gained by inlining it.
+        _epochs_zero_hint = (
+            "An epochs=0 ablation cannot produce a checkpoint -- remove the stage from "
+            "the params file rather than setting its epochs to 0, if anything downstream "
+            "needs its output. " if epochs == 0 else ""
+        )
         raise RuntimeError(
             f"stage 2 finished without ever saving a checkpoint to {checkpoint_path}. "
-            f"{'An epochs=0 ablation cannot produce a checkpoint -- remove the stage from '
-               'the params file rather than setting its epochs to 0, if anything downstream '
-               'needs its output. ' if epochs == 0 else ''}"
+            f"{_epochs_zero_hint}"
             f"No epoch's val criterion beat the running best, so nothing was written. "
             f"If deriv_target_centered switched mid-run, the grace period leaves "
             f"best_val_loss at the EMA reached during it -- a val_loss that then only "
@@ -1508,6 +1518,7 @@ def train_stage2(
         epoch_history, train_loss_history, val_loss_history, best_so_far_history,
         loss_curve_path, title="Stage 2 loss", event_epochs=loss_curve_events,
     )
+    write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
     loss_component_scatter(
         epoch_history, component_histories, loss_components_path,
         title="Stage 2 loss components",

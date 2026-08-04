@@ -35,3 +35,17 @@ _STAGE_DIRS = {1: _PYTHON_ROOT / "checkpoints" / "stage1",
                4: _PYTHON_ROOT / "checkpoints" / "stage4",
                5: _PYTHON_ROOT / "checkpoints" / "stage5"}
 _CHECKPOINTS_ROOT = _PYTHON_ROOT / "checkpoints"
+
+
+def default_latent_cache_dir(python_root: Path) -> Path:
+    """The shared latent-cache root, `<python_root>/checkpoints/latent_cache`.
+
+    One definition rather than a literal per caller, so the trainers and the
+    DIAGNOSTICS land in the same cache. They can share safely: the key is a
+    fingerprint of the encoder's own state_dict (weights and buffers) plus the
+    run and its step list and encode_both_streams -- so a diagnostic reading a
+    frozen encoder out of a checkpoint hits entries the trainer wrote with that
+    exact encoder. That is the common case, since a diagnostic is usually run
+    right after the stage that produced the checkpoint.
+    """
+    return python_root / "checkpoints" / "latent_cache"

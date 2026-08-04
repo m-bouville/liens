@@ -17,6 +17,8 @@ being on sys.path):
 
 import argparse
 import math
+import statistics
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -40,7 +42,7 @@ from training.checkpoint_components import cross_check_ancestor_config
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss, compute_dt_decade_weights
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
-from utils.plots import loss_curve, should_write_loss_figure
+from utils.plots import loss_curve, write_loss_history, should_write_loss_figure
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -274,12 +276,134 @@ def _load_frozen_encoder(
     return encoder, ae_checkpoint, ae_config, ae_checkpoint_path
 
 
+def _record_spike(guard: "_SpikeGuard", total, dt_window, theta) -> float | None:
+    """Attribution for a skipped batch: what was IN it.
+
+    "Cursed with sudden peaks" is not actionable; "the spikes are all
+    dt near max_dt at low noise" is. Records the worst one seen so the epoch
+    summary can name it, rather than printing per-batch and drowning the log.
+    """
+    try:
+        loss_v = float(total.detach())
+        dt_max = float(dt_window.detach().max())
+        theta0 = float(theta.detach()[:, 0].mean()) if theta.numel() else float("nan")
+    except Exception:
+        return
+    # Per-epoch, not all-time. Keeping the running maximum meant every report
+    # after the first repeated the same stale numbers -- on a real run,
+    # "loss 4.323e+07 ... dt_max=125, theta=-0.2763" was printed identically
+    # for dozens of epochs, including AFTER a rollback had restored different
+    # weights, so it described a batch that no longer existed.
+    if guard.worst is None or loss_v > guard.worst[0]:
+        guard.worst = (loss_v, guard.median(), dt_max, theta0)
+
+
+class _SpikeGuard:
+    """Skips an optimizer step whose loss is a catastrophic outlier.
+
+    Both 128x128 stage-3 runs were ENDED by a single such spike: 3a's last
+    save was epoch 3547 and it stopped at 4047, 3b's were 2294 and 2794 --
+    in each case exactly one patience window, entirely spent after the spike,
+    never recovering to the pre-spike best. Neither run had plateaued; the
+    reported "convergence" was a crash.
+
+    val_loss spiking alongside train confirms the WEIGHTS were damaged, not
+    just one forward pass: val runs under no_grad with no z0 noise.
+
+    Two distinct failure modes, both covered:
+
+    * NON-FINITE loss. grad_clip does not save you here -- it makes it worse.
+      clip_grad_norm_ computes clip_coef = max_norm / (total_norm + eps),
+      which for an infinite norm is 0, and 0 * inf = nan. One infinite
+      gradient turns the whole parameter vector to NaN in a single step,
+      permanently. A merely large gradient clips correctly.
+
+    * FINITE but enormous. Clipping bounds the step's norm but not its
+      direction, so a wildly wrong batch still moves the weights somewhere
+      the model needs hundreds of epochs to climb out of.
+
+    Deliberately conservative: the threshold is a multiple of a running
+    MEDIAN (not mean -- the mean is what the outliers corrupt), and the guard
+    stays inactive until it has enough history to have a meaningful median.
+    It is meant to catch catastrophes, not to smooth ordinary noise, because
+    silently dropping hard batches would bias what the model learns.
+    """
+
+    def __init__(self, factor: float, window: int = 200, min_history: int = 50):
+        self.factor = factor
+        self.min_history = min_history
+        self._recent: deque[float] = deque(maxlen=window)
+        self.n_skipped = 0
+        self.n_nonfinite = 0
+        self.n_skipped_this_epoch = 0
+        self.consecutive_total_skip_epochs = 0
+        self.worst: tuple[float, float, float, float] | None = None   # loss, median, dt_max, theta0
+        self.last_worst: tuple[float, float, float, float] | None = None
+
+    def should_skip(self, loss_value: float) -> bool:
+        if self.factor <= 0:
+            return False
+        if not math.isfinite(loss_value):
+            self.n_skipped += 1
+            self.n_nonfinite += 1
+            return True
+        if len(self._recent) >= self.min_history:
+            med = statistics.median(self._recent)
+            if med > 0 and loss_value > self.factor * med:
+                self.n_skipped += 1
+                self.n_skipped_this_epoch += 1
+                return True
+        self._recent.append(loss_value)
+        return False
+
+    def median(self) -> float:
+        return statistics.median(self._recent) if self._recent else float("nan")
+
+    def end_epoch(self, n_batches: int, extra_skipped: int = 0) -> bool:
+        """Returns True when EVERY batch this epoch was skipped.
+
+        THE DEADLOCK THIS EXISTS FOR. Once the weights are broken, every batch
+        is an outlier, so every batch is skipped, so no gradient step is ever
+        taken and the weights can never recover. The median does not adapt
+        either -- skipped losses are deliberately not recorded, which is right
+        for a transient spike and fatal for a permanent one.
+
+        Observed on 128x128 stage 3b: from epoch 2340 onward, 7 of 7 batches
+        skipped every single epoch, val_loss frozen at exactly 231105.000, for
+        hundreds of epochs. The guard turned a crash the run had previously
+        SURVIVED (3a recovered from its own spike) into a permanent freeze.
+        """
+        # extra_skipped: batches the OTHER guard skipped. A batch is skipped
+        # by at most one of them (a loss-skipped batch never reaches backward,
+        # so its gradient is never inspected), so the counts simply add. The
+        # deadlock is "no step was taken at all", regardless of which guard
+        # prevented it.
+        all_skipped = n_batches > 0 and (self.n_skipped_this_epoch + extra_skipped) >= n_batches
+        self.consecutive_total_skip_epochs = (
+            self.consecutive_total_skip_epochs + 1 if all_skipped else 0)
+        self.n_skipped_this_epoch = 0
+        # HANDED OVER, not discarded. end_epoch() runs BEFORE the per-epoch
+        # report, so clearing `worst` outright left the report with nothing --
+        # every skip line lost its dt_max/theta attribution, which was the
+        # whole point of recording it. Fixing the STALE attribution must not
+        # remove it: last_worst is this epoch's, and only this epoch's.
+        self.last_worst = self.worst
+        self.worst = None
+        return all_skipped
+
+    def forget_history(self) -> None:
+        """After a rollback the old median describes weights that no longer
+        exist; keeping it would re-trip the guard immediately."""
+        self._recent.clear()
+        self.consecutive_total_skip_epochs = 0
+
+
 def _resume_f_theta_from_checkpoint(
     f_theta: torch.nn.Module, resume_from: Path, ae_config: dict,
     hidden_dim: int, n_hidden_layers: int, dt_cap: float, n_substeps: int,
     n_rollout_steps: int,
     device: torch.device,
-) -> None:
+) -> float | None:
     """
     Loads f_theta's weights from a prior LDS checkpoint (curriculum
     rollout: train at n_rollout_steps=1 first, then resume here at the
@@ -291,6 +415,9 @@ def _resume_f_theta_from_checkpoint(
     body -- same logic, same order, just named and callable on its
     own.
     """
+    # None unless the ancestor is COMPARABLE (see below); every early return
+    # and non-resume path must still produce a value.
+    _reference: float | None = None
     if resume_from is not None:
         # Curriculum rollout: train with n_rollout_steps=1 first (stable,
         # fast, avoids the epoch-1 loss blowup a from-scratch jump straight
@@ -354,6 +481,22 @@ def _resume_f_theta_from_checkpoint(
                   f"instead would use a pointwise f_theta as a one-shot corrector, which is "
                   f"NOT equivalent -- double-check that is intentional.\n")
 
+        # COMPARABLE ANCESTOR -> its val_loss is a valid ceiling.
+        #
+        # I previously argued stage 3 could not have one because "the
+        # ancestor's val_loss was measured at a different n_rollout_steps".
+        # True when it IS different -- and this function already detects that.
+        # When it MATCHES, the two numbers measure the same quantity and the
+        # ceiling applies exactly as it does for stages 1/2.
+        #
+        # Observed cost of not having it: a 3a run resumed from val_loss
+        # 0.563700, saved 0.568295 at its epoch 234, and early-stopped at 734
+        # having never beaten its own ancestor -- a 0.82% regression written
+        # over a better checkpoint.
+        _comparable = (prev_n_rollout == n_rollout_steps
+                       and prev_config.get("n_substeps", 1) == n_substeps)
+        _reference = float(prev_lds["val_loss"]) if (
+            _comparable and prev_lds.get("val_loss") is not None) else None
         if prev_n_rollout is not None and n_rollout_steps <= prev_n_rollout:
             print(f"WARNING: resuming from a checkpoint trained at n_rollout_steps="
                   f"{prev_n_rollout}, but this run asks for n_rollout_steps="
@@ -361,6 +504,7 @@ def _resume_f_theta_from_checkpoint(
                   f"direction (easy -> hard). Continuing anyway, but double-check this "
                   f"is intentional.\n")
 
+    return _reference
 
 def train_lds(
     size: int, base_path: Path,
@@ -376,6 +520,9 @@ def train_lds(
     encode_batch_size: int = 256, val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5,
     early_stopping_patience: int | None = None,
     lr_warmup_steps: int = 20, grad_clip: float = 1.0,
+    spike_skip_factor: float = 10.0, grad_spike_factor: float = 10.0,
+    val_excursion_factor: float = 3.0,
+    spike_deadlock_epochs: int = 5, max_spike_rollbacks: int = 3,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
     resume_from: Path | None = None,
@@ -689,7 +836,7 @@ def train_lds(
               f"distribution, weighted by each decade's own measured raw loss mass -- "
               f"{dict(sorted(dt_decade_weights_fn.decade_weight.items()))}\n")
 
-    _resume_f_theta_from_checkpoint(
+    _ancestor_reference = _resume_f_theta_from_checkpoint(
         f_theta, resume_from, ae_config, hidden_dim, n_hidden_layers, dt_cap, n_substeps,
         n_rollout_steps, device,
     )
@@ -824,13 +971,47 @@ def train_lds(
         l_1step_scaled = l_1step / rollout_scale
 
         if train:
-            optimizer.zero_grad()
-            total.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(f_theta.parameters(), grad_clip)
-            optimizer.step()
-            if lr_scheduler is not None:
-                lr_scheduler.step()
+            # The guard reads the loss BEFORE backward(): a non-finite loss
+            # must never reach clip_grad_norm_, which converts inf to nan (see
+            # _SpikeGuard). .item() here costs a sync per batch, which is the
+            # price of not losing a 3000-epoch run to one bad window.
+            if spike_guard.should_skip(float(total.detach())):
+                _record_spike(spike_guard, total, dt_window, theta)
+                optimizer.zero_grad()
+            else:
+                optimizer.zero_grad()
+                total.backward()
+                # THE PRE-CLIP GRADIENT NORM, which clip_grad_norm_ returns
+                # anyway -- so this guard is free.
+                #
+                # It catches what the LOSS guard structurally cannot. On
+                # 128x128 stage 3a the batch that wrecked the model had an
+                # ORDINARY loss: with a median of 0.797 and the guard at 10x,
+                # nothing above 8.0 was seen, yet the weights were destroyed
+                # inside that epoch. The loss is not the quantity that moves
+                # the weights; the gradient is.
+                #
+                # Why an ordinary batch can do it: f_theta enters as
+                # f*dt^2/2, and at dt=125 that is a factor of 7800, so a 1e-3
+                # change in f_theta's output is a change of ~8 in the
+                # prediction. grad_clip bounds the NORM, then Adam
+                # re-normalises per-parameter, so each step still moves each
+                # weight by ~lr regardless.
+                _gnorm = torch.nn.utils.clip_grad_norm_(
+                    f_theta.parameters(), grad_clip if grad_clip > 0 else float("inf"))
+                if grad_guard.should_skip(float(_gnorm)):
+                    _record_spike(grad_guard, _gnorm, dt_window, theta)
+                    optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    # ONLY when a step was actually taken. Advancing the
+                    # schedule on a skipped batch consumes lr_warmup_steps
+                    # without training, and torch warns about it
+                    # ("lr_scheduler.step() before optimizer.step()") -- which
+                    # is how this surfaced, from the first end-to-end run of
+                    # the rollback path.
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
 
         # Returned as GPU tensors, NOT .item()'d here -- .item() blocks
         # the CPU until the GPU actually finishes and forces a full
@@ -861,6 +1042,19 @@ def train_lds(
         ema_warmup_epochs=clamp_grace_epochs(ema_warmup_epochs, n_epoch_iterations),
         val_ema_decay=val_ema_decay,
     )
+    # The ancestor's own val_loss as a ceiling, when it measures the SAME
+    # quantity (same n_rollout_steps and n_substeps -- see
+    # _resume_f_theta_from_checkpoint for why that is the condition).
+    #
+    # Without it a resumed stage-3 run can overwrite a better checkpoint with a
+    # worse one, which is exactly what happened: a 3a run resumed from
+    # val_loss 0.563700, saved 0.568295 at its epoch 234, and early-stopped at
+    # 734 having never beaten its own ancestor.
+    if _ancestor_reference is not None:
+        tracker.reference_val_loss = _ancestor_reference
+        print(f"reference ceiling: this run must BEAT the ancestor's own val_loss "
+              f"({_ancestor_reference:.6f}) to save, since it measures the same quantity "
+              f"(same n_rollout_steps and n_substeps).")
     epochs_since_improvement = 0
 
     show_1step = n_rollout_steps > 1  # at n=1, L_1step == L_rollout always -- redundant to show
@@ -872,6 +1066,15 @@ def train_lds(
     else:
         print(f"/{epochs:3d}  train    valid      ema")
 
+    spike_guard = _SpikeGuard(spike_skip_factor)
+    # Separate history: gradient norms and losses live on different scales, so
+    # one shared median would be meaningless for both.
+    grad_guard = _SpikeGuard(grad_spike_factor)
+    _spikes_reported = 0
+    _grad_spikes_reported = 0
+    _n_rollbacks = 0
+    _n_train_batches = 0
+
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         f_theta.train()
         # GPU-resident accumulators, not Python floats -- see step()'s
@@ -882,7 +1085,9 @@ def train_lds(
         train_1step_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
+            _n_train_batches = 0
             for batch in train_loader:
+                _n_train_batches += 1
                 bs = batch[0].size(0)
                 loss, l_1step = step(batch, train=True)
                 train_loss_sum += loss * bs
@@ -908,7 +1113,95 @@ def train_lds(
         val_loss = (val_loss_sum / n_val).item()
         val_1step = (val_1step_sum / n_val).item()
 
+        # Captured BEFORE update(): the reference must be where the run WAS,
+        # not an average this epoch's own excursion has already pulled up.
+        # DEADLOCK -> ROLL BACK. Skipping protects against a transient bad
+        # batch; it cannot repair weights that are already broken, and then it
+        # blocks every step forever. The best checkpoint on disk is by
+        # construction from before the damage, so restoring it returns the run
+        # to a known-good state and lets it continue.
+        _deadlocked = spike_guard.end_epoch(
+            _n_train_batches, extra_skipped=grad_guard.n_skipped_this_epoch)
+        grad_guard.end_epoch(_n_train_batches, extra_skipped=spike_guard.n_skipped_this_epoch)
+        if _deadlocked and spike_guard.consecutive_total_skip_epochs >= spike_deadlock_epochs:
+            _have_checkpoint = Path(checkpoint_path).exists()
+            if _n_rollbacks >= max_spike_rollbacks or not _have_checkpoint:
+                # STOP, do not raise -- when a checkpoint exists.
+                #
+                # Rolling back three times and diverging again is a real
+                # training outcome, not a program error: the run found what it
+                # could and then destabilised. The best checkpoint on disk is
+                # by construction from before the damage and is exactly what a
+                # normal early stop would have returned.
+                #
+                # Raising instead propagated out of run_lds_stage and killed
+                # the whole params file, so stages 4 and 5 never ran -- with a
+                # perfectly good val_loss=1.074618 checkpoint sitting on disk.
+                if _have_checkpoint:
+                    _best = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+                    print(f"\nSTOPPING at epoch {epoch}: every batch has been skipped for "
+                          f"{spike_guard.consecutive_total_skip_epochs} consecutive epochs and "
+                          f"{_n_rollbacks} rollback(s) have not held, so training cannot "
+                          f"continue. Keeping the best checkpoint (epoch {_best['epoch']}, "
+                          f"val_loss={_best['val_loss']:.6f}), which is what an ordinary early "
+                          f"stop would have returned.\n"
+                          f"  To get further: LOWER lr (currently {lr:g}) -- that is the lever. "
+                          f"RAISING spike_skip_factor (currently {spike_skip_factor:g}) only "
+                          f"lets the damaging batches through; lowering it skips MORE and "
+                          f"deadlocks sooner.\n")
+                    break
+                raise RuntimeError(
+                    f"stage 3: every batch has been skipped for "
+                    f"{spike_guard.consecutive_total_skip_epochs} consecutive epochs, so no "
+                    f"gradient step is being taken and the weights cannot recover, and no "
+                    f"checkpoint exists to roll back to or to keep. Lower lr (currently "
+                    f"{lr:g}) and restart.")
+            _n_rollbacks += 1
+            _restored = torch.load(checkpoint_path, map_location=device, weights_only=True)
+            f_theta.load_state_dict(_restored["model_state"])
+            # The optimizer's moment estimates were built from the very
+            # gradients that caused the divergence -- carrying them across a
+            # rollback would re-apply the damage on the first step back.
+            optimizer = torch.optim.Adam(f_theta.parameters(), lr=lr)
+            # THE SCHEDULER MUST BE REBUILT WITH IT. LinearLR holds a
+            # reference to the optimizer it was constructed on, so after the
+            # rebuild the old scheduler kept driving the DISCARDED optimizer
+            # while the live one ran at a frozen lr. Harmless once warmup is
+            # long finished (factor 1.0, so both read `lr`), but silently wrong
+            # for any decaying schedule, and for a rollback during warmup.
+            #
+            # Restarting the warmup is deliberate, not incidental: re-entering
+            # gently after a divergence is exactly what is wanted.
+            if lr_warmup_steps > 0:
+                lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.01, total_iters=lr_warmup_steps,
+                )
+            spike_guard.forget_history()
+            grad_guard.forget_history()
+            # THE CRITERION MUST BE RESET TOO. Restoring the weights is only
+            # half of it: the diverged epochs pushed val_ema to ~1e5, and from
+            # there a perfectly healthy restored model cannot clear
+            # best_val_loss for tens of epochs while epochs_since_improvement
+            # keeps counting. That is the very poisoned-criterion failure that
+            # ended stage 3a -- reintroduced by the rollback if left here.
+            #
+            # The restored checkpoint's own val_loss is the honest bar: it is
+            # this model's measured performance, so it seeds the reference
+            # ceiling exactly as stage 1/2's reference row does.
+            _grace = max(2, round(1 / (1 - val_ema_decay))) if val_ema_decay < 1 else 2
+            _grace = clamp_grace_epochs(_grace, epochs - epoch + 1)
+            tracker.reset_with_grace(_grace, reference_val_loss=float(_restored["val_loss"]))
+            epochs_since_improvement = 0
+            print(f"  [epoch {epoch}: ROLLED BACK to the best checkpoint "
+                  f"(epoch {_restored['epoch']}, val_loss={_restored['val_loss']:.6f}) after "
+                  f"{spike_deadlock_epochs} epochs with every batch skipped. Optimizer state "
+                  f"reset too. Rollback {_n_rollbacks} of {max_spike_rollbacks}.]")
+
+        _ema_before = tracker.val_ema
         criterion, saved_this_epoch = tracker.update(epoch, val_loss)
+        _excursion = (val_excursion_factor > 0 and _ema_before is not None
+                       and (not math.isfinite(val_loss)
+                            or val_loss > val_excursion_factor * _ema_before))
 
         epoch_history.append(epoch)
         train_loss_history.append(train_loss)
@@ -925,6 +1218,33 @@ def train_lds(
                 secondary_val=val_1step_history if show_1step else None,
                 secondary_label="1step",
             )
+            write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
+
+        # SKIPPED BATCHES ARE NEVER SILENT. A guard that quietly drops data
+        # would be worse than the crash it prevents: the run would look
+        # healthy while training on a filtered distribution.
+        if grad_guard.n_skipped != _grad_spikes_reported:
+            _newg = grad_guard.n_skipped - _grad_spikes_reported
+            _grad_spikes_reported = grad_guard.n_skipped
+            _wg = grad_guard.last_worst
+            _dg = ("" if _wg is None else
+                    f" worst: grad_norm {_wg[0]:.4g} vs median {_wg[1]:.4g}, "
+                    f"dt_max={_wg[2]:.4g}, mean theta[0]={_wg[3]:.4g}")
+            print(f"  [epoch {epoch}: skipped {_newg} batch(es) whose GRADIENT NORM was a "
+                  f"catastrophic outlier, despite an ordinary loss. This is the case the "
+                  f"loss guard cannot see.{_dg}]")
+
+        if spike_guard.n_skipped != _spikes_reported:
+            _new = spike_guard.n_skipped - _spikes_reported
+            _spikes_reported = spike_guard.n_skipped
+            _w = spike_guard.last_worst
+            _detail = ("" if _w is None else
+                        f" worst: loss {_w[0]:.4g} vs median {_w[1]:.4g}, "
+                        f"dt_max={_w[2]:.4g}, mean theta[0]={_w[3]:.4g}")
+            print(f"  [epoch {epoch}: skipped {_new} batch(es) whose loss was a "
+                  f"catastrophic outlier ({spike_guard.n_nonfinite} non-finite in total). "
+                  f"The optimizer step was NOT taken, so the weights are untouched."
+                  f"{_detail}]")
 
         ema_str = f"{tracker.val_ema:.6f}" if tracker.val_ema is not None else "  (warmup)"
         if show_1step:
@@ -963,8 +1283,36 @@ def train_lds(
         else:
             epochs_since_improvement += 1
 
-        if log_every_epoch or saved_this_epoch:
-            print(msg)
+        # AN EXCURSION PRINTS EVEN WHEN NOTHING SAVED.
+        #
+        # With log_every_epoch=False the row is gated on saved_this_epoch, so
+        # a run that spikes and never recovers goes SILENT at exactly the
+        # moment it matters. Measured on 128x128 stage 3a: the log's last line
+        # is epoch 3547 and the run stopped at 4047 -- the 500 epochs holding
+        # the spike that ended it produced no output at all, and the log reads
+        # as a clean descent followed by "Early stopping". Only the loss curve
+        # showed otherwise.
+        if log_every_epoch or saved_this_epoch or _excursion:
+            _mark = ""
+            if _excursion:
+                _ratio = (float("inf") if not math.isfinite(val_loss)
+                           else val_loss / _ema_before)
+                # DELIBERATELY NEUTRAL about the cause. The first version
+                # asserted "the weights moved somewhere bad", and on a real 3b
+                # run that was wrong for most of the reports: train stayed at
+                # ~1.40 and BOTH 1-step columns at ~0.62-0.82 -- entirely
+                # normal -- while the 2-step val hit 337. Arithmetic over 5335
+                # windows puts that on a SINGLE window at ~1.8e6. The weights
+                # were fine; a handful of val windows diverge under the
+                # 2-step autonomous rollout.
+                #
+                # Comparing against the train column tells the two apart, so
+                # the message shows it rather than guessing.
+                _mark = (f"   <- val EXCURSION: {_ratio:.1f}x the running EMA "
+                         f"({_ema_before:.4f}), with train={train_loss:.4f}. "
+                         f"If train is normal the weights are fine and a few VAL "
+                         f"windows are diverging; if train spiked too, the weights moved.")
+            print(msg + _mark)
 
         # Only counts post-warmup, since raw val_loss during warmup can be
         # wildly noisy by design (see ema_warmup_epochs) -- counting those
@@ -989,6 +1337,7 @@ def train_lds(
         secondary_val=val_1step_history if show_1step else None,
         secondary_label="1step",
     )
+    write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
 
     if not checkpoint_path.exists():
         # A run that never saved is a FAILED run, and it must say so HERE.
@@ -1017,11 +1366,20 @@ def train_lds(
             f"val_loss stayed finite (best {min(finite):.6g}) but never improved on the "
             f"criterion -- check ema_warmup_epochs vs early_stopping_patience."
         )
+        # Built as an ordinary variable rather than a multi-line conditional
+        # inside an f-string replacement field. That construct is legal from
+        # 3.12 (PEP 701) but implicit concatenation across lines INSIDE {...}
+        # is exactly the corner that tooling handles inconsistently -- it
+        # raised "unterminated string literal" on a user's 3.13 run while
+        # parsing fine here. Nothing is gained by inlining it.
+        _epochs_zero_hint = (
+            "An epochs=0 ablation cannot produce a checkpoint -- remove the stage from "
+            "the params file rather than setting its epochs to 0, if anything downstream "
+            "needs its output. " if epochs == 0 else ""
+        )
         raise RuntimeError(
             f"stage 3 finished without ever saving a checkpoint to {checkpoint_path}. "
-            f"{'An epochs=0 ablation cannot produce a checkpoint -- remove the stage from '
-               'the params file rather than setting its epochs to 0, if anything downstream '
-               'needs its output. ' if epochs == 0 else ''}"
+            f"{_epochs_zero_hint}"
             f"{diagnosis} Loss curve written to {loss_curve_path}."
         )
 

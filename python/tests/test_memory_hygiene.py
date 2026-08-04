@@ -257,3 +257,172 @@ def test_the_detector_uses_identity_not_bare_paths():
     src = source_without_comments(_ROOT / "tests/conftest.py")
     assert "st.st_mtime_ns" in src, "the snapshot must record identity, not just paths"
     assert "vanished" in src, "moves must be recognised by matching a disappeared file"
+
+
+def test_the_leak_report_does_not_assert_a_single_cause():
+    """
+    The first time this detector fired for real it named the wrong culprit.
+
+    The four files were output/stage3b/128x128-stage3b-loss_curve.{png,csv},
+    checkpoints/stage3b/128x128-stage3b.pt and registry-stage3b.csv -- size
+    128, which NO test uses (they use 4, 8, 32 and 64) and a pipeline registry
+    no test writes. They were the person's own training run, writing while the
+    suite happened to be running. The message nevertheless stated flatly that
+    "A test is using a default path anchored to _PYTHON_ROOT", sending the
+    reader hunting through the suite for a bug that was not there.
+
+    Same failure as the val-excursion message asserting weight damage: a
+    diagnostic that names the wrong cause is worse than one that names none.
+    """
+    src = source_without_comments(_ROOT / "tests/conftest.py")
+    assert "TWO possible causes" in src
+    assert "concurrent TRAINING RUN" in src
+    assert "size 4/8/32/64" in src, (
+        "the message must give the reader a way to tell the two apart"
+    )
+    assert "A test is using a default path anchored to _PYTHON_ROOT.\\n" not in src
+
+
+def test_the_leak_report_shows_timestamps():
+    """A modification time is what distinguishes 'written just now by the
+    suite' from 'written by the run that finished ten minutes ago'."""
+    src = source_without_comments(_ROOT / "tests/conftest.py")
+    assert "modified {when}" in src
+    assert "st_mtime" in src
+
+
+def test_a_file_still_changing_at_teardown_is_not_a_leak(tmp_path):
+    """
+    A file still being rewritten AFTER the tests have finished was not written
+    by them. Two snapshots a second apart at teardown separate a live external
+    writer -- a training run left running -- from a real leak, whose writes are
+    complete by the time the session ends.
+
+    Measured rather than assumed: the detector fired on
+    output/stage3b/128x128-stage3b-loss_curve.png, and four xdist workers
+    reported mtimes of 22:09:37, :47, :47 and :52 for it -- still advancing,
+    long after any test had touched anything. The checkpoint beside it sat
+    fixed at 22:09:33. Asking the person to tell those apart by eye is a worse
+    answer than measuring it.
+    """
+    import threading
+    import time as _t
+
+    before = snapshot_files([tmp_path])
+    (tmp_path / "leak.png").write_bytes(b"x" * 50)          # written once, then quiet
+
+    stop = threading.Event()
+
+    def _writer():                                           # a concurrent run
+        n = 0
+        while not stop.is_set():
+            (tmp_path / "training.png").write_bytes(b"y" * (100 + n))
+            n += 1
+            _t.sleep(0.1)
+
+    threading.Thread(target=_writer, daemon=True).start()
+    _t.sleep(0.3)
+    try:
+        after = snapshot_files([tmp_path])
+        _t.sleep(1.0)
+        still = {k for k, v in snapshot_files([tmp_path]).items()
+                 if k in after and after[k] != v}
+        reported = [p for p in files_written_between(before, after) if p not in still]
+    finally:
+        stop.set()
+
+    assert {p.name for p in still} == {"training.png"}
+    assert {p.name for p in reported} == {"leak.png"}, (
+        "the one-shot write must still be reported, or the detector stops detecting"
+    )
+
+
+def test_the_fixture_applies_the_still_changing_filter():
+    src = source_without_comments(_ROOT / "tests/conftest.py")
+    assert "still_changing" in src
+    assert "time.sleep(1.0)" in src
+    assert "p not in still_changing" in src, "the filter is computed but not applied"
+    assert "ignoring" in src, "an ignored file must still be reported, not hidden"
+
+
+# --------------------------------------------------------------------
+# attributing a file to the tests or to the person
+# --------------------------------------------------------------------
+
+def test_a_grid_size_no_test_uses_is_attributed_to_the_person():
+    """
+    Timing cannot settle this. The still-changing check separates a training
+    run that is ACTIVELY writing at teardown from a test leak -- but a real
+    stage-4 run that FINISHED at 22:35:12, mid-session, is changing nothing by
+    the time the session ends, and was reported as a leak anyway.
+
+    The filename can settle it: no test ever builds a 128x128 sweep.
+    """
+    from pathlib import Path
+
+    from conftest import TEST_GRID_SIZES, _looks_like_a_test_artifact
+
+    assert 128 not in TEST_GRID_SIZES and 256 not in TEST_GRID_SIZES
+    assert not _looks_like_a_test_artifact(Path("128x128-stage4-loss_curve.png"))
+    assert _looks_like_a_test_artifact(Path("64x64-stage3b-f_theta_diagnostic.png")), (
+        "the historical real leak must still be reported"
+    )
+    assert _looks_like_a_test_artifact(Path("32x32-stage2.pt"))
+
+
+def test_an_unrecognised_name_is_treated_as_a_LEAK():
+    """
+    GUARDS an exoneration that swallows real leaks. Only a clear, non-test grid
+    size lets a file off; anything unparseable is reported, because a genuine
+    leak with an unexpected name must not vanish.
+    """
+    from pathlib import Path
+
+    from conftest import _looks_like_a_test_artifact
+    for name in ("something-odd.pt", "diagnostic.png", "registry-stage4.csv"):
+        assert _looks_like_a_test_artifact(Path(name)), name
+
+
+def test_no_test_builds_a_sweep_outside_TEST_GRID_SIZES():
+    """
+    The declared set is only trustworthy if it stays true. A test that starts
+    building a 128x128 sweep would make the detector blind to its own leaks --
+    silently, since the exoneration is by name.
+    """
+    import pathlib
+    import re
+
+    from conftest import TEST_GRID_SIZES
+
+    root = pathlib.Path(__file__).resolve().parent
+    offenders = []
+    for p in sorted(root.glob("test_*.py")):
+        src = source_without_comments(p)
+        for m in re.finditer(r"_build_sweep\([^)]*size\s*=\s*(\d+)", src):
+            if int(m.group(1)) not in TEST_GRID_SIZES:
+                offenders.append(f"{p.name}: size={m.group(1)}")
+        for m in re.finditer(r"_build_run_dir_with_stats\([^)]*size\s*=\s*(\d+)", src):
+            if int(m.group(1)) not in TEST_GRID_SIZES:
+                offenders.append(f"{p.name}: size={m.group(1)}")
+    assert not offenders, (
+        "a test builds a sweep at a size the detector does not know about, so a "
+        "leak from it would be silently exonerated: " + ", ".join(offenders)
+    )
+
+
+def test_nameless_siblings_inherit_the_attribution():
+    """
+    registry-stage4.csv carries no <N>x<N> prefix, but the same run_lds_stage
+    call wrote 128x128-stage4.pt beside it. Attributing the checkpoint and
+    reporting the registry would be incoherent.
+    """
+    src = source_without_comments(_ROOT / "tests/conftest.py")
+    assert "_their_dirs" in src
+    assert "p.parent in _their_dirs" in src
+    # The FIXTURE must actually call the helper. Defining it and never wiring
+    # it in is precisely what happened: an indentation mismatch made two
+    # str-replace edits no-ops, leaving _looks_like_a_test_artifact defined,
+    # unused, and every attribution test passing on the helper alone.
+    assert "_theirs = [p for p in added if not _looks_like_a_test_artifact(p)]" in src, (
+        "the helper is defined but the detector never consults it"
+    )

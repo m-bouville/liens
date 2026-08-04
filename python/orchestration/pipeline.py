@@ -20,7 +20,7 @@ from orchestration.checkpoint_registry import (
     _signature_kwargs, _upsert_registry,
 )
 from orchestration.logging_utils import _log_to_file
-from orchestration.paths import _PYTHON_ROOT, _STAGE_DIRS
+from orchestration.paths import default_latent_cache_dir, _PYTHON_ROOT, _STAGE_DIRS
 from orchestration.stage_params import (
     _backup_before_overwrite, _prepare_stage_kwargs, _resolve_stage_specific_ancestor,
     _strip_unrecognized_params, parse_stage_params, renamed_keys,
@@ -31,6 +31,46 @@ from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2
 from training.train_lds import train_lds
 from training.train_refinement import train_refinement
+
+
+def _nonfatal_diagnostic(fn, label):
+    """Diagnostics must never abort the pipeline.
+
+    They are figures and printed tables -- they inform, they are not the
+    product. Before this, a KeyError inside check_parameter_dependence (a
+    sweep whose stats.csv lacks a column the diagnostic plots) killed a
+    full-chain run BETWEEN stages 3b and 4: all the training had succeeded,
+    the remaining stages never ran, and the traceback pointed at pandas. Same
+    failure shape as the exhausted-rollback raise that took out stages 4/5
+    with a good checkpoint on disk.
+
+    Loud on failure -- full traceback, unmistakable banner -- then continue.
+    Applied by REBINDING the imported names once, so every call site in this
+    module is covered uniformly, including ones added later.
+    """
+    import functools
+    import traceback
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            print("\n" + "!" * 70)
+            print(f"!! SANITY CHECK FAILED (non-fatal): {label}")
+            print("!! The pipeline continues; this figure/table is missing.")
+            print("!" * 70)
+            traceback.print_exc()
+            print("!" * 70 + "\n")
+            return None
+    return wrapped
+
+
+for _diag_name in ("check_reconstruction", "check_latent_channels",
+                    "check_interpolation", "check_perturbation",
+                    "check_rollout", "check_parameter_dependence"):
+    if _diag_name in globals():
+        globals()[_diag_name] = _nonfatal_diagnostic(globals()[_diag_name], _diag_name)
 
 
 def run_from_params_file(params_path: Path, default_base: Path,
@@ -432,7 +472,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                     # what 3a wrote. Under checkpoints/ rather than output/
                     # because it derives from a checkpoint's weights and is
                     # invalidated by them, not by anything a user edits.
-                    latent_cache_dir=_PYTHON_ROOT / "checkpoints" / "latent_cache",
+                    latent_cache_dir=default_latent_cache_dir(_PYTHON_ROOT),
                     checkpoint_path=stage_output_path(stage_key), device=device,
                     loss_curve_path=(
                         _PYTHON_ROOT.parent / "output" / f"stage{stage_key}"
@@ -490,7 +530,12 @@ def run_from_params_file(params_path: Path, default_base: Path,
         # under stage_output_path("3a"/"3b").with_suffix(".log");
         # reusing either path here would silently erase that training
         # log. Prints to console only for now.
-        if fresh_3a or fresh_3b:
+        #
+        # ALSO gated on run_sanity_checks: this block prints "Sanity check:"
+        # banners and produces figures, but was added after the flag existed
+        # and was never wired to it -- run_sanity_checks=False still ran it,
+        # and a crash inside it aborted the chain between 3b and 4.
+        if run_sanity_checks and (fresh_3a or fresh_3b):
             print("=" * 70)
             print("Sanity check: rollout quality (stage 3b checkpoint)")
             print("=" * 70)
@@ -610,71 +655,77 @@ def run_from_params_file(params_path: Path, default_base: Path,
                     checkpoint, _STAGE_DIRS[stage_key] / "eval_views",
                 )
 
-                print("=" * 70)
-                print(f"Sanity check: reconstruction quality (stage {stage_key} checkpoint)")
-                print("=" * 70)
-                check_reconstruction(
-                    checkpoint_path=ae_view_path, device=device,
-                    min_step=kwargs.get("min_step", 0),
-                    min_stdev_phi=kwargs.get("min_stdev_phi"),
-                    output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-reconstruction.png",
-                )
-                print()
-
-                print("=" * 70)
-                print(f"Sanity check: latent channel activations (stage {stage_key} checkpoint)")
-                print("=" * 70)
-                check_latent_channels(
-                    ae_checkpoint_path=ae_view_path, device=device,
-                    min_step=kwargs.get("min_step", 0),
-                    min_stdev_phi=kwargs.get("min_stdev_phi"),
-                    output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-latent_channels.png",
-                )
-                print()
-
-                print("=" * 70)
-                print(f"Sanity check: rollout quality (stage {stage_key} checkpoint)")
-                print("=" * 70)
-                check_rollout(
-                    lds_checkpoint_path=lds_view_path, device=device,
-                    output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-rollout.png",
-                )
-                print()
-
-                # E is trainable here with stats_head frozen -- structurally
-                # the same anchor pattern as stage 2's own stats0_weight
-                # anchor (see this module's docstring), and the same
-                # failure mode as D's checkerboard is possible in
-                # principle: E could drift into a region stats_head can no
-                # longer correctly interpret, without the combined loss
-                # alone revealing it. These are the diagnostics built
-                # specifically to check that, previously only run after
-                # stage 2 -- skipped gracefully (not an error) if the
-                # ancestor AE has no stats_head at all (stats_weight<=0
-                # back in stage 1), matching train_refinement()'s own
-                # graceful handling of that same condition.
-                try:
+                # Same gating bug as the 3a/3b comparison block: these print
+                # "Sanity check:" banners but were never wired to
+                # run_sanity_checks, so =False still ran them. Assigning the
+                # gate to a local and testing it before EACH check keeps the
+                # (deep) indentation structure untouched.
+                if run_sanity_checks:
                     print("=" * 70)
-                    print(f"Sanity check: interpolation consistency (stage {stage_key} checkpoint)")
+                    print(f"Sanity check: reconstruction quality (stage {stage_key} checkpoint)")
                     print("=" * 70)
-                    check_interpolation(
+                    check_reconstruction(
                         checkpoint_path=ae_view_path, device=device,
-                        output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-interpolation.png",
+                        min_step=kwargs.get("min_step", 0),
+                        min_stdev_phi=kwargs.get("min_stdev_phi"),
+                        output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-reconstruction.png",
                     )
                     print()
 
                     print("=" * 70)
-                    print(f"Sanity check: perturbation response (stage {stage_key} checkpoint)")
+                    print(f"Sanity check: latent channel activations (stage {stage_key} checkpoint)")
                     print("=" * 70)
-                    check_perturbation(
-                        checkpoint_path=ae_view_path, device=device,
-                        output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-perturbation.png",
+                    check_latent_channels(
+                        ae_checkpoint_path=ae_view_path, device=device,
+                        min_step=kwargs.get("min_step", 0),
+                        min_stdev_phi=kwargs.get("min_stdev_phi"),
+                        output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-latent_channels.png",
                     )
                     print()
-                except ValueError as e:
-                    if "no stats_head" not in str(e):
-                        raise
-                    print(f"Skipping interpolation/perturbation sanity checks: {e}\n")
+
+                    print("=" * 70)
+                    print(f"Sanity check: rollout quality (stage {stage_key} checkpoint)")
+                    print("=" * 70)
+                    check_rollout(
+                        lds_checkpoint_path=lds_view_path, device=device,
+                        output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-rollout.png",
+                    )
+                    print()
+
+                    # E is trainable here with stats_head frozen -- structurally
+                    # the same anchor pattern as stage 2's own stats0_weight
+                    # anchor (see this module's docstring), and the same
+                    # failure mode as D's checkerboard is possible in
+                    # principle: E could drift into a region stats_head can no
+                    # longer correctly interpret, without the combined loss
+                    # alone revealing it. These are the diagnostics built
+                    # specifically to check that, previously only run after
+                    # stage 2 -- skipped gracefully (not an error) if the
+                    # ancestor AE has no stats_head at all (stats_weight<=0
+                    # back in stage 1), matching train_refinement()'s own
+                    # graceful handling of that same condition.
+                    try:
+                        print("=" * 70)
+                        print(f"Sanity check: interpolation consistency (stage {stage_key} checkpoint)")
+                        print("=" * 70)
+                        check_interpolation(
+                            checkpoint_path=ae_view_path, device=device,
+                            output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-interpolation.png",
+                        )
+                        print()
+
+                        print("=" * 70)
+                        print(f"Sanity check: perturbation response (stage {stage_key} checkpoint)")
+                        print("=" * 70)
+                        check_perturbation(
+                            checkpoint_path=ae_view_path, device=device,
+                            output_path=_PYTHON_ROOT.parent / "output" / f"stage{stage_key}/{checkpoint.stem}-perturbation.png",
+                        )
+                        print()
+                    except ValueError as e:
+                        if "no stats_head" not in str(e):
+                            raise
+                        print(f"Skipping interpolation/perturbation sanity checks: {e}\n")
         return checkpoint
 
     if not has_stage4:

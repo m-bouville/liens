@@ -217,10 +217,28 @@ def ensure_lds_checkpoint(
     # cleaned up the same way (OS's own temp-directory cleanup),
     # instead of needing its own separate cleanup path.
     _default_if_none("loss_curve_path", tmp_dir / "loss_curve.png")
+    # val_fraction forced to its MINIMUM here. epochs=0 already skips the
+    # train set (never iterated), but the val set was still built AND ENCODED
+    # in full -- ~30,000 windows on the 128 sweep, every one pushed through the
+    # frozen AE's forward pass -- to produce a single val_loss that this very
+    # function's own NOTE calls uninformative. It is the dominant cost of every
+    # diagnostic run against an AE-family checkpoint.
+    #
+    # Safe against the diagnostic's own population: split_run_dirs carves TEST
+    # first (perm[:n_test]) and val from what follows, so shrinking val moves
+    # dirs into train -- which is skipped -- and leaves test_dirs identical.
+    # The evaluation therefore sees exactly the same windows.
+    #
+    # Not zero: the epoch-0 evaluation still runs, and an empty val set would
+    # divide by zero. One dir is enough for a structurally valid checkpoint,
+    # which is all the ephemeral wrapper is for.
+    _ephemeral_kwargs = dict(train_lds_kwargs)
+    _ephemeral_kwargs["val_fraction"] = 1e-9
+
     train_lds(
         size=size, base_path=base_path, ae_checkpoint_path=checkpoint_path,
         epochs=0, checkpoint_path=tmp_checkpoint_path, device=device,
         log_every_epoch=False,
-        **train_lds_kwargs,
+        **_ephemeral_kwargs,
     )
     return tmp_checkpoint_path

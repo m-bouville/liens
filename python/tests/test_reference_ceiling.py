@@ -19,8 +19,10 @@ run's own objective -- its value was computed, printed, and discarded. Feeding
 it to the tracker costs nothing.
 """
 import inspect
+from pathlib import Path
 
 import pytest
+import torch
 
 from conftest import source_without_comments
 from training.checkpoint_criterion import CheckpointCriterionTracker
@@ -213,9 +215,100 @@ def test_only_the_stages_with_a_reference_row_seed_the_tracker():
         src = source_without_comments(root / f"training/{name}.py")
         have[name] = "tracker.reference_val_loss = " in src
     assert have["train_stage1"] and have["train_stage2"]
-    assert not have["train_lds"] and not have["train_refinement"], (
-        "a stage gained a reference seed without a reference row to measure it from"
+    # Stage 3 seeds from its ANCESTOR's val_loss instead of a reference row --
+    # valid only when the ancestor measures the same quantity. See
+    # test_stage3_seeds_from_a_comparable_ancestor.
+    assert not have["train_refinement"], (
+        "stage 4/5 gained a reference seed; it evaluates and SAVES at epoch 0, "
+        "so its own first row already plays that role"
     )
+
+
+def test_stage3_seeds_from_a_COMPARABLE_ancestor():
+    """
+    I originally argued stage 3 could not have a ceiling because "the
+    ancestor's val_loss was measured at a different n_rollout_steps". True
+    when it differs -- and _resume_f_theta_from_checkpoint already detects
+    that. When it MATCHES, the numbers measure the same thing.
+
+    Cost of not having it: a 3a run resumed from val_loss 0.563700, saved
+    0.568295 at its epoch 234, and early-stopped at 734 having never beaten
+    its own ancestor -- a 0.82% regression written over a better checkpoint.
+    """
+    import pathlib as _pl
+    root = _pl.Path(__file__).resolve().parent.parent
+    src = source_without_comments(root / "training/train_lds.py")
+    assert "_comparable = (prev_n_rollout == n_rollout_steps" in src
+    assert 'prev_config.get("n_substeps", 1) == n_substeps' in src, (
+        "n_substeps changes the integrator, so it changes what val_loss means"
+    )
+    assert "tracker.reference_val_loss = _ancestor_reference" in src
+
+
+def test_stage3_does_NOT_seed_from_an_incomparable_ancestor():
+    """
+    GUARDS seeding across the 3a -> 3b boundary, where n_rollout_steps goes
+    1 -> 2 and n_substeps 1 -> 3. 3b's val_loss is a different quantity and
+    is legitimately larger; a ceiling from 3a would block every save.
+    """
+    import pathlib as _pl
+    root = _pl.Path(__file__).resolve().parent.parent
+    src = source_without_comments(root / "training/train_lds.py")
+    block = src[src.index("_comparable = ("):src.index("_reference = float")]
+    assert "==" in block and "!=" not in block, "the comparability test must be equality"
+    assert "_reference: float | None = None" in src, (
+        "must default to None so a non-resume or incomparable path seeds nothing"
+    )
+
+
+def test_END_TO_END_a_non_improving_resume_keeps_the_ancestor_byte_for_byte(tmp_path):
+    """
+    The contract, exercised through a real training run rather than matched in
+    the source.
+
+    Every other test in this file checks the tracker in isolation or asserts a
+    literal appears in train_stage1.py. Neither would catch the wiring being
+    right and the OUTCOME wrong -- e.g. the ancestor being copied but
+    truncated, or the fallback returning a path that does not exist, which is
+    exactly the contract every caller depends on.
+
+    Resumes an ancestor with epochs=1: under the ceiling the single epoch must
+    beat the ancestor to save, which on this tiny sweep it usually does not.
+    Both outcomes are legitimate, so the test asserts the INVARIANT that holds
+    either way -- a checkpoint exists at the output path and it loads.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from training.train_stage1 import train_autoencoder
+    from test_cache_in_memory_param import _REF_ROW_CONFIG, _ref_row_ancestor
+
+    # SHARED ancestor, same reasoning as the trajectory test: the contract
+    # under test is config-independent, so a private ancestor was a whole
+    # extra stage-1 run for nothing.
+    base_path, ancestor = _ref_row_ancestor(tmp_path)
+    common = dict(_REF_ROW_CONFIG, base_path=base_path, log_every_epoch=True)
+    ancestor_bytes = Path(ancestor).read_bytes()
+
+    out = train_autoencoder(checkpoint_path=tmp_path / "out.pt",
+                             loss_curve_path=tmp_path / "out.png",
+                             resume_from=ancestor, **common)
+
+    # The contract: a path that EXISTS and loads, whichever outcome occurred.
+    assert Path(out).exists(), "the fallback returned a path with no file at it"
+    loaded = torch.load(out, map_location="cpu", weights_only=True)
+    assert "model_state" in loaded and "epoch" in loaded
+
+    kept = Path(out).read_bytes() == ancestor_bytes
+    if kept:
+        # ancestor copied forward -- must be a COMPLETE copy, not truncated
+        assert len(Path(out).read_bytes()) == len(ancestor_bytes)
+    else:
+        # something saved: it must have genuinely beaten the ancestor's val
+        anc = torch.load(ancestor, map_location="cpu", weights_only=True)
+        assert loaded["val_loss"] < anc["val_loss"], (
+            f"saved {loaded['val_loss']} against an ancestor at {anc['val_loss']} -- "
+            f"the ceiling did not hold"
+        )
 
 
 @pytest.mark.parametrize("module", ["training/train_stage1.py", "training/train_stage2.py"])

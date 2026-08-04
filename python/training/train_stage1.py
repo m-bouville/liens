@@ -29,7 +29,7 @@ from training.datasets import MicrostructureSnapshotDataset, complete_run_dirs, 
 from training.losses import ReconLoss, StatsLoss
 from training.stats_head import StatsHead
 from utils.naming import ae_checkpoint_name
-from utils.plots import loss_component_scatter, loss_curve, should_write_loss_figure
+from utils.plots import loss_component_scatter, loss_curve, write_loss_history, should_write_loss_figure
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -604,6 +604,7 @@ def train_autoencoder(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                 loss_curve_path, title="Stage 1 loss",
             )
+            write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
         if include_stats:
             current_val_components = {
                 "recon0": val_recon0 / recon0_scale,
@@ -711,6 +712,7 @@ def train_autoencoder(
         epoch_history, train_loss_history, val_loss_history, best_so_far_history,
         loss_curve_path, title="Stage 1 loss",
     )
+    write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
     if component_histories:
         loss_component_scatter(
             epoch_history, component_histories, loss_components_path,

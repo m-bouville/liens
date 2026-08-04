@@ -118,7 +118,7 @@ def _load_ae_f_theta_and_dataset(
     ae_stats_weight: float | None, hidden_dim: int, n_hidden_layers: int,
     condition_on_theta: bool | None, euler_only: bool | None, device: str | None,
     window_length_override: int | None = None, announce_euler_only: bool = True,
-    max_dt: float | None = None,
+    max_dt: float | None = None, latent_cache_dir: Path | str | None = None,
 ):
     """
     The MODEL/DATASET half of check_parameter_dependence()'s own setup
@@ -288,6 +288,16 @@ def _load_ae_f_theta_and_dataset(
         test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
         min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
         max_dt=max_dt, encode_both_streams=True,
+        # The diagnostics re-encoded their whole population on every run while
+        # the trainers had been caching since the feature landed. Nothing about
+        # the cache is training-specific: the key is the ENCODER's own
+        # fingerprint plus the run and step list, and a diagnostic uses a
+        # frozen encoder straight out of a checkpoint -- usually the very
+        # checkpoint the trainer just wrote, so the entries are already there.
+        #
+        # Most visible on an off-distribution run: --max-dt large disables the
+        # prefix truncation, so every frame of every run gets encoded.
+        latent_cache_dir=latent_cache_dir,
     )
     print(f"Evaluating {len(dataset)} test windows...")
 
@@ -349,7 +359,7 @@ def _load_models_and_dataset(
     condition_on_theta: bool | None, euler_only: bool | None,
     output_path: Path | None, dz0dt_output_path: Path | None,
     dt_dependence_output_path: Path | None, device: str | None,
-    max_dt: float | None = None,
+    max_dt: float | None = None, latent_cache_dir: Path | str | None = None,
 ) -> _LoadedContext:
     """check_parameter_dependence()'s own setup phase -- resolves this
     function's own three output paths, then delegates model/dataset
@@ -410,7 +420,7 @@ def _load_models_and_dataset(
         _load_ae_f_theta_and_dataset(
             lds_checkpoint_path, min_step, min_stdev_phi, min_passing_steps, base_path, size,
             ae_stats_weight, hidden_dim, n_hidden_layers, condition_on_theta, euler_only, device,
-            max_dt=max_dt,
+            max_dt=max_dt, latent_cache_dir=latent_cache_dir,
         )
     )
 

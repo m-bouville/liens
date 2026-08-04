@@ -253,22 +253,18 @@ def test_reference_row_does_not_change_the_training_trajectory(tmp_path, capsys)
     be identical. Only the observable had to move off the checkpoint, which is
     now a function of the criterion as well as of the trajectory.
     """
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    from test_train_lds import _build_sweep
     import training.train_stage1 as mod
 
-    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
-    common = dict(size=32, base_path=base_path, epochs=1, batch_size=4, base_channels=4,
-                   latent_channels=4, val_fraction=0.34, test_fraction=0.17, num_workers=0,
-                   min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
-                   # log_every_epoch=True: the observable here is the epoch-1
-                   # TRAIN LOSS, and with False only SAVED epochs print. Once
-                   # the reference ceiling stopped epoch 1 saving on a resume,
-                   # the row vanished and the parser found nothing to compare.
-                   device="cpu", seed=0, log_every_epoch=True)
-    ancestor = train_autoencoder(checkpoint_path=tmp_path / "anc.pt",
-                                  loss_curve_path=tmp_path / "anc.png", **common)
+    # SHARED ancestor: this test's own config was arbitrary -- it exercises RNG
+    # restoration, which is config-independent -- so building a private one
+    # cost a full extra stage-1 run for nothing. _ref_row_ancestor is cached
+    # across every test in this file that resumes.
+    #
+    # log_every_epoch is overridden only on the RESUMED arms: the ancestor
+    # never needs its rows printed, and keeping it out of the cache key is
+    # what lets the ancestor be shared at all.
+    base_path, ancestor = _ref_row_ancestor(tmp_path)
+    common = dict(_REF_ROW_CONFIG, base_path=base_path, log_every_epoch=True)
 
     # CLEARED before the measured run: the ancestor above prints its own
     # epoch-1 row, and parsing the FIRST such row in the capture picked that
