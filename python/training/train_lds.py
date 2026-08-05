@@ -955,6 +955,11 @@ def train_lds(
     _spikes_reported = 0
     _grad_spikes_reported = 0
     _n_rollbacks = 0
+    # Set only when THIS RUN saves. Path.exists() is not the same question:
+    # with force=True the previous run's file sits at checkpoint_path until
+    # the first save overwrites it, so "a checkpoint exists" was true from
+    # epoch 1 of a run that had saved nothing.
+    _saved_this_run = False
     _n_train_batches = 0
 
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
@@ -1006,7 +1011,18 @@ def train_lds(
             _n_train_batches, extra_skipped=grad_guard.n_skipped_this_epoch)
         grad_guard.end_epoch(_n_train_batches, extra_skipped=spike_guard.n_skipped_this_epoch)
         if _deadlocked and spike_guard.consecutive_total_skip_epochs >= spike_deadlock_epochs:
-            _have_checkpoint = Path(checkpoint_path).exists()
+            # THIS RUN's own save, not merely a file at the path.
+            #
+            # Observed: a 3b run at max_dt=2000 diverged from epoch 1, saved
+            # nothing, and at epoch 49 "ROLLED BACK to the best checkpoint
+            # (epoch 4124, val_loss=1.074618)" -- the PREVIOUS session's best,
+            # trained at max_dt=200 with a different f_theta scale entirely.
+            # Every epoch after that restore was inf.
+            #
+            # Restoring a stranger's weights is worse than stopping: it looks
+            # like recovery, produces a checkpoint that loads, and silently
+            # mixes two configurations.
+            _have_checkpoint = _saved_this_run and Path(checkpoint_path).exists()
             if _n_rollbacks >= max_spike_rollbacks or not _have_checkpoint:
                 # STOP, do not raise -- when a checkpoint exists.
                 #
@@ -1035,9 +1051,17 @@ def train_lds(
                 raise RuntimeError(
                     f"stage 3: every batch has been skipped for "
                     f"{spike_guard.consecutive_total_skip_epochs} consecutive epochs, so no "
-                    f"gradient step is being taken and the weights cannot recover, and no "
-                    f"checkpoint exists to roll back to or to keep. Lower lr (currently "
-                    f"{lr:g}) and restart.")
+                    f"gradient step is being taken and the weights cannot recover, and "
+                    + ("this run has SAVED NOTHING, so there is no checkpoint of its own to "
+                       "roll back to or to keep -- any file at the checkpoint path belongs "
+                       "to a previous run, possibly with different settings, and restoring "
+                       "it would silently mix two configurations. "
+                       if not _saved_this_run else
+                       "no checkpoint exists to roll back to or to keep. ")
+                    + f"The loss was already diverging before any gradient step, so lr is "
+                      f"unlikely to be the whole story -- check that n_substeps scales with "
+                      f"max_dt (delta_t = max_dt/n_substeps must stay roughly constant). "
+                      f"lr is currently {lr:g}.")
             _n_rollbacks += 1
             _restored = torch.load(checkpoint_path, map_location=device, weights_only=True)
             f_theta.load_state_dict(_restored["model_state"])
@@ -1136,6 +1160,7 @@ def train_lds(
             msg = f"{epoch:4d} {train_loss:7.3f},{val_loss:7.3f} |{ema_str:>9}"
 
         if saved_this_epoch:
+            _saved_this_run = True
             epochs_since_improvement = 0
             atomic_torch_save({
                 "model_state": f_theta.state_dict(),

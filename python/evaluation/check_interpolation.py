@@ -120,7 +120,8 @@ def check_interpolation(
         test_dirs = checkpoint.get("test_dirs") or []
         if not test_dirs:
             raise ValueError(f"{checkpoint_path} has no saved test_dirs")
-        test_dirs = [Path(d) for d in test_dirs]
+        test_dirs = load.validate_run_dirs(
+            [Path(d) for d in test_dirs], source=str(checkpoint_path))
         triples = find_all_triples(test_dirs, min_step)
         if not triples:
             raise ValueError("No consecutive (t1,t2,t3) triples found in test_dirs")

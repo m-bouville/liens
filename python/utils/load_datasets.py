@@ -295,6 +295,85 @@ def check_snapshots_saved(run_dir: str | Path, metadata: RunMetadata) -> dict[st
     return {"missing": missing, "bad_size": bad_size}
 
 
+def validate_run_dirs(run_dirs, source: str = "the checkpoint",
+                       max_missing_fraction: float = 0.05,
+                       min_stdev_phi: float | None = None,
+                       required: tuple[str, ...] | None = None):
+    """Drop run dirs that have lost their metadata.txt -- up to a tolerance.
+
+    test_dirs are recorded IN a checkpoint at training time and replayed by
+    every diagnostic afterwards, so anything that changes on disk in between
+    shows up here. Two very different causes land in the same place:
+
+    * A RACE. A run being regenerated is briefly absent -- observed with
+      T775_n045_s191, one run of 427, mid-rewrite while the diagnostics
+      happened to run. Losing five diagnostics over 1/427 of a statistical
+      population is a bad trade; the right answer is to skip it and say so.
+
+    * A STALE SPLIT. The checkpoint was trained on a different sweep, or a
+      large part of the data is gone. Silently evaluating on whatever is left
+      would report numbers for a population nobody chose.
+
+    The MISSING FRACTION separates them, and nothing else available here does:
+    a handful is a race, a hundred is a stale split. Default 5%.
+
+    Note the latent cache cannot rescue either case. It stores latents only,
+    and its key includes the surviving step list -- which comes from the run's
+    own statistics.csv -- so the run must be readable before the cache can be
+    consulted at all. "1361/1361 read from the latent cache" means "not
+    re-encoded", not "not needed on disk".
+
+    Returns the surviving dirs.
+    """
+    # BOTH files, not just metadata.txt. build_good_steps reads
+    # statistics.csv too (for min_stdev_phi), and checking only metadata.txt
+    # let a half-written run through -- the error then surfaced as
+    # FileNotFoundError inside pandas.read_csv, four frames deep, exactly the
+    # opaque failure this function exists to replace. A run being regenerated
+    # gains its files in some order; requiring all of them is the only check
+    # that does not depend on which.
+    # statistics.csv is required only when it will actually be READ.
+    # build_good_steps reads it to apply min_stdev_phi; with no such filter it
+    # never opens the file, and demanding it would drop runs over a check
+    # nothing depends on -- which broke nine fixtures that legitimately build
+    # metadata-only runs.
+    if required is None:
+        required = (("metadata.txt", "statistics.csv") if min_stdev_phi is not None
+                    else ("metadata.txt",))
+
+    run_dirs = list(run_dirs)
+
+    def _complete(d):
+        return all((Path(d) / name).is_file() for name in required)
+
+    present = [d for d in run_dirs if _complete(d)]
+    missing = [Path(d) for d in run_dirs if not _complete(d)]
+    if not missing:
+        return run_dirs
+
+    shown = "\n  ".join(str(m) for m in missing[:10])
+    more = f"\n  ... and {len(missing) - 10} more" if len(missing) > 10 else ""
+    fraction = len(missing) / len(run_dirs) if run_dirs else 1.0
+
+    if fraction > max_missing_fraction or not present:
+        raise FileNotFoundError(
+            f"{len(missing)} of {len(run_dirs)} run dir(s) ({100 * fraction:.1f}%) recorded "
+            f"in {source} are missing one of {list(required)}:\n  {shown}{more}\n"
+            f"That is above the {100 * max_missing_fraction:.0f}% tolerance for a transient "
+            f"(a run being regenerated), so this looks like a STALE SPLIT: the checkpoint "
+            f"was trained on a different sweep, or a large part of the data is gone. "
+            f"Evaluating on what remains would report numbers for a population nobody "
+            f"chose. Retrain the stage, or point --base at the sweep it was trained on."
+        )
+
+    print(f"\nNOTE: skipping {len(missing)} of {len(run_dirs)} run dir(s) "
+          f"({100 * fraction:.1f}%, under the {100 * max_missing_fraction:.0f}% tolerance) "
+          f"recorded in {source} missing one of {list(required)} -- most likely being "
+          f"regenerated right now:\n  {shown}{more}\n"
+          f"Evaluating on the remaining {len(present)}.\n")
+    return present
+
+
 def read_metadata(path: str | Path) -> RunMetadata:
     """
     Parse a per-run metadata.txt. Unlike config.txt's comma-separated

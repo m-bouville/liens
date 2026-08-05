@@ -446,6 +446,14 @@ def test_print_binned_by_dt2_uses_correct_decade_boundaries_and_medians(capsys):
     assert "median=    8.0000e+00" in output  # median of [5, 8, 1_000_000] == 8, not dragged toward the outlier
 
 
+def _fake_run_dir(tmp_path):
+    """Minimal run dir: validate_run_dirs only requires metadata.txt to exist."""
+    d = tmp_path / "fake_run_dir"
+    d.mkdir(exist_ok=True)
+    (d / "metadata.txt").write_text("Nx = 32\nNy = 32\n")
+    return d
+
+
 def test_check_f_theta_threads_dt_cap_from_the_saved_checkpoint(monkeypatch, tmp_path):
     """
     REGRESSION: check_f_theta()'s own LatentDynamics reconstruction is
@@ -488,7 +496,12 @@ def test_check_f_theta_threads_dt_cap_from_the_saved_checkpoint(monkeypatch, tmp
 
     checkpoint_path = tmp_path / "fake-stage3.pt"
     torch.save({
-        "epoch": 1, "val_loss": 0.05, "test_dirs": ["fake_run_dir"],
+        # A run dir that EXISTS with a metadata.txt: check_f_theta now
+        # validates the checkpoint's stored test_dirs before building
+        # anything, so a purely fictional path is rejected before
+        # LatentDynamics is ever constructed. The stub relied on that
+        # validation not existing.
+        "epoch": 1, "val_loss": 0.05, "test_dirs": [str(_fake_run_dir(tmp_path))],
         "ae_checkpoint": "does-not-need-to-exist.pt",
         "config": {"latent_channels": 4, "n_theta": 1, "hidden_dim": 8,
                    "n_hidden_layers": 1, "dt_cap": 125.0},

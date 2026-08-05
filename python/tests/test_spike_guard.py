@@ -358,7 +358,7 @@ def test_rollbacks_are_bounded_and_then_it_STOPS():
     """
     src = source_without_comments(_ROOT / "training/train_lds.py")
     assert "_n_rollbacks >= max_spike_rollbacks" in src
-    block = src[src.index("_have_checkpoint = Path(checkpoint_path).exists()"):]
+    block = src[src.index("_have_checkpoint = _saved_this_run and"):]
     block = block[:block.index("_n_rollbacks += 1")]
     assert "if _have_checkpoint:" in block and "break" in block, (
         "an exhausted rollback budget must STOP, keeping the best checkpoint"
@@ -858,3 +858,217 @@ def test_the_guard_lives_in_ONE_place():
         src = source_without_comments(_ROOT / mod)
         assert "from training.spike_guard import" in src, f"{mod} does not use the shared module"
         assert "class _SpikeGuard" not in src, f"{mod} has its own copy"
+
+
+def test_END_TO_END_stage45_guard_skips_and_reports(tmp_path, capsys,
+                                                     isolated_project_root):
+    """
+    Every other stage-4/5 guard test matches SOURCE. That is what let an
+    unwired helper, a wrong tuple index and a missing latent_cache_dir through
+    earlier today: each part correct, the assembly untested.
+
+    Forces the skip deterministically by monkeypatching should_skip, then
+    checks the run SURVIVES it and says so -- the guard must protect the run,
+    not end it.
+    """
+    import sys
+
+    sys.path.insert(0, str(_ROOT / "tests"))
+    from test_train_refinement import (
+        _build_ae_checkpoint, _build_lds_checkpoint, _build_sweep,
+    )
+    from training.spike_guard import _SpikeGuard
+    from training.train_refinement import train_refinement
+
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_path, lds_path = tmp_path / "ae.pt", tmp_path / "lds.pt"
+    _build_ae_checkpoint(ae_path, include_stats_head=True)
+    _build_lds_checkpoint(lds_path)
+
+    real = _SpikeGuard.should_skip
+    state = {"n": 0}
+
+    def skip_a_few(self, value):
+        state["n"] += 1
+        if 3 <= state["n"] <= 5:          # a handful, not all: no deadlock
+            self.n_skipped += 1
+            self.n_skipped_this_epoch += 1
+            return True
+        return real(self, value)
+
+    _SpikeGuard.should_skip = skip_a_few
+    try:
+        out_path = train_refinement(
+            base_path=base_path, ae_checkpoint_path=ae_path,
+            lds_checkpoint_path=lds_path, freeze_decoder=True,
+            rollout_weight=1.0, recon0_weight=0.1, stats0_weight=0.1,
+            epochs=3, batch_size=4, n_rollout_steps=1,
+            min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+            checkpoint_path=tmp_path / "s4.pt", device="cpu", log_every_epoch=False,
+        )
+    finally:
+        _SpikeGuard.should_skip = real
+
+    text = capsys.readouterr().out
+    assert "catastrophic outlier" in text, (
+        f"batches were skipped but never reported:\n{text[-1200:]}"
+    )
+    assert "The optimizer step was NOT taken" in text
+    # and the run must SURVIVE: a guard that ends the run is worse than none
+    assert Path(out_path).exists()
+    loaded = torch.load(out_path, map_location="cpu", weights_only=True)
+    assert math.isfinite(float(loaded["val_loss"]))
+
+
+def test_END_TO_END_stage45_deadlock_stops_without_raising(tmp_path, capsys,
+                                                            isolated_project_root):
+    """
+    An all-skipped run must STOP cleanly, keeping the best checkpoint -- the
+    stage-3b lesson, where raising killed the whole params file and stages 4/5
+    never ran with a good checkpoint on disk.
+    """
+    import sys
+
+    sys.path.insert(0, str(_ROOT / "tests"))
+    from test_train_refinement import (
+        _build_ae_checkpoint, _build_lds_checkpoint, _build_sweep,
+    )
+    from training.spike_guard import _SpikeGuard
+    from training.train_refinement import train_refinement
+
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_path, lds_path = tmp_path / "ae.pt", tmp_path / "lds.pt"
+    _build_ae_checkpoint(ae_path, include_stats_head=True)
+    _build_lds_checkpoint(lds_path)
+
+    real = _SpikeGuard.should_skip
+    state = {"n": 0}
+
+    def skip_everything_after_a_while(self, value):
+        state["n"] += 1
+        if state["n"] > 6:                 # a couple of real epochs first
+            self.n_skipped += 1
+            self.n_skipped_this_epoch += 1
+            return True
+        return real(self, value)
+
+    _SpikeGuard.should_skip = skip_everything_after_a_while
+    try:
+        out_path = train_refinement(
+            base_path=base_path, ae_checkpoint_path=ae_path,
+            lds_checkpoint_path=lds_path, freeze_decoder=True,
+            rollout_weight=1.0, recon0_weight=0.1, stats0_weight=0.1,
+            epochs=30, batch_size=4, n_rollout_steps=1,
+            min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+            checkpoint_path=tmp_path / "s4.pt", device="cpu", log_every_epoch=False,
+        )
+    finally:
+        _SpikeGuard.should_skip = real
+
+    text = capsys.readouterr().out
+    assert "STOPPING at epoch" in text, f"did not stop cleanly:\n{text[-1200:]}"
+    assert "LOWER lr" in text, "the advice must not be backwards"
+    assert Path(out_path).exists(), "stopped without leaving a checkpoint"
+
+
+def test_the_rollback_requires_THIS_RUNS_own_save():
+    """
+    REPORTED BUG. A 3b run at max_dt=2000 diverged from epoch 1, saved
+    nothing, and at epoch 49 announced
+
+        ROLLED BACK to the best checkpoint (epoch 4124, val_loss=1.074618)
+
+    -- the PREVIOUS session's best, trained at max_dt=200 with a different
+    f_theta scale entirely. Every epoch after that restore was inf.
+
+    `Path.exists()` is not the question being asked: with force=True the old
+    file sits at checkpoint_path until the first save overwrites it, so "a
+    checkpoint exists" was true from epoch 1 of a run that had produced none.
+
+    Restoring a stranger's weights is worse than stopping -- it looks like
+    recovery, produces a checkpoint that loads, and silently mixes two
+    configurations.
+    """
+    src = source_without_comments(_ROOT / "training/train_lds.py")
+    assert "_have_checkpoint = _saved_this_run and Path(checkpoint_path).exists()" in src, (
+        "the rollback still accepts any file at the path"
+    )
+    # and the flag must be set where the save ACTUALLY happens
+    block = src[src.index("if saved_this_epoch:"):]
+    block = block[:block.index("atomic_torch_save(")]
+    assert "_saved_this_run = True" in block, (
+        "the flag is not set in the branch that writes the checkpoint"
+    )
+    assert "_saved_this_run = False" in src, "the flag is never initialised"
+
+
+def test_the_no_checkpoint_message_distinguishes_the_two_cases():
+    """
+    "no checkpoint exists" and "this run saved nothing, but someone else's
+    file is sitting there" need different actions from the reader, and the
+    second is the one that just cost a run.
+    """
+    src = source_without_comments(_ROOT / "training/train_lds.py")
+    assert "SAVED NOTHING" in src
+    assert "belongs" in src and "previous run" in src
+    assert "n_substeps scales with" in src, (
+        "a loss diverging before any gradient step is not an lr problem; the "
+        "message must say so"
+    )
+
+
+def test_END_TO_END_a_stale_checkpoint_is_NOT_restored(tmp_path, capsys,
+                                                        isolated_project_root):
+    """
+    The behavioural half: plant a foreign checkpoint at the output path, make
+    every batch skip from the start so the run saves nothing, and assert it
+    STOPS rather than restoring the stranger.
+    """
+    import sys
+
+    sys.path.insert(0, str(_ROOT / "tests"))
+    from test_train_lds import _cached_stage2_ancestor
+    from training.train_lds import train_lds, _SpikeGuard
+
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path, stats0_weight=0.01)
+    common = dict(
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path,
+        ae_stats_weight=0.01, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, n_rollout_steps=1,
+        min_step=0, min_stdev_phi=None, encode_batch_size=4, ema_warmup_epochs=0,
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    # a REAL checkpoint from a different run, left at the path
+    foreign = train_lds(epochs=1, checkpoint_path=tmp_path / "out.pt",
+                         loss_curve_path=tmp_path / "a.png", **common)
+    assert Path(foreign).exists()
+    foreign_bytes = Path(foreign).read_bytes()
+
+    # Skip every batch AND suppress every save. Both are needed: a run that
+    # never steps can still "improve" on epoch 1 against an infinite bar and
+    # save, which would make the rollback legitimate. The real 3b run saved
+    # nothing, and that is the case under test.
+    from training.checkpoint_criterion import CheckpointCriterionTracker
+
+    real = _SpikeGuard.should_skip
+    real_update = CheckpointCriterionTracker.update
+    _SpikeGuard.should_skip = lambda self, value: (
+        setattr(self, "n_skipped", self.n_skipped + 1) or
+        setattr(self, "n_skipped_this_epoch", self.n_skipped_this_epoch + 1) or True
+    )
+    CheckpointCriterionTracker.update = lambda self, epoch, val: (
+        real_update(self, epoch, val)[0], False)
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            train_lds(epochs=30, checkpoint_path=tmp_path / "out.pt",
+                       loss_curve_path=tmp_path / "b.png",
+                       spike_deadlock_epochs=2, max_spike_rollbacks=2, **common)
+    finally:
+        _SpikeGuard.should_skip = real
+        CheckpointCriterionTracker.update = real_update
+
+    assert "SAVED NOTHING" in str(exc.value), (
+        f"it did not identify the stale-file case:\n{exc.value}"
+    )
+    assert "ROLLED BACK" not in capsys.readouterr().out, "it restored the foreign checkpoint"
+    assert Path(foreign).read_bytes() == foreign_bytes, "the foreign checkpoint was overwritten"

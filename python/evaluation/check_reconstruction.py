@@ -33,6 +33,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
+import utils.load_datasets as load
 
 from evaluation.check_rollout import _format_small
 from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
@@ -94,7 +95,9 @@ def check_reconstruction(
             f"{checkpoint_path} has no saved test_dirs -- it was likely trained with "
             f"--test-fraction 0, or with an older version of train_ae.py."
         )
-    test_dirs = [Path(d) for d in test_dirs]
+    test_dirs = load.validate_run_dirs(
+        [Path(d) for d in test_dirs], source=str(checkpoint_path),
+            min_stdev_phi=min_stdev_phi)
 
     stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
     stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(

@@ -88,7 +88,8 @@ def check_perturbation(
     test_dirs = checkpoint.get("test_dirs") or []
     if not test_dirs:
         raise ValueError(f"{checkpoint_path} has no saved test_dirs")
-    test_dirs = [Path(d) for d in test_dirs]
+    test_dirs = load.validate_run_dirs(
+        [Path(d) for d in test_dirs], source=str(checkpoint_path))
 
     nx = ny = model_cfg["size"]
     frames = []

@@ -416,7 +416,9 @@ def check_rollout(
                 f"{lds_checkpoint_path} has no saved test_dirs -- it was likely trained "
                 f"with --test-fraction 0."
             )
-        test_dirs = [Path(d) for d in test_dirs]
+        test_dirs = load.validate_run_dirs(
+            [Path(d) for d in test_dirs], source=str(lds_checkpoint_path),
+            min_stdev_phi=min_stdev_phi)
 
         # Only used to PICK representative (run_dir, steps) windows from the
         # actual filtered test distribution -- compute_sample() then does

@@ -257,7 +257,9 @@ def check_latent_channels(
     test_dirs = checkpoint.get("test_dirs") or []
     test_dataset = None
     if test_dirs:
-        test_dirs = [Path(d) for d in test_dirs]
+        test_dirs = load.validate_run_dirs(
+            [Path(d) for d in test_dirs], source=str(ae_checkpoint_path),
+            min_stdev_phi=min_stdev_phi)
         test_dataset = MicrostructureSnapshotDataset(test_dirs, augment=False, min_step=min_step,
                                                        min_stdev_phi=min_stdev_phi)
         if len(test_dataset) == 0:

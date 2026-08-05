@@ -247,7 +247,9 @@ def _load_ae_f_theta_and_dataset(
     test_dirs = lds_checkpoint.get("test_dirs") or []
     if not test_dirs:
         raise ValueError(f"{lds_checkpoint_path} has no saved test_dirs")
-    test_dirs = [Path(d) for d in test_dirs]
+    test_dirs = load.validate_run_dirs(
+        [Path(d) for d in test_dirs], source=str(_original_checkpoint_path),
+            min_stdev_phi=min_stdev_phi)
 
     ae_checkpoint_path = Path(lds_checkpoint["ae_checkpoint"])
     ae, ae_encoder, ae_checkpoint, stream_configs, recon_stream_name = build_ae_from_checkpoint(
