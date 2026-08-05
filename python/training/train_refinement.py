@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from training.checkpoint_components import cross_check_ancestor_config
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
+from training.spike_guard import _SpikeGuard, _record_spike
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
     clamp_grace_epochs,
@@ -70,6 +71,7 @@ def train_refinement(
     n_rollout_steps: int | None = None, min_step: int | None = None, min_stdev_phi: float | None = None,
     val_ema_decay: float = 0.7, ema_warmup_epochs: int = 0,
     early_stopping_patience: int | None = None, grad_clip: float = 1.0,
+    spike_skip_factor: float = 10.0, grad_spike_factor: float = 10.0,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
     on_checkpoint_saved=None, log_every_epoch: bool = True,
     loss_curve_path: Path | None = None,
@@ -351,11 +353,32 @@ def train_refinement(
             z1_resync=lds_z1_resync,
         )
         if train:
-            optimizer.zero_grad()
-            loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
-            optimizer.step()
+            # SAME MACHINERY AS STAGE 3, for the same observed failure.
+            # Stages 4/5 spike too and had no protection:
+            #   stage 4: epoch 37 train 0.3647 -> epoch 38 train 302,890.5
+            #   stage 5: epoch 20 train 1.4757 -> epoch 21 train 2,838.0
+            # with val barely moving in both -- so the weights survived and a
+            # few train batches had exploded. Those runs got lucky.
+            #
+            # At ~135 batches per epoch (vs stage 3's 7) a single bad batch is
+            # 1e5-1e8x the median, so a factor-10 threshold catches it with an
+            # enormous margin over ordinary variation.
+            if spike_guard.should_skip(float(loss.detach())):
+                _record_spike(spike_guard, loss, dt_window, theta)
+                optimizer.zero_grad()
+            else:
+                optimizer.zero_grad()
+                loss.backward()
+                # The pre-clip norm, which clip_grad_norm_ returns anyway.
+                # Catches the ordinary-loss/huge-gradient case the loss guard
+                # structurally cannot see (measured on stage 3a).
+                _gnorm = torch.nn.utils.clip_grad_norm_(
+                    trainable_params, grad_clip if grad_clip > 0 else float("inf"))
+                if grad_guard.should_skip(float(_gnorm)):
+                    _record_spike(grad_guard, _gnorm, dt_window, theta)
+                    optimizer.zero_grad()
+                else:
+                    optimizer.step()
         # Returned as GPU tensors, NOT .item()'d here -- .item() blocks
         # the CPU until the GPU actually finishes and forces a full
         # round trip EVERY batch. .detach() keeps each value a scalar
@@ -380,6 +403,13 @@ def train_refinement(
     print(f"/{epochs:3d} train = {rollout_weight}*rollout/{rollout_scale} "
           f"+{recon0_weight}*recon0/{recon0_scale} "
           f"+{stats0_weight}*stats0/{stats0_scale} | valid = ...  | ema")
+
+    spike_guard = _SpikeGuard(spike_skip_factor)
+    # Separate history: gradient norms and losses live on different scales.
+    grad_guard = _SpikeGuard(grad_spike_factor)
+    _spikes_reported = 0
+    _grad_spikes_reported = 0
+    _n_train_batches = 0
 
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         ae.train()
@@ -482,7 +512,9 @@ def train_refinement(
         train_stats0_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
+            _n_train_batches = 0
             for batch in train_loader:
+                _n_train_batches += 1
                 bs = batch[0].size(0)
                 loss, rollout, recon0, stats0 = step(
                     batch, train=True, effective_rollout_weight=effective_rollout_weight)
@@ -519,6 +551,36 @@ def train_refinement(
         val_rollout = (val_rollout_sum / n_val).item()
         val_recon0 = (val_recon0_sum / n_val).item()
         val_stats0 = (val_stats0_sum / n_val).item()
+
+        # SKIPPED BATCHES ARE NEVER SILENT -- a guard that quietly drops data
+        # would be worse than the crash it prevents, since the run would look
+        # healthy while training on a filtered distribution.
+        _deadlocked = spike_guard.end_epoch(
+            _n_train_batches, extra_skipped=grad_guard.n_skipped_this_epoch)
+        grad_guard.end_epoch(_n_train_batches, extra_skipped=spike_guard.n_skipped_this_epoch)
+        for _g, _seen, _what in ((grad_guard, _grad_spikes_reported, "GRADIENT NORM"),
+                                  (spike_guard, _spikes_reported, "loss")):
+            if _g.n_skipped != _seen:
+                _w = _g.last_worst
+                _d = ("" if _w is None else
+                       f" worst: {_w[0]:.4g} vs median {_w[1]:.4g}, "
+                       f"dt_max={_w[2]:.4g}, mean theta[0]={_w[3]:.4g}")
+                print(f"  [epoch {epoch}: skipped {_g.n_skipped - _seen} batch(es) whose "
+                      f"{_what} was a catastrophic outlier. The optimizer step was NOT "
+                      f"taken, so the weights are untouched.{_d}]")
+        _grad_spikes_reported, _spikes_reported = grad_guard.n_skipped, spike_guard.n_skipped
+        if _deadlocked and spike_guard.consecutive_total_skip_epochs >= 5:
+            # STOP, keeping the best checkpoint -- the stage-3 lesson. No
+            # rollback here: at ~135 batches per epoch an all-skipped epoch
+            # means the model is comprehensively broken, not that one window
+            # tripped a threshold, and stage 4/5's checkpoint is a JOINT one
+            # whose restore path would need its own testing to be trustworthy.
+            print(f"\nSTOPPING at epoch {epoch}: every batch has been skipped for "
+                  f"{spike_guard.consecutive_total_skip_epochs} consecutive epochs, so no "
+                  f"gradient step is being taken and the weights cannot recover. Keeping "
+                  f"the best checkpoint so far. LOWER lr (currently {lr:g}); raising "
+                  f"spike_skip_factor only lets the damaging batches through.\n")
+            break
 
         criterion, saved_this_epoch = tracker.update(epoch, val_loss)
 

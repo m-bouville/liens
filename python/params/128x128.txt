@@ -102,7 +102,7 @@ z0_noise_scale=   0.1	# was 0.175
 dt_cap		  = inf   # 125/0.05 = 2500 time steps
 max_dt        = 200
 
-force 	      = True
+# force 	      = True
 
 
 
@@ -133,7 +133,7 @@ z0_noise_scale=   0.1
 dt_cap		  = same		# must be
 max_dt        = same
 
-force 	      = True
+# force 	      = True
 
 
 
@@ -154,7 +154,6 @@ rollout_weight_warmup_start = 1e-5  # geometric warmup
 
 lr 			  =   0.2e-4  	# default: 1.e-3
 
-
 epochs 		  = 100
 patience 	  =  15 	# tends to shoot up: patience won't pay
 
@@ -162,7 +161,7 @@ batches		  =  96
 
 max_dt        = same
 
-force 	      = True
+# force 	      = True
 
 
 
@@ -172,8 +171,13 @@ rollout_weight = 0.2        # now secondary -- see reasoning below
 recon0_weight   = 1  # was 1.0        # now primary, per the original design intent
 stats0_weight   = 0.25
 
+# resume_from = checkpoints/stage5/128x128-stage5-20260805_05h48.pt
+
+recon0_scale    =   0.4e-3
+stats0_scale    =   0.015
+
 n_rollout_steps= same      # match stage 4's -- same reasoning as before
-rollout_scale  = 100.
+rollout_scale  = 0.03
 
 epochs         =  50
 patience       =  10

@@ -167,7 +167,10 @@ def test_the_report_names_what_was_IN_the_batch():
     """
     src = source_without_comments(_ROOT / "training/train_lds.py")
     assert "dt_max=" in src and "theta[0]" in src
-    assert "def _record_spike" in src
+    # _record_spike moved to training/spike_guard.py when stages 4 and 5
+    # became a second caller; train_lds re-exports it.
+    shared = source_without_comments(_ROOT / "training/spike_guard.py")
+    assert "def _record_spike" in shared
 
 
 def test_the_step_is_skipped_not_just_the_backward():
@@ -774,3 +777,84 @@ def test_the_lr_schedule_does_not_advance_on_a_skipped_batch():
     assert "lr_scheduler.step()" not in skip_branch, (
         "the schedule advances on a skipped batch"
     )
+
+
+# --------------------------------------------------------------------
+# stages 4 and 5 get the same protection
+# --------------------------------------------------------------------
+
+def test_stage45_has_both_guards():
+    """
+    Stages 4/5 spike exactly like stage 3 and had NO protection:
+
+        stage 4: epoch 37 train 0.3647 -> epoch 38 train 302,890.5   (830,520x)
+        stage 5: epoch 20 train 1.4757 -> epoch 21 train 2,838.0     (1,923x)
+
+    val barely moved in both, so the weights survived and a few train batches
+    had exploded. Those runs got lucky -- the same event in stage 3 destroyed
+    the model.
+    """
+    import inspect
+
+    from training.train_refinement import train_refinement
+    params = inspect.signature(train_refinement).parameters
+    assert params["spike_skip_factor"].default == 10.0
+    assert params["grad_spike_factor"].default == 10.0
+
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "spike_guard.should_skip(float(loss.detach()))" in src
+    assert "grad_guard.should_skip(float(_gnorm))" in src
+
+
+def test_stage45_reads_the_loss_BEFORE_backward():
+    """A non-finite loss must never reach clip_grad_norm_, which turns inf
+    into nan and poisons every parameter permanently."""
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    block = src[src.index("spike_guard.should_skip(float(loss.detach()))"):]
+    block = block[:block.index("optimizer.step()")]
+    assert block.index("should_skip") < block.index("backward()")
+
+
+def test_stage45_uses_the_PRE_clip_norm_and_keeps_measuring_it_when_clipping_is_off():
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert 'grad_clip if grad_clip > 0 else float("inf")' in src
+
+
+def test_stage45_reports_skips_and_stops_on_deadlock():
+    """
+    Silent skipping would be worse than the crash: the run would look healthy
+    while training on a filtered distribution. And an all-skipped run must not
+    freeze -- the stage-3b lesson, where the guard turned a survivable crash
+    into a permanent one.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    # Scoped to the CONDITION, not the file: the message string survives in
+    # the f-string even with the `if` disabled, so a file-level check passed
+    # against that mutation -- verified.
+    assert "if _g.n_skipped != _seen:" in src, "skips are computed but never reported"
+    assert "catastrophic outlier" in src
+    assert "spike_guard.end_epoch(" in src
+    assert "consecutive_total_skip_epochs >= 5" in src
+    assert "STOPPING at epoch" in src
+    assert "LOWER lr" in src, "the advice must not be backwards"
+
+
+def test_stage45_deadlock_counts_BOTH_guards():
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "extra_skipped=grad_guard.n_skipped_this_epoch" in src
+    assert "extra_skipped=spike_guard.n_skipped_this_epoch" in src
+
+
+def test_the_guard_lives_in_ONE_place():
+    """
+    Extracted to training/spike_guard.py when stages 4/5 became a second
+    caller -- the justification for extraction, since line count alone is not
+    one. Two copies would drift, and the copy that drifts is the one nobody
+    is looking at when the next spike lands.
+    """
+    shared = source_without_comments(_ROOT / "training/spike_guard.py")
+    assert "class _SpikeGuard" in shared
+    for mod in ("training/train_lds.py", "training/train_refinement.py"):
+        src = source_without_comments(_ROOT / mod)
+        assert "from training.spike_guard import" in src, f"{mod} does not use the shared module"
+        assert "class _SpikeGuard" not in src, f"{mod} has its own copy"
