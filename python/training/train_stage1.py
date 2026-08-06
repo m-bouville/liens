@@ -19,6 +19,7 @@ import gc
 import torch
 from torch.utils.data import DataLoader
 
+from utils.logging_utils import print_run_parameters
 from models.autoencoder import Autoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_streams import DEFAULT_STREAM_NAME, LatentStreamMode
@@ -101,6 +102,13 @@ def _vram_report(tag: str) -> str:
             f" / reserved {torch.cuda.memory_reserved() / 1024**3:.2f}"
             f" / peak {torch.cuda.max_memory_allocated() / 1024**3:.2f}"
             f" / free {free_b / 1024**3:.2f} of {total_b / 1024**3:.2f} GB")
+
+
+_STAGE1_PREAMBLE_PARAMS = (
+    # See train_lds's _LDS_PREAMBLE_PARAMS for why these are excluded here.
+    "size", "epochs", "batch_size", "min_step", "min_stdev_phi", "min_passing_steps",
+    "stats0_weight", "recon0_scale", "stats0_scale", "early_stopping_patience",
+)
 
 
 def train_autoencoder(
@@ -260,6 +268,7 @@ def train_autoencoder(
                           f"explicitly -- config.txt no longer provides ML training defaults.")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps}  "
           f"stats0_weight={stats0_weight}")
+    print_run_parameters(train_autoencoder, locals(), _STAGE1_PREAMBLE_PARAMS)
 
     include_stats = stats0_weight > 1e-6
 

@@ -327,3 +327,51 @@ def test_epoch_advisory_only_fires_when_genuinely_short(tmp_path, capsys):
     # no target -> bare fact, never an advisory
     out = report(17, None)
     assert "17" in out and "may have been killed" not in out
+
+
+# Every trainer that resets its criterion mid-run. A fourth joins here.
+_GRACE_CALL_SITES = [
+    "training/train_stage2.py",     # deriv-target switch
+    "training/train_refinement.py",  # rollout ramp completing
+    "training/train_lds.py",         # non-comparable (3a -> 3b) resume
+]
+
+
+@pytest.mark.parametrize("path", _GRACE_CALL_SITES)
+def test_every_grace_site_uses_the_shared_derivation(path):
+    """
+    SITE ENUMERATION. The grace length was derived inline at three sites
+    before extraction, which is the exact shape that produces a fix reaching
+    N-1 of N. Re-inlining it at stage 2 (as max(1, ...)) broke nothing --
+    verified -- because that site had no test tying it to the shared
+    definition.
+
+    Structural, not string-matching on the expression: any re-derivation is
+    rejected, however it is spelled, because what is asserted is that the
+    trainer CALLS the helper and does not compute 1/(1-decay) itself.
+    """
+    from conftest import source_without_comments
+    from pathlib import Path
+    src = source_without_comments(Path(__file__).resolve().parent.parent / path)
+    assert "grace_epochs_for_ema(val_ema_decay)" in src, (
+        f"{path} does not use the shared grace derivation -- if it re-derives the "
+        f"window inline, a correction to grace_epochs_for_ema silently skips it"
+    )
+    assert "1 / (1 - val_ema_decay)" not in src, (
+        f"{path} still derives the EMA window itself, so it can drift from "
+        f"grace_epochs_for_ema without any test noticing"
+    )
+
+
+def test_the_grace_window_tracks_the_ema_decay():
+    """
+    The property the helper exists for: grace is the EMA's own averaging
+    window, so a slower EMA gets proportionally longer to settle. Not a free
+    parameter -- deriving it is what keeps it consistent with the decay.
+    """
+    from training.checkpoint_criterion import grace_epochs_for_ema
+    assert grace_epochs_for_ema(0.9) > grace_epochs_for_ema(0.7)
+    assert grace_epochs_for_ema(0.99) > grace_epochs_for_ema(0.9)
+    assert grace_epochs_for_ema(0.7) == 3
+    for decay in (0.0, 0.3, 0.5, 1.0):
+        assert grace_epochs_for_ema(decay) >= 2, "the two-epoch floor is unconditional"

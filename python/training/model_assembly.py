@@ -11,7 +11,7 @@ from models.autoencoder import Autoencoder, MultiStreamAutoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.decoder import Decoder
 from models.encoder import Encoder
-from models.latent_dynamics import LatentDynamics
+from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from models.latent_streams import LatentStreamConfig, LatentStreamMode, resolve_stream_configs_from_checkpoint_config
 from training.checkpoint_components import ComponentCheckpoint
 from training.stats_head import StatsHead
@@ -205,17 +205,14 @@ def build_models_from_components(
                               latent_spatial=lds_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=lds_cfg["hidden_dim"],
                               n_hidden_layers=lds_cfg["n_hidden_layers"],
-                              # inf (exact no-op) for any checkpoint saved
-                              # before dt_cap existed -- same reasoning as
-                              # latent_spatial_size's own .get() above.
-                              dt_cap=lds_cfg.get("dt_cap", float("inf")),
-                              # n_substeps too, and for a sharper reason than dt_cap:
-                              # it changes what f_theta MEANS. Rebuilding a model
-                              # trained at n_substeps=N as 1 applies a POINTWISE
-                              # z1_dot as a one-shot corrector over the whole dt --
-                              # the "NOT equivalent" direction train_lds warns about
-                              # on resume. The weights load cleanly either way.
-                              n_substeps=lds_cfg.get("n_substeps", 1)).to(device)
+                              # EVERY meaning-changing field, from ONE list --
+                              # see integration_kwargs_from_config. Spelling them
+                              # out here is what let alpha reach train_lds and NOT
+                              # this site, so stage 4 rebuilt an adaptive f_theta as
+                              # a one-shot corrector at dt=500 and skipped every
+                              # batch by epoch 4 -- the exact failure the old
+                              # n_substeps comment here warned about.
+                              **integration_kwargs_from_config(lds_cfg)).to(device)
     f_theta.load_state_dict(components["lds"].state_dict)
 
     return ae, stats_head, f_theta, frozen_modules, final_stream_configs, recon_stream_name

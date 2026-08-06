@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.constants import LATENT_SPATIAL_SIZE
-from models.latent_dynamics import LatentDynamics
+from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
 from utils import load_datasets as load
@@ -263,25 +263,14 @@ def _load_ae_f_theta_and_dataset(
         latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
         latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
-        # inf (exact no-op) for any checkpoint saved before dt_cap
-        # existed -- same .get()-with-fallback pattern as
-        # latent_spatial_size just above, and as model_assembly.py's
-        # own build_models_from_components uses for the SAME parameter.
-        # A real, reported bug otherwise: this is a SEPARATE LatentDynamics
-        # construction from that one (this whole function evaluates a
-        # raw Stage 3a/3b checkpoint directly, not via
-        # build_models_from_components at all), so fixing dt_cap there
-        # didn't fix it here -- a checkpoint saved with a real, finite
-        # dt_cap would silently evaluate as if dt_cap were still inf,
-        # with no error or warning anywhere to indicate the mismatch.
-        dt_cap=lds_config.get("dt_cap", float("inf")),
-        # n_substeps from the checkpoint too, and for a SHARPER reason than
-        # dt_cap: it changes what f_theta MEANS. Rebuilding a model trained
-        # at n_substeps=N as n_substeps=1 applies a POINTWISE z1_dot as a
-        # one-shot corrector over the whole dt -- the "NOT equivalent"
-        # direction train_lds warns about on resume. The weights load
-        # cleanly, so nothing else would catch it.
-        n_substeps=lds_config.get("n_substeps", 1),
+        # EVERY meaning-changing field, from ONE list -- see
+        # integration_kwargs_from_config. The comments this replaces recorded,
+        # three times independently, that "fixing dt_cap in either of those did
+        # NOT fix it here": the same field had to be added by hand at each of
+        # five separate reconstruction sites. alpha then reached four of them
+        # and not model_assembly, and stage 4 ran an adaptive f_theta one-shot
+        # at dt=500. One list, one call, and a new field cannot miss a site.
+        **integration_kwargs_from_config(lds_config),
     ).to(device)
     f_theta.load_state_dict(lds_checkpoint["model_state"])
     f_theta.eval()

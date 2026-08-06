@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from models.constants import LATENT_SPATIAL_SIZE
-from models.latent_dynamics import LatentDynamics
+from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import OneStepLoss
@@ -83,6 +83,18 @@ def main():
         latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
         latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
+        # THE FIFTH reconstruction site, and the one that propagated NOTHING --
+        # not even dt_cap, which the other four had been given by hand. It
+        # therefore rebuilt every checkpoint at the pre-2026 defaults, so an
+        # adaptive or sub-stepped f_theta was compared one-shot against AB2 and
+        # the comparison measured the rebuild, not the integrators.
+        #
+        # This script calls forward()/forward_ab2() directly rather than
+        # rollout(), so n_substeps and alpha do not change what it evaluates
+        # TODAY -- but that is a property of its current body, not a reason for
+        # the model to disagree with its own checkpoint. dt_cap does apply
+        # inside forward(), and did silently differ.
+        **integration_kwargs_from_config(lds_config),
     ).to(device)
     f_theta.load_state_dict(lds_checkpoint["model_state"])
     f_theta.eval()

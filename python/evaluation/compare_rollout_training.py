@@ -32,7 +32,7 @@ import numpy as np
 import torch
 
 from models.constants import LATENT_SPATIAL_SIZE
-from models.latent_dynamics import LatentDynamics
+from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from evaluation._window_parsing import parse_fixed_window
 from training.checkpoint_components import build_ae_from_checkpoint
 from utils import load_datasets as load
@@ -56,23 +56,14 @@ def load_lds(checkpoint_path: Path, device: torch.device):
         latent_channels=config["latent_channels"], n_theta=config["n_theta"],
         latent_spatial=config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=config["hidden_dim"], n_hidden_layers=config["n_hidden_layers"],
-        # inf (exact no-op) for any checkpoint saved before dt_cap
-        # existed -- same .get()-with-fallback pattern as
-        # latent_spatial_size just above. A real, reported bug
-        # otherwise: this LatentDynamics reconstruction is SEPARATE
-        # from model_assembly.py's own build_models_from_components
-        # (which already has this fix) and from
-        # evaluation._latent_eval.py's own copy (ditto) -- fixing
-        # dt_cap in either of those did NOT fix it here. A checkpoint
-        # saved with a real, finite dt_cap would silently evaluate as
-        # if dt_cap were still inf, with no error or warning anywhere
-        # to indicate the mismatch.
-        dt_cap=config.get("dt_cap", float("inf")),
-        # n_substeps likewise, and for a sharper reason: it changes what
-        # f_theta MEANS. This is the FOURTH separate LatentDynamics
-        # reconstruction in the codebase -- the comment just above already
-        # records that fixing dt_cap in the others did not fix it here.
-        n_substeps=config.get("n_substeps", 1),
+        # EVERY meaning-changing field, from ONE list -- see
+        # integration_kwargs_from_config. The comments this replaces recorded,
+        # three times independently, that "fixing dt_cap in either of those did
+        # NOT fix it here": the same field had to be added by hand at each of
+        # five separate reconstruction sites. alpha then reached four of them
+        # and not model_assembly, and stage 4 ran an adaptive f_theta one-shot
+        # at dt=500. One list, one call, and a new field cannot miss a site.
+        **integration_kwargs_from_config(config),
     ).to(device)
     f_theta.load_state_dict(checkpoint["model_state"])
     f_theta.eval()

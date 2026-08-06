@@ -15,10 +15,11 @@ from torch.utils.data import DataLoader
 
 from training.checkpoint_components import cross_check_ancestor_config
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
-from training.spike_guard import _SpikeGuard, _record_spike
+from training.spike_guard import _SpikeGuard, _record_spike, end_epoch_pair
+from utils.logging_utils import print_run_parameters
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
-    clamp_grace_epochs,
+    clamp_grace_epochs, grace_epochs_for_ema,
 )
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import StatsLoss
@@ -55,6 +56,15 @@ def geometric_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int,
         return full_weight
     frac = (epoch - 1) / max(1, warmup_epochs - 1)
     return full_weight * (start_fraction ** (1.0 - frac))
+
+
+_REFINEMENT_PREAMBLE_PARAMS = (
+    # See _LDS_PREAMBLE_PARAMS for why these are excluded rather than repeated.
+    "freeze_decoder", "size", "rollout_weight_warmup_epochs", "rollout_weight_warmup_start",
+    "max_dt", "rollout_weight", "recon0_weight", "stats0_weight", "rollout_scale",
+    "recon0_scale", "stats0_scale", "epochs", "batch_size", "n_rollout_steps",
+    "min_step", "min_stdev_phi", "early_stopping_patience",
+)
 
 
 def train_refinement(
@@ -177,7 +187,9 @@ def train_refinement(
               f"against runs without a warmup.")
     print(f"rollout_weight={rollout_weight}  recon0_weight={recon0_weight}  "
           f"stats0_weight={stats0_weight}")
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  n_rollout_steps={n_rollout_steps}\n")
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  n_rollout_steps={n_rollout_steps}")
+    print_run_parameters(train_refinement, locals(), _REFINEMENT_PREAMBLE_PARAMS)
+    print()
 
     stats_loss_fn = None
     stat_names = None
@@ -493,7 +505,7 @@ def train_refinement(
             # then ends up as that one epoch's own raw value, lucky or not.
             # Same derivation as stage 2's, from val_ema_decay's own averaging
             # window.
-            grace = max(2, round(1 / (1 - val_ema_decay))) if val_ema_decay < 1 else 2
+            grace = grace_epochs_for_ema(val_ema_decay)
             grace = clamp_grace_epochs(grace, epochs - epoch + 1)
             if grace > 0:
                 print(f"  [epoch {epoch}: rollout_weight has reached full strength -- giving "
@@ -555,9 +567,9 @@ def train_refinement(
         # SKIPPED BATCHES ARE NEVER SILENT -- a guard that quietly drops data
         # would be worse than the crash it prevents, since the run would look
         # healthy while training on a filtered distribution.
-        _deadlocked = spike_guard.end_epoch(
-            _n_train_batches, extra_skipped=grad_guard.n_skipped_this_epoch)
-        grad_guard.end_epoch(_n_train_batches, extra_skipped=spike_guard.n_skipped_this_epoch)
+        # BOTH counts captured before either reset -- see end_epoch_pair's own
+        # docstring for the ordering bug this replaces.
+        _deadlocked = end_epoch_pair(spike_guard, grad_guard, _n_train_batches)
         for _g, _seen, _what in ((grad_guard, _grad_spikes_reported, "GRADIENT NORM"),
                                   (spike_guard, _spikes_reported, "loss")):
             if _g.n_skipped != _seen:

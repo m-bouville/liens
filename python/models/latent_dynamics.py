@@ -12,6 +12,46 @@ import torch.nn as nn
 from .constants import LATENT_SPATIAL_SIZE
 
 
+# EVERY field that changes what f_theta MEANS, in ONE place.
+#
+# These are the arguments that must survive a save/rebuild round trip: two
+# checkpoints with identical weights and different values here are different
+# models, not the same model configured differently. Architecture fields
+# (latent_channels, hidden_dim, ...) are excluded because a mismatch there
+# fails loudly at load_state_dict; these fail SILENTLY, by integrating with a
+# step the weights were never fitted for.
+#
+# The list exists because it was got wrong the moment it grew. alpha was added
+# to the checkpoint config and to train_lds's own resume, and NOT to
+# model_assembly -- so stage 4 rebuilt an f_theta fitted at delta_t~36 and ran
+# it ONE-SHOT at dt=500, skipping 325 of 325 batches by epoch 4. The comment
+# beside n_substeps at that site already explained why exactly this must not
+# happen; the field list was simply not enumerated anywhere, so a new field
+# reached four of five sites.
+_MEANING_FIELDS = {
+    "dt_cap": float("inf"),   # inf is an exact no-op: pre-dt_cap checkpoints
+    "n_substeps": 1,          # 1 is the historical default
+    "alpha": None,            # None = fixed count, i.e. behaviour before alpha
+    "max_substeps": 256,
+}
+
+
+def integration_kwargs_from_config(config: dict) -> dict:
+    """The integration settings a saved config implies, defaulted for age.
+
+    Call this at EVERY site that rebuilds a LatentDynamics from a checkpoint
+    (model_assembly, the check_* diagnostics, compare_*). Each default is the
+    value that reproduces the behaviour of a checkpoint saved before that field
+    existed, so an old checkpoint rebuilds exactly as it always did.
+
+    Deliberately NOT a classmethod on LatentDynamics: the caller usually also
+    needs the architecture fields from the same config, and mixing "read the
+    config" into the constructor would make the model responsible for a file
+    format it never writes.
+    """
+    return {name: config.get(name, default) for name, default in _MEANING_FIELDS.items()}
+
+
 class LatentDynamics(nn.Module):
     """
     Taylor expansion of z0 (the state stream):
@@ -70,7 +110,8 @@ class LatentDynamics(nn.Module):
     def __init__(self, latent_channels: int, n_theta: int = 1,
                  latent_spatial: int = LATENT_SPATIAL_SIZE, hidden_dim: int = 256,
                  n_hidden_layers: int = 2, dt_cap: float = float("inf"),
-                 n_substeps: int = 1):
+                 n_substeps: int = 1, alpha: float | None = None,
+                 max_substeps: int = 256):
         super().__init__()
         self.latent_channels = latent_channels
         self.latent_spatial = latent_spatial
@@ -90,7 +131,15 @@ class LatentDynamics(nn.Module):
         if n_substeps < 1:
             raise ValueError(f"n_substeps must be >= 1, got {n_substeps}")
         self.n_substeps = int(n_substeps)
-        if self.n_substeps > 1 and math.isfinite(dt_cap):
+        # `alpha is not None` joins the condition: an ADAPTIVE model sub-steps
+        # too, so the same clash applies -- and less predictably, because h is
+        # derived per sample per transition. Any sample whose h exceeds the cap
+        # gets its quadratic term truncated while its z1 trapezoid runs on the
+        # UNCAPPED h; whether that happens depends on |f|/|z1| at that state,
+        # so the inconsistency comes and goes within a batch. Found by review:
+        # the original condition predates alpha and could not see it, so an
+        # adaptive model with a finite cap warned about nothing.
+        if (self.n_substeps > 1 or alpha is not None) and math.isfinite(dt_cap):
             # dt_cap and sub-stepping are two answers to ONE question: how to
             # stop f*(dt^2/2) dominating at large dt. The cap truncates the
             # term; sub-stepping removes the large dt. Using both makes an
@@ -131,6 +180,69 @@ class LatentDynamics(nn.Module):
         # reversal back toward the correct euler-dominated large-dt
         # regime, not just a delay of the point where it breaks down.
         self.dt_cap = dt_cap
+
+        # alpha: the TAYLOR-VALIDITY RATIO that replaces n_substeps as the
+        # thing held constant. Every sub-step contributes a linear term
+        # z1*delta_t and a curvature correction f_theta*delta_t^2/2; alpha
+        # bounds the second as a fraction of the first,
+        #
+        #     |f_theta|*delta_t / |z1|  <=  alpha
+        #
+        # so the step follows the local dynamics instead of the save schedule.
+        # Solved for the count, that is
+        #
+        #     n = ceil(|f_theta|*dt / (alpha*|z1|))
+        #
+        # which is the SAME equation n_substeps expresses, read the other way:
+        # n_substeps fixes the step and lets alpha fall where it may, alpha
+        # fixes the validity and lets the step follow. Measured on the
+        # 128x128 sweep (see evaluation/check_alpha.py), fixing n_substeps=14
+        # gave a median alpha of 0.105 and a MAX of 1.07 -- the worst sub-steps
+        # had a "correction" as large as the displacement it corrected, i.e.
+        # outside Taylor validity entirely, while the typical window was
+        # over-resolved tenfold to make those survivable.
+        #
+        # Scale-free by construction: the ratio form has no units, so it does
+        # not need retuning when max_dt moves. It also handles both degenerate
+        # ends correctly. |f_theta| -> 0 asks for an unbounded step, which is
+        # right (no curvature means linear extrapolation is exact) and is the
+        # state of every fresh stage 3a, since f's final layer is zero-init --
+        # an ABSOLUTE tolerance on |f|*delta_t^2 would divide by zero there.
+        # |z1| -> 0 asks for delta_t -> 0, guarded by max_substeps below.
+        #
+        # None (the default) keeps the FIXED n_substeps behaviour exactly, so
+        # every existing checkpoint and caller is unaffected.
+        if alpha is not None and not (alpha > 0):
+            raise ValueError(f"alpha must be > 0, got {alpha}")
+        if alpha is not None and self.n_substeps != 1:
+            # Both set means two answers to one question -- the same clash
+            # dt_cap and n_substeps have, and it must be an ERROR rather than
+            # a warning here because there is no reading under which it does
+            # something sensible: the count would be adaptive AND multiplied.
+            raise ValueError(
+                f"alpha={alpha} and n_substeps={self.n_substeps} both set. alpha REPLACES "
+                f"n_substeps (it derives the count per transition); leave n_substeps at its "
+                f"default of 1 when using alpha."
+            )
+        self.alpha = alpha
+        # max_substeps: a COST bound, not a stability one -- the criterion
+        # itself is unbounded when |z1| -> 0 (a state with no velocity and
+        # nonzero curvature admits no valid step at all), and one such window
+        # must not stall a batch forever. Hit only in the degenerate corner;
+        # if it binds routinely, that is a finding about the data, so
+        # rollout() counts and reports it rather than silently clamping.
+        if max_substeps < 1:
+            raise ValueError(f"max_substeps must be >= 1, got {max_substeps}")
+        self.max_substeps = int(max_substeps)
+        self.n_substeps_clamped = 0
+        # Running totals for the epoch report. The whole argument for alpha
+        # over a fixed count is that the step ADAPTS as f_theta sharpens --
+        # and that claim is unobservable unless the realised count is
+        # reported. A fixed n_substeps appears in the log because it is a
+        # parameter; a derived one appears nowhere unless it is measured.
+        self._substep_total = 0
+        self._substep_batches = 0
+        self._substep_max = 0
 
         flat_dim = latent_channels * latent_spatial * latent_spatial
         in_dim = 2 * flat_dim + n_theta  # z0 + z1 + theta -- dt is not a network input (see forward())
@@ -217,11 +329,95 @@ class LatentDynamics(nn.Module):
         dt_capped = torch.clamp(dt_r, max=self.dt_cap)
         return z0 + z1 * dt_r + f_val * (dt_capped ** 2 / 2)
 
+    def _substeps_for(self, z0: torch.Tensor, z1: torch.Tensor, dt: torch.Tensor,
+                       theta: torch.Tensor, f_n: torch.Tensor) -> torch.Tensor:
+        """Per-sample sub-step count from the alpha criterion, as a (B,) long tensor.
+
+        n = ceil(|f_theta|*dt / (alpha*|z1|)), floored at 1 and capped at
+        max_substeps. Norms over the WHOLE latent tensor, not per channel:
+        alpha describes ONE step taken for the whole state, and a per-channel
+        ratio would be dominated by whichever channel happens to sit near zero
+        -- a property of that channel, not of the step.
+
+        DETACHED, and the guarantee is STRUCTURAL rather than a matter of
+        discipline: the return is a long tensor, and integer tensors cannot
+        carry gradients, so no path from the count back into f can exist
+        however this body is later rewritten. That is what protects against
+        the real hazard -- if the count depended differentiably on |f_theta|,
+        gradient descent would discover that shrinking f earns longer steps
+        and lowers the loss that way, optimising the integrator instead of the
+        physics.
+
+        The surrounding no_grad is therefore a MEMORY optimisation, not the
+        correctness guarantee: without it the norms would build a graph that
+        the .long() conversion immediately orphans. Worth keeping (the graph
+        is per-transition and the rollout is a loop), worth not mistaking for
+        the safety property. Removing it changes nothing observable, which is
+        exactly why a test asserting "the count has no grad_fn" passes against
+        its removal and proves nothing.
+
+        Uses the f_n already computed at the transition's start, so the
+        criterion costs no extra evaluation. It is therefore a PREDICTOR: it
+        cannot see |f_theta| rising within the transition, which is the
+        dangerous direction. rollout() re-evaluates it per transition rather
+        than once per window for exactly that reason.
+        """
+        with torch.no_grad():
+            b = z0.shape[0]
+            f_norm = torch.linalg.vector_norm(f_n.reshape(b, -1), dim=1)
+            z1_norm = torch.linalg.vector_norm(z1.reshape(b, -1), dim=1)
+            dt_flat = dt.reshape(b).abs()
+            # 0/0 (no velocity AND no curvature) is a DEAD state: nothing is
+            # happening, so one step suffices. Distinguished from |z1|=0 with
+            # |f|>0, which genuinely admits no valid step and is what
+            # max_substeps then bounds.
+            raw = torch.where(
+                f_norm > 0,
+                f_norm * dt_flat / (self.alpha * z1_norm.clamp_min(torch.finfo(z1_norm.dtype).tiny)),
+                torch.zeros_like(f_norm),
+            )
+            n = torch.ceil(raw).clamp(min=1.0, max=float(self.max_substeps))
+            n = torch.nan_to_num(n, nan=float(self.max_substeps),
+                                  posinf=float(self.max_substeps))
+            self.n_substeps_clamped += int((raw > self.max_substeps).sum())
+            self._substep_total += int(n.sum())
+            self._substep_batches += int(n.numel())
+            self._substep_max = max(self._substep_max, int(n.max()))
+            return n.long()
+
+    def substep_stats(self, reset: bool = True) -> dict | None:
+        """Mean/max realised sub-steps since the last reset, or None if fixed.
+
+        None rather than a dict of the constant when alpha is unset: a caller
+        printing "mean 7.0 max 7" every epoch for a fixed n_substeps=7 is
+        noise, and the distinction between a derived and a declared count is
+        exactly what the report is for.
+
+        ONE condition, not two. The counters advance only inside
+        _substeps_for, which runs only when alpha is set -- so an empty
+        counter IS the fixed-count case, and an explicit `alpha is None` test
+        beside it is redundant. Verified by removing it: nothing changed,
+        which is the definition of dead code rather than a missing test.
+        """
+        if self._substep_batches == 0:
+            return None
+        stats = {"mean": self._substep_total / self._substep_batches,
+                 "max": self._substep_max, "clamped": self.n_substeps_clamped,
+                 "transitions": self._substep_batches}
+        if reset:
+            # Per-epoch, not cumulative -- a cumulative mean would flatten the
+            # drift this exists to show. n_substeps_clamped is deliberately
+            # NOT reset: a clamp that bound once in a run is worth carrying.
+            self._substep_total = self._substep_batches = self._substep_max = 0
+        return stats
+
     def _integrate(self, z0: torch.Tensor, z1: torch.Tensor, dt: torch.Tensor,
                     theta: torch.Tensor, f_carry: torch.Tensor | None = None):
         """
-        Advance (z0, z1) across ONE real transition of `dt`, in
-        self.n_substeps sub-steps of delta_t = dt / n_substeps.
+        Advance (z0, z1) across ONE real transition of `dt`, in sub-steps of
+        delta_t = dt / n -- with n either the fixed self.n_substeps or, when
+        self.alpha is set, derived per sample from the alpha criterion (see
+        _substeps_for).
 
         Returns (z0_next, z1_next, f_next). f_next is the f_theta value at the
         arrival state, carried into the following transition so that each
@@ -260,20 +456,47 @@ class LatentDynamics(nn.Module):
         evaluations, and at equal budget is slightly MORE accurate
         (4.9e-5 at N=64 recycled vs 5.7e-5 at N=32 re-evaluated).
 
-        dt_cap applies to the SUB-step, so it becomes inert as n_substeps
-        grows -- which is the point: it exists to bound f*(dt^2/2) at large dt,
-        and sub-stepping removes the large dt.
+        dt_cap applies to the SUB-step, so it becomes inert as n grows --
+        which is the point: it exists to bound f*(dt^2/2) at large dt, and
+        sub-stepping removes the large dt.
+
+        VARIABLE delta_t, per sample. Samples in a batch need different counts,
+        so the loop runs to the batch's MAXIMUM and masks samples that have
+        already arrived: their h is zeroed, which makes each further sub-step
+        an exact no-op (z0 += 0, z1 += 0) rather than a special case. Cost is
+        therefore the batch max, which is why callers should batch windows of
+        similar required count -- see rollout()'s own note. Every sample still
+        lands EXACTLY on the transition endpoint, because h = dt/n divides dt
+        exactly and n sub-steps of it are taken; the milestone is hit by
+        construction, not by a final correction step.
         """
         dt_r = dt.view(-1, 1, 1, 1)
-        h = dt_r / self.n_substeps
-        h_capped = torch.clamp(h, max=self.dt_cap)
         f_n = self.f(z0, z1, theta) if f_carry is None else f_carry
-        for _ in range(self.n_substeps):
-            z0 = z0 + z1 * h + f_n * (h_capped ** 2 / 2)
-            z1_pred = z1 + f_n * h
+        if self.alpha is None:
+            n_steps = torch.full((z0.shape[0],), self.n_substeps,
+                                  dtype=torch.long, device=z0.device)
+        else:
+            n_steps = self._substeps_for(z0, z1, dt, theta, f_n)
+        h = dt_r / n_steps.view(-1, 1, 1, 1).to(dt_r.dtype)
+        h_capped = torch.clamp(h, max=self.dt_cap)
+        n_max = int(n_steps.max().item())
+        for step in range(n_max):
+            # active: samples that still have sub-steps left. Zeroing h rather
+            # than indexing keeps the batch shape static, which matters for
+            # autograd and for not fragmenting the f_theta call.
+            active = (n_steps > step).view(-1, 1, 1, 1).to(h.dtype)
+            h_i, h_capped_i = h * active, h_capped * active
+            z0 = z0 + z1 * h_i + f_n * (h_capped_i ** 2 / 2)
+            z1_pred = z1 + f_n * h_i
             f_next = self.f(z0, z1_pred, theta)
-            z1 = z1 + (f_n + f_next) * (h / 2)
-            f_n = f_next
+            z1 = z1 + (f_n + f_next) * (h_i / 2)
+            # An INACTIVE sample must keep the f it arrived with: f_next was
+            # evaluated at its unchanged state, so the two agree in exact
+            # arithmetic, but taking f_next unconditionally would let
+            # floating-point drift accumulate over the remaining no-op steps
+            # and, worse, would make the carried f depend on how many other
+            # samples happened to share the batch.
+            f_n = torch.where(active.bool(), f_next, f_n)
         return z0, z1, f_n
 
     def rollout(self, z0: torch.Tensor, z1_sequence: torch.Tensor, dts: torch.Tensor,
@@ -305,7 +528,7 @@ class LatentDynamics(nn.Module):
         z0_hats = [z0]
         z0_cur = z0
 
-        if self.n_substeps == 1 and z1_resync:
+        if self.n_substeps == 1 and self.alpha is None and z1_resync:
             # The historical path, kept EXACTLY as it was rather than being
             # expressed as a special case of the loop below. _integrate's
             # trapezoidal z1 update produces a different (better) z1, and with
@@ -313,6 +536,12 @@ class LatentDynamics(nn.Module):
             # two agree numerically, but only for a reason that has to be
             # re-derived every time someone reads it. A separate branch makes
             # "the default is untouched" checkable by inspection.
+            #
+            # `self.alpha is None` is part of the condition because alpha
+            # leaves n_substeps at 1 by construction (setting both is an
+            # error, see __init__) -- so without this clause an adaptive model
+            # would silently take the ONE-SHOT path and never sub-step at all,
+            # which is the exact configuration alpha exists to prevent.
             for i in range(n_steps):
                 z0_cur = self.forward(z0_cur, z1_sequence[:, i], dts[:, i], theta)
                 z0_hats.append(z0_cur)

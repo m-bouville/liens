@@ -23,6 +23,7 @@ import pytest
 
 from conftest import source_without_comments
 from training.train_lds import _SpikeGuard
+from training.spike_guard import end_epoch_pair
 
 import pathlib
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -326,7 +327,7 @@ def test_forget_history_clears_the_median_after_a_rollback():
 
 def test_the_trainer_rolls_back_rather_than_freezing():
     src = source_without_comments(_ROOT / "training/train_lds.py")
-    assert "spike_guard.end_epoch(" in src and "_n_train_batches" in src
+    assert "end_epoch_pair(spike_guard, grad_guard, _n_train_batches)" in src
     assert "consecutive_total_skip_epochs >= spike_deadlock_epochs" in src
     assert 'f_theta.load_state_dict(_restored["model_state"])' in src
 
@@ -473,12 +474,16 @@ def test_deadlock_counts_skips_from_BOTH_guards():
         "3 loss-skips + 4 grad-skips = 7 of 7, but the deadlock was not detected"
     )
 
-    # And the TRAINER must actually pass the other guard's count. Testing the
-    # method alone left this unchecked: dropping extra_skipped from the call
-    # site kept every behavioural test green -- verified.
-    src = source_without_comments(_ROOT / "training/train_lds.py")
-    assert "extra_skipped=grad_guard.n_skipped_this_epoch" in src
-    assert "extra_skipped=spike_guard.n_skipped_this_epoch" in src
+    # And the TRAINERS must actually pass the other guard's count -- through
+    # the shared handshake, which captures both counts BEFORE either reset
+    # (see end_epoch_pair's own docstring for the inline ordering bug it
+    # replaced). Site-enumerated: a third trainer gaining guards joins here.
+    for trainer in ("training/train_lds.py", "training/train_refinement.py"):
+        src = source_without_comments(_ROOT / trainer)
+        assert "end_epoch_pair(spike_guard, grad_guard, _n_train_batches)" in src, trainer
+        assert "extra_skipped" not in src, (
+            f"{trainer} calls end_epoch inline with extra_skipped -- the exact "
+            f"capture-after-reset form end_epoch_pair replaced")
 
 
 def test_extra_skipped_defaults_to_zero():
@@ -833,16 +838,33 @@ def test_stage45_reports_skips_and_stops_on_deadlock():
     # against that mutation -- verified.
     assert "if _g.n_skipped != _seen:" in src, "skips are computed but never reported"
     assert "catastrophic outlier" in src
-    assert "spike_guard.end_epoch(" in src
+    assert "end_epoch_pair(spike_guard" in src
     assert "consecutive_total_skip_epochs >= 5" in src
     assert "STOPPING at epoch" in src
     assert "LOWER lr" in src, "the advice must not be backwards"
 
 
 def test_stage45_deadlock_counts_BOTH_guards():
-    src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "extra_skipped=grad_guard.n_skipped_this_epoch" in src
-    assert "extra_skipped=spike_guard.n_skipped_this_epoch" in src
+    """
+    BOTH directions, which the inline form got wrong: the second end_epoch
+    call always received extra_skipped=0, because the first zeroes the
+    per-epoch counter as it returns. The deadlock check read only
+    spike_guard's counter (correct, combined, computed first), so nothing
+    visible broke -- grad_guard.consecutive_total_skip_epochs silently
+    undercounted instead. Behavioral, since the source-matching version of
+    this test passed against that bug -- verified.
+    """
+    spike, grad = _warm(_SpikeGuard(factor=10.0)), _warm(_SpikeGuard(factor=10.0))
+    for _ in range(3):
+        spike.should_skip(1e7)
+    for _ in range(4):
+        grad.should_skip(1e7)
+    assert end_epoch_pair(spike, grad, 7) is True
+    assert spike.consecutive_total_skip_epochs == 1
+    assert grad.consecutive_total_skip_epochs == 1, (
+        "grad_guard did not see spike_guard's skips -- the counts were read "
+        "after the reset instead of before it"
+    )
 
 
 def test_the_guard_lives_in_ONE_place():
@@ -1011,10 +1033,51 @@ def test_the_no_checkpoint_message_distinguishes_the_two_cases():
     src = source_without_comments(_ROOT / "training/train_lds.py")
     assert "SAVED NOTHING" in src
     assert "belongs" in src and "previous run" in src
-    assert "n_substeps scales with" in src, (
-        "a loss diverging before any gradient step is not an lr problem; the "
-        "message must say so"
+
+
+def test_the_deadlock_advice_names_the_knob_that_actually_sets_the_step():
+    """
+    BEHAVIORAL, by reading the advice rather than the source that produces it.
+
+    The previous version asserted "n_substeps scales with" against
+    train_lds.py, and broke the moment the text was legitimately branched (the
+    branched wording spells it "n_substeps (currently 7) scales with max_dt").
+    It failed on a correct change while never checking the thing that matters:
+    whether the advice points at the parameter that actually sets delta_t.
+
+    Under alpha it must NOT send the reader to n_substeps/max_dt -- neither
+    does anything when alpha is in use, and a deadlock message is read at
+    exactly the moment someone is deciding what to change.
+    """
+    from training.train_lds import deadlock_step_hint
+
+    fixed = deadlock_step_hint(alpha=None, n_substeps=7, max_substeps=256, clamped=0)
+    assert "n_substeps" in fixed and "max_dt" in fixed
+    assert "alpha" in fixed, "the fixed-count advice should still offer alpha as the way out"
+
+    adaptive = deadlock_step_hint(alpha=0.1, n_substeps=1, max_substeps=256, clamped=0)
+    assert "LOWER alpha" in adaptive
+    assert "0.1" in adaptive, "the advice must name the CURRENT value, not just the knob"
+    assert "check_alpha" in adaptive, "calibration is not guesswork; point at the tool"
+    assert "scales with max_dt" not in adaptive, (
+        "the adaptive advice sends the reader to max_dt/n_substeps, which do not "
+        "set delta_t when alpha is in use"
     )
+
+
+def test_a_binding_clamp_changes_the_deadlock_diagnosis():
+    """
+    A clamped run is NOT an "alpha too loose" run: max_substeps overrode the
+    criterion, so those transitions ran coarser than alpha asked for. Lowering
+    alpha there tightens a criterion that was never what limited the step.
+    """
+    from training.train_lds import deadlock_step_hint
+
+    clean = deadlock_step_hint(alpha=0.1, n_substeps=1, max_substeps=256, clamped=0)
+    clamped = deadlock_step_hint(alpha=0.1, n_substeps=1, max_substeps=256, clamped=42)
+    assert "max_substeps" not in clean, "no clamp bound; do not mention it"
+    assert "max_substeps=256" in clamped and "42" in clamped
+    assert "raise max_substeps before lowering alpha" in clamped
 
 
 def test_END_TO_END_a_stale_checkpoint_is_NOT_restored(tmp_path, capsys,

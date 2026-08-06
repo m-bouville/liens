@@ -426,6 +426,45 @@ def test_port_writes_a_checkpoint_that_reloads(tmp_path):
     assert written["config"]["ported_from_size"] == 64
 
 
+def test_port_reestimates_batchnorm_from_a_real_sweep(tmp_path):
+    """
+    GUARDS _batches_from_sweep END-TO-END. Its lazy import named a dataset
+    class that does not exist (MicrostructureDataset) and passed a `size=`
+    kwarg the real class does not accept -- and because every other BatchNorm
+    test feeds reestimate_batchnorm_statistics batches directly, the one path
+    that builds batches from an actual sweep had never executed in any test.
+    Same lesson as the rollback: a path no test has run is a path that does
+    not work.
+
+    The second assertion guards the write-back: re-estimation mutates the live
+    encoder, and the checkpoint dict built before that point held the PRE-
+    re-estimation buffers, so a port that re-estimated but saved the old
+    model_state would pass any "it ran without error" check while writing
+    exactly what it was asked not to.
+    """
+    from test_train_lds import _build_sweep
+    from training.port_checkpoint import port_checkpoint
+    base_path = _build_sweep(tmp_path, n_runs=3, size=64)
+    src = tmp_path / "32x32-stage1.pt"
+    torch.save(_stage1_checkpoint(32), src)
+
+    out_plain = port_checkpoint(src, to_size=64, output_path=tmp_path / "plain.pt")
+    out = port_checkpoint(src, to_size=64, output_path=tmp_path / "reestimated.pt",
+                           base_path=base_path, batch_size=2, n_batches=2)
+    assert out.exists()
+
+    plain = torch.load(out_plain, map_location="cpu", weights_only=True)["model_state"]
+    written = torch.load(out, map_location="cpu", weights_only=True)["model_state"]
+    running_keys = [k for k in written
+                     if k.startswith("encoder.") and k.endswith(("running_mean", "running_var"))]
+    assert running_keys, "no BatchNorm running statistics in the ported encoder at all?"
+    assert any(not torch.equal(written[k], plain[k]) for k in running_keys), (
+        "re-estimation ran but the written checkpoint holds the pre-re-estimation "
+        "running statistics -- the model_state rebuild after reestimate_batchnorm_"
+        "statistics is not reaching the saved dict"
+    )
+
+
 def test_default_output_is_named_for_what_it_is_not_for_its_source(tmp_path):
     """
     GUARDS deriving the output name from the source. Porting a stage-2

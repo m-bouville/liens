@@ -437,6 +437,122 @@ def rescale_checkpoint_to_size(
     )
 
 
+def extract_stage1_checkpoint(
+    resume_from: Path | dict, device: str | torch.device | None = None,
+) -> dict:
+    """Stage 2 -> stage 1 at the SAME size: a single-stream, stage-1-shaped
+    checkpoint that `train_autoencoder(resume_from=...)` accepts directly.
+
+    Deliberately NOT a rescale at equal size. A rescale reinitialises the
+    bottleneck, the unbottleneck and the deepest blocks because channels[-1]
+    changes; here NOTHING changes shape, so the trunk, the state bottleneck,
+    the decoder and stats_head all carry over bit-for-bit. With
+    z0_from_deriv_weight=0, the autoencoder training stage 2 has already done
+    is ordinary stage-1 work bought at stage-2 prices -- this keeps it.
+
+    What is dropped is exactly the non-recon stream(s): their bottlenecks and
+    theta-conditioners (the recon stream is never theta-conditioned -- see
+    Autoencoder.__init__ -- so no conditioner survives at all). f_theta was
+    never part of an AE-family checkpoint and needs no handling.
+
+    Unlike a port, stats_mean/stats_std are KEPT: they are properties of the
+    DATA, and the data (same size, same sweep) has not changed. test_dirs are
+    kept for the same reason -- preserving the held-out split, so the resumed
+    stage-1 run cannot train on windows every downstream evaluation treats as
+    unseen.
+
+    epoch/val_loss ARE reset (0 / +inf, like a port): the resumed run has its
+    own save criterion and its own EMA, and a val_loss measured under stage
+    2's weighting is not a bar this run should have to clear.
+    `extracted_from_stage2` in the config records provenance.
+    """
+    device = torch.device(device or "cpu")
+
+    if isinstance(resume_from, dict):
+        prev = resume_from
+        source = "<in-memory checkpoint>"
+    else:
+        prev = torch.load(resume_from, map_location=device, weights_only=True)
+        source = str(resume_from)
+
+    model_cfg = prev["config"]
+    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
+        stream_configs, recon_stream_name, prev["model_state"],
+    )
+    dropped_streams = [n for n in stream_configs if n != recon_stream_name]
+    state_cfg = stream_configs[recon_stream_name]
+    size = int(model_cfg["size"])
+    base_channels = int(model_cfg["base_channels"])
+    latent_spatial = state_cfg.spatial_size
+
+    old_encoder_state = _strip_encoder_or_decoder_prefix(prev["model_state"], "encoder")
+    if not old_encoder_state:
+        raise ValueError(
+            f"No encoder weights found in {source} under any known key layout "
+            f"('encoders.shared.' or 'encoder.'). Keys begin: "
+            f"{sorted(prev['model_state'])[:4]}"
+        )
+    # Keep the shared trunk and the RECON stream's own bottleneck; drop every
+    # other stream's bottleneck and theta-conditioner. Filtering by the
+    # dropped streams' NAMES (not by "everything but state's") means a key
+    # belonging to neither -- a future top-level encoder parameter -- passes
+    # through and is checked by the strict load below instead of vanishing.
+    dropped_prefixes = tuple(
+        f"{group}.{name}." for name in dropped_streams
+        for group in ("bottlenecks", "theta_conditioners")
+    )
+    encoder_state = {k: v for k, v in old_encoder_state.items()
+                      if not k.startswith(dropped_prefixes)}
+
+    old_decoder_state = _strip_decoder_prefix_for_stream(
+        prev["model_state"], model_cfg, recon_stream_name)
+    if not old_decoder_state:
+        raise ValueError(
+            f"No decoder weights found in {source} for stream {recon_stream_name!r} under any "
+            f"known key layout ('decoders.<name>.', 'decoders.shared.' or 'decoder.'). Keys "
+            f"begin: {sorted(prev['model_state'])[:4]}"
+        )
+
+    # Built from a REAL Autoencoder, for the same reason the port is (see
+    # rescale_checkpoint_to_size above): train_stage1 strict-loads, and the
+    # assembled object owns state belonging to neither submodule
+    # (log_output_scale). The submodule loads are STRICT -- at equal size
+    # every key must match exactly, so any leftover or missing key is a bug
+    # here and must fail here, not at the resume.
+    autoencoder = Autoencoder(size=size, channels=1, base_channels=base_channels,
+                               latent_channels=state_cfg.channels,
+                               latent_spatial_size=latent_spatial).to(device)
+    autoencoder.encoder.load_state_dict(encoder_state)
+    autoencoder.decoder.load_state_dict(old_decoder_state)
+    model_state = {k: v.detach().clone() for k, v in autoencoder.state_dict().items()}
+
+    new_config = dict(model_cfg)
+    new_config["stream_configs"] = {
+        recon_stream_name: {
+            "channels": state_cfg.channels, "spatial_size": state_cfg.spatial_size,
+            "mode": state_cfg.mode.value, "condition_on_theta": state_cfg.condition_on_theta,
+        }
+    }
+    new_config["recon_stream_name"] = recon_stream_name
+    # Single decoder now; a stage-2 stream->decoder map describing decoders
+    # that no longer exist would fail the next resolve.
+    new_config.pop("decoder_for_stream", None)
+    new_config["extracted_from_stage2"] = True
+
+    return {
+        "model_state": model_state,
+        "stats_head_state": prev.get("stats_head_state"),
+        "epoch": 0,
+        "val_loss": float("inf"),
+        "val_loss_ema": None,
+        "normalized": prev.get("normalized", False),
+        "test_dirs": prev.get("test_dirs", []),
+        "config": new_config,
+        "stats_config": prev.get("stats_config"),
+    }
+
+
 def describe_rescale(rescaled: RescaledCheckpoint) -> str:
     """One-line-per-fact summary for the console.
 
@@ -533,127 +649,3 @@ def reestimate_batchnorm_statistics(
             "replace, and silent. Check that `batches` is not an exhausted iterator."
         )
     return seen
-
-
-def extract_stage1_checkpoint(
-    source: Path | dict, device: str | torch.device | None = None,
-) -> dict:
-    """
-    A stage-1-shaped checkpoint from a stage-2 one, AT THE SAME SIZE.
-
-    Use when stage 1 stopped early and stage 2 has since kept training the
-    autoencoder: with z0_from_deriv_weight=0, stage 2's L_deriv cannot shape
-    z0, so every improvement in its recon0/stats0 is ordinary stage-1 progress
-    bought at stage-2 prices. This hands that progress back so stage 1 can
-    resume from it instead of from its own (possibly much earlier) checkpoint.
-
-    NOT a rescale, and deliberately a separate function rather than
-    rescale_checkpoint_to_size(to_size == from_size). The two differ in the
-    thing that matters most:
-
-        rescale   channels[-1] doubles, so the bottleneck, the FiLM
-                  conditioners and the decoder's unbottleneck CANNOT carry
-                  over -- they are reinitialised, and f_theta/stats_head are
-                  discarded because the latent basis is rebuilt.
-        extract   nothing changes shape, so EVERYTHING the recon pathway
-                  owns carries over unchanged, stats_head included. The only
-                  losses are the deriv stream and its head, which stage 2
-                  rebuilds from scratch anyway.
-
-    Running a rescale at equal size would therefore throw away exactly the
-    trained weights this function exists to preserve.
-
-    stats_config is kept INTACT here, unlike in a port: stats_mean/stats_std
-    are properties of the DATA, and at the same size on the same sweep they
-    are still correct. Stripping them would force a needless recomputation and
-    would look like the port's behaviour for a reason that does not apply.
-
-    Returns the checkpoint dict; the caller writes it (see port_checkpoint.py
-    for the atomic-save + backup convention).
-    """
-    device = torch.device(device or "cpu")
-    if isinstance(source, dict):
-        prev, origin = source, "<in-memory checkpoint>"
-    else:
-        prev = torch.load(source, map_location=device, weights_only=True)
-        origin = str(source)
-
-    model_cfg = prev["config"]
-    stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(model_cfg)
-    stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
-        stream_configs, recon_stream_name, prev["model_state"],
-    )
-    dropped = [n for n in stream_configs if n != recon_stream_name]
-
-    encoder_state = _strip_encoder_or_decoder_prefix(prev["model_state"], "encoder")
-    decoder_state = _strip_decoder_prefix_for_stream(
-        prev["model_state"], model_cfg, recon_stream_name)
-    if not encoder_state or not decoder_state:
-        raise ValueError(
-            f"Could not find encoder and/or decoder weights in {origin} under any known key "
-            f"layout. Keys begin: {sorted(prev['model_state'])[:4]}"
-        )
-
-    # Only the recon stream's own bottleneck/conditioner: the ModuleDicts are
-    # keyed by stream name, so the dropped streams' entries must go with them
-    # or the single-stream Encoder will refuse them as unexpected keys.
-    keep = {}
-    for key, value in encoder_state.items():
-        parts = key.split(".")
-        if parts[0] in ("bottlenecks", "theta_conditioners"):
-            if len(parts) > 1 and parts[1] != recon_stream_name:
-                continue
-        keep[key] = value
-    encoder_state = keep
-
-    state_cfg = stream_configs[recon_stream_name]
-    size = int(model_cfg["size"])
-    autoencoder = Autoencoder(size=size, channels=1,
-                               base_channels=int(model_cfg["base_channels"]),
-                               latent_channels=state_cfg.channels,
-                               latent_spatial_size=state_cfg.spatial_size)
-    # The single-stream Autoencoder names its bottleneck without a stream key
-    # (see models/autoencoder.py's own _STREAM_NAME), so the recon stream's
-    # entries are renamed rather than dropped.
-    target = set(autoencoder.encoder.state_dict())
-    renamed = {}
-    for key, value in encoder_state.items():
-        if key not in target:
-            stripped = key.replace(f".{recon_stream_name}.", ".", 1)
-            if stripped in target:
-                key = stripped
-        renamed[key] = value
-    autoencoder.encoder.load_state_dict(renamed)
-    autoencoder.decoder.load_state_dict(decoder_state)
-    autoencoder = autoencoder.to(device)
-
-    new_config = dict(model_cfg)
-    new_config["stream_configs"] = {
-        recon_stream_name: {"channels": state_cfg.channels,
-                             "spatial_size": state_cfg.spatial_size,
-                             "mode": state_cfg.mode.value,
-                             "condition_on_theta": state_cfg.condition_on_theta}
-    }
-    new_config["recon_stream_name"] = recon_stream_name
-    new_config.pop("decoder_for_stream", None)
-    new_config["extracted_from_stage2"] = True
-
-    if dropped:
-        print(f"extracted a stage-1 checkpoint from {origin}: kept the recon pathway "
-              f"({recon_stream_name} + its decoder + stats_head), dropped stream(s) {dropped}. "
-              f"Nothing was reinitialised -- the size is unchanged, so every trained weight the "
-              f"recon pathway owns carries over.")
-
-    return {
-        "model_state": {k: v.detach().clone() for k, v in autoencoder.state_dict().items()},
-        # stats_head0 is on the recon latent, whose basis is UNCHANGED here, so
-        # unlike a port its weights are still meaningful.
-        "stats_head_state": prev.get("stats_head_state"),
-        "epoch": 0,
-        "val_loss": float("inf"),
-        "val_loss_ema": None,
-        "normalized": prev.get("normalized", False),
-        "test_dirs": prev.get("test_dirs", []),
-        "config": new_config,
-        "stats_config": prev.get("stats_config"),
-    }

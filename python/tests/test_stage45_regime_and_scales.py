@@ -56,7 +56,17 @@ def test_all_three_semantic_parameters_reach_stage45():
     """
     refinement = source_without_comments(_ROOT / "training/train_refinement.py")
     assembly = source_without_comments(_ROOT / "training/model_assembly.py")
-    assert 'lds_cfg.get("n_substeps", 1)' in assembly
+    # n_substeps now arrives through the SHARED field list rather than by name.
+    # It had to change: alpha was added to the config and to train_lds and NOT
+    # here, so stage 4 rebuilt an adaptive f_theta as a one-shot corrector at
+    # dt=500 and skipped every batch by epoch 4 -- a FOURTH incident of exactly
+    # the pattern this test was written to prevent, arriving because the test
+    # named one field instead of requiring the list.
+    from models.latent_dynamics import _MEANING_FIELDS
+    assert "integration_kwargs_from_config(lds_cfg)" in assembly, (
+        "stage 4/5 does not rebuild f_theta from the shared field list"
+    )
+    assert "n_substeps" in _MEANING_FIELDS and "alpha" in _MEANING_FIELDS
     assert 'lds_data_config.get("max_dt")' in refinement
     assert 'config.get("z1_resync", True)' in refinement
 
@@ -272,10 +282,25 @@ def test_the_reset_grace_is_at_least_two_epochs():
     GUARDS max(1, ...). A single-epoch grace is mathematically IDENTICAL to no
     grace: with only one epoch there is no second value for the EMA to blend
     with, so best_val_loss ends up as that epoch's own raw value, lucky or
-    not. Stage 2 records the same derivation.
+    not.
+
+    BEHAVIORAL, against the shared derivation (three callers now: stage 2's
+    deriv-target switch, this ramp, and stage 3's non-comparable resume). The
+    source-matching version asserted the inlined expression and so broke on
+    extraction while saying nothing about the property -- and would have
+    passed a max(1, ...) written any other way.
     """
+    from training.checkpoint_criterion import grace_epochs_for_ema
+    assert grace_epochs_for_ema(0.0) == 2, "no smoothing at all still needs the floor"
+    assert grace_epochs_for_ema(0.5) == 2
+    assert grace_epochs_for_ema(1.0) == 2, "an infinite window has no derived length"
+    assert grace_epochs_for_ema(0.7) == 3, "1/(1-0.7) = 3.33 -> 3"
+    assert grace_epochs_for_ema(0.9) == 10
+    assert grace_epochs_for_ema(0.99) == 100
+
+    # And this trainer must use it rather than re-deriving it.
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "max(2, round(1 / (1 - val_ema_decay)))" in src
+    assert "grace_epochs_for_ema(val_ema_decay)" in src
 
 
 def test_the_reset_is_clamped_against_the_remaining_epochs():

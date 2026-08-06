@@ -34,7 +34,7 @@ from models.latent_streams import (
     resolve_stream_configs_from_checkpoint_config,
 )
 from training.checkpoint_criterion import (
-    CheckpointCriterionTracker, atomic_torch_save, clamp_grace_epochs,
+    CheckpointCriterionTracker, atomic_torch_save, clamp_grace_epochs, grace_epochs_for_ema,
 )
 from training.checkpoint_components import cross_check_ancestor_config
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
@@ -277,14 +277,15 @@ def _load_frozen_encoder(
 # Re-exported: the definitions moved to training/spike_guard.py when stages
 # 4 and 5 became a second caller. Kept importable from here so existing
 # callers and tests (tests/test_spike_guard.py) are unaffected.
-from training.spike_guard import _SpikeGuard, _record_spike  # noqa: E402,F401
+from training.spike_guard import _SpikeGuard, _record_spike, end_epoch_pair  # noqa: E402,F401
+from utils.logging_utils import print_run_parameters
 
 
 def _resume_f_theta_from_checkpoint(
     f_theta: torch.nn.Module, resume_from: Path, ae_config: dict,
     hidden_dim: int, n_hidden_layers: int, dt_cap: float, n_substeps: int,
     n_rollout_steps: int,
-    device: torch.device,
+    device: torch.device, alpha: float | None = None,
 ) -> float | None:
     """
     Loads f_theta's weights from a prior LDS checkpoint (curriculum
@@ -354,13 +355,38 @@ def _resume_f_theta_from_checkpoint(
         # legitimately at that boundary and is warned about rather than
         # refused.
         prev_n_substeps = prev_config.get("n_substeps", 1)
-        if prev_n_substeps != n_substeps:
+        # SUPPRESSED when alpha is set, because n_substeps is then a
+        # placeholder, not a description. alpha leaves n_substeps at 1 by
+        # construction (setting both is an error), so resuming an n_substeps=7
+        # checkpoint under alpha printed "now running at n_substeps=1 ... going
+        # N -> 1 would use a pointwise f_theta as a one-shot corrector" -- a
+        # warning about the exact configuration alpha exists to prevent, fired
+        # at a run that was sub-stepping adaptively the whole time. Reported on
+        # a real run and read as alarming, which is worse than silence: the
+        # alpha NOTE just below says the true thing about the same change.
+        if prev_n_substeps != n_substeps and alpha is None:
             print(f"NOTE: resuming from a checkpoint trained at n_substeps="
                   f"{prev_n_substeps}, now running at n_substeps={n_substeps}. This is the "
                   f"expected 3a -> 3b direction if it is 1 -> N: f_theta was fitted as a "
                   f"dt-AVERAGED corrector over the whole step and will now be refined toward "
                   f"the pointwise z1_dot the sub-stepped integrator needs. Going N -> 1 "
                   f"instead would use a pointwise f_theta as a one-shot corrector, which is "
+                  f"NOT equivalent -- double-check that is intentional.\n")
+
+        # alpha REPORTED on change, same treatment as n_substeps and for the
+        # same reason: it changes what f_theta means (a corrector calibrated to
+        # one step size, now being asked to serve another), but changing it is
+        # a legitimate operation -- it is how a run moves from a fixed count to
+        # the adaptive criterion at all. Fatal would block the transition the
+        # parameter exists to enable.
+        prev_alpha = prev_config.get("alpha")
+        if prev_alpha != alpha:
+            print(f"NOTE: resuming from a checkpoint trained at alpha={prev_alpha}, now "
+                  f"running at alpha={alpha}. alpha bounds the curvature correction as a "
+                  f"fraction of the linear term, so a SMALLER alpha refines f_theta toward "
+                  f"the pointwise z1_dot a finer step needs -- the same direction as raising "
+                  f"n_substeps. Going the other way (larger alpha, or alpha -> None) asks a "
+                  f"finely-fitted f_theta to act as a coarser one-shot corrector, which is "
                   f"NOT equivalent -- double-check that is intentional.\n")
 
         # COMPARABLE ANCESTOR -> its val_loss is a valid ceiling.
@@ -375,8 +401,15 @@ def _resume_f_theta_from_checkpoint(
         # 0.563700, saved 0.568295 at its epoch 234, and early-stopped at 734
         # having never beaten its own ancestor -- a 0.82% regression written
         # over a better checkpoint.
+        # alpha joins the key for the same reason n_substeps is in it: both
+        # decide the step the corrector was fitted against, so an ancestor
+        # trained under a different one measured a different quantity and its
+        # val_loss is not a bar this run should clear. Omitting it would let an
+        # alpha change inherit a ceiling from a differently-integrated run --
+        # the silent version of the failure the ceiling exists to prevent.
         _comparable = (prev_n_rollout == n_rollout_steps
-                       and prev_config.get("n_substeps", 1) == n_substeps)
+                       and prev_config.get("n_substeps", 1) == n_substeps
+                       and prev_config.get("alpha") == alpha)
         _reference = float(prev_lds["val_loss"]) if (
             _comparable and prev_lds.get("val_loss") is not None) else None
         if prev_n_rollout is not None and n_rollout_steps <= prev_n_rollout:
@@ -387,6 +420,60 @@ def _resume_f_theta_from_checkpoint(
                   f"is intentional.\n")
 
     return _reference
+
+def deadlock_step_hint(alpha: float | None, n_substeps: int, max_substeps: int,
+                        clamped: int) -> str:
+    """The step-size advice printed when training deadlocks, branched on which
+    knob actually sets delta_t.
+
+    A PURE FUNCTION taking the four values it needs, rather than text inlined
+    in the epoch loop, so the advice can be tested by READING IT. The inlined
+    version could only be checked by asserting substrings against train_lds.py
+    itself, and that test broke the moment the text was legitimately branched
+    -- it asserted "n_substeps scales with", which the branched wording spells
+    "n_substeps (currently 7) scales with max_dt". A test that fails on a
+    correct change while saying nothing about whether the ADVICE is right is
+    the failure mode this project keeps re-learning.
+
+    Why the branch exists at all: with alpha set, delta_t is derived from
+    |f_theta|/|z1| per transition and has nothing to do with max_dt or
+    n_substeps, so the unbranched text sent an adaptive run's reader to a
+    parameter that does nothing -- at the exact moment they are choosing what
+    to change.
+
+    `clamped` gets its own sentence because a binding max_substeps means the
+    criterion was OVERRIDDEN: those transitions ran COARSER than alpha asked
+    for, which calls for raising max_substeps, not for lowering alpha. Reading
+    a clamped run as "alpha too loose" tightens a criterion that was never
+    what limited the step.
+    """
+    if alpha is None:
+        return (f"check that n_substeps (currently {n_substeps}) scales with max_dt "
+                f"(delta_t = max_dt/n_substeps must stay roughly constant), or switch "
+                f"to alpha, which derives delta_t per transition instead of assuming "
+                f"the save schedule tracks the local timescale.")
+    return (f"LOWER alpha (currently {alpha:g}) -- that is the step-size lever here; "
+            f"max_dt and n_substeps do not set delta_t when alpha is in use. Calibrate "
+            f"it with evaluation/check_alpha.py against a configuration known to be "
+            f"stable, anchoring on that run's MEDIAN alpha rather than its tail."
+            + (f" NOTE: max_substeps={max_substeps} bound on {clamped} transition(s), so "
+               f"those ran COARSER than alpha asked for -- raise max_substeps before "
+               f"lowering alpha further, or the criterion is not what limited them."
+               if clamped else ""))
+
+
+_LDS_PREAMBLE_PARAMS = (
+    # Already printed above, WITH their own context -- max_dt next to the
+    # exclusion rule it implies, the dt-decade weights next to the decades
+    # they were measured from. Repeating them in the block below would make
+    # it noisy enough to stop being read, which is how the old hand-rolled
+    # preamble drifted in the first place.
+    "min_step", "min_stdev_phi", "min_passing_steps", "ae_stats_weight", "max_dt",
+    "n_rollout_steps", "one_step_weight", "grad_clip", "lr_warmup_steps",
+    "z0_noise_scale", "lr", "seed", "epochs", "batch_size", "early_stopping_patience",
+    "use_dt_decade_weights", "n_substeps",
+)
+
 
 def train_lds(
     size: int, base_path: Path,
@@ -414,7 +501,8 @@ def train_lds(
     one_step_weight: float = 0.0,
     use_dt_decade_weights: bool = False,
     z0_noise_scale: float = 0.0,
-    dt_cap: float = float("inf"), n_substeps: int = 1, z1_resync: bool = True,
+    dt_cap: float = float("inf"), n_substeps: int = 1, alpha: float | None = None,
+    max_substeps: int = 256, z1_resync: bool = True,
     latent_cache_dir: Path | str | None = None,
 ) -> Path:
     """
@@ -605,6 +693,7 @@ def train_lds(
     print(f"n_rollout_steps={n_rollout_steps}  one_step_weight={one_step_weight}")
     print(f"grad_clip={grad_clip}  lr_warmup_steps={lr_warmup_steps}  z0_noise_scale={z0_noise_scale}")
     print(f"lr={lr}  seed={seed}")
+    print_run_parameters(train_lds, locals(), _LDS_PREAMBLE_PARAMS)
 
     encoder, ae_checkpoint, ae_config, ae_checkpoint_path = _load_frozen_encoder(
         ae_checkpoint_path, ae_latent_channels, ae_stats_weight, size, condition_on_theta, device,
@@ -696,7 +785,8 @@ def train_lds(
     f_theta = LatentDynamics(latent_channels=ae_config["latent_channels"], n_theta=1,
                               latent_spatial=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
-                              dt_cap=dt_cap, n_substeps=n_substeps).to(device)
+                              dt_cap=dt_cap, n_substeps=n_substeps, alpha=alpha,
+                              max_substeps=max_substeps).to(device)
 
     # Global per-decade loss weights, computed ONCE from train_set's own
     # full dt distribution AND its own raw per-transition loss
@@ -720,7 +810,7 @@ def train_lds(
 
     _ancestor_reference = _resume_f_theta_from_checkpoint(
         f_theta, resume_from, ae_config, hidden_dim, n_hidden_layers, dt_cap, n_substeps,
-        n_rollout_steps, device,
+        n_rollout_steps, device, alpha=alpha,
     )
 
     step_weights_tensor = torch.tensor(step_weights, dtype=torch.float32, device=device) \
@@ -937,6 +1027,38 @@ def train_lds(
         print(f"reference ceiling: this run must BEAT the ancestor's own val_loss "
               f"({_ancestor_reference:.6f}) to save, since it measures the same quantity "
               f"(same n_rollout_steps and n_substeps).")
+    elif resume_from is not None:
+        # THE 3a -> 3b BOUNDARY. _ancestor_reference is None here precisely
+        # because _resume_f_theta_from_checkpoint judged the ancestor
+        # NON-comparable -- a different n_rollout_steps or n_substeps, i.e. the
+        # objective itself changed. That verdict is already computed for the
+        # ceiling; this is the second thing it implies.
+        #
+        # Without it the EMA seeds on the FIRST epoch's val_loss under the new,
+        # much larger objective and then relaxes downward toward the true
+        # level, minting a new "best" nearly every epoch on the way -- purely
+        # from the EMA settling, not from the model improving. Observed
+        # directly in a 3b log: the EMA entered at 211.7 against a val_loss of
+        # ~85 and saved on ten of its first eleven epochs, while BOTH val
+        # components were flat or worsening (rollout 85.5 -> 91.0, 1-step
+        # 0.665 -> 0.677). Those saves overwrite a 3a checkpoint that was
+        # genuinely better at what it measured.
+        #
+        # Exactly what stage 2 does at its deriv-target switch and stage 4/5
+        # at the end of the rollout ramp -- same mechanism, same fix, and now
+        # the same derivation (grace_epochs_for_ema). The 3a -> 3b handoff
+        # changes the objective at least as much as either: 1 -> N rollout
+        # steps, and one_step_weight typically 0 -> 0.5.
+        _grace = clamp_grace_epochs(grace_epochs_for_ema(val_ema_decay), max(1, epochs))
+        if _grace > 0:
+            print(f"resumed from an ancestor trained on a DIFFERENT objective "
+                  f"(n_rollout_steps/n_substeps differ), so its val_loss is not a bar this "
+                  f"run should clear -- giving the tracker a {_grace}-epoch grace period "
+                  f"before saving, so the EMA settles at the new objective's own scale "
+                  f"instead of saving its way down.")
+            tracker.reset_with_grace(_grace)
+    # None until the first adaptive epoch reports; see the drift note below.
+    _last_substep_mean = None
     epochs_since_improvement = 0
 
     show_1step = n_rollout_steps > 1  # at n=1, L_1step == L_rollout always -- redundant to show
@@ -981,11 +1103,19 @@ def train_lds(
                 train_1step_sum += l_1step * bs
             train_loss = (train_loss_sum / n_train).item()
             train_1step = (train_1step_sum / n_train).item()
+            # Captured HERE, between the train and val loops, so the reported
+            # sub-step drift is measured on TRAINING transitions only. Found
+            # by review: the capture used to sit after the val loop, so every
+            # epoch's number averaged the (fixed) val population into the
+            # train one -- diluting exactly the drift-with-training the report
+            # exists to show, and making "transitions" count both.
+            _train_substeps = f_theta.substep_stats()
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
             # "epoch", rather than a misleading 0.0.
             train_loss = train_1step = float("nan")
+            _train_substeps = None
 
         f_theta.eval()
         val_loss_sum = torch.zeros((), device=device)
@@ -1007,9 +1137,9 @@ def train_lds(
         # blocks every step forever. The best checkpoint on disk is by
         # construction from before the damage, so restoring it returns the run
         # to a known-good state and lets it continue.
-        _deadlocked = spike_guard.end_epoch(
-            _n_train_batches, extra_skipped=grad_guard.n_skipped_this_epoch)
-        grad_guard.end_epoch(_n_train_batches, extra_skipped=spike_guard.n_skipped_this_epoch)
+        # BOTH counts captured before either reset -- see end_epoch_pair's own
+        # docstring for the ordering bug this replaces.
+        _deadlocked = end_epoch_pair(spike_guard, grad_guard, _n_train_batches)
         if _deadlocked and spike_guard.consecutive_total_skip_epochs >= spike_deadlock_epochs:
             # THIS RUN's own save, not merely a file at the path.
             #
@@ -1035,6 +1165,9 @@ def train_lds(
                 # Raising instead propagated out of run_lds_stage and killed
                 # the whole params file, so stages 4 and 5 never ran -- with a
                 # perfectly good val_loss=1.074618 checkpoint sitting on disk.
+                _step_hint = deadlock_step_hint(
+                    alpha, n_substeps, max_substeps,
+                    getattr(f_theta, "n_substeps_clamped", 0))
                 if _have_checkpoint:
                     _best = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
                     print(f"\nSTOPPING at epoch {epoch}: every batch has been skipped for "
@@ -1043,8 +1176,8 @@ def train_lds(
                           f"continue. Keeping the best checkpoint (epoch {_best['epoch']}, "
                           f"val_loss={_best['val_loss']:.6f}), which is what an ordinary early "
                           f"stop would have returned.\n"
-                          f"  To get further: LOWER lr (currently {lr:g}) -- that is the lever. "
-                          f"RAISING spike_skip_factor (currently {spike_skip_factor:g}) only "
+                          f"  To get further: LOWER lr (currently {lr:g}), or {_step_hint}\n"
+                          f"  RAISING spike_skip_factor (currently {spike_skip_factor:g}) only "
                           f"lets the damaging batches through; lowering it skips MORE and "
                           f"deadlocks sooner.\n")
                     break
@@ -1059,8 +1192,7 @@ def train_lds(
                        if not _saved_this_run else
                        "no checkpoint exists to roll back to or to keep. ")
                     + f"The loss was already diverging before any gradient step, so lr is "
-                      f"unlikely to be the whole story -- check that n_substeps scales with "
-                      f"max_dt (delta_t = max_dt/n_substeps must stay roughly constant). "
+                      f"unlikely to be the whole story -- {_step_hint} "
                       f"lr is currently {lr:g}.")
             _n_rollbacks += 1
             _restored = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -1094,7 +1226,7 @@ def train_lds(
             # The restored checkpoint's own val_loss is the honest bar: it is
             # this model's measured performance, so it seeds the reference
             # ceiling exactly as stage 1/2's reference row does.
-            _grace = max(2, round(1 / (1 - val_ema_decay))) if val_ema_decay < 1 else 2
+            _grace = grace_epochs_for_ema(val_ema_decay)
             _grace = clamp_grace_epochs(_grace, epochs - epoch + 1)
             tracker.reset_with_grace(_grace, reference_val_loss=float(_restored["val_loss"]))
             epochs_since_improvement = 0
@@ -1175,6 +1307,12 @@ def train_lds(
                     "hidden_dim": hidden_dim, "n_hidden_layers": n_hidden_layers,
                     "dt_cap": dt_cap,
                     "n_substeps": n_substeps,
+                    # alpha belongs here for the same reason dt_cap does: it
+                    # defines what f_theta was fitted to MEAN. Two checkpoints
+                    # with the same weights and different alpha are corrections
+                    # calibrated to different step sizes.
+                    "alpha": alpha,
+                    "max_substeps": max_substeps,
                     "z1_resync": z1_resync,
                 },
                 "data_config": {
@@ -1219,6 +1357,26 @@ def train_lds(
                          f"({_ema_before:.4f}), with train={train_loss:.4f}. "
                          f"If train is normal the weights are fine and a few VAL "
                          f"windows are diverging; if train spiked too, the weights moved.")
+            # THE DRIFT, made visible. alpha's justification over a fixed
+            # count is that the step tightens on its own as f_theta sharpens;
+            # without the realised count in the log that is an assertion, not
+            # an observation. Reported on a CHANGE rather than every epoch --
+            # a constant repeated 5000 times is noise, a movement from 18 to
+            # 26 sub-steps is the mechanism working (or, if it never moves,
+            # evidence that alpha merely picked a lucky constant).
+            # Discard the VAL transitions accumulated since the train capture
+            # -- without this they would leak into the next epoch's train
+            # numbers, which is the same mixing one loop later.
+            f_theta.substep_stats()
+            _substeps = _train_substeps
+            if _substeps is not None:
+                _mean = _substeps["mean"]
+                if (_last_substep_mean is None
+                        or abs(_mean - _last_substep_mean) > 0.05 * max(_last_substep_mean, 1e-9)):
+                    _mark += (f"   [sub-steps: mean {_mean:.1f}, max {_substeps['max']}"
+                              + (f", CLAMPED {_substeps['clamped']}x at max_substeps"
+                                 if _substeps["clamped"] else "") + "]")
+                    _last_substep_mean = _mean
             print(msg + _mark)
 
         # Only counts post-warmup, since raw val_loss during warmup can be
@@ -1336,6 +1494,19 @@ def main():
                               "window's own |z1(t0)|*dt Euler-step magnitude -- see "
                               "train_lds()'s own docstring for the full rationale (default "
                               "0.0: off, exact prior behavior)")
+    parser.add_argument("--alpha", type=float, default=None,
+                         help="Taylor-validity ratio: the curvature correction may contribute "
+                              "at most this fraction of the linear term, |f_theta|*delta_t/|z1| "
+                              "<= alpha. REPLACES --n-substeps (giving both is an error): the "
+                              "sub-step count is derived per transition per sample, so the step "
+                              "follows the local dynamics instead of the save schedule and one "
+                              "setting stays valid across a dt range. Calibrate with "
+                              "evaluation/check_alpha.py rather than guessing")
+    parser.add_argument("--max-substeps", type=int, default=256,
+                         help="cost bound on the derived count, for the |z1|->0 corner where the "
+                              "ratio criterion admits no step at all. Not a stability bound; if "
+                              "it binds routinely that is a finding about the data, so it is "
+                              "counted and reported rather than silently applied")
     parser.add_argument("--n-substeps", type=int, default=1,
                          help="integration steps taken BETWEEN two real frames (default 1 = "
                               "today's behaviour, and stage 3a's configuration). delta_t = dt/N, "
@@ -1377,7 +1548,8 @@ def main():
         ae_stats_weight=args.ae_stats_weight,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
-        dt_cap=args.dt_cap, n_substeps=args.n_substeps, z1_resync=args.z1_resync,
+        dt_cap=args.dt_cap, n_substeps=args.n_substeps, alpha=args.alpha,
+        max_substeps=args.max_substeps, z1_resync=args.z1_resync,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
         num_workers=args.num_workers, n_rollout_steps=args.n_rollout_steps,
         min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,

@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from utils.logging_utils import print_run_parameters
 from models.autoencoder import MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -25,6 +26,7 @@ from models.latent_streams import cross_check_stream_configs_against_state_dict,
                                    resolve_stream_configs_from_checkpoint_config
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save, clamp_grace_epochs,
+    grace_epochs_for_ema,
 )
 from training.checkpoint_components import cross_check_ancestor_config
 from training.extend_encoder import extend_state_checkpoint_with_deriv_stream
@@ -64,6 +66,15 @@ def _compact_loss(value: float, width: int = 7, precision: int = 4) -> str:
     """
     fixed = f"{value:{width}.{precision}f}"
     return fixed if len(fixed) <= width else f"{value:{width}.{precision}g}"
+
+
+_STAGE2_PREAMBLE_PARAMS = (
+    # See train_lds's _LDS_PREAMBLE_PARAMS for why these are excluded here.
+    "deriv_weight", "deriv_weight_warmup_epochs", "stats0_weight", "stats1_weight",
+    "z0_from_deriv_weight", "deriv_dt_weight_exponent", "deriv_target_centered",
+    "val_aug_averaging", "recon0_scale", "epochs", "batch_size", "augment",
+    "early_stopping_patience", "n_frozen_stages",
+)
 
 
 def train_stage2(
@@ -597,6 +608,7 @@ def train_stage2(
         checkpoint_path = _PYTHON_ROOT / "checkpoints" / "stage2" / f"{name}-stage2.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
+    print_run_parameters(train_stage2, locals(), _STAGE2_PREAMBLE_PARAMS)
 
     if loss_curve_path is None:
         name = ae_checkpoint_name(size, model_cfg["latent_channels"], ancestor_stats_weight)
@@ -1170,7 +1182,7 @@ def train_stage2(
             # epoch, there's no second value for the ema to blend with,
             # so best_val_loss at the moment grace ends is exactly that
             # one epoch's own raw value, lucky or not.
-            grace_epochs = max(2, round(1 / (1 - val_ema_decay))) if val_ema_decay < 1 else 2
+            grace_epochs = grace_epochs_for_ema(val_ema_decay)
             # Clamped against the epochs ACTUALLY remaining after this
             # one -- see clamp_grace_epochs' own docstring. Without
             # this, a switch late in a short run (or any run with fewer

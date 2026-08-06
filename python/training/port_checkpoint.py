@@ -71,7 +71,7 @@ def _batches_from_sweep(base_path: Path, size: int, batch_size: int, n_batches: 
     Imported lazily so that the common path -- port without re-estimation --
     does not pay for the dataset machinery or require a sweep to exist at all.
     """
-    from training.datasets import MicrostructureDataset  # noqa: PLC0415
+    from training.datasets import MicrostructureSnapshotDataset  # noqa: PLC0415
     from utils import load_datasets as load  # noqa: PLC0415
 
     run_dirs = load.enumerate_run_dirs_from_metadata(base_path, size, size)
@@ -85,7 +85,7 @@ def _batches_from_sweep(base_path: Path, size: int, batch_size: int, n_batches: 
     # count below pools populations evolved to different times.
 
     report_save_step_distribution(run_dirs)
-    dataset = MicrostructureDataset(run_dirs, size=size, include_stats=False)
+    dataset = MicrostructureSnapshotDataset(run_dirs, include_stats=False)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     for i, batch in enumerate(loader):
         if i >= n_batches:

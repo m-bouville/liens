@@ -6,6 +6,7 @@ from pathlib import Path
 from utils import load_datasets as load
 from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2
+from training.checkpoint_criterion import grace_epochs_for_ema
 from training.train_lds import train_lds
 
 
@@ -609,3 +610,132 @@ def test_dt_cap_mismatch_on_resume_raises_a_clear_error(tmp_path, isolated_proje
             checkpoint_path=tmp_path / "stage3b.pt", device="cpu", seed=0,
             log_every_epoch=False, loss_curve_path=tmp_path / "curve3b.png",
         )
+
+
+def _train_3a(tmp_path, base_path, stage2_path, **overrides):
+    """A minimal stage-3a checkpoint to resume from."""
+    kwargs = dict(
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
+        epochs=1, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        n_rollout_steps=1, min_step=0, min_stdev_phi=None,
+        encode_batch_size=4, ema_warmup_epochs=0,
+        checkpoint_path=tmp_path / "stage3a.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve3a.png",
+    )
+    kwargs.update(overrides)
+    return train_lds(**kwargs)
+
+
+def _train_3b(tmp_path, base_path, stage2_path, stage3a_path, capsys=None, **overrides):
+    kwargs = dict(
+        size=32, base_path=base_path, resume_from=stage3a_path,
+        ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
+        epochs=4, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        n_rollout_steps=2, min_step=0, min_stdev_phi=None,
+        encode_batch_size=4, ema_warmup_epochs=0, val_ema_decay=0.7,
+        checkpoint_path=tmp_path / "stage3b.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve3b.png",
+    )
+    kwargs.update(overrides)
+    return train_lds(**kwargs)
+
+
+def test_a_non_comparable_resume_gets_a_grace_period(tmp_path, isolated_project_root, capsys):
+    """
+    3a -> 3b changes the objective (n_rollout_steps 1 -> 2), so the ancestor's
+    val_loss is not a bar this run should clear -- and, less obviously, the
+    EMA now seeds on a val_loss measured under the NEW objective and relaxes
+    toward its true level, minting a "best" almost every epoch on the way
+    down. Observed in a real 3b log: the EMA entered at 211.7 against ~85 and
+    saved on ten of its first eleven epochs while both val components were
+    flat or worsening.
+
+    BEHAVIORAL: no save may happen during the grace window, whatever the
+    numbers do. Asserted through the checkpoint's own recorded epoch rather
+    than through log text.
+    """
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
+    stage3a_path = _train_3a(tmp_path, base_path, stage2_path)
+    saved_epochs = []
+    _train_3b(tmp_path, base_path, stage2_path, stage3a_path,
+              on_checkpoint_saved=lambda path, epoch: saved_epochs.append(epoch))
+
+    grace = grace_epochs_for_ema(0.7)
+    assert grace >= 2
+    early = [e for e in saved_epochs if 1 <= e <= grace]
+    assert not early, (
+        f"saved at epoch(s) {early} inside the {grace}-epoch grace window -- the EMA is "
+        f"still relaxing from its seed under the new objective, so those 'improvements' "
+        f"are the tracker settling, not the model learning"
+    )
+
+
+def test_a_COMPARABLE_resume_gets_no_grace_period(tmp_path, isolated_project_root, capsys):
+    """
+    The counterpart, and the reason this is gated on the ancestor's
+    COMPARABILITY rather than on resume_from alone: when n_rollout_steps and
+    n_substeps match, the ancestor's val_loss measures the same quantity, the
+    reference ceiling applies, and a grace period would only delay a save the
+    run is entitled to make.
+
+    The two branches are mutually exclusive, which is what makes this
+    checkable without depending on whether the run happens to improve: a
+    comparable resume announces its ceiling and no grace, a non-comparable one
+    the reverse. An earlier version of this test asserted only that the
+    ceiling still held -- true under BOTH branches, so widening the gate to
+    `if resume_from is not None` kept it green. Verified.
+    """
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
+    stage3a_path = _train_3a(tmp_path, base_path, stage2_path)
+    capsys.readouterr()
+
+    _train_3b(tmp_path, base_path, stage2_path, stage3a_path,
+              n_rollout_steps=1,  # SAME as the ancestor -> comparable
+              checkpoint_path=tmp_path / "stage3b-same.pt")
+    out = capsys.readouterr().out
+    assert "reference ceiling" in out, (
+        "a comparable resume must apply the ancestor's val_loss as a ceiling"
+    )
+    assert "grace period" not in out, (
+        "a comparable resume was given a grace period -- it measures the same "
+        "quantity as its ancestor, so there is nothing for the EMA to re-seed on, "
+        "and the delay only blocks saves the run has earned"
+    )
+
+
+def test_the_grace_and_the_ceiling_are_the_same_verdict(tmp_path, isolated_project_root, capsys):
+    """
+    Both branches read the SAME comparability judgement, made once inside
+    _resume_f_theta_from_checkpoint. Pinning that they never both fire (or
+    both stay silent) on a resume keeps them from drifting into two
+    independent notions of "is this ancestor comparable".
+    """
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
+    stage3a_path = _train_3a(tmp_path, base_path, stage2_path)
+    capsys.readouterr()
+
+    _train_3b(tmp_path, base_path, stage2_path, stage3a_path,
+              checkpoint_path=tmp_path / "stage3b-diff.pt")
+    out = capsys.readouterr().out
+    assert ("grace period" in out) != ("reference ceiling" in out), (
+        "exactly one of the ceiling and the grace period must apply on a resume -- "
+        "they are two consequences of one comparability verdict"
+    )
+    assert "grace period" in out, "a non-comparable resume (1 -> 2 steps) must get the grace"
+
+
+def test_the_grace_period_cannot_swallow_every_epoch(tmp_path, isolated_project_root):
+    """
+    clamp_grace_epochs, at the one new call site. A short 3b run must still
+    produce a file: a grace period covering every epoch means no checkpoint at
+    all, which downstream sees as a confusing FileNotFoundError rather than a
+    worse model. Same failure this clamp was added for twice before.
+    """
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
+    stage3a_path = _train_3a(tmp_path, base_path, stage2_path)
+    out = _train_3b(tmp_path, base_path, stage2_path, stage3a_path,
+                    epochs=1,  # shorter than the derived grace of 3
+                    checkpoint_path=tmp_path / "stage3b-short.pt")
+    assert out.exists(), "a short non-comparable resume produced no checkpoint at all"

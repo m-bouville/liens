@@ -48,6 +48,32 @@ def clamp_grace_epochs(requested: int, epochs_remaining: int) -> int:
     return max(0, min(requested, epochs_remaining - 1))
 
 
+def grace_epochs_for_ema(val_ema_decay: float) -> int:
+    """The EMA's own effective averaging window, 1/(1-decay), as a grace
+    period -- the right length for any reset where the criterion's MEANING
+    changed and the EMA must re-fill with values measured under the new one.
+
+    Not a free parameter, which is why it is derived rather than exposed: it
+    follows from val_ema_decay, and a separately-settable grace could be set
+    inconsistently with the decay it is supposed to track.
+
+    max(2, ...), NOT max(1, ...): a single-epoch grace is mathematically
+    IDENTICAL to no grace at all (see reset_with_grace's own docstring) --
+    with one epoch there is no second value for the EMA to blend with, so
+    best_val_loss at the moment grace ends is exactly that one epoch's raw
+    value, lucky or not. val_ema_decay >= 1 has no finite window and falls
+    back to the same floor.
+
+    Extracted once there were THREE callers (stage 2's deriv-target switch,
+    stage 4/5's rollout ramp completing, stage 3's non-comparable resume) --
+    the same criterion the spike guard was extracted under. Callers still
+    clamp with clamp_grace_epochs afterwards: that answers a different
+    question (will any epoch be left able to save) from this one (how long
+    until the EMA means anything).
+    """
+    return max(2, round(1 / (1 - val_ema_decay))) if val_ema_decay < 1 else 2
+
+
 @dataclass
 class CheckpointCriterionTracker:
     """

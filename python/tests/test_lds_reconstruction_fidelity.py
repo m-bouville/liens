@@ -2,19 +2,24 @@
 Every place that rebuilds a LatentDynamics from a checkpoint must carry the
 parameters that change what f_theta MEANS.
 
-There are FOUR independent reconstructions -- evaluation/_latent_eval.py,
-evaluation/check_rollout.py, training/model_assembly.py and
-evaluation/compare_rollout_training.py -- and compare_rollout_training's own
-comment records that fixing dt_cap in the others did not fix it there. So this
-is checked collectively, once, rather than trusting four copies to stay in
-step.
+HISTORY, because it is the argument for how these tests are now written. There
+were FIVE independent reconstructions, each with its own hand-written list of
+fields, and each new field had to be added at all of them: dt_cap was fixed
+three times before it was right (compare_rollout_training's own comment
+recorded that fixing it elsewhere "did NOT fix it here"), n_substeps was missed
+at all four sites at once, and alpha then reached four of five -- so stage 4
+rebuilt an f_theta fitted at delta_t~36 and ran it ONE-SHOT at dt=500, skipping
+325 of 325 batches by epoch 4.
 
-n_substeps was missed at all four when it was introduced. The consequence is
-silent and severe: a checkpoint trained at n_substeps=N carries a POINTWISE
-z1_dot, and rebuilding it at n_substeps=1 applies that as a one-shot corrector
-over the whole dt -- the "NOT equivalent" direction train_lds explicitly warns
-about on resume. The weights load cleanly, so no error is raised; the
-diagnostic simply reports the wrong model.
+The fields now come from ONE list (models.latent_dynamics._MEANING_FIELDS) via
+integration_kwargs_from_config, so this file no longer asserts per-site
+literals like '.get("dt_cap", float("inf"))'. Those assertions were themselves
+a symptom: written once per site per field, they broke on the refactor that
+made the whole class of bug impossible, while saying nothing about whether the
+propagation was correct. The field-level checks live in
+test_integration_config_propagation.py; what remains here is the SITE
+enumeration and the historical-default guarantee, expressed against the shared
+list.
 """
 import ast
 import pathlib
@@ -41,7 +46,9 @@ def _lds_call_kwargs(path: pathlib.Path):
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "LatentDynamics"):
-            return {kw.arg for kw in node.keywords if kw.arg}
+            # kw.arg is None for a ** splat -- recorded as "**" so a test can
+            # require the shared list rather than individually named fields.
+            return {kw.arg if kw.arg else "**" for kw in node.keywords}
     return None
 
 
@@ -54,14 +61,19 @@ def test_every_reconstruction_site_exists(site):
 @pytest.mark.parametrize("param", ["dt_cap", "n_substeps"])
 def test_semantic_parameters_are_restored_from_the_checkpoint(site, param):
     """
-    GUARDS a reconstruction that drops one of these and silently gets the
-    constructor default. latent_spatial_size is excluded from the parametrize
-    because one site names it `latent_spatial`; the check below covers it.
+    Now satisfied by the SHARED list rather than by naming each field at each
+    site: the call splats integration_kwargs_from_config, which supplies every
+    entry of _MEANING_FIELDS. Kept parametrized over the fields anyway, so the
+    failure message still names the one that went missing.
     """
+    from models.latent_dynamics import _MEANING_FIELDS
     kwargs = _lds_call_kwargs(_ROOT / site)
-    assert param in kwargs, (
-        f"{site} rebuilds LatentDynamics without {param} -- it will silently get the "
-        f"constructor default, which is not what the checkpoint was trained with"
+    assert param in _MEANING_FIELDS, (
+        f"{param} is no longer in the shared field list, so no site propagates it"
+    )
+    assert kwargs is not None and "**" in kwargs, (
+        f"{site} does not splat the shared field list, so {param} reaches it only "
+        f"if someone remembered to name it -- which is how {param} was missed before"
     )
 
 
@@ -71,20 +83,21 @@ def test_the_latent_geometry_is_restored_too(site):
     assert "latent_spatial" in kwargs or "latent_spatial_size" in kwargs, site
 
 
-@pytest.mark.parametrize("site", _SITES)
-def test_restored_with_a_historical_default_not_a_bare_lookup(site):
+def test_restored_with_a_historical_default_not_a_bare_lookup():
     """
     GUARDS `config["n_substeps"]`, which KeyErrors on every checkpoint written
-    before the parameter existed. The project convention is
-    .get(key, <the value that reproduces the old behaviour>) -- inf for dt_cap,
-    1 for n_substeps.
+    before the parameter existed. Now checked ONCE against the shared list --
+    it uses .get(name, default) for every field, so the guarantee is structural
+    rather than five copies of a literal.
     """
-    src = source_without_comments(_ROOT / site)
-    for param, default in (("dt_cap", 'float("inf")'), ("n_substeps", "1")):
-        assert f'.get("{param}", {default})' in src, (
-            f"{site} must use .get(\"{param}\", {default}) so pre-{param} checkpoints "
-            f"still load with their original behaviour"
-        )
+    from models.latent_dynamics import integration_kwargs_from_config
+    restored = integration_kwargs_from_config({})   # a pre-everything checkpoint
+    assert restored["dt_cap"] == float("inf")
+    assert restored["n_substeps"] == 1
+    assert restored["alpha"] is None
+    # And it must not raise on a config missing every field, which is the
+    # actual failure mode a bare lookup produces.
+    assert set(restored) == set(integration_kwargs_from_config({"dt_cap": 1.0}))
 
 
 # compare_integrators.py also rebuilds a LatentDynamics, but it is already
