@@ -114,7 +114,7 @@ def test_the_threshold_uses_the_MEDIAN_not_the_mean():
     """
     import statistics as _st
     guard = _warm_skewed(_SpikeGuard(factor=50.0))
-    hist = list(guard._recent)
+    hist = list(guard.history())
     mean, med = sum(hist) / len(hist), _st.median(hist)
     assert mean > 2 * med, f"history not skewed enough to discriminate: {mean=} {med=}"
     assert guard.should_skip(100.0), (
@@ -156,9 +156,13 @@ def test_skips_are_reported_not_silent():
     GUARDS a guard that drops data quietly: the run would look healthy while
     training on a filtered distribution.
     """
-    src = source_without_comments(_ROOT / "training/train_lds.py")
+    # The message text lives in spike_guard.skip_report now (one compact line
+    # per epoch after the first); train_lds keeps only the wiring.
+    src = source_without_comments(_ROOT / "training/spike_guard.py")
     assert "skipped" in src and "catastrophic outlier" in src
-    assert "spike_guard.n_skipped != _spikes_reported" in src
+    # train_lds drives the reporter, which decides whether to call skip_report.
+    assert "_skip_reporter.epoch(" in source_without_comments(
+        _ROOT / "training/train_lds.py")
 
 
 def test_the_report_names_what_was_IN_the_batch():
@@ -166,7 +170,7 @@ def test_the_report_names_what_was_IN_the_batch():
     "Cursed with sudden peaks" is not actionable; "the spikes are all dt near
     max_dt at low noise" is. dt_max and theta are what turn one into the other.
     """
-    src = source_without_comments(_ROOT / "training/train_lds.py")
+    src = source_without_comments(_ROOT / "training/spike_guard.py")
     assert "dt_max=" in src and "theta[0]" in src
     # _record_spike moved to training/spike_guard.py when stages 4 and 5
     # became a second caller; train_lds re-exports it.
@@ -420,7 +424,7 @@ def test_the_gradient_norm_is_guarded_separately():
     from training.train_lds import train_lds
     assert "grad_spike_factor" in inspect.signature(train_lds).parameters
     src = source_without_comments(_ROOT / "training/train_lds.py")
-    assert "grad_guard.should_skip(float(_gnorm))" in src
+    assert "grad_guard.should_skip(float(_gnorm), band=_band)" in src
 
 
 def test_the_guard_uses_the_PRE_clip_norm():
@@ -500,7 +504,7 @@ def test_grad_skips_are_reported_distinctly():
     gradient outlier with an ordinary loss is ill-conditioning. Reporting them
     identically would erase the distinction that took a CSV to establish.
     """
-    src = source_without_comments(_ROOT / "training/train_lds.py")
+    src = source_without_comments(_ROOT / "training/spike_guard.py")
     assert "GRADIENT NORM was a" in src
     assert "despite an ordinary loss" in src
 
@@ -566,12 +570,19 @@ def test_the_attribution_is_per_epoch_not_all_time():
 
 
 def test_the_report_reads_last_worst_not_worst():
+    """
+    `worst` is cleared by end_epoch; `last_worst` is the copy that survives it.
+    Reading the cleared field would print stale or empty attributions -- so
+    both guards' values must come from last_worst wherever the report is
+    assembled.
+    """
     src = source_without_comments(_ROOT / "training/train_lds.py")
-    assert "_wg = grad_guard.last_worst" in src
-    assert "_w = spike_guard.last_worst" in src
-    assert "= spike_guard.worst" not in src, (
+    assert "grad_guard.last_worst" in src
+    assert "spike_guard.last_worst" in src
+    assert "spike_guard.worst" not in src, (
         "the report reads the field end_epoch has already cleared"
     )
+    assert "grad_guard.worst" not in src
 
 
 def test_the_excursion_message_does_not_assert_weight_damage():
@@ -624,7 +635,7 @@ def test_END_TO_END_a_deadlock_really_rolls_back_and_keeps_training(tmp_path, ca
     real = _SpikeGuard.should_skip
     state = {"epoch_calls": 0}
 
-    def always_skip_after_a_while(self, value):
+    def always_skip_after_a_while(self, value, band=None):
         state["epoch_calls"] += 1
         if state["epoch_calls"] > 12:       # a few real epochs first, so a checkpoint exists
             self.n_skipped += 1
@@ -691,7 +702,7 @@ def test_END_TO_END_an_exhausted_rollback_budget_stops_without_raising(tmp_path,
     real = _SpikeGuard.should_skip
     state = {"n": 0}
 
-    def skip_everything_after_a_while(self, value):
+    def skip_everything_after_a_while(self, value, band=None):
         state["n"] += 1
         if state["n"] > 12:
             self.n_skipped += 1
@@ -807,15 +818,15 @@ def test_stage45_has_both_guards():
     assert params["grad_spike_factor"].default == 10.0
 
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "spike_guard.should_skip(float(loss.detach()))" in src
-    assert "grad_guard.should_skip(float(_gnorm))" in src
+    assert "spike_guard.should_skip(float(loss.detach()), band=_band)" in src
+    assert "grad_guard.should_skip(float(_gnorm), band=_band)" in src
 
 
 def test_stage45_reads_the_loss_BEFORE_backward():
     """A non-finite loss must never reach clip_grad_norm_, which turns inf
     into nan and poisons every parameter permanently."""
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    block = src[src.index("spike_guard.should_skip(float(loss.detach()))"):]
+    block = src[src.index("spike_guard.should_skip(float(loss.detach()), band=_band)"):]
     block = block[:block.index("optimizer.step()")]
     assert block.index("should_skip") < block.index("backward()")
 
@@ -910,7 +921,7 @@ def test_END_TO_END_stage45_guard_skips_and_reports(tmp_path, capsys,
     real = _SpikeGuard.should_skip
     state = {"n": 0}
 
-    def skip_a_few(self, value):
+    def skip_a_few(self, value, band=None):
         state["n"] += 1
         if 3 <= state["n"] <= 5:          # a handful, not all: no deadlock
             self.n_skipped += 1
@@ -966,7 +977,7 @@ def test_END_TO_END_stage45_deadlock_stops_without_raising(tmp_path, capsys,
     real = _SpikeGuard.should_skip
     state = {"n": 0}
 
-    def skip_everything_after_a_while(self, value):
+    def skip_everything_after_a_while(self, value, band=None):
         state["n"] += 1
         if state["n"] > 6:                 # a couple of real epochs first
             self.n_skipped += 1
@@ -1115,7 +1126,7 @@ def test_END_TO_END_a_stale_checkpoint_is_NOT_restored(tmp_path, capsys,
 
     real = _SpikeGuard.should_skip
     real_update = CheckpointCriterionTracker.update
-    _SpikeGuard.should_skip = lambda self, value: (
+    _SpikeGuard.should_skip = lambda self, value, band=None: (
         setattr(self, "n_skipped", self.n_skipped + 1) or
         setattr(self, "n_skipped_this_epoch", self.n_skipped_this_epoch + 1) or True
     )
@@ -1135,3 +1146,597 @@ def test_END_TO_END_a_stale_checkpoint_is_NOT_restored(tmp_path, capsys,
     )
     assert "ROLLED BACK" not in capsys.readouterr().out, "it restored the foreign checkpoint"
     assert Path(foreign).read_bytes() == foreign_bytes, "the foreign checkpoint was overwritten"
+
+
+# --------------------------------------------------------------------
+# A skipped batch must leave the model UNCHANGED -- buffers included
+# --------------------------------------------------------------------
+
+def _bn_module():
+    return torch.nn.Sequential(
+        torch.nn.Conv2d(1, 4, 3, padding=1),
+        torch.nn.BatchNorm2d(4),
+        torch.nn.ReLU(),
+    )
+
+
+def test_a_forward_pass_in_train_mode_moves_batchnorm_buffers():
+    """
+    THE PREMISE, stated first so the fix below is not tested against an
+    assumption. If this ever stops being true the restore is dead weight --
+    but while it is true, a skipped batch changes the model even though every
+    parameter is frozen.
+    """
+    m = _bn_module()
+    m.train()
+    before = m[1].running_mean.detach().clone()
+    m(torch.randn(8, 1, 6, 6))
+    assert not torch.equal(m[1].running_mean, before), (
+        "BatchNorm did not update its running stats in train mode -- the rest "
+        "of this section is testing nothing"
+    )
+
+
+def test_restoring_undoes_exactly_what_a_skipped_forward_did():
+    """
+    Observed on stage 4: epochs 8 and 9 skipped 487 of 487 batches, so every
+    parameter was frozen, and val_loss still moved 575.70 -> 582.34. Only the
+    buffers could carry that, which means a deadlock was not the frozen,
+    recoverable state the guard reported -- the encoder kept drifting in the
+    one direction nothing was checking.
+    """
+    from training.spike_guard import restore_running_stats, snapshot_running_stats
+
+    m = _bn_module()
+    m.train()
+    m(torch.randn(8, 1, 6, 6))          # some history, so the restore is not trivial
+    mean_before = m[1].running_mean.detach().clone()
+    var_before = m[1].running_var.detach().clone()
+    count_before = m[1].num_batches_tracked.detach().clone()
+
+    snapshot = snapshot_running_stats(m)
+    m(torch.randn(8, 1, 6, 6) * 10 + 5)  # a "spike" batch, then skipped
+    restore_running_stats(snapshot)
+
+    assert torch.equal(m[1].running_mean, mean_before)
+    assert torch.equal(m[1].running_var, var_before)
+    assert torch.equal(m[1].num_batches_tracked, count_before), (
+        "num_batches_tracked was not restored -- with momentum=None it drives "
+        "the cumulative average, so every later update stays biased"
+    )
+
+
+def test_the_snapshot_covers_nested_and_multiple_modules():
+    """ae and f_theta are passed together, and the encoder's BatchNorms are
+    nested several levels down."""
+    from training.spike_guard import restore_running_stats, snapshot_running_stats
+
+    # NESTED, not chained: the encoder's BatchNorms sit several levels down
+    # inside blocks, which is what .modules() has to walk. (Chaining two
+    # 1-channel blocks would just be a shape error -- my first version of this
+    # test did exactly that.)
+    class _Nested(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = torch.nn.ModuleList([_bn_module(), _bn_module()])
+
+        def forward(self, x):
+            return sum(m(x) for m in self.inner)
+
+    a = _Nested()
+    b = _bn_module()
+    a.train()
+    b.train()
+    snapshot = snapshot_running_stats(a, b, None)   # None tolerated: f_theta may be absent
+    assert len(snapshot) == 3 * 3, f"expected 3 buffers per BatchNorm x 3, got {len(snapshot)}"
+    a(torch.randn(4, 1, 6, 6))
+    b(torch.randn(4, 1, 6, 6))
+    restore_running_stats(snapshot)
+    for mod in (a.inner[0][1], a.inner[1][1], b[1]):
+        assert float(mod.num_batches_tracked) == 0.0, (
+            "a nested BatchNorm was missed by the snapshot walk"
+        )
+
+
+def test_a_module_without_batchnorm_snapshots_nothing():
+    """LatentDynamics is Linear + LeakyReLU, so stage 3 pays nothing for this."""
+    from training.spike_guard import snapshot_running_stats
+    plain = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.LeakyReLU())
+    assert snapshot_running_stats(plain) == []
+
+
+def test_both_skip_paths_restore_the_buffers():
+    """
+    SITE ENUMERATION over the two skip branches. The gradient path is the
+    easier to forget -- its loss looked ordinary, so nothing about the batch
+    suggests the model was touched -- and it ran the same forward.
+    """
+    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert src.count("restore_running_stats(_bn_snapshot)") == 2, (
+        "both the loss-skip and gradient-skip branches must restore; found "
+        f"{src.count('restore_running_stats(_bn_snapshot)')}"
+    )
+    # and the snapshot must be taken BEFORE the forward that moves the buffers
+    snap = src.index("_bn_snapshot = snapshot_running_stats")
+    forward = src.index("loss, components = compute_stage45_loss")
+    assert snap < forward, (
+        "the snapshot is taken after the forward pass, so it records the "
+        "already-drifted buffers and the restore is a no-op"
+    )
+
+
+# --------------------------------------------------------------------
+# Non-finite skips must COUNT -- the 200-epoch max_dt=2000 incident
+# --------------------------------------------------------------------
+
+def test_nonfinite_skips_count_toward_the_epochs_total():
+    """
+    THE MISSING INCREMENT. A non-finite loss/gradient took the early-return
+    branch, which skipped correctly but never touched n_skipped_this_epoch --
+    so the most catastrophic kind of skip was the only kind that counted for
+    nothing. On the max_dt=2000 run, ~19 of 23 batches per epoch were
+    non-finite gradient skips: the combined total the deadlock check saw was
+    4-8, never 23, for 200 straight epochs.
+    """
+    from training.spike_guard import _SpikeGuard
+    g = _SpikeGuard(10.0)
+    for v in (float("inf"), float("nan"), float("-inf")):
+        assert g.should_skip(v)
+    assert g.n_skipped_this_epoch == 3, (
+        f"non-finite skips did not count toward the epoch total "
+        f"(got {g.n_skipped_this_epoch}); the all-skipped deadlock can then "
+        f"never fire on a run whose batches are non-finite"
+    )
+    assert g.n_nonfinite == 3
+
+
+def test_the_max_dt_2000_deadlock_now_fires():
+    """
+    THE INCIDENT, replayed: 23 batches; each epoch ~19 non-finite gradient
+    skips + the rest loss-outlier skips, split across the two guards exactly
+    as end_epoch_pair sees them. Five such epochs must trip the deadlock
+    counter on which the trainers' spike_deadlock_epochs check reads.
+    The real run did this for TWO HUNDRED epochs without firing.
+    """
+    from training.spike_guard import _SpikeGuard, end_epoch_pair
+    loss_g = _SpikeGuard(10.0, min_history=4)
+    grad_g = _SpikeGuard(10.0)
+    for v in (1.0, 1.1, 0.9, 1.05):     # a little finite history for the loss guard
+        loss_g.should_skip(v)
+    for epoch in range(5):
+        for _ in range(4):               # loss outliers (finite, huge)
+            assert loss_g.should_skip(1e6)
+        for _ in range(19):              # infinite gradient norms
+            assert grad_g.should_skip(float("inf"))
+        deadlocked = end_epoch_pair(loss_g, grad_g, n_batches=23)
+        assert deadlocked, f"epoch {epoch}: 23/23 skipped but not flagged as total"
+    assert loss_g.consecutive_total_skip_epochs == 5
+
+
+def test_a_partially_skipped_epoch_is_still_not_a_deadlock():
+    """The counting fix must not make the guard trigger-happy: one surviving
+    batch means a step was taken and the run can move."""
+    from training.spike_guard import _SpikeGuard, end_epoch_pair
+    loss_g = _SpikeGuard(10.0)
+    grad_g = _SpikeGuard(10.0)
+    for _ in range(22):
+        grad_g.should_skip(float("inf"))
+    assert not end_epoch_pair(loss_g, grad_g, n_batches=23)
+    assert loss_g.consecutive_total_skip_epochs == 0
+
+
+def test_nonfinite_values_are_never_recorded_into_the_history():
+    """
+    The complement of counting them: they must be COUNTED but not RECORDED,
+    or one inf makes the median nan and the ratio threshold dead forever.
+    """
+    from training.spike_guard import _SpikeGuard
+    g = _SpikeGuard(10.0, min_history=2)
+    g.should_skip(1.0)
+    g.should_skip(float("inf"))
+    g.should_skip(1.2)
+    # Check the HISTORY, not the median: my first version asserted on the
+    # median of [1.0, inf, 1.2] -- whose median is the MIDDLE element, 1.2,
+    # perfectly finite -- so the mutation that records the inf passed. An
+    # odd-length window hides exactly one poison value; the even-length case
+    # (mean of the two middle values) surfaces it. Inspecting the deque
+    # asserts the actual invariant instead of one parity's symptom.
+    assert all(math.isfinite(v) for v in g.history()), (
+        f"a non-finite value entered the history: {list(g.history())}"
+    )
+    assert list(g.history()) == [1.0, 1.2]
+
+
+# --------------------------------------------------------------------
+# Honest reporting: empty history and never-saved exits
+# --------------------------------------------------------------------
+
+def test_an_empty_history_renders_as_words_not_nan():
+    """
+    "vs median nan" on the max_dt=2000 run read as a broken statistic and
+    steered the diagnosis toward value-poisoning; the truth -- the guard had
+    never once seen a finite value in 200 epochs -- was a louder finding than
+    any threshold, and the report should say it in words.
+    """
+    from training.spike_guard import _SpikeGuard
+    rendered = _SpikeGuard.median_display(float("nan"))
+    assert "nan" not in rendered.lower().replace("no fin", "")
+    assert "NO finite value" in rendered
+    assert _SpikeGuard.median_display(3.25) == "3.25"
+
+
+def test_the_reports_use_the_display_not_raw_formatting():
+    """All three skip-report sites must render the median through
+    median_display, or the nan reappears at whichever site was missed."""
+    for fname in ("training/spike_guard.py", "training/train_refinement.py"):
+        src = source_without_comments(_ROOT / fname)
+        assert "median {_SpikeGuard.median_display" in src or \
+               "median_display(grad_worst" in src or \
+               "median_display(_w" in src or "median_display(_wg" in src, fname
+        assert "vs median {_w[1]:.4g}" not in src, f"{fname} still raw-formats a median"
+        assert "vs median {_wg[1]:.4g}" not in src, f"{fname} still raw-formats a median"
+
+
+def test_early_stop_distinguishes_never_saved_from_plateaued():
+    """
+    "No improvement for 200 epochs" describes convergence; the max_dt=2000 run
+    used it to describe total paralysis. The two exits need different words,
+    and the never-saved one must direct the reader at the skip counts and warn
+    that any file on disk belongs to a previous run.
+    """
+    from training.spike_guard import early_stop_message
+    plateaued = early_stop_message(2618, 500, saved_this_run=True)
+    assert "no improvement for 500 epochs" in plateaued
+    assert "NOTHING" not in plateaued
+
+    paralyzed = early_stop_message(200, 200, saved_this_run=False)
+    assert "NOTHING was ever saved" in paralyzed
+    assert "previous run" in paralyzed
+    assert "skip counts" in paralyzed
+    assert "no improvement for 200 epochs" not in paralyzed
+
+
+def test_both_trainers_route_the_early_stop_through_the_function():
+    """Wiring: the message can only stay honest if both sites call it with
+    their live save flag."""
+    for fname in ("training/train_lds.py", "training/train_refinement.py"):
+        src = source_without_comments(_ROOT / fname)
+        assert "early_stop_message(epoch, early_stopping_patience, _saved_this_run)" in src, (
+            f"{fname} does not pass its save flag to early_stop_message"
+        )
+
+
+# --------------------------------------------------------------------
+# Per-band medians: a bucketed batch is judged against its own kind
+# --------------------------------------------------------------------
+
+def test_difficulty_band_groups_dt_by_factors_of_two():
+    from training.spike_guard import difficulty_band
+    # Boundaries are at POWERS OF TWO, not at round decimal values: 500 and
+    # 999 are in different bands (512 separates them), which my first version
+    # of this test asserted the other way round without checking.
+    assert difficulty_band(600) == difficulty_band(1000)      # both inside 512-1024
+    assert difficulty_band(511) != difficulty_band(512)
+    assert difficulty_band(1024) == difficulty_band(512) + 1
+    # degenerate inputs must not raise: dt can be 0 in a malformed window
+    assert difficulty_band(0) == 0
+    assert difficulty_band(float("nan")) == 0
+    assert difficulty_band(float("inf")) == 0
+
+
+def test_a_systematically_harder_band_is_not_skipped_as_a_block():
+    """
+    THE INCIDENT. Under cost-bucketed batching the hard windows share batches,
+    so their loss is systematically high -- and against a POOLED median that
+    reads as "catastrophic outlier" every time. Measured on the first
+    max_dt=1000 run that trained: 14-19 of ~37 batches skipped every epoch for
+    48 consecutive epochs, all attributed to dt_max=1000. The run looked
+    stable because the guard had restored the max_dt=500 population by
+    stealth, one batch at a time.
+
+    With per-band medians the hard band is compared against itself, so an
+    ordinary hard batch passes and only a real anomaly is skipped.
+    """
+    from training.spike_guard import _SpikeGuard, difficulty_band
+    easy_band, hard_band = difficulty_band(100), difficulty_band(1000)
+
+    pooled = _SpikeGuard(factor=10.0, min_history=20)
+    banded = _SpikeGuard(factor=10.0, min_history=20)
+    # Interleaved, as bucketing yields them: many easy batches at loss ~1,
+    # some hard ones at ~40 -- 40x the easy median but utterly ordinary for
+    # their own band.
+    pooled_skips = banded_skips = 0
+    for i in range(200):
+        hard = (i % 3 == 0)
+        value = 40.0 if hard else 1.0
+        band = hard_band if hard else easy_band
+        pooled_skips += pooled.should_skip(value)           # no band: one history
+        banded_skips += banded.should_skip(value, band=band)
+    assert pooled_skips > 30, (
+        f"the pooled guard skipped only {pooled_skips} -- the fixture does not "
+        f"reproduce the block-skipping this test is about"
+    )
+    assert banded_skips == 0, (
+        f"the banded guard still skipped {banded_skips} ordinary hard batches"
+    )
+
+
+def test_a_real_outlier_within_a_hard_band_is_still_skipped():
+    """
+    The complement, and the thing that must NOT be lost: banding is meant to
+    stop hard-but-normal batches being dropped, not to stop catastrophes in
+    the hard band being caught.
+    """
+    from training.spike_guard import _SpikeGuard, difficulty_band
+    band = difficulty_band(1000)
+    g = _SpikeGuard(factor=10.0, min_history=20)
+    for _ in range(50):
+        assert not g.should_skip(40.0, band=band)
+    assert g.should_skip(40_000.0, band=band), (
+        "a 1000x outlier within its own band passed -- banding has disabled "
+        "the guard rather than focusing it"
+    )
+
+
+def test_bands_do_not_contaminate_each_other():
+    """A quiet band must not inherit a loud band's threshold, in either
+    direction."""
+    from training.spike_guard import _SpikeGuard
+    g = _SpikeGuard(factor=10.0, min_history=10)
+    for _ in range(20):
+        g.should_skip(1000.0, band=9)      # loud band
+    for _ in range(20):
+        g.should_skip(1.0, band=3)         # quiet band
+    assert g.median(9) == 1000.0 and g.median(3) == 1.0
+    # 50 is ordinary for the loud band, a 50x outlier for the quiet one
+    assert not g.should_skip(50.0, band=9)
+    assert g.should_skip(50.0, band=3)
+
+
+def test_the_reported_median_is_the_bands_own():
+    """
+    The report must name the number the decision was made against. Printing
+    the pooled median would show a threshold that was never applied -- worse
+    than useless when the bands sit at different levels by design.
+    """
+    from training.spike_guard import _SpikeGuard, _record_spike, difficulty_band
+    g = _SpikeGuard(factor=10.0, min_history=5)
+    for _ in range(10):
+        g.should_skip(1.0, band=difficulty_band(100))
+    for _ in range(10):
+        g.should_skip(40.0, band=difficulty_band(1000))
+
+    dt_window = torch.full((4, 2), 1000.0)
+    theta = torch.zeros(4, 1)
+    _record_spike(g, torch.tensor(500.0), dt_window, theta)
+    assert g.worst is not None
+    assert g.worst[1] == 40.0, (
+        f"reported median {g.worst[1]} is not the dt=1000 band's own (40.0)"
+    )
+
+
+def test_banding_is_a_no_op_without_bucketing():
+    """
+    SAFE TO SWITCH ON. An unbucketed batch of ~1000 windows drawn from the
+    whole population contains a near-maximum-dt window with near-certainty,
+    so every batch reports the same dt_max, lands in one band, and behaves
+    exactly as it did before bands existed.
+    """
+    from training.spike_guard import _SpikeGuard, difficulty_band
+    band = difficulty_band(1000)
+    old_style = _SpikeGuard(factor=10.0, min_history=10)
+    banded = _SpikeGuard(factor=10.0, min_history=10)
+    values = [1.0, 1.2, 0.9, 5.0, 1.1, 300.0, 1.0, 0.8, 250.0, 1.3] * 8
+    for v in values:
+        a = old_style.should_skip(v)
+        b = banded.should_skip(v, band=band)
+        assert a == b, f"banding changed the decision for {v}: {a} vs {b}"
+    assert old_style.n_skipped == banded.n_skipped
+
+
+def test_forget_history_clears_every_band():
+    """After a rollback every band's median describes weights that no longer
+    exist -- clearing only the current one would leave the others re-tripping
+    the guard immediately."""
+    from training.spike_guard import _SpikeGuard
+    g = _SpikeGuard(factor=10.0, min_history=2)
+    for band in (3, 7, 9):
+        for _ in range(5):
+            g.should_skip(1.0, band=band)
+    g.forget_history()
+    for band in (3, 7, 9):
+        assert math.isnan(g.median(band)), f"band {band} kept its history"
+
+
+def test_both_trainers_pass_the_band():
+    from conftest import source_without_comments
+    for fname in ("training/train_lds.py", "training/train_refinement.py"):
+        src = source_without_comments(_ROOT / fname)
+        assert "_band = difficulty_band(float(dt_window.detach().max()))" in src, fname
+        assert src.count("band=_band") == 2, (
+            f"{fname}: both the loss guard and the gradient guard must be "
+            f"banded, found {src.count('band=_band')}"
+        )
+
+
+# --------------------------------------------------------------------
+# Compact skip reporting
+# --------------------------------------------------------------------
+
+def test_the_first_skip_explains_itself_and_later_ones_do_not():
+    """
+    The rationale is worth reading ONCE. Repeating it every epoch -- three
+    lines per guard, six lines total, between consecutive epoch lines -- made
+    the loss curve unreadable in exactly the regime that needed watching, once
+    skipping became routine (1-4 batches of 13, every epoch, the guard working
+    as intended).
+    """
+    from training.spike_guard import skip_report
+    worst = (4.6e8, 4.8e6, 1250.0, -0.10)
+    first = skip_report(9, 1, worst, 3, worst, 13, verbose=True)
+    later = skip_report(10, 1, worst, 3, worst, 13, verbose=False)
+    assert "loss guard cannot see" in first
+    assert "loss guard cannot see" not in later
+    assert len(later.splitlines()) == 1, later
+    assert len(first.splitlines()) > len(later.splitlines())
+
+
+def test_the_compact_line_carries_what_varies():
+    """
+    Counts, the worst/median RATIO, and the dt band. The ratio rather than the
+    two raw numbers because it is what the threshold tests -- a bare count
+    cannot distinguish "10x, marginal" from "1e8x, catastrophic", and that
+    distinction is what separated the block-skipping incident from genuine
+    outliers.
+    """
+    from training.spike_guard import skip_report
+    line = skip_report(31, 4, (4.4e8, 1.2e7, 1250.0, -0.15),
+                        2, (4.6e8, 4.8e6, 1250.0, -0.10), 13, verbose=False)
+    assert "2 grad" in line and "4 loss" in line
+    assert "of 13" in line, "the batch count is what makes a skip count meaningful"
+    assert "dt_max=1250" in line
+    import re
+    # A ratio, not a specific value -- asserting "96" pinned my own arithmetic
+    # rather than the property, and broke on a fixture tweak.
+    assert re.search(r"\d+(\.\d+)?x\)", line), f"no worst/median ratio in: {line}"
+
+
+def test_nothing_is_printed_when_nothing_was_skipped():
+    """A clean epoch must produce no line at all -- the caller prints the
+    return value unconditionally."""
+    from training.spike_guard import skip_report
+    assert skip_report(12, 0, None, 0, None, 13, verbose=False) == ""
+    assert skip_report(12, 0, None, 0, None, 13, verbose=True) == ""
+
+
+def test_a_missing_or_unusable_median_does_not_break_the_ratio():
+    """An empty history gives a nan median (see median_display); the compact
+    line must degrade rather than print 'nanx'."""
+    from training.spike_guard import skip_report
+    line = skip_report(3, 0, None, 2, (1e6, float("nan"), 500.0, -0.2), 13,
+                        verbose=False)
+    assert "n/a" in line and "nan" not in line.lower().replace("n/a", "")
+
+
+def test_train_lds_reports_once_then_compactly():
+    """
+    The once-then-compact behaviour moved INTO SkipReporter when notability
+    gating was added -- the explanation now attaches to the first NOTABLE
+    skip, not the first skip of any kind, so it cannot be checked from
+    train_lds's source any more. Verified through the reporter instead.
+    """
+    from conftest import source_without_comments
+    from training.spike_guard import SkipReporter
+    src = source_without_comments(_ROOT / "training/train_lds.py")
+    assert "_skip_reporter.epoch(" in src
+
+    r = SkipReporter()
+    severe = (4.0e4, 1e2, 1250.0, -0.1)
+    first = r.epoch(6, 0, None, 1, severe, 13)
+    second = r.epoch(7, 0, None, 1, severe, 13)
+    assert "loss guard cannot see" in first
+    assert "loss guard cannot see" not in second
+    assert len(second.splitlines()) == 1
+
+
+# --------------------------------------------------------------------
+# Notability: only report skips worth reading
+# --------------------------------------------------------------------
+
+def _marginal():
+    """1 batch at 11.9x a 10x threshold -- the guard trimming a tail."""
+    return (1.19e3, 1e2, 1250.0, -0.1)
+
+
+def _severe():
+    return (4.0e4, 1e2, 1250.0, -0.1)          # 400x
+
+
+def test_a_marginal_single_skip_is_not_reported():
+    """
+    THE COMPLAINT, and it is right: 1 batch of 13 at 11.9x against a 10x
+    threshold is the guard doing its job. A line for it every epoch trains the
+    reader to skim past the line that matters -- and on this project that line
+    is the difference between "a marginal tail is trimmed" and "half the epoch
+    is excluded", or between 11.9x and the 1e7-1e8x of a real catastrophe.
+    """
+    from training.spike_guard import SkipReporter
+    r = SkipReporter()
+    assert r.epoch(7, 0, None, 1, _marginal(), 13) == ""
+    assert r.epoch(8, 0, None, 1, _marginal(), 13) == ""
+
+
+def test_a_large_ratio_is_reported_however_few_the_batches():
+    """One batch two orders past the threshold is not a tail."""
+    from training.spike_guard import SkipReporter
+    r = SkipReporter()
+    out = r.epoch(11, 0, None, 1, _severe(), 13)
+    assert out and "epoch 11" in out
+
+
+def test_a_large_share_of_the_epoch_is_reported_however_small_the_ratio():
+    """Four marginal batches of 13 is a third of the gradient signal gone --
+    the count matters even when each one is barely over."""
+    from training.spike_guard import SkipReporter
+    r = SkipReporter()
+    assert r.epoch(9, 0, None, 4, _marginal(), 13) != ""
+
+
+def test_non_finite_is_always_reported():
+    """
+    An inf gradient turns the whole parameter vector to nan in ONE step if it
+    gets through -- grad_clip makes it worse, not better (clip_coef =
+    max_norm/(inf+eps) = 0, and 0*inf = nan). It can never be routine.
+    """
+    from training.spike_guard import SkipReporter
+    r = SkipReporter()
+    out = r.epoch(4, 0, None, 1, _marginal(), 13, n_nonfinite_new=1)
+    assert out != "", "a non-finite skip was suppressed as marginal"
+
+
+def test_suppressed_skips_are_digested_not_discarded():
+    """
+    Silence must not mean lost. The digest states how many batches over how
+    many epochs and the worst ratio seen, so a slow drift upward is still
+    visible without a line per epoch.
+    """
+    from training.spike_guard import SkipReporter
+    r = SkipReporter(digest_every=10)
+    for ep in range(1, 10):
+        assert r.epoch(ep, 0, None, 1, _marginal(), 13) == ""
+    out = r.epoch(10, 0, None, 1, _marginal(), 13)
+    assert "further batch(es) skipped" in out, out
+    assert "10 further" in out, f"digest lost some of the count: {out}"
+    assert "11.9x" in out
+    # and the counter resets, so the next digest is not cumulative
+    for ep in range(11, 20):
+        r.epoch(ep, 0, None, 1, _marginal(), 13)
+    out2 = r.epoch(20, 0, None, 1, _marginal(), 13)
+    assert "10 further" in out2, out2
+
+
+def test_the_explanation_appears_on_the_first_NOTABLE_skip():
+    """
+    Not on the first skip of any kind: if a marginal one came first, the
+    explanation would be attached to the least interesting event and the
+    genuinely notable one would get the compact form.
+    """
+    from training.spike_guard import SkipReporter
+    r = SkipReporter()
+    r.epoch(5, 0, None, 1, _marginal(), 13)          # suppressed
+    out = r.epoch(6, 0, None, 1, _severe(), 13)
+    assert "loss guard cannot see" in out, out
+    later = r.epoch(7, 0, None, 1, _severe(), 13)
+    assert "loss guard cannot see" not in later
+    assert len(later.splitlines()) == 1
+
+
+def test_train_lds_uses_the_reporter_and_feeds_it_nonfinite_counts():
+    from conftest import source_without_comments
+    src = source_without_comments(_ROOT / "training/train_lds.py")
+    assert "_skip_reporter = SkipReporter()" in src
+    assert "n_nonfinite_new=_new_nonfinite" in src, (
+        "non-finite skips would be judged by ratio alone and could be "
+        "suppressed as marginal"
+    )
+    assert "grad_guard.n_nonfinite" in src and "spike_guard.n_nonfinite" in src

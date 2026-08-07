@@ -1598,6 +1598,37 @@ class MicrostructureEvolutionDataset(Dataset):
             all_dts.extend((steps[i + 1] - steps[i]) * dt_scale for i in range(len(steps) - 1))
         return np.array(all_dts, dtype=np.float32)
 
+    def max_dt_per_window(self) -> np.ndarray:
+        """The LARGEST transition in each base window -- shape (n_base_windows,).
+
+        Exists for dt-homogeneous batching. Under adaptive sub-stepping the
+        cost of a batch is its MAXIMUM sub-step count, because the integrator
+        loops until the last sample in the batch has arrived and the arrived
+        ones are masked (they still occupy the forward pass). A batch drawn
+        uniformly from a population whose counts span 8x to 132x therefore
+        pays close to the population maximum on every batch: measured on the
+        128x128 stage-3b population, mean 17.7 against max 132, i.e. roughly
+        7x the work the same windows would cost if grouped.
+
+        Grouping by the window's own worst transition, rather than by its
+        first or its total span, matches what the cost actually depends on --
+        the same reasoning the max_dt window filter uses, and for the same
+        reason: a window is as expensive as its most demanding step.
+
+        Computed from run metadata only (never touching _run_data), on the
+        same pattern as all_dts, so a sampler can call it before training
+        starts without forcing any frame loads.
+        """
+        out = []
+        for run_idx, start in self._index:
+            end = start + self.window_length
+            steps = self._run_steps[run_idx][start:end]
+            dt_scale = self._run_dt_scale[run_idx]
+            out.append(max((steps[i + 1] - steps[i]) * dt_scale
+                            for i in range(len(steps) - 1)))
+        return np.array(out, dtype=np.float32)
+
+
     def __getitem__(self, idx: int):
         if self.augment:
             base_idx, aug_idx = divmod(idx, _N_AUGMENT_VARIANTS)

@@ -694,3 +694,369 @@ def test_the_substep_report_covers_training_transitions_only():
     assert "_substeps = _train_substeps" in src, (
         "the report does not use the train-only capture"
     )
+
+
+# --------------------------------------------------------------------
+# Truncated backpropagation through the sub-steps
+# --------------------------------------------------------------------
+
+def _tbptt_model(scale=0.005, **kw):
+    torch.manual_seed(0)
+    m = LatentDynamics(latent_channels=4, latent_spatial=8, hidden_dim=16,
+                        n_hidden_layers=1, **kw)
+    with torch.no_grad():
+        torch.manual_seed(11)
+        m.net[-1].weight.normal_(0, scale)
+        m.net[-1].bias.normal_(0, scale)
+    return m
+
+
+def _tbptt_inputs(b=2):
+    torch.manual_seed(3)
+    return (torch.randn(b, 4, 8, 8) * 0.3, torch.randn(b, 4, 8, 8) * 0.3,
+            torch.full((b,), 120.0), torch.zeros(b, 1))
+
+
+def test_truncation_leaves_the_forward_pass_bit_identical():
+    """
+    THE NON-NEGOTIABLE PROPERTY. Truncation is a gradient-only device: it must
+    not perturb the trajectory, the milestones, or the order of convergence.
+    If it changed the forward, a checkpoint trained with it would evaluate
+    differently from one trained without, and truncate_bptt would have to join
+    _MEANING_FIELDS and propagate to every rebuild site.
+    """
+    z0, z1, dt, theta = _tbptt_inputs()
+    with torch.no_grad():
+        ref, ref_z1, ref_f = _tbptt_model(n_substeps=256)._integrate(
+            z0.clone(), z1.clone(), dt, theta)
+    for k in (2, 8, 64):
+        with torch.no_grad():
+            got, got_z1, got_f = _tbptt_model(n_substeps=256, truncate_bptt=k)._integrate(
+                z0.clone(), z1.clone(), dt, theta)
+        assert torch.equal(ref, got), f"k={k} changed z0"
+        assert torch.equal(ref_z1, got_z1), f"k={k} changed z1"
+        assert torch.equal(ref_f, got_f), f"k={k} changed the carried f"
+
+
+def _max_graph_depth(out) -> int:
+    """Deepest chain reachable from `out`, over ALL branches.
+
+    BFS, not a single-successor walk: torch.where keeps an edge to its
+    unselected branch, so following one next_function per node can wander a
+    path that hides a fully retained graph behind a masked edge -- the first
+    version of this test did exactly that."""
+    seen: dict = {}
+    frontier = [(out.grad_fn, 0)]
+    best = 0
+    while frontier:
+        fn, d = frontier.pop()
+        if fn is None or seen.get(fn, -1) >= d:
+            continue
+        seen[fn] = d
+        best = max(best, d)
+        for nf, _ in fn.next_functions:
+            frontier.append((nf, d + 1))
+    return best
+
+
+def test_truncation_shortens_the_backward_graph():
+    """Structural: fewer chained Jacobians AND fewer retained ops -- the
+    memory. The all-cut fast path is what frees them; torch.where alone
+    retains its unselected attached branch, so without that path the depth
+    does not shrink at all (measured 138 vs 131 untruncated)."""
+    def depth(k):
+        m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                            n_hidden_layers=1, n_substeps=64, truncate_bptt=k)
+        torch.manual_seed(1)
+        out, _, _ = m._integrate(torch.randn(1, 2, 4, 4), torch.randn(1, 2, 4, 4),
+                                  torch.full((1,), 10.0), torch.zeros(1, 1))
+        return _max_graph_depth(out)
+
+    full = depth(None)
+    assert depth(8) < full / 3, (depth(8), full)
+    assert depth(4) < depth(8)
+
+
+def test_every_sample_of_a_heterogeneous_batch_gets_gradient():
+    """
+    THE REVIEW FINDING, and the worst kind: silent. Counts in a batch are
+    heterogeneous -- that is the adaptive criterion's point -- and a
+    batch-wide detach at global boundaries zeroes the gradient of every
+    sample that has already arrived: its output's graph is severed, the only
+    surviving paths run through the zero-multiplied no-op updates, so
+    requires_grad stays True, backward() runs, and the sample contributes
+    EXACTLY nothing. Measured before the fix on counts (70, 100, 140, 200)
+    with k=64: samples 0-2 had |grad| = 0.0; only the deepest trained. Every
+    deep bucketed batch of the best-yet max_dt=2000 run trained that way.
+
+    Count 129 is in the fixture deliberately: it has remaining == 1 at the
+    128 boundary, so it also pins the per-sample form of the
+    one-step-final-segment rule (cut only when >= 2 of the sample's OWN
+    steps remain).
+    """
+    m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, alpha=0.1, max_substeps=2048,
+                        truncate_bptt=64)
+    torch.manual_seed(0)
+    B = 5
+    z0, z1 = torch.randn(B, 2, 4, 4), torch.randn(B, 2, 4, 4)
+    counts = torch.tensor([70, 100, 129, 140, 200])
+    m._substeps_for = lambda *a, **k: counts
+    out, _, _ = m._integrate(z0, z1, torch.full((B,), 100.0), torch.zeros(B, 1))
+    per_sample = out.reshape(B, -1).square().sum(dim=1)
+    for i in range(B):
+        m.zero_grad()
+        per_sample[i].backward(retain_graph=True)
+        g = sum(float(p.grad.abs().sum()) for p in m.parameters()
+                if p.grad is not None)
+        assert g > 0.0, (
+            f"sample {i} (n={int(counts[i])}) contributes zero gradient -- "
+            f"truncation is cutting samples that have already arrived (or are "
+            f"one step from arriving)"
+        )
+
+
+def test_deep_samples_are_still_truncated_in_a_mixed_batch():
+    """
+    The complement: keeping arrived samples attached must not stop the DEEP
+    samples being cut. A mutation that detaches only when every sample can be
+    cut would leave any batch containing one early-arriving window fully
+    untruncated -- with counts (3, 2048) that is the difference between a
+    bounded gradient and the exponential one truncation exists to prevent.
+    """
+    def deep_norm(k):
+        m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                            n_hidden_layers=1, alpha=0.1, max_substeps=4096,
+                            truncate_bptt=k)
+        torch.manual_seed(0)
+        z0, z1 = torch.randn(2, 2, 4, 4) * 0.3, torch.randn(2, 2, 4, 4) * 0.3
+        m._substeps_for = lambda *a, **kw: torch.tensor([3, 2048])
+        out, _, _ = m._integrate(z0, z1, torch.full((2,), 120.0),
+                                  torch.zeros(2, 1))
+        out[1].square().sum().backward()
+        return max(float(p.grad.abs().max()) for p in m.parameters()
+                   if p.grad is not None)
+
+    assert deep_norm(16) < deep_norm(None) / 50, (
+        "the deep sample of a mixed batch is not being truncated"
+    )
+
+
+def test_truncation_bounds_the_gradient_magnitude():
+    """
+    THE FAILURE IT EXISTS FOR. Gradient magnitude is exponential in sub-step
+    count: on this project depth 264 trained with norms ~3e3, while depth
+    ~1700 gave INFINITE norms on every batch with finite losses. Truncation
+    must break that growth -- the untruncated norm should be flat in depth
+    (already saturated) while the truncated one stays orders below.
+    """
+    z0, z1, dt, theta = _tbptt_inputs()
+
+    def norm(n, k):
+        m = _tbptt_model(n_substeps=n, truncate_bptt=k)
+        out, _, _ = m._integrate(z0.clone(), z1.clone(), dt, theta)
+        out.square().sum().backward()
+        return float(torch.nn.utils.clip_grad_norm_(m.parameters(), float("inf")))
+
+    deep_full, deep_trunc = norm(2048, None), norm(2048, 16)
+    assert deep_trunc < deep_full / 100, (
+        f"truncated norm {deep_trunc:.3e} is not meaningfully below the full "
+        f"{deep_full:.3e} -- the cut is not biting"
+    )
+    # and a SMALLER segment bounds it further
+    assert norm(2048, 16) < norm(2048, 64)
+
+
+@pytest.mark.parametrize("k", [2, 3, 8, 64])
+def test_every_substep_count_produces_a_usable_gradient(k):
+    """
+    THE PRODUCTION CRASH. Each sub-step's z0 update consumes the f_n RECYCLED
+    from the previous step, so a final segment of ONE step updates z0 from an
+    f_n that was just detached -- and that step's own f evaluation feeds only
+    z1 and the next f_n, neither of which reaches the output. z0 therefore has
+    no gradient path whenever
+
+        n_max % truncate_bptt == 1
+
+    and backward() raises "element 0 of tensors does not require grad". At
+    k=64 the trap values are 65, 129, ... 961, inside the observed range of
+    876-1024; with n_rollout_steps=2 over cost-bucketed (homogeneous) batches
+    both transitions can land on one together and the whole loss loses its
+    graph. It killed a run at epoch 38.
+
+    I had found this at k=1 and "fixed" it by requiring k >= 2 -- addressing
+    the case I happened to test rather than the condition, since k=1 is just
+    the case where every segment has length 1. This sweeps EVERY count, which
+    is what the earlier test should have done.
+    """
+    m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, truncate_bptt=k)
+    for n in range(2, 4 * k + 3):
+        m.n_substeps = n
+        torch.manual_seed(0)
+        out, _, _ = m._integrate(torch.randn(1, 2, 4, 4), torch.randn(1, 2, 4, 4),
+                                  torch.full((1,), 5.0), torch.zeros(1, 1))
+        assert out.grad_fn is not None, (
+            f"k={k}, n_max={n} (n%k={n % k}): output has no gradient path"
+        )
+        out.square().sum().backward()
+        largest = max(float(p.grad.abs().max()) for p in m.parameters()
+                      if p.grad is not None)
+        assert largest > 0.0, f"k={k}, n_max={n}: gradient is identically zero"
+        m.zero_grad()
+
+
+def test_k_of_one_is_rejected_because_it_leaves_no_gradient():
+    """
+    FOUND BY MEASUREMENT, not by reading. Each sub-step's z0 update consumes
+    the f_n RECYCLED from the previous step -- that recycling is what keeps the
+    scheme at one f evaluation per step. So at k=1 every f_n is detached before
+    it ever reaches a z0 update, the output has no grad_fn at all, and
+    backward() raises. A segment needs two steps for one f evaluation to both
+    live inside it and feed a later z0.
+    """
+    with pytest.raises(ValueError, match="truncate_bptt must be >= 2"):
+        LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, truncate_bptt=1)
+    with pytest.raises(ValueError, match="truncate_bptt must be >= 2"):
+        LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, truncate_bptt=0)
+
+
+def test_the_gradient_still_flows_at_the_smallest_allowed_segment():
+    """k=2 is the boundary -- it must produce a usable gradient, or the
+    validation is off by one."""
+    z0, z1, dt, theta = _tbptt_inputs()
+    m = _tbptt_model(n_substeps=64, truncate_bptt=2)
+    out, _, _ = m._integrate(z0, z1, dt, theta)
+    out.square().sum().backward()
+    grads = [p.grad for p in m.parameters() if p.grad is not None]
+    assert grads and any(float(g.abs().max()) > 0 for g in grads)
+
+
+def test_all_three_carried_tensors_detach_together():
+    """
+    z0, z1 and f_n all cross a segment boundary. Detaching a subset leaves a
+    path around the cut -- z1 reaches the next z0 through z1*h, f_n through
+    both -- so the chain reconstitutes and the truncation silently does
+    nothing. Checked by requiring the truncated gradient to differ from the
+    untruncated one; a partial detach would leave them equal.
+    """
+    z0, z1, dt, theta = _tbptt_inputs()
+
+    def norm(n, k):
+        m = _tbptt_model(n_substeps=n, truncate_bptt=k)
+        out, _, _ = m._integrate(z0.clone(), z1.clone(), dt, theta)
+        out.square().sum().backward()
+        return float(torch.nn.utils.clip_grad_norm_(m.parameters(), float("inf")))
+
+    # A partial detach is NOT caught by "the gradient changed" -- detaching
+    # only z0 changes it too, and my first version of this test passed against
+    # exactly that mutation. What separates them is the SUPPRESSION FACTOR at
+    # depth: with all three cut the norm falls ~6400x below the untruncated
+    # one at depth 2048; with only z0 cut the surviving z1/f_n chain keeps it
+    # within ~170x. Measured on this fixture, so the 1000x bar sits well
+    # between the two.
+    suppression = norm(2048, None) / norm(2048, 16)
+    assert suppression > 1000.0, (
+        f"truncation suppresses the gradient only {suppression:.0f}x at depth "
+        f"2048 -- a path is surviving the cut (z1 and f_n must detach too, not "
+        f"just z0)"
+    )
+
+
+def test_truncation_is_off_by_default_and_absent_from_the_meaning_fields():
+    """
+    Off by default so every existing run is unchanged, and NOT a meaning field
+    because the forward is identical with and without it -- a checkpoint
+    rebuilt without it evaluates exactly as it trained. Putting it in
+    _MEANING_FIELDS would also make the no_grad diagnostics pay detach calls
+    for a graph they never build.
+    """
+    from models.latent_dynamics import _MEANING_FIELDS
+    m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1)
+    assert m.truncate_bptt is None
+    assert "truncate_bptt" not in _MEANING_FIELDS
+
+
+def test_train_lds_exposes_truncation_and_records_it():
+    import inspect
+
+    import pathlib
+
+    from conftest import source_without_comments
+    from training.train_lds import train_lds
+    assert inspect.signature(train_lds).parameters["truncate_bptt"].default is None
+    root = pathlib.Path(__file__).resolve().parent.parent
+    src = source_without_comments(root / "training/train_lds.py")
+    assert "truncate_bptt=truncate_bptt" in src, "the model is not built with it"
+    assert '"truncate_bptt": truncate_bptt' in src, (
+        "not recorded in the checkpoint config -- provenance for how the "
+        "gradient was computed is lost"
+    )
+
+
+def _retained_nodes(out) -> int:
+    """Autograd nodes reachable from `out` -- proportional to the activations
+    the backward pass must keep alive, i.e. to VRAM."""
+    seen, frontier, n = set(), [out.grad_fn], 0
+    while frontier:
+        fn = frontier.pop()
+        if fn is None or fn in seen:
+            continue
+        seen.add(fn)
+        n += 1
+        for nf, _ in fn.next_functions:
+            frontier.append(nf)
+    return n
+
+
+def _integrate_counts(counts, k):
+    m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, alpha=0.1, max_substeps=4096,
+                        truncate_bptt=k)
+    torch.manual_seed(0)
+    b = len(counts)
+    m._substeps_for = lambda *a, **kw: torch.tensor(counts)
+    return m._integrate(torch.randn(b, 2, 4, 4) * 0.3, torch.randn(b, 2, 4, 4) * 0.3,
+                         torch.full((b,), 60.0), torch.zeros(b, 1))
+
+
+@pytest.mark.parametrize("counts", [
+    [256] * 4,                      # homogeneous
+    [240, 246, 250, 256],           # narrow, as a well-bucketed batch
+    [200, 218, 237, 256],           # moderate spread
+    [16, 64, 128, 256],             # wide -- the worst case for arrival spread
+])
+def test_truncation_bounds_retained_memory_however_heterogeneous_the_batch(counts):
+    """
+    THE VRAM REGRESSION. A graph belongs to a TENSOR, not an element, so the
+    per-sample torch.where form -- keeping arrived samples attached -- retained
+    that segment's ops for the WHOLE batch. Measured at k=16, depth 256:
+    homogeneous kept its 17x saving, [200..256] fell to 4x, and
+    [16,64,128,256] to 0.99x, i.e. truncation bounded nothing at all. Bucketing
+    makes batches heterogeneous by construction, so this was the common case.
+
+    Capturing each sample's value AT ARRIVAL and then detaching the running
+    state outright restores the bound: the copy carries that sample's gradient
+    back only to the previous boundary, and nothing needs the running tensors
+    attached.
+    """
+    full = _retained_nodes(_integrate_counts(counts, None)[0])
+    trunc = _retained_nodes(_integrate_counts(counts, 16)[0])
+    assert trunc < full / 3.5, (
+        f"counts={counts}: truncation retains {trunc} nodes vs {full} "
+        f"untruncated ({full / trunc:.1f}x) -- memory is not being bounded"
+    )
+
+
+def test_arrival_capture_keeps_the_forward_bit_identical():
+    """The accumulator returns each sample's value from the step it arrived;
+    the masked loop leaves that value unchanged afterwards, so the two must
+    agree exactly -- including z1 and the carried f."""
+    for counts in ([70, 100, 140, 200], [65, 66], [1, 2, 3, 4], [256] * 3):
+        plain = _integrate_counts(counts, None)
+        trunc = _integrate_counts(counts, 64)
+        for name, a, b in zip(("z0", "z1", "f"), plain, trunc):
+            assert torch.equal(a, b), f"counts={counts}: {name} differs"

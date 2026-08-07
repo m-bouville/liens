@@ -89,8 +89,8 @@ ae_stats_weight= 1.
 
 use_dt_decade_weights = True
 
-epochs 		  =5000		# increase?
-patience 	  = 500
+epochs 		  =10000		# increase?
+patience 	  =  500
 
 num_workers	  =   8   # was 8
 batches		  = 2048
@@ -100,7 +100,7 @@ lr 			  = 5e-6  # was 0.2e-3; default: 1.e-3
 z0_noise_scale=   0.02	# was 0.175
 
 dt_cap		  = inf		# for second order
-max_dt        = 1000   # 1000/0.05 = 20'000 time steps
+max_dt        = 2000   # 2000/0.05 = 40'000 time steps
 
 # force 	      = True
 
@@ -109,32 +109,39 @@ max_dt        = 1000   # 1000/0.05 = 20'000 time steps
 # Stage 3b
 #   latent dynamics surrogate (rollout)
 n_rollout_steps=  2			# always > 1 for 3b
-# n_substeps     = 14		# constant sub-step
-alpha			=  0.1		# adaptative sub-step
 z1_resync      = False		# always False for 3b
+
+alpha			=  0.15		# adaptative sub-step
+max_substeps    = 2048		# default: 256
+bucket_batches 	= True		# default: True
+batch_cost_budget= 100000	# batch_size × max_cost; default: None
+	# = (usable VRAM) / (n_rollout_steps × bytes_per_sample_substep [≈ 15 kB])
+truncate_bptt = 64
+bucket_refresh_epochs=0
 
 # resume_from = checkpoints/stage3b/128x128-stage3b-20260806_18h10.pt
 
-rollout_scale = 1e-6
+rollout_scale  = 1			# was 1e-6
 ae_stats_weight= 1.
-one_step_weight= 0.5
+one_step_weight= 0. 		# was 0.5
 
 use_dt_decade_weights = same
 
 epochs 		  = 2000
-patience 	  =  200
+patience 	  =  100
 
 num_workers	  = same
-batches		  = same
+batches		  = 4096
+# min_batch_size=  512 		# not implemented
 spike_skip_factor= same
 
-lr 			  =   3.e-6  	# was 0.1e-3; default: 1.e-3
+lr 			  =   3.e-6  	# was 3.e-6; default: 1.e-3
 z0_noise_scale=   0.02
 
 dt_cap		  = same		# must be
-max_dt        = same 
+max_dt        = 2000 
 
-# force 	      = True
+force 	      = True
 
 
 
@@ -151,17 +158,17 @@ recon0_scale    =   0.15e-3
 stats0_scale    =   0.03
 
 rollout_scale   =   0.2
-rollout_weight_warmup_epochs= 10
+rollout_weight_warmup_epochs= 20
 rollout_weight_warmup_start = 1e-3  # geometric warmup
 
-lr 			  =   0.2e-4  	# default: 1.e-3
+lr 			  =   5e-6  	# default: 1.e-3
 
 epochs 		  = 100
 patience 	  =  25 	# tends to shoot up: patience won't pay
 
 batches		  =  64		# was 96
 
-max_dt        = 500
+max_dt        = same
 
 force 	      = True
 

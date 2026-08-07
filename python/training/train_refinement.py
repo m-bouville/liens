@@ -15,7 +15,10 @@ from torch.utils.data import DataLoader
 
 from training.checkpoint_components import cross_check_ancestor_config
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
-from training.spike_guard import _SpikeGuard, _record_spike, end_epoch_pair
+from training.spike_guard import (
+    _SpikeGuard, _record_spike, difficulty_band, early_stop_message, end_epoch_pair,
+    restore_running_stats, snapshot_running_stats,
+)
 from utils.logging_utils import print_run_parameters
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
@@ -354,6 +357,12 @@ def train_refinement(
 
     def step(batch, train: bool, effective_rollout_weight: float | None = None):
         x_window, dt_window, theta, true_stats = unpack(batch)
+        # BEFORE the forward, because the forward is what moves the buffers.
+        # A skipped batch must leave the model exactly as it found it, and
+        # "the optimizer step was not taken" only covers PARAMETERS -- see
+        # snapshot_running_stats for the stage-4 run where 487/487 skipped
+        # batches still moved val_loss by 1.2%.
+        _bn_snapshot = snapshot_running_stats(ae, f_theta) if train else None
         loss, components = compute_stage45_loss(
             ae, f_theta, stats_head, x_window, dt_window, theta,
             rollout_weight=(rollout_weight if effective_rollout_weight is None
@@ -375,9 +384,14 @@ def train_refinement(
             # At ~135 batches per epoch (vs stage 3's 7) a single bad batch is
             # 1e5-1e8x the median, so a factor-10 threshold catches it with an
             # enormous margin over ordinary variation.
-            if spike_guard.should_skip(float(loss.detach())):
+            # See train_lds: per-band comparison, so a bucketed batch is
+            # judged against batches of similar difficulty rather than against
+            # the whole population's median.
+            _band = difficulty_band(float(dt_window.detach().max()))
+            if spike_guard.should_skip(float(loss.detach()), band=_band):
                 _record_spike(spike_guard, loss, dt_window, theta)
                 optimizer.zero_grad()
+                restore_running_stats(_bn_snapshot)
             else:
                 optimizer.zero_grad()
                 loss.backward()
@@ -386,9 +400,14 @@ def train_refinement(
                 # structurally cannot see (measured on stage 3a).
                 _gnorm = torch.nn.utils.clip_grad_norm_(
                     trainable_params, grad_clip if grad_clip > 0 else float("inf"))
-                if grad_guard.should_skip(float(_gnorm)):
+                if grad_guard.should_skip(float(_gnorm), band=_band):
                     _record_spike(grad_guard, _gnorm, dt_window, theta)
                     optimizer.zero_grad()
+                    # The gradient path ran the SAME forward, so it moved the
+                    # same buffers -- both skip branches need the restore, and
+                    # this one is the easier to forget because the loss looked
+                    # ordinary.
+                    restore_running_stats(_bn_snapshot)
                 else:
                     optimizer.step()
         # Returned as GPU tensors, NOT .item()'d here -- .item() blocks
@@ -406,6 +425,11 @@ def train_refinement(
         return (loss.detach(), components["rollout"].detach(),
                 components["recon0"].detach(), components["stats0"].detach())
 
+    # Whether THIS run has written the checkpoint at least once -- train_lds
+    # tracks the same thing for its no-save guard; here it feeds
+    # early_stop_message, so an exit with zero saves is reported as the
+    # never-improved event it is rather than as ordinary patience.
+    _saved_this_run = False
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=ema_warmup_epochs,
                                           val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
@@ -575,11 +599,12 @@ def train_refinement(
             if _g.n_skipped != _seen:
                 _w = _g.last_worst
                 _d = ("" if _w is None else
-                       f" worst: {_w[0]:.4g} vs median {_w[1]:.4g}, "
+                       f" worst: {_w[0]:.4g} vs median {_SpikeGuard.median_display(_w[1])}, "
                        f"dt_max={_w[2]:.4g}, mean theta[0]={_w[3]:.4g}")
                 print(f"  [epoch {epoch}: skipped {_g.n_skipped - _seen} batch(es) whose "
                       f"{_what} was a catastrophic outlier. The optimizer step was NOT "
-                      f"taken, so the weights are untouched.{_d}]")
+                      f"taken, and the BatchNorm running statistics its forward pass "
+                      f"moved were restored, so the model is untouched.{_d}]")
         _grad_spikes_reported, _spikes_reported = grad_guard.n_skipped, spike_guard.n_skipped
         if _deadlocked and spike_guard.consecutive_total_skip_epochs >= 5:
             # STOP, keeping the best checkpoint -- the stage-3 lesson. No
@@ -716,6 +741,7 @@ def train_refinement(
                           f"Suggested: {_suggest}\n")
 
         if saved_this_epoch:
+            _saved_this_run = True
             epochs_since_improvement = 0
             atomic_torch_save({
                 "ae_state": ae.state_dict(),
@@ -766,8 +792,7 @@ def train_refinement(
             print(msg)
 
         if early_stopping_patience is not None and epochs_since_improvement >= early_stopping_patience:
-            print(f"Early stopping at epoch {epoch}: no improvement for "
-                  f"{early_stopping_patience} epochs")
+            print(early_stop_message(epoch, early_stopping_patience, _saved_this_run))
             break
 
     # Unconditional final write: the in-loop calls are throttled (see

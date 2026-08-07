@@ -15,6 +15,8 @@ import math
 import statistics
 from collections import deque
 
+import torch
+
 
 def _record_spike(guard: "_SpikeGuard", total, dt_window, theta) -> float | None:
     """Attribution for a skipped batch: what was IN it.
@@ -35,7 +37,42 @@ def _record_spike(guard: "_SpikeGuard", total, dt_window, theta) -> float | None
     # for dozens of epochs, including AFTER a rollback had restored different
     # weights, so it described a batch that no longer existed.
     if guard.worst is None or loss_v > guard.worst[0]:
-        guard.worst = (loss_v, guard.median(), dt_max, theta0)
+        # The band's OWN median, matching the threshold this batch was judged
+        # against -- see _SpikeGuard.median.
+        guard.worst = (loss_v, guard.median(difficulty_band(dt_max)), dt_max, theta0)
+
+
+def difficulty_band(dt_max: float) -> int:
+    """Which comparison population a batch belongs to, from its largest dt.
+
+    The guard skips a batch whose loss exceeds a multiple of a running median.
+    That works when batches are interchangeable samples of the population --
+    a high loss then really does mean "something went wrong". Under
+    cost-bucketed batching they are NOT interchangeable: the hard windows are
+    deliberately grouped, so their batches have a systematically high loss and
+    were skipped as a block, epoch after epoch. Measured on the first
+    max_dt=1000 run that trained: 14-19 of ~37 batches skipped every epoch for
+    48 epochs, every one attributed to dt_max=1000. The run was stable because
+    the guard had quietly restored the max_dt=500 population, one batch at a
+    time.
+
+    Comparing a batch against batches of SIMILAR difficulty restores the
+    original meaning: an outlier is an anomaly within its own band, not
+    membership of the hard tail.
+
+    log2 bands (factor-2 in dt) are coarse enough to keep each band's history
+    populated and fine enough that loss level within a band is comparable --
+    loss grows roughly as dt^0.7 here, so a factor-2 band spans ~1.6x, well
+    inside the factor-10 threshold.
+
+    NO-OP WITHOUT BUCKETING, which is what makes this safe to switch on: an
+    unbucketed batch of ~1000 windows drawn from the whole population contains
+    a near-maximum-dt window with near-certainty, so every batch reports the
+    same dt_max and lands in one band -- exactly today's behaviour.
+    """
+    if not math.isfinite(dt_max) or dt_max <= 0:
+        return 0
+    return int(math.floor(math.log2(dt_max)))
 
 
 class _SpikeGuard:
@@ -72,7 +109,12 @@ class _SpikeGuard:
     def __init__(self, factor: float, window: int = 200, min_history: int = 50):
         self.factor = factor
         self.min_history = min_history
-        self._recent: deque[float] = deque(maxlen=window)
+        self.window = window
+        # One history PER DIFFICULTY BAND -- see difficulty_band. A single
+        # shared deque made "is this batch an outlier?" mean "is this batch
+        # harder than average?", which under bucketing is answered by the
+        # sampler rather than by anything going wrong.
+        self._recent: dict[int, deque[float]] = {}
         self.n_skipped = 0
         self.n_nonfinite = 0
         self.n_skipped_this_epoch = 0
@@ -80,24 +122,80 @@ class _SpikeGuard:
         self.worst: tuple[float, float, float, float] | None = None   # loss, median, dt_max, theta0
         self.last_worst: tuple[float, float, float, float] | None = None
 
-    def should_skip(self, loss_value: float) -> bool:
+    def _band(self, band: int | None) -> deque:
+        if band not in self._recent:
+            self._recent[band] = deque(maxlen=self.window)
+        return self._recent[band]
+
+    def should_skip(self, loss_value: float, band: int | None = None) -> bool:
+        """`band` defaults to None -- ONE shared history, i.e. the old
+        behaviour -- so a caller that does not bucket is unaffected."""
         if self.factor <= 0:
             return False
         if not math.isfinite(loss_value):
             self.n_skipped += 1
             self.n_nonfinite += 1
+            # COUNTED toward this epoch's total, exactly like a finite outlier.
+            # This line was missing, and the omission cost a 200-epoch run: at
+            # max_dt=2000, ~19 of 23 batches per epoch had INFINITE gradient
+            # norms, all skipped through this branch -- none counted -- so the
+            # combined total end_epoch_pair saw was the loss guard's 4-8, never
+            # 23, and the all-skipped deadlock could not fire. The run burned
+            # 200 epochs x 23 full forward+backward passes taking not one
+            # optimizer step, then exited claiming "no improvement", when
+            # spike_deadlock_epochs=5 should have stopped it at epoch 5.
+            #
+            # The failure was invisible precisely because non-finite is the
+            # MOST skipped-looking skip there is: the explicit isfinite check
+            # made the batch obviously handled, and nothing suggested it was
+            # handled off the books.
+            self.n_skipped_this_epoch += 1
             return True
-        if len(self._recent) >= self.min_history:
-            med = statistics.median(self._recent)
+        history = self._band(band)
+        if len(history) >= self.min_history:
+            med = statistics.median(history)
             if med > 0 and loss_value > self.factor * med:
                 self.n_skipped += 1
                 self.n_skipped_this_epoch += 1
                 return True
-        self._recent.append(loss_value)
+        history.append(loss_value)
         return False
 
-    def median(self) -> float:
-        return statistics.median(self._recent) if self._recent else float("nan")
+    def history(self, band: int | None = None) -> deque:
+        """The recorded values for `band` -- read-only view for diagnostics.
+
+        Exists because `_recent` changed shape when the bands were introduced
+        (a deque became a dict of deques), and several tests were reaching
+        into it directly. An accessor keeps that internal.
+        """
+        return self._recent.get(band, deque())
+
+    def median(self, band: int | None = None) -> float:
+        """The median of `band`'s own history -- the value the threshold used.
+
+        Reporting the pooled median instead would print a number the decision
+        was never made against, which is worse than useless when the whole
+        point of the bands is that they sit at different levels.
+        """
+        history = self._recent.get(band)
+        return statistics.median(history) if history else float("nan")
+
+    @staticmethod
+    def median_display(value: float) -> str:
+        """How a median renders in a skip report.
+
+        nan here means EMPTY HISTORY -- non-finite values are never recorded,
+        so the deque cannot contain one; it can only have nothing at all. On
+        the max_dt=2000 run every batch reaching the gradient guard was
+        non-finite for 200 straight epochs, so its history stayed empty and
+        every report printed "vs median nan" -- which reads as a broken
+        statistic and sent the diagnosis toward value-poisoning, when the
+        honest statement was "this guard has never once seen a finite value".
+        Worth saying THAT, since a guard with no finite history is itself a
+        louder finding than any threshold it might have applied.
+        """
+        return (f"{value:.4g}" if math.isfinite(value)
+                else "n/a -- NO finite value ever recorded")
 
     def end_epoch(self, n_batches: int, extra_skipped: int = 0) -> bool:
         """Returns True when EVERY batch this epoch was skipped.
@@ -138,6 +236,171 @@ class _SpikeGuard:
         self.consecutive_total_skip_epochs = 0
 
 
+def skip_report(epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst,
+                 n_batches: int, verbose: bool) -> str:
+    """One line per epoch for both guards, verbose only the FIRST time.
+
+    The original printed a three-line paragraph PER GUARD PER EPOCH, each
+    re-explaining what the guard is for. Once skipping became routine -- 1 to 4
+    batches of 13, every epoch, which is the guard working as intended -- that
+    was six lines of unchanging exposition between consecutive epoch lines, and
+    the loss curve became unreadable in the one regime where it most needed
+    watching.
+
+    So: the explanation is printed ONCE (it is genuinely worth reading once),
+    and every later epoch gets a single compact line carrying only what varies
+    -- the counts, the worst-vs-median ratio, and the dt band the outliers came
+    from. The ratio replaces printing both numbers because it is what the
+    threshold actually tests, and a bare count with no ratio cannot distinguish
+    "10x, marginal" from "1e8x, catastrophic".
+
+    Returns "" when nothing was skipped, so the caller prints nothing at all.
+    """
+    if not (loss_new or grad_new):
+        return ""
+
+    def _ratio(worst) -> str:
+        if worst is None or not math.isfinite(worst[1]) or worst[1] <= 0:
+            return "n/a"
+        return f"{worst[0] / worst[1]:.3g}x"
+
+    if verbose:
+        parts = []
+        if grad_new:
+            parts.append(
+                f"  [epoch {epoch}: skipped {grad_new} batch(es) whose GRADIENT NORM was a "
+                f"catastrophic outlier, despite an ordinary loss. This is the case the loss "
+                f"guard cannot see."
+                + ("" if grad_worst is None else
+                   f" worst: grad_norm {grad_worst[0]:.4g} vs median "
+                   f"{_SpikeGuard.median_display(grad_worst[1])}, dt_max={grad_worst[2]:.4g}, "
+                   f"mean theta[0]={grad_worst[3]:.4g}")
+                + "]")
+        if loss_new:
+            parts.append(
+                f"  [epoch {epoch}: skipped {loss_new} batch(es) whose loss was a catastrophic "
+                f"outlier. The optimizer step was NOT taken, and the BatchNorm running "
+                f"statistics its forward pass moved were restored, so the model is untouched."
+                + ("" if loss_worst is None else
+                   f" worst: loss {loss_worst[0]:.4g} vs median "
+                   f"{_SpikeGuard.median_display(loss_worst[1])}, dt_max={loss_worst[2]:.4g}, "
+                   f"mean theta[0]={loss_worst[3]:.4g}")
+                + "]")
+        parts.append(
+            "  (further skips are reported on one compact line per epoch; the counts and "
+            "the worst/median ratio are what vary.)")
+        return "\n".join(parts)
+
+    bits = []
+    if grad_new:
+        bits.append(f"{grad_new} grad ({_ratio(grad_worst)})")
+    if loss_new:
+        bits.append(f"{loss_new} loss ({_ratio(loss_worst)})")
+    worst = grad_worst if grad_new else loss_worst
+    band = "" if worst is None else f" @ dt_max={worst[2]:.4g}"
+    return f"  [epoch {epoch}: skipped {' + '.join(bits)} of {n_batches}{band}]"
+
+
+class SkipReporter:
+    """Decides which skips are worth a line, and digests the rest.
+
+    A guard that skips 1 batch of 13 at 11.9x its band median is WORKING: the
+    threshold is 10x, so that batch was barely over, and trimming it is the
+    whole point. Printing a line for it every epoch trains the reader to skim
+    past the line that matters -- which on this project is the difference
+    between "a marginal tail is being trimmed" and "half the epoch is being
+    excluded", and between 11.9x and the 1e7-1e8x ratios that marked genuine
+    catastrophes.
+
+    So a skip is REPORTED when it is one of:
+
+      * BIG RATIO (>= notable_ratio x the band median). 10x is the threshold
+        itself; 100x is an order of magnitude past it, i.e. not marginal.
+      * BIG SHARE (>= notable_fraction of the epoch's batches). One batch of
+        13 is noise; four is a third of the gradient signal gone.
+      * NON-FINITE. Always: an inf/nan gradient is the case that turns the
+        whole parameter vector to nan in one step if it gets through.
+
+    Everything else accumulates silently and comes out as one digest line
+    every `digest_every` epochs, so the information is kept without the noise.
+    """
+
+    def __init__(self, notable_ratio: float = 100.0, notable_fraction: float = 0.25,
+                 digest_every: int = 25):
+        self.notable_ratio = notable_ratio
+        self.notable_fraction = notable_fraction
+        self.digest_every = digest_every
+        self._explained = False
+        self._quiet_epochs = 0
+        self._quiet_batches = 0
+        self._quiet_worst = 0.0
+        self._last_digest_epoch = 0
+
+    @staticmethod
+    def _ratio(worst) -> float:
+        if worst is None or not math.isfinite(worst[1]) or worst[1] <= 0:
+            return float("inf") if worst is not None else 0.0
+        return worst[0] / worst[1]
+
+    def epoch(self, epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst,
+               n_batches: int, n_nonfinite_new: int = 0) -> str:
+        """The line(s) to print for this epoch -- possibly empty."""
+        lines = []
+        total = loss_new + grad_new
+        if total:
+            ratio = max(self._ratio(loss_worst), self._ratio(grad_worst))
+            share = total / max(n_batches, 1)
+            notable = (n_nonfinite_new > 0
+                       or ratio >= self.notable_ratio
+                       or share >= self.notable_fraction)
+            if notable:
+                lines.append(skip_report(epoch, loss_new, loss_worst, grad_new,
+                                          grad_worst, n_batches,
+                                          verbose=not self._explained))
+                self._explained = True
+            else:
+                self._quiet_epochs += 1
+                self._quiet_batches += total
+                self._quiet_worst = max(self._quiet_worst, ratio)
+
+        if (self.digest_every and self._quiet_epochs
+                and epoch - self._last_digest_epoch >= self.digest_every):
+            lines.append(
+                f"  [epochs {self._last_digest_epoch + 1}-{epoch}: {self._quiet_batches} "
+                f"further batch(es) skipped across {self._quiet_epochs} epoch(s), worst "
+                f"{self._quiet_worst:.3g}x its band median -- below the reporting bar "
+                f"({self.notable_ratio:g}x, or {100 * self.notable_fraction:g}% of an "
+                f"epoch's batches), i.e. the guard trimming a marginal tail]")
+            self._last_digest_epoch = epoch
+            self._quiet_epochs = self._quiet_batches = 0
+            self._quiet_worst = 0.0
+        return "\n".join(x for x in lines if x)
+
+
+def early_stop_message(epoch: int, patience: int, saved_this_run: bool) -> str:
+    """The line printed when patience runs out, honest about the two cases.
+
+    "No improvement for N epochs" describes a run that climbed, plateaued and
+    stopped. A run that NEVER saved is a different event wearing the same
+    exit: the max_dt=2000 run skipped every batch of every epoch, took not
+    one optimizer step, and left with "no improvement for 200 epochs" -- a
+    sentence that sent the reader toward convergence when the story was
+    total paralysis. The distinction costs one boolean the trainers already
+    track for the no-save guard.
+
+    A pure function for the same reason deadlock_step_hint is one: inlined
+    text can only be tested by matching source, and such tests break on
+    correct changes while never checking what the message SAYS.
+    """
+    if saved_this_run:
+        return (f"Early stopping at epoch {epoch}: no improvement for "
+                f"{patience} epochs")
+    return (f"Early stopping at epoch {epoch}: NOTHING was ever saved -- this is "
+            f"not a converged run, it is one that never improved on its starting "
+            f"point (or never took a step at all; check the skip counts above). "
+            f"The checkpoint on disk, if any, belongs to a previous run.")
+
+
 def end_epoch_pair(spike_guard: _SpikeGuard, grad_guard: _SpikeGuard,
                     n_batches: int) -> bool:
     """Close BOTH guards' epochs, each seeing the other's skips.
@@ -165,3 +428,49 @@ def end_epoch_pair(spike_guard: _SpikeGuard, grad_guard: _SpikeGuard,
     return deadlocked
 
 
+def snapshot_running_stats(*modules) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Clone every normalisation running buffer in `modules`.
+
+    THE GUARD'S OWN CLAIM, made true. A skipped batch prints "the optimizer
+    step was NOT taken, so the weights are untouched" -- true of PARAMETERS
+    and false of BUFFERS: the forward pass has already run by the time the
+    loss is known, and in train mode every BatchNorm has updated its
+    running_mean/running_var/num_batches_tracked on the way through. There is
+    no way to decide the skip earlier, because the loss IS the signal.
+
+    Observed on stage 4: epochs 8 and 9 skipped 487 of 487 batches -- every
+    parameter frozen -- and val_loss still moved, 575.70 -> 582.34. That is
+    only possible through the buffers, and it means a deadlock was not the
+    frozen, recoverable state the message described: the encoder kept drifting
+    in the one direction nothing was checking, while the guard reported it as
+    inert.
+
+    Stage 3 is immune (its encoder is frozen and LatentDynamics is Linear +
+    LeakyReLU, no normalisation at all), which is why this surfaced only once
+    stages 4/5 gained the same guards.
+
+    num_batches_tracked is included: with momentum=None it drives the
+    cumulative average, so leaving it advanced by a skipped batch biases every
+    later update.
+    """
+    saved = []
+    for module in modules:
+        if module is None:
+            continue
+        for m in module.modules():
+            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                for buf in (m.running_mean, m.running_var, m.num_batches_tracked):
+                    if buf is not None:
+                        saved.append((buf, buf.detach().clone()))
+    return saved
+
+
+def restore_running_stats(snapshot: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+    """Undo the buffer updates a skipped batch's forward pass performed.
+
+    copy_ rather than reassignment: the buffers are registered on their
+    modules, so rebinding the name would leave the module holding the drifted
+    tensor and silently do nothing.
+    """
+    for buf, saved in snapshot:
+        buf.copy_(saved)

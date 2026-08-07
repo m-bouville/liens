@@ -82,6 +82,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 
+from utils.plots import log_axis_ticks as _log_axis_ticks
+
 from utils import load_datasets as load
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/
@@ -302,28 +304,6 @@ def _format_temp(temperature: float) -> str:
     and prints "0.975" where it is not.
     """
     return f"{temperature:.3f}".rstrip("0").rstrip(".")
-
-
-def _log_axis_ticks(axis, lo: float, hi: float, mantissas=(1, 2, 3, 5)) -> None:
-    """
-    Label a log axis at {1,2,3,5}x10^k rather than at decades only.
-
-    Matplotlib's default LogLocator labels decades, so an axis spanning
-    less than one decade (which -a(T)/b does: 0.005 to 0.45) can end up
-    with a SINGLE labelled tick, leaving the reader no way to read a
-    value off the plot at all.
-    """
-    if not (hi > lo > 0):
-        return
-    ticks = [m * 10.0 ** k
-              for k in range(int(np.floor(np.log10(lo))), int(np.ceil(np.log10(hi))) + 1)
-              for m in mantissas]
-    ticks = [t for t in ticks if lo <= t <= hi]
-    if len(ticks) < 2:
-        return
-    axis.set_ticks(ticks)
-    axis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:g}"))
-    axis.set_minor_locator(mticker.NullLocator())
 
 
 def _normalized_ylim(ax) -> None:
@@ -1176,12 +1156,21 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
     into bands that obscure the lines; in those panels there is one point
     per temperature, so the markers are the data.
     """
-    fig, axes = plt.subplots(2, 4, figsize=(24, 9))
+    # 2x3. The two collapse panels (t/tau and t/tau_down) and the
+    # LAST-value panel are gone; what the LAST-value panel carried is now an
+    # overlay on the MAX-value panel, where the two can be read against each
+    # other directly instead of across the figure.
+    #
+    # Five panels in six slots: [0, 2] is switched off rather than letting
+    # something fill it, because the column pairing is the point -- column 0
+    # is the same data raw and normalized, column 1 is the two timescales
+    # against the same driving force -- and column 2 has only one member.
+    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
     # Linked pairwise rather than with subplots(sharex="col"), which
     # would also link column 1 -- whose two panels have different x
-    # quantities (t/tau against -a(T)/b) and must not share a scale.
+    # quantities (tau against tau_down) and must not share a y scale.
     axes[0, 0].sharex(axes[1, 0])
-    axes[0, 3].sharex(axes[1, 3])
+    axes[0, 2].set_axis_off()
 
     colors = plt.cm.viridis(np.linspace(0, 1, max(len(temperatures), 2)))
     color_of = dict(zip(temperatures, colors))
@@ -1198,7 +1187,7 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
     ax.set_ylabel("stdev_phi")
     ax.set_title(f"raw: stdev_phi vs t, one curve per T\n({statistic} over noise then seeds, "
                   f"band = {'p25-p75' if statistic == 'median' else '1 sd'})")
-    ax.legend(fontsize=7, ncol=2)
+    ax.legend(fontsize=7, ncol=2, loc="upper left")
 
     ax = axes[1, 0]
     for temp in temperatures:
@@ -1214,22 +1203,9 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
     ax.set_ylabel("stdev_phi / sqrt(-a(T)/b)  [%]")
     _normalized_ylim(ax)
     ax.set_title("amplitude removed: the height difference near T0\nis Landau scaling, not timing")
-    ax.legend(fontsize=7, ncol=2)
+    ax.legend(fontsize=7, ncol=2, loc="upper left")
 
     ax = axes[0, 1]
-    for temp in collapse_temps:
-        c = curves[temp]
-        ax.plot(c["steps"] / taus[temp], 100.0 * c["normalized"], "-", color=color_of[temp],
-                 label=f"T={_format_temp(temp)}")
-    ax.axvline(1.0, color="k", ls=":", lw=1)
-    ax.set_xscale("log")
-    ax.set_xlabel("t / tau(T)")
-    ax.set_ylabel("stdev_phi / sqrt(-a(T)/b)  [%]")
-    _normalized_ylim(ax)
-    ax.set_title("THE TEST: same curves, time rescaled by tau(T)\ncollapse => T is a clock speed")
-    ax.legend(fontsize=7, ncol=2)
-
-    ax = axes[1, 1]
     finite = [t for t in temperatures if np.isfinite(taus[t])]
     drive_xlim = None
     if finite:
@@ -1243,7 +1219,7 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
         ax.set_yscale("log")
         _log_axis_ticks(ax.xaxis, min(xs), max(xs))
         _log_axis_ticks(ax.yaxis, min(ys), max(ys))
-        # Remembered so [1,2] can share it: both panels plot against the same
+        # Remembered so [1,1] can share it: both panels plot against the same
         # x quantity, but tau_down is defined at fewer temperatures, so letting
         # it autoscale would silently show a narrower slice of the same axis
         # and invite a visual comparison of two different ranges.
@@ -1266,25 +1242,7 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
         ax.set_title("does the driving force set the clock?\n"
                       "tau ~ 1/(T0-T) would give exponent 1")
 
-    ax = axes[0, 2]
-    for temp in down_temps:
-        c = curves[temp]
-        ax.plot(c["steps"] / taus_down[temp], 100.0 * c["normalized"], "-",
-                 color=color_of[temp], label=f"T={_format_temp(temp)}")
-    ax.axvline(1.0, color="k", ls=":", lw=1)
-    ax.set_xscale("log")
-    ax.set_xlabel("t / tau_down(T)")
-    ax.set_ylabel("stdev_phi / sqrt(-a(T)/b)  [%]")
-    _normalized_ylim(ax)
-    ax.set_title("same, rescaled by tau_down(T)\n(coarsening completion, not growth)")
-    if down_temps:
-        ax.legend(fontsize=7, ncol=2)
-    else:
-        ax.text(0.5, 0.5, "coarsening does not complete\nwithin the simulated window\n"
-                           "at any temperature", ha="center", va="center",
-                 transform=ax.transAxes, fontsize=9)
-
-    ax = axes[1, 2]
+    ax = axes[1, 1]
     finite_down = [t for t in temperatures if np.isfinite(taus_down[t])]
     if finite_down:
         xs = [temp_amplitude[t] ** 2 for t in finite_down]
@@ -1294,7 +1252,7 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
             ax.annotate(_format_temp(t), (x, y), fontsize=6,
                          textcoords="offset points", xytext=(3, 3))
         ax.set_xscale("log")
-        # LINEAR y, unlike [1,1]. tau spans ~90x across this axis and needs a
+        # LINEAR y, unlike [0,1]. tau spans ~90x across this axis and needs a
         # log scale to be readable at all; tau_down varies by well under a
         # factor of 2, and a log scale would stretch that near-constancy into
         # something that looks like a trend. The contrast between the two
@@ -1308,8 +1266,8 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
                  transform=ax.transAxes, fontsize=9)
     if drive_xlim is not None:
         ax.set_xscale("log")
-        ax.set_xlim(drive_xlim)  # same x range as [1,1] -- see there
-    # Same x as [1,1] so the two can be read directly against each other.
+        ax.set_xlim(drive_xlim)  # same x range as [0,1] -- see there
+    # Same x as [0,1] so the two can be read directly against each other.
     # tau is a local growth time and lies on a clean -1 slope; tau_down
     # terminates when domains reach the BOX, so it need not, and its
     # VERTICAL position is the size-dependent quantity.
@@ -1317,79 +1275,89 @@ def _plot(curves, taus, taus_down, temperatures, temp_amplitude, collapse_temps,
     ax.set_ylabel("tau_down (million steps)")
     ax.set_title("coarsening completion vs driving force\n(this one scales with the box)")
 
-    # --- column 3: where the collapse breaks ----------------------------
-    # TWO series, on TWIN axes. An earlier version drew a third series
-    # for the rescaled panel; it was identical to the normalized one by
-    # construction (rescaling t cannot change a curve's last or maximum
-    # VALUE), so it is gone. The information it was carrying -- which
-    # temperatures the collapse test could not include -- is now shown
-    # directly, as hollow markers on the temperatures whose tau is NaN.
+    # --- column 2: where the collapse breaks ----------------------------
+    # ONE panel now, not two. The LAST-value and MAX-value panels plotted the
+    # same three series against T and differed only in which point of each
+    # curve they reduced to -- so reading one against the other meant looking
+    # across the figure and holding a shape in mind. LAST is now an OVERLAY on
+    # MAX, hollow and unjoined, so the gap between a curve's peak and where it
+    # ends up is a vertical distance on one axis: the decay after the peak IS
+    # the late-time coarsening/finite-size effect the pair existed to show.
     #
     # Twin axes because raw stdev_phi and the normalized curve are
     # different quantities: putting them on one axis made any horizontal
     # reference line ambiguous (it belongs to the normalized quantity
     # only). Left/right axes are colour-matched to their own series, the
     # same convention the project's dz0dt panels already use.
+    #
+    # Unjoined markers for the overlay, deliberately: a line would invite
+    # reading a trend ACROSS temperatures, but each hollow point's meaning is
+    # its distance from the filled point directly above it, at the same T.
     excluded = [t for t in temperatures if t not in set(collapse_temps)]
-    for ax, which, title in (
-        (axes[0, 3], 0, "LAST value of each curve vs T\n(late time: coarsening / finite size)"),
-        (axes[1, 3], 1, "MAX value of each curve vs T\n(how far each T actually gets)"),
-    ):
-        ax_norm = ax.twinx()
-        raw_x, raw_y = [], []
+    ax = axes[1, 2]
+    ax_norm = ax.twinx()
+
+    def _raw_series(which: int):
+        xs, ys = [], []
         for t in temperatures:
             value = _last_and_max(curves[t]["centre"])[which]
             if np.isfinite(value):
-                raw_x.append(t)
-                raw_y.append(value)
-        ax.plot(raw_x, raw_y, "-", color="tab:blue", marker="o", ms=3, label="raw stdev_phi")
+                xs.append(t)
+                ys.append(value)
+        return xs, ys
 
-        norm_x, norm_y = [], []
-        for t in temperatures:
-            if curves[t]["normalized"] is None:
-                continue
-            value = _last_and_max(curves[t]["normalized"])[which]
-            if np.isfinite(value):
-                norm_x.append(t)
-                norm_y.append(value)
-        ax_norm.plot(norm_x, [100.0 * y for y in norm_y], "-", color="tab:orange",
-                      marker="o", ms=3, label="normalized")
-        # Hollow overlay: no tau, so absent from the collapse panel.
-        miss_x = [t for t in norm_x if t in set(excluded)]
-        miss_y = [y for t, y in zip(norm_x, norm_y) if t in set(excluded)]
-        if miss_x:
-            ax_norm.plot(miss_x, [100.0 * y for y in miss_y], linestyle="none", marker="o", ms=8,
-                          markerfacecolor="none", markeredgecolor="tab:red",
-                          label="no tau: excluded from collapse test")
-        if which == 1 and norm_y and min(norm_y) < ref_fraction:
-            # Only meaningful on the MAX panel, and only against the
-            # normalized axis: tau exists iff the normalized curve gets
-            # at least this high, so this line is exactly the boundary
-            # that decides the hollow markers above.
-            #
-            # Drawn ONLY when some temperature actually falls below it.
-            # When every curve clears the threshold -- the usual case on
-            # a large box, where maxima sit at 90-98% -- the line adds no
-            # information and, sitting at 50%, stretches the axis over
-            # the empty half and flattens the real variation into the top
-            # sliver.
-            ax_norm.axhline(100.0 * ref_fraction, color="k", ls=":", lw=1,
-                             label=f"tau threshold ({100 * ref_fraction:g}%)")
+    max_x, max_y = _raw_series(1)
+    ax.plot(max_x, max_y, "-", color="tab:blue", marker="o", ms=3,
+             label="raw stdev_phi (max)")
+    last_x, last_y = _raw_series(0)
+    ax.plot(last_x, last_y, linestyle="none", marker="o", ms=6,
+             markerfacecolor="none", markeredgecolor="tab:blue",
+             label="raw stdev_phi (last)")
 
-        # Anchored at 0 so the raw curve is read as a magnitude rather than as
-        # a shape: autoscaling a monotone decay makes a 15% fall look like a
-        # collapse. The normalized twin keeps its own scaling (0-100%).
-        ax.set_ylim(bottom=0.0)
-        ax.set_ylabel("raw stdev_phi", color="tab:blue")
-        ax.tick_params(axis="y", labelcolor="tab:blue")
-        ax_norm.set_ylabel("stdev_phi / sqrt(-a(T)/b)  [%]", color="tab:orange")
-        _normalized_ylim(ax_norm)  # twin axis only: the left axis is raw stdev_phi, not normalized
-        ax_norm.tick_params(axis="y", labelcolor="tab:orange")
-        ax.set_xlabel("T")
-        ax.set_title(title)
-        handles, labels = ax.get_legend_handles_labels()
-        h2, l2 = ax_norm.get_legend_handles_labels()
-        ax.legend(handles + h2, labels + l2, fontsize=7, loc="lower left")
+    norm_x, norm_y = [], []
+    for t in temperatures:
+        if curves[t]["normalized"] is None:
+            continue
+        value = _last_and_max(curves[t]["normalized"])[1]
+        if np.isfinite(value):
+            norm_x.append(t)
+            norm_y.append(value)
+    ax_norm.plot(norm_x, [100.0 * y for y in norm_y], "-", color="tab:orange",
+                  marker="o", ms=3, label="normalized (max)")
+    # Hollow overlay: no tau, so absent from the collapse test.
+    miss_x = [t for t in norm_x if t in set(excluded)]
+    miss_y = [y for t, y in zip(norm_x, norm_y) if t in set(excluded)]
+    if miss_x:
+        ax_norm.plot(miss_x, [100.0 * y for y in miss_y], linestyle="none", marker="o", ms=8,
+                      markerfacecolor="none", markeredgecolor="tab:red",
+                      label="no tau: excluded from collapse test")
+    if norm_y and min(norm_y) < ref_fraction:
+        # Against the NORMALIZED axis: tau exists iff the normalized curve
+        # gets at least this high, so this line is exactly the boundary that
+        # decides the hollow red markers above.
+        #
+        # Drawn ONLY when some temperature actually falls below it. When every
+        # curve clears the threshold -- the usual case on a large box, where
+        # maxima sit at 90-98% -- the line adds no information and, sitting at
+        # 50%, stretches the axis over the empty half and flattens the real
+        # variation into the top sliver.
+        ax_norm.axhline(100.0 * ref_fraction, color="k", ls=":", lw=1,
+                         label=f"tau threshold ({100 * ref_fraction:g}%)")
+
+    # Anchored at 0 so the raw curves are read as magnitudes rather than as
+    # shapes: autoscaling a monotone decay makes a 15% fall look like a
+    # collapse. The normalized twin keeps its own scaling (0-100%).
+    ax.set_ylim(bottom=0.0)
+    ax.set_ylabel("raw stdev_phi", color="tab:blue")
+    ax.tick_params(axis="y", labelcolor="tab:blue")
+    ax_norm.set_ylabel("stdev_phi / sqrt(-a(T)/b)  [%]", color="tab:orange")
+    _normalized_ylim(ax_norm)  # twin axis only: the left axis is raw stdev_phi, not normalized
+    ax_norm.tick_params(axis="y", labelcolor="tab:orange")
+    ax.set_xlabel("T")
+    ax.set_title("MAX value of each curve vs T\n(hollow blue = LAST value: the late-time decay)")
+    handles, labels = ax.get_legend_handles_labels()
+    h2, l2 = ax_norm.get_legend_handles_labels()
+    ax.legend(handles + h2, labels + l2, fontsize=7, loc="lower left")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)

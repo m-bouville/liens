@@ -8,12 +8,52 @@ from pathlib import Path
 
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 
 from . import load_datasets as load
 
 
 LOSS_FIGURE_EVERY = 10
+
+
+def log_axis_ticks(axis, lo: float, hi: float, mantissas=None) -> None:
+    """
+    Label a log axis at {1,2,3,5}x10^k rather than at decades only.
+
+    Matplotlib's default LogLocator labels decades, so an axis spanning
+    less than one decade -- which several of this project's do (-a(T)/b
+    runs 0.005 to 0.45; check_alpha's Delta_t runs 12 to 500) -- ends up
+    with a SINGLE labelled tick, leaving the reader no way to read a value
+    off the plot at all.
+
+    Shared rather than duplicated: check_stdev_phi_time defined it first,
+    check_alpha needed exactly the same thing, and a second caller is this
+    project's bar for extraction.
+    """
+    if not (hi > lo > 0):
+        return
+    if mantissas is None:
+        # THINNED BY SPAN. {1,2,3,5} per decade is right for the sub-decade
+        # case this was written for, and unreadable over three decades -- the
+        # alpha histogram came out with "0.00050.0010.0020.003" run together.
+        # Fewer labels over a wider range keeps every one legible, which is
+        # the whole point: a labelled tick nobody can read is worse than the
+        # decade-only default it replaced.
+        decades = math.log10(hi / lo)
+        mantissas = ((1,) if decades > 2.5 else
+                      (1, 3) if decades > 1.2 else
+                      (1, 2, 3, 5))
+    ticks = [m * 10.0 ** k
+              for k in range(int(np.floor(np.log10(lo))), int(np.ceil(np.log10(hi))) + 1)
+              for m in mantissas]
+    ticks = [t for t in ticks if lo <= t <= hi]
+    if len(ticks) < 2:
+        return
+    axis.set_ticks(ticks)
+    axis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:g}"))
+    axis.set_minor_locator(mticker.NullLocator())
+
 
 
 def should_write_loss_figure(epoch: int, log_every_epoch: bool, every: int = LOSS_FIGURE_EVERY) -> bool:

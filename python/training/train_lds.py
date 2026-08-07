@@ -277,7 +277,13 @@ def _load_frozen_encoder(
 # Re-exported: the definitions moved to training/spike_guard.py when stages
 # 4 and 5 became a second caller. Kept importable from here so existing
 # callers and tests (tests/test_spike_guard.py) are unaffected.
-from training.spike_guard import _SpikeGuard, _record_spike, end_epoch_pair  # noqa: E402,F401
+from training.dt_bucketing import (  # noqa: E402
+    BudgetedBatchSampler, budget_report, estimate_window_costs,
+)
+from training.spike_guard import (  # noqa: E402,F401
+    _SpikeGuard, _record_spike, difficulty_band, early_stop_message, end_epoch_pair,
+    SkipReporter, skip_report,
+)
 from utils.logging_utils import print_run_parameters
 
 
@@ -502,7 +508,10 @@ def train_lds(
     use_dt_decade_weights: bool = False,
     z0_noise_scale: float = 0.0,
     dt_cap: float = float("inf"), n_substeps: int = 1, alpha: float | None = None,
-    max_substeps: int = 256, z1_resync: bool = True,
+    max_substeps: int = 256, truncate_bptt: int | None = None,
+    bucket_batches: bool = True,
+    bucket_refresh_epochs: int = 25, batch_cost_budget: float | None = None,
+    z1_resync: bool = True,
     latent_cache_dir: Path | str | None = None,
 ) -> Path:
     """
@@ -743,6 +752,12 @@ def train_lds(
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
         )
+        # Defined on BOTH branches: the epochs=0 ablation builds no train
+        # loader at all, and the epoch loop's refresh check reads this name
+        # regardless. Initialising it only where the loader is built made
+        # epochs=0 raise UnboundLocalError -- caught by the ablation's own
+        # test, which exists for exactly this class of oversight.
+        _bucket_sampler = None
         print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
               f"{len(val_set)} val windows (n_rollout_steps={n_rollout_steps}, "
               f"window_length={window_length})\n")
@@ -763,8 +778,18 @@ def train_lds(
         )
         print(f"{len(train_set)} train windows, {len(val_set)} val windows "
               f"(n_rollout_steps={n_rollout_steps}, window_length={window_length})\n")
-        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                                   persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
+        # COST-BUCKETED BATCHES when the integrator is adaptive. The masked
+        # sub-step loop runs to the batch's MAXIMUM count, so a batch drawn
+        # uniformly from a population whose counts span an order of magnitude
+        # pays close to the population maximum every time -- measured 5.8x the
+        # per-window ideal at batch_size=2048. Grouping windows of similar
+        # cost brings that to ~1.2x. Fixed n_substeps has no such spread, so
+        # this does nothing there and is not built.
+        _bucket_sampler = None
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                                   num_workers=num_workers,
+                                   persistent_workers=num_workers > 0,
+                                   pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
                              persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
 
@@ -786,7 +811,7 @@ def train_lds(
                               latent_spatial=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
                               dt_cap=dt_cap, n_substeps=n_substeps, alpha=alpha,
-                              max_substeps=max_substeps).to(device)
+                              max_substeps=max_substeps, truncate_bptt=truncate_bptt).to(device)
 
     # Global per-decade loss weights, computed ONCE from train_set's own
     # full dt distribution AND its own raw per-transition loss
@@ -947,7 +972,14 @@ def train_lds(
             # must never reach clip_grad_norm_, which converts inf to nan (see
             # _SpikeGuard). .item() here costs a sync per batch, which is the
             # price of not losing a 3000-epoch run to one bad window.
-            if spike_guard.should_skip(float(total.detach())):
+            # The batch's own difficulty band, from the same dt_window the
+            # spike attribution reports. Under cost-bucketed batching the hard
+            # windows share batches, so a pooled median made "harder than
+            # average" indistinguishable from "went wrong" and skipped those
+            # batches as a block -- 14-19 of ~37 every epoch on the first
+            # max_dt=1000 run, restoring the max_dt=500 population by stealth.
+            _band = difficulty_band(float(dt_window.detach().max()))
+            if spike_guard.should_skip(float(total.detach()), band=_band):
                 _record_spike(spike_guard, total, dt_window, theta)
                 optimizer.zero_grad()
             else:
@@ -971,7 +1003,7 @@ def train_lds(
                 # weight by ~lr regardless.
                 _gnorm = torch.nn.utils.clip_grad_norm_(
                     f_theta.parameters(), grad_clip if grad_clip > 0 else float("inf"))
-                if grad_guard.should_skip(float(_gnorm)):
+                if grad_guard.should_skip(float(_gnorm), band=_band):
                     _record_spike(grad_guard, _gnorm, dt_window, theta)
                     optimizer.zero_grad()
                 else:
@@ -1065,10 +1097,6 @@ def train_lds(
 
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
-    if show_1step:
-        print(f"/{epochs:3d}  train  (1step)   valid  (1step)     ema")
-    else:
-        print(f"/{epochs:3d}  train    valid      ema")
 
     spike_guard = _SpikeGuard(spike_skip_factor)
     # Separate history: gradient norms and losses live on different scales, so
@@ -1076,6 +1104,15 @@ def train_lds(
     grad_guard = _SpikeGuard(grad_spike_factor)
     _spikes_reported = 0
     _grad_spikes_reported = 0
+    # The guards' rationale is printed ONCE, then every later epoch gets a
+    # single compact line -- see skip_report. Routine skipping (1-4 batches of
+    # 13, every epoch) was producing six lines of unchanging exposition
+    # between consecutive epoch lines.
+    # Only NOTABLE skips get a line; the rest are digested periodically. One
+    # batch of 13 at 11.9x a 10x threshold is the guard working, and a line
+    # for it every epoch buries the ones that are not.
+    _skip_reporter = SkipReporter()
+    _nonfinite_reported = 0
     _n_rollbacks = 0
     # Set only when THIS RUN saves. Path.exists() is not the same question:
     # with force=True the previous run's file sits at checkpoint_path until
@@ -1084,7 +1121,62 @@ def train_lds(
     _saved_this_run = False
     _n_train_batches = 0
 
+    # COST-BUCKETED BATCHES, built HERE rather than beside the plain loader
+    # because the estimate needs f_theta -- which is constructed after the
+    # datasets, and whose weights arrive later still via resume_from. Sorting
+    # on a freshly-initialised f_theta would rank every window identically
+    # (its final layer is zero-init), producing a sort that means nothing and
+    # then ages badly. Building after the resume uses the weights the run
+    # actually starts from.
+    #
+    # The masked sub-step loop runs to the batch's MAXIMUM count, so a batch
+    # drawn uniformly from a population whose counts span an order of
+    # magnitude pays close to the population maximum every time -- measured
+    # 5.8x the per-window ideal at batch_size=2048 against ~1.2x bucketed.
+    # Fixed n_substeps has no such spread, so this is gated on alpha.
+    if epochs > 0 and alpha is not None and bucket_batches:
+        _bucket_sampler = BudgetedBatchSampler(
+            estimate_window_costs(train_set, f_theta, alpha, max_substeps, device),
+            batch_size, budget=batch_cost_budget, seed=seed,
+            truncate_bptt=truncate_bptt)
+        train_loader = DataLoader(train_set, batch_sampler=_bucket_sampler,
+                                   num_workers=num_workers,
+                                   persistent_workers=num_workers > 0,
+                                   pin_memory=device.type == "cuda")
+        print(budget_report(_bucket_sampler, batch_size, n_rollout_steps) + "\n")
+        # Reset so the peak measured over epoch 1 is THIS run's training
+        # footprint, not whatever the dataset build or the cost estimate left
+        # behind. Reported once, after epoch 1, because the bytes-per-
+        # sample-substep constant it yields is what turns budget-setting from
+        # arithmetic into a measurement -- and it does not change afterwards.
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+
+    # THE COLUMN HEADER LAST, immediately before the first epoch line it
+    # labels. It used to be printed with the "Starting N epochs" banner, which
+    # is before the sampler exists -- so the batching report landed BELOW the
+    # header and the reader saw a column legend followed by two paragraphs of
+    # prose before any numbers.
+    if show_1step:
+        print(f"/{epochs:3d}  train  (1step)   valid  (1step)     ema")
+    else:
+        print(f"/{epochs:3d}  train    valid      ema")
+
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
+        # REFRESH the bucketing on a schedule, not every epoch. The estimate
+        # costs one f_theta evaluation per window (~9% of an epoch's forward
+        # passes), and it degrades gracefully: a 20% drift in the true counts
+        # still gives ~2.0x the ideal against 5.8x unbucketed, so refreshing
+        # rarely keeps most of the saving for a fraction of the price. Not
+        # refreshing at all would decay toward the unbucketed cost as f_theta
+        # sharpens and the count distribution moves under the sort.
+        if (_bucket_sampler is not None and epoch > 1
+                and bucket_refresh_epochs > 0
+                and (epoch - 1) % bucket_refresh_epochs == 0):
+            _bucket_sampler.update_costs(
+                estimate_window_costs(train_set, f_theta, alpha, max_substeps, device))
+            if _bucket_sampler.last_refresh_note:
+                print(f"  [epoch {epoch}: {_bucket_sampler.last_refresh_note}]")
         f_theta.train()
         # GPU-resident accumulators, not Python floats -- see step()'s
         # own docstring/comment: `loss * bs` below stays a GPU tensor
@@ -1103,6 +1195,19 @@ def train_lds(
                 train_1step_sum += l_1step * bs
             train_loss = (train_loss_sum / n_train).item()
             train_1step = (train_1step_sum / n_train).item()
+            if (_bucket_sampler is not None and epoch == 1
+                    and device.type == "cuda"):
+                # ONLY the newly-measured lines. Re-printing the whole report
+                # repeated four paragraphs the reader had just read, to add one
+                # number -- and buried the epoch lines between two copies of it.
+                _full = budget_report(
+                    _bucket_sampler, batch_size, n_rollout_steps,
+                    peak_bytes=float(torch.cuda.max_memory_allocated(device)),
+                    reserved_bytes=float(torch.cuda.max_memory_reserved(device)))
+                _dry = budget_report(_bucket_sampler, batch_size, n_rollout_steps)
+                _new_lines = _full[len(_dry):].strip("\n")
+                if _new_lines:
+                    print(_new_lines)
             # Captured HERE, between the train and val loops, so the reported
             # sub-step drift is measured on TRAINING transitions only. Found
             # by review: the capture used to sit after the val loop, so every
@@ -1261,28 +1366,20 @@ def train_lds(
         # SKIPPED BATCHES ARE NEVER SILENT. A guard that quietly drops data
         # would be worse than the crash it prevents: the run would look
         # healthy while training on a filtered distribution.
-        if grad_guard.n_skipped != _grad_spikes_reported:
-            _newg = grad_guard.n_skipped - _grad_spikes_reported
-            _grad_spikes_reported = grad_guard.n_skipped
-            _wg = grad_guard.last_worst
-            _dg = ("" if _wg is None else
-                    f" worst: grad_norm {_wg[0]:.4g} vs median {_wg[1]:.4g}, "
-                    f"dt_max={_wg[2]:.4g}, mean theta[0]={_wg[3]:.4g}")
-            print(f"  [epoch {epoch}: skipped {_newg} batch(es) whose GRADIENT NORM was a "
-                  f"catastrophic outlier, despite an ordinary loss. This is the case the "
-                  f"loss guard cannot see.{_dg}]")
-
-        if spike_guard.n_skipped != _spikes_reported:
-            _new = spike_guard.n_skipped - _spikes_reported
-            _spikes_reported = spike_guard.n_skipped
-            _w = spike_guard.last_worst
-            _detail = ("" if _w is None else
-                        f" worst: loss {_w[0]:.4g} vs median {_w[1]:.4g}, "
-                        f"dt_max={_w[2]:.4g}, mean theta[0]={_w[3]:.4g}")
-            print(f"  [epoch {epoch}: skipped {_new} batch(es) whose loss was a "
-                  f"catastrophic outlier ({spike_guard.n_nonfinite} non-finite in total). "
-                  f"The optimizer step was NOT taken, so the weights are untouched."
-                  f"{_detail}]")
+        _newg = grad_guard.n_skipped - _grad_spikes_reported
+        _new = spike_guard.n_skipped - _spikes_reported
+        _grad_spikes_reported = grad_guard.n_skipped
+        _spikes_reported = spike_guard.n_skipped
+        # Non-finite is ALWAYS notable: an inf gradient turns the whole
+        # parameter vector to nan in a single step if it gets through.
+        _all_nonfinite = spike_guard.n_nonfinite + grad_guard.n_nonfinite
+        _new_nonfinite = _all_nonfinite - _nonfinite_reported
+        _nonfinite_reported = _all_nonfinite
+        _line = _skip_reporter.epoch(
+            epoch, _new, spike_guard.last_worst, _newg, grad_guard.last_worst,
+            _n_train_batches, n_nonfinite_new=_new_nonfinite)
+        if _line:
+            print(_line)
 
         ema_str = f"{tracker.val_ema:.6f}" if tracker.val_ema is not None else "  (warmup)"
         if show_1step:
@@ -1312,6 +1409,11 @@ def train_lds(
                     # with the same weights and different alpha are corrections
                     # calibrated to different step sizes.
                     "alpha": alpha,
+                    # Recorded for provenance only. Deliberately NOT in
+                    # _MEANING_FIELDS: truncation changes how the gradient was
+                    # computed, not what f_theta means, so a rebuild without it
+                    # evaluates exactly as this run trained.
+                    "truncate_bptt": truncate_bptt,
                     "max_substeps": max_substeps,
                     "z1_resync": z1_resync,
                 },
@@ -1385,8 +1487,7 @@ def train_lds(
         # training has even stabilized.
         if (early_stopping_patience is not None and epoch > ema_warmup_epochs
                 and epochs_since_improvement >= early_stopping_patience):
-            print(f"Early stopping at epoch {epoch}: no improvement for "
-                  f"{early_stopping_patience} epochs")
+            print(early_stop_message(epoch, early_stopping_patience, _saved_this_run))
             break
 
     # Unconditional final write: the in-loop calls are throttled (see
@@ -1502,6 +1603,31 @@ def main():
                               "follows the local dynamics instead of the save schedule and one "
                               "setting stays valid across a dt range. Calibrate with "
                               "evaluation/check_alpha.py rather than guessing")
+    parser.add_argument("--no-bucket-batches", dest="bucket_batches",
+                         action="store_false",
+                         help="disable cost-bucketed batching (only active under --alpha). "
+                              "Bucketing groups windows of similar sub-step count into the "
+                              "same batch, because the masked loop costs the batch MAXIMUM: "
+                              "measured 5.8x the per-window ideal unbucketed against ~1.2x "
+                              "bucketed. Turn it off to get uniformly-sampled batches back")
+    parser.add_argument("--truncate-bptt", type=int, default=None,
+                         help="detach the sub-step graph every K sub-steps (>=2). The "
+                              "forward integration is unchanged; only the gradient is "
+                              "truncated, bounding its magnitude, which is exponential in "
+                              "sub-step count. Needed above ~300 chained sub-steps, where "
+                              "float32 overflows and every batch reports an infinite "
+                              "gradient norm with a finite loss")
+    parser.add_argument("--batch-cost-budget", type=float, default=None,
+                         help="peak backward memory bound, in sample-substeps "
+                              "(batch_size x the batch's MAX sub-step count -- the max, "
+                              "because the masked loop allocates full-batch tensors every "
+                              "iteration). Default: batch_size x the population's median "
+                              "count, so a typical batch has exactly batch_size windows "
+                              "and deeper ones shrink")
+    parser.add_argument("--bucket-refresh-epochs", type=int, default=25,
+                         help="re-estimate the per-window cost every N epochs (0 = never). "
+                              "The sort ages as f_theta sharpens; a 20%% drift still gives "
+                              "~2x against 5.8x unbucketed, so this can be infrequent")
     parser.add_argument("--max-substeps", type=int, default=256,
                          help="cost bound on the derived count, for the |z1|->0 corner where the "
                               "ratio criterion admits no step at all. Not a stability bound; if "
@@ -1549,7 +1675,10 @@ def main():
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         dt_cap=args.dt_cap, n_substeps=args.n_substeps, alpha=args.alpha,
-        max_substeps=args.max_substeps, z1_resync=args.z1_resync,
+        max_substeps=args.max_substeps, truncate_bptt=args.truncate_bptt,
+        bucket_batches=args.bucket_batches,
+        bucket_refresh_epochs=args.bucket_refresh_epochs,
+        batch_cost_budget=args.batch_cost_budget, z1_resync=args.z1_resync,
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
         num_workers=args.num_workers, n_rollout_steps=args.n_rollout_steps,
         min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,

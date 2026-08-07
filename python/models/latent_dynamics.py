@@ -33,6 +33,14 @@ _MEANING_FIELDS = {
     "n_substeps": 1,          # 1 is the historical default
     "alpha": None,            # None = fixed count, i.e. behaviour before alpha
     "max_substeps": 256,
+    # truncate_bptt is deliberately ABSENT. Every other field here changes what
+    # f_theta MEANS -- two checkpoints with the same weights and different
+    # values integrate differently, so a rebuild must reproduce them. Truncation
+    # changes only how the GRADIENT was computed during training; the forward
+    # pass is bit-identical with it and without it, so a checkpoint rebuilt
+    # without it evaluates exactly as it trained. Propagating it would also be
+    # actively wrong for the diagnostics, which run under no_grad and would pay
+    # detach calls for a graph they never build.
 }
 
 
@@ -111,7 +119,7 @@ class LatentDynamics(nn.Module):
                  latent_spatial: int = LATENT_SPATIAL_SIZE, hidden_dim: int = 256,
                  n_hidden_layers: int = 2, dt_cap: float = float("inf"),
                  n_substeps: int = 1, alpha: float | None = None,
-                 max_substeps: int = 256):
+                 max_substeps: int = 256, truncate_bptt: int | None = None):
         super().__init__()
         self.latent_channels = latent_channels
         self.latent_spatial = latent_spatial
@@ -231,6 +239,25 @@ class LatentDynamics(nn.Module):
         # must not stall a batch forever. Hit only in the degenerate corner;
         # if it binds routinely, that is a finding about the data, so
         # rollout() counts and reports it rather than silently clamping.
+        # TRUNCATED BPTT: detach the sub-step graph every k steps. None (the
+        # default) keeps the graph whole, so every existing run is unchanged.
+        # See _integrate's loop for what it buys and what it costs.
+        if truncate_bptt is not None and truncate_bptt < 2:
+            # >= 2, NOT >= 1. At k=1 the output carries NO gradient at all:
+            # each sub-step's z0 update consumes the f_n carried in from the
+            # PREVIOUS step (that is the recycling that keeps the scheme at one
+            # f evaluation per step), so if every step detaches, the final
+            # z0's only parameter-dependent term is a detached f_n and
+            # backward() raises "element 0 does not require grad". A segment
+            # needs at least one f evaluation that both lives inside it and
+            # feeds a later z0 update, which takes two steps.
+            raise ValueError(
+                f"truncate_bptt must be >= 2 or None, got {truncate_bptt}. "
+                f"At 1 the recycled f_n is detached before it ever reaches a z0 "
+                f"update, leaving the output with no gradient path; None keeps "
+                f"the full chain."
+            )
+        self.truncate_bptt = truncate_bptt
         if max_substeps < 1:
             raise ValueError(f"max_substeps must be >= 1, got {max_substeps}")
         self.max_substeps = int(max_substeps)
@@ -480,6 +507,11 @@ class LatentDynamics(nn.Module):
         h = dt_r / n_steps.view(-1, 1, 1, 1).to(dt_r.dtype)
         h_capped = torch.clamp(h, max=self.dt_cap)
         n_max = int(n_steps.max().item())
+        # Arrival accumulators, only under truncation (see the loop). Seeded
+        # from the inputs so a sample arriving at step 0 is still covered, and
+        # so the tensors exist with the right shape/dtype either way.
+        if self.truncate_bptt is not None:
+            z0_out, z1_out, f_out = z0, z1, f_n
         for step in range(n_max):
             # active: samples that still have sub-steps left. Zeroing h rather
             # than indexing keeps the batch shape static, which matters for
@@ -497,6 +529,126 @@ class LatentDynamics(nn.Module):
             # and, worse, would make the carried f depend on how many other
             # samples happened to share the batch.
             f_n = torch.where(active.bool(), f_next, f_n)
+            # TRUNCATED BACKPROPAGATION THROUGH THE SUB-STEPS. Detaching every
+            # `truncate_bptt` sub-steps cuts the backward graph into segments of
+            # that depth. The forward integration is UNCHANGED -- same values,
+            # same milestones, same order of convergence -- and the gradient
+            # becomes the sum of within-segment gradients instead of the full
+            # chain.
+            #
+            # WHY: the backward pass multiplies one Jacobian per sub-step, so
+            # its magnitude is exponential in the count. Measured on this
+            # project: depth 264 (max_dt=500) trains with gradient norms ~3e3;
+            # depth ~1700 (max_dt=2000 at alpha=0.1 unclamped, max 867 sub-steps
+            # x 2 rollout steps) gives INFINITE norms on every batch while the
+            # losses stay finite. No learning rate, memory budget or clamp
+            # addresses that -- it is float32 range, not optimisation. Raising
+            # max_substeps makes it worse, since a larger cap permits a deeper
+            # graph.
+            #
+            # WHAT IT COSTS: the gradient loses the dependence of late sub-steps
+            # on early ones, so it is biased. The bias is small when a segment
+            # spans the dynamics' own correlation length. Opt-in: None (the
+            # default) leaves the graph whole and every existing run identical.
+            #
+            # z0 AND z1 AND f_n detach TOGETHER. Detaching a subset leaves a
+            # path around the cut -- z1 carries gradient into the next segment's
+            # z0 through z1*h, and f_n through both -- so any one left attached
+            # reconstitutes the chain and the truncation silently does nothing.
+            # `step + 2 < n_max`, NOT `step + 1 < n_max`: the final segment
+            # must contain at least TWO sub-steps.
+            #
+            # THE BUG THIS FIXES, hit in production at k=64. Each sub-step's z0
+            # update consumes the f_n RECYCLED from the previous step -- that
+            # recycling is what keeps the scheme at one f evaluation per step.
+            # A final segment of ONE step therefore updates z0 using an f_n
+            # that was just detached, and the step's own f evaluation feeds
+            # only z1 and the next f_n, neither of which reaches the output. So
+            # z0 emerges with NO gradient path whenever
+            #
+            #     n_max % truncate_bptt == 1
+            #
+            # and backward() raises "element 0 of tensors does not require grad
+            # and does not have a grad_fn". At k=64 the trap values are 65, 129,
+            # ... 961 -- squarely inside the observed range of 876-1024 -- and
+            # with n_rollout_steps=2 over cost-BUCKETED (hence homogeneous)
+            # batches, both transitions can land on one together and take the
+            # whole loss's graph with them.
+            #
+            # I had already found and documented this at k=1 and "fixed" it by
+            # requiring k >= 2, which addressed the symptom I happened to test
+            # rather than the condition: k=1 is simply the case where EVERY
+            # segment is length 1. Requiring two steps at the end covers both.
+            # PER-SAMPLE, not batch-wide. The counts in a batch are
+            # heterogeneous (that is the adaptive criterion's whole point), and
+            # a batch-wide detach at global boundaries ZEROES the gradient of
+            # every sample that has already arrived: its final value's graph is
+            # severed, and the only surviving paths run through the
+            # zero-multiplied no-op updates -- so requires_grad stays True,
+            # backward() runs, and the sample contributes exactly nothing.
+            # Measured on counts (70, 100, 140, 200) with k=64: samples 0-2
+            # had |grad| = 0.0 to the last digit; only the deepest trained. In
+            # a real deep bucketed batch that silently reduces the gradient to
+            # the few windows past the last boundary.
+            #
+            # The rule: cut a sample at a boundary only if >= 2 of ITS OWN
+            # steps remain. remaining <= 0 (arrived): its value IS the output,
+            # cutting it kills its loss. remaining == 1: its final z0 update
+            # consumes the f_n recycled from THIS step, so cutting now leaves
+            # that update with a detached f_n -- the one-step-final-segment
+            # bug, per sample. remaining >= 2: safe, it rebuilds before
+            # arrival.
+            #
+            # Memory stays bounded: the samples KEPT attached at a boundary
+            # are those within 1 step of arrival, whose retained history is
+            # their own final segment (<= k+1 steps of batch-wide ops).
+            # torch.where preserves values exactly, so the forward remains
+            # bit-identical -- only which graph each sample's output hangs on
+            # changes.
+            if self.truncate_bptt is not None:
+                # ARRIVAL CAPTURE, then an unconditional cut.
+                #
+                # The previous per-sample form kept arrived samples attached
+                # through torch.where -- but a graph belongs to a TENSOR, not
+                # to an element, so keeping one sample attached retained that
+                # segment's ops for the whole batch. Measured retained-node
+                # counts at k=16, depth 256: homogeneous batch 17x saving,
+                # [200..256] only 4x, [16,64,128,256] NONE (4902 vs 4857
+                # untruncated). Truncation quietly stopped bounding memory in
+                # proportion to how heterogeneous the batch was -- and
+                # bucketing makes batches heterogeneous by construction.
+                #
+                # Instead: the step a sample ARRIVES, copy its value out into
+                # an accumulator. That copy carries the sample's own gradient
+                # path, back only as far as the previous boundary. The running
+                # state then has no reason to stay attached and is detached
+                # outright, freeing the segment for every sample at once.
+                #
+                # Retained memory is therefore (number of distinct segments in
+                # which some sample arrives) x k, rather than the full depth.
+                # Under bucketing arrivals cluster in one or two segments, so
+                # this is ~k; in the worst (unbucketed) case it degrades to the
+                # untruncated cost, which is what it was already doing.
+                arrive = (n_steps == step + 1).view(-1, 1, 1, 1)
+                if bool(arrive.any()):
+                    z0_out = torch.where(arrive, z0, z0_out)
+                    z1_out = torch.where(arrive, z1, z1_out)
+                    f_out = torch.where(arrive, f_n, f_out)
+                # DEFER a boundary when a sample arrives on the very next
+                # step. That step's z0 update consumes the f_n recycled from
+                # THIS one, so detaching now would hand the arriving sample a
+                # gradient-free value -- the one-step-final-segment bug,
+                # which making the cut unconditional reintroduced (caught by
+                # the every-count sweep at n_max % k == 1). Deferring costs
+                # one extra segment of retention only for the boundaries
+                # immediately preceding an arrival.
+                if ((step + 1) % self.truncate_bptt == 0
+                        and not bool((n_steps == step + 2).any())):
+                    z0, z1, f_n = z0.detach(), z1.detach(), f_n.detach()
+        if self.truncate_bptt is not None:
+            # Every sample arrives at some step <= n_max, so the accumulators
+            # are complete; the running tensors are detached leftovers.
+            return z0_out, z1_out, f_out
         return z0, z1, f_n
 
     def rollout(self, z0: torch.Tensor, z1_sequence: torch.Tensor, dts: torch.Tensor,

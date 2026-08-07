@@ -144,7 +144,20 @@ def test_the_field_list_covers_every_meaning_changing_constructor_argument():
     """
     params = set(inspect.signature(LatentDynamics.__init__).parameters) - {"self"}
     architecture = {"latent_channels", "n_theta", "latent_spatial", "hidden_dim",
-                    "n_hidden_layers"}
+                    "n_hidden_layers",
+                    # truncate_bptt is NEITHER architecture nor meaning-changing,
+                    # and is listed here as the deliberate third case. It alters
+                    # how the GRADIENT was computed during training; the forward
+                    # pass is bit-identical with and without it (pinned by
+                    # test_truncation_leaves_the_forward_pass_bit_identical), so
+                    # a checkpoint rebuilt without it evaluates exactly as it
+                    # trained. Propagating it would also make the no_grad
+                    # diagnostics pay detach calls for a graph they never build.
+                    #
+                    # This test firing on it is the machinery working: a new
+                    # constructor argument must be classified deliberately, not
+                    # default into silence.
+                    "truncate_bptt"}
     uncovered = params - architecture - set(_MEANING_FIELDS)
     assert not uncovered, (
         f"LatentDynamics gained {sorted(uncovered)}, which is neither architecture "

@@ -442,3 +442,67 @@ def fit_saturating_exponential(dt: np.ndarray, error: np.ndarray, n_grid: int = 
     return best_c, best_tau, r2_real, best_sse, pred_real
 
 
+
+
+def fit_broken_power_law(x: np.ndarray, y: np.ndarray, n_candidates: int = 60,
+                          min_side: int = 8, min_side_fraction: float = 0.15):
+    """Continuous two-slope fit in log-log: y ~ x^p1 below x_knee, x^p2 above.
+
+    WHY NOT A SPLINE, which is the obvious reach for "flat then sloped". A
+    spline is a smoothing device: it would render the bend faithfully and
+    report nothing about it, leaving "there seems to be a regime change" a
+    visual impression. The bend is the physics -- delta_t/t against t is the
+    question of whether the step follows coarsening's own slowdown -- so the
+    fit should NAME the knee and the two exponents rather than draw through
+    them. It also cannot wiggle: a spline through noisy binned medians
+    invents structure at the ends, exactly where the data is thinnest.
+
+    Continuity is imposed rather than fitted (two independent segments would
+    jump at the knee, which no physical crossover does), via the hinge basis
+    [1, u, max(u - k, 0)] with u = log x. The second coefficient is then the
+    CHANGE in slope, so p2 = p1 + c2 by construction.
+
+    The knee is chosen by exhaustive search over candidate positions rather
+    than by optimisation: the SSE-vs-knee curve is not convex and a local
+    method lands wherever it starts.
+
+    Each side must hold at least `min_side` points AND `min_side_fraction` of
+    them. The absolute floor alone is not enough: at 1800 points it let a
+    "regime" be eight of them, and on real data that produced a first segment
+    of slope +3.76 -- fitted to a handful of early windows -- with a 30%
+    apparent improvement, which is exactly the spurious knee a reader would
+    have believed. A regime that covers under a sixth of the range is a tail
+    artefact, whatever it does to the SSE.
+
+    Returns (x_knee, p1, p2, sse_broken, sse_single). Comparing the two SSEs
+    is how the caller decides whether the bend is worth reporting at all --
+    a broken fit has two extra parameters and will always fit at least as
+    well, so a marginal improvement means "one power law, drawn on noisy
+    data", not "a regime change".
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+    u, v = np.log(x[ok]), np.log(y[ok])
+    min_side = max(min_side, int(np.ceil(min_side_fraction * u.size)))
+    if u.size < 2 * min_side + 1:
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+
+    single = np.polyfit(u, v, 1)
+    sse_single = float(np.sum((v - np.polyval(single, u)) ** 2))
+
+    order = np.argsort(u)
+    u, v = u[order], v[order]
+    lo, hi = u[min_side], u[-min_side - 1]
+    if not (hi > lo):
+        return float("nan"), float(single[0]), float(single[0]), sse_single, sse_single
+
+    best = None
+    for k in np.linspace(lo, hi, n_candidates):
+        basis = np.column_stack([np.ones_like(u), u, np.maximum(u - k, 0.0)])
+        coef, *_ = np.linalg.lstsq(basis, v, rcond=None)
+        sse = float(np.sum((v - basis @ coef) ** 2))
+        if best is None or sse < best[0]:
+            best = (sse, k, coef)
+    sse, k, coef = best
+    return float(np.exp(k)), float(coef[1]), float(coef[1] + coef[2]), sse, sse_single
