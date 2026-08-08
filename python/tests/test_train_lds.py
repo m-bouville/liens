@@ -2,7 +2,6 @@ import numpy as np
 import torch
 from conftest import cached_artifact, copy_cached_files
 import pytest
-from pathlib import Path
 from utils import load_datasets as load
 from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2
@@ -739,3 +738,45 @@ def test_the_grace_period_cannot_swallow_every_epoch(tmp_path, isolated_project_
                     epochs=1,  # shorter than the derived grace of 3
                     checkpoint_path=tmp_path / "stage3b-short.pt")
     assert out.exists(), "a short non-comparable resume produced no checkpoint at all"
+
+
+def test_the_rollout_warning_fires_only_on_a_genuine_step_backwards():
+    """
+    `<=` fired on the EQUAL case, which is the ordinary same-objective resume:
+    3a resuming 3a printed "resuming from a checkpoint trained at
+    n_rollout_steps=1, but this run asks for n_rollout_steps=1 -- not larger",
+    which reads as a warning about nothing.
+    """
+    from conftest import source_without_comments
+    import pathlib
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    assert "n_rollout_steps < prev_n_rollout" in src
+    assert "n_rollout_steps <= prev_n_rollout" not in src, (
+        "the warning fires when the objective is unchanged"
+    )
+
+
+def test_a_STALLED_run_reports_but_a_healthy_one_does_not():
+    """
+    The pipeline sets log_every_epoch=False deliberately -- stage 3 runs go to
+    thousands of epochs -- so a row printed only on a save or an excursion. A
+    resume under a reference ceiling it never beats does neither: a real 3a
+    run produced 25 epochs and not one row, and looked hung.
+
+    The fix must NOT be a fixed epoch grid: every 10 epochs over 10000 is a
+    thousand lines, which trades one problem for another. Gating on
+    epochs_since_improvement means a run that keeps saving never triggers it,
+    while a stalled one reports about twenty times before patience ends it.
+    """
+    from conftest import source_without_comments
+    import pathlib
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    assert "epochs_since_improvement % 25 == 0" in src, (
+        "the heartbeat is not gated on the stall"
+    )
+    assert "or _stalled:" in src, "the stall row is computed but not used"
+    assert "epoch % 10 == 0" not in src, (
+        "a fixed epoch grid would print a thousand lines on a 10000-epoch run"
+    )

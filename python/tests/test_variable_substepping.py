@@ -1060,3 +1060,86 @@ def test_arrival_capture_keeps_the_forward_bit_identical():
         trunc = _integrate_counts(counts, 64)
         for name, a, b in zip(("z0", "z1", "f"), plain, trunc):
             assert torch.equal(a, b), f"counts={counts}: {name} differs"
+
+
+def test_the_realised_retained_cost_is_recorded_per_transition():
+    """
+    THE GAP BETWEEN BUDGET AND REALITY, made measurable. The sampler budgets
+    on a pre-epoch ESTIMATE (each window's first state, worst transition); the
+    integrator re-derives counts per transition from the state it actually
+    reaches. Nothing has ever compared the two, so "the budget is 30000" has
+    never implied "memory is bounded by 30000".
+    """
+    m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, alpha=0.1, max_substeps=4096,
+                        truncate_bptt=64)
+    torch.manual_seed(0)
+    B = 8
+    counts = torch.tensor([50, 60, 70, 80, 300, 320, 340, 360])
+    m._substeps_for = lambda *a, **k: counts
+    m._integrate(torch.randn(B, 2, 4, 4), torch.randn(B, 2, 4, 4),
+                  torch.full((B,), 100.0), torch.zeros(B, 1))
+    hi, lo = float(counts.max()), float(counts.min())
+    expected = B * min(hi, B * 64.0, (hi - lo) + 64.0)
+    assert m._retained_peak == pytest.approx(expected), (
+        f"realised retained peak {m._retained_peak} != {expected}"
+    )
+
+    # AND a case where the n bound is the binding one: two samples, counts far
+    # apart. Two samples can produce at most two arrival segments however wide
+    # the gap, so span + k (18064) grossly over-charges what 2 * k (128) can
+    # cost. Without this case the fixture above passes with the n bound
+    # removed, since its span is narrow enough for span + k to bind anyway.
+    m2 = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                         n_hidden_layers=1, alpha=0.1, max_substeps=32768,
+                         truncate_bptt=64)
+    m2._substeps_for = lambda *a, **k: torch.tensor([100, 18000])
+    torch.manual_seed(0)
+    m2._integrate(torch.randn(2, 2, 4, 4), torch.randn(2, 2, 4, 4),
+                   torch.full((2,), 100.0), torch.zeros(2, 1))
+    assert m2._retained_peak == pytest.approx(2 * 128.0), (
+        f"{m2._retained_peak} -- the n bound is missing, so a 2-sample batch "
+        f"is charged for arrival segments it cannot have"
+    )
+
+
+def test_the_realised_peak_resets_per_epoch():
+    """Cumulative would hide the drift it exists to show."""
+    m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, alpha=0.1, max_substeps=4096,
+                        truncate_bptt=64)
+    torch.manual_seed(0)
+    m._substeps_for = lambda *a, **k: torch.tensor([100, 200])
+    m._integrate(torch.randn(2, 2, 4, 4), torch.randn(2, 2, 4, 4),
+                  torch.full((2,), 100.0), torch.zeros(2, 1))
+    assert m._retained_peak > 0
+    m.substep_stats(reset=True)
+    assert m._retained_peak == 0.0, "cumulative would hide the drift"
+
+    # The same through the ADAPTIVE path, where substep_stats returns a dict
+    # rather than early-returning: the reset must clear the peak there too.
+    # Without this the mutation that drops the reset from the dict branch
+    # survives, because the only covered path was the early return.
+    m3 = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                         n_hidden_layers=1, alpha=0.1, max_substeps=4096,
+                         truncate_bptt=64)
+    torch.manual_seed(0)
+    m3._integrate(torch.randn(4, 2, 4, 4) * 0.3, torch.randn(4, 2, 4, 4) * 0.3,
+                   torch.full((4,), 300.0), torch.zeros(4, 1))
+    assert m3.substep_stats(reset=False) is not None, "fixture took no adaptive path"
+    assert m3._retained_peak > 0
+    m3.substep_stats(reset=True)
+    assert m3._retained_peak == 0.0
+
+
+def test_it_is_not_recorded_without_truncation():
+    """Without truncation the whole history is retained and the quantity has
+    no meaning -- reporting a number there would invite sizing a budget from
+    it."""
+    m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, alpha=0.1, max_substeps=4096)
+    torch.manual_seed(0)
+    m._substeps_for = lambda *a, **k: torch.tensor([100, 200])
+    m._integrate(torch.randn(2, 2, 4, 4), torch.randn(2, 2, 4, 4),
+                  torch.full((2,), 100.0), torch.zeros(2, 1))
+    assert m._retained_peak == 0.0

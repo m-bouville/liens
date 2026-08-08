@@ -127,9 +127,17 @@ class _SpikeGuard:
             self._recent[band] = deque(maxlen=self.window)
         return self._recent[band]
 
-    def should_skip(self, loss_value: float, band: int | None = None) -> bool:
+    def should_skip(self, loss_value: float, band: int | None = None,
+                     loss_was_ordinary: bool = False) -> bool:
         """`band` defaults to None -- ONE shared history, i.e. the old
-        behaviour -- so a caller that does not bucket is unaffected."""
+        behaviour -- so a caller that does not bucket is unaffected.
+
+        `loss_was_ordinary` says the LOSS guard looked at this same batch and
+        declined to skip it. It defaults to False, which is the conservative
+        reading: never adapt unless the caller positively asserts the loss was
+        fine. The loss guard itself must therefore leave it False -- it has no
+        second opinion to appeal to.
+        """
         if self.factor <= 0:
             return False
         if not math.isfinite(loss_value):
@@ -157,6 +165,35 @@ class _SpikeGuard:
             if med > 0 and loss_value > self.factor * med:
                 self.n_skipped += 1
                 self.n_skipped_this_epoch += 1
+                # TWO FAILURE MODES, and they must not be conflated.
+                #
+                # (a) DIVERGENCE: the weights are moving somewhere bad. The
+                #     LOSS is elevated too. Recording anything here would
+                #     raise the bar until spikes read as normal and the guard
+                #     silently stopped guarding -- which is why nothing was
+                #     recorded originally.
+                #
+                # (b) A STRUCTURALLY LARGE BAND: an ORDINARY loss with a huge
+                #     gradient. f_theta enters the update as f*dt^2/2, so at
+                #     long dt the gradient carries a factor of thousands while
+                #     the loss does not. These batches are not anomalies; they
+                #     are what the top dt band looks like. Recording NOTHING
+                #     freezes such a band out permanently, because its median
+                #     can never move. Measured on stage 3b: ~3 of 10 batches
+                #     skipped every epoch for hundreds of epochs, and a
+                #     controlled comparison showed f_theta got WORSE at long
+                #     dt over the run -- 0.1492 -> 0.1631 in decade 3 -- while
+                #     improving nowhere.
+                #
+                # `loss_was_ordinary` is the discriminator, and it is exactly
+                # what the caller already knows: the gradient guard only runs
+                # at all when the loss guard declined to skip. An earlier
+                # version used a magnitude cutoff instead, calibrated from one
+                # example at 2.7x the threshold -- but the real skips run 33x
+                # to 625x, so it almost never engaged. The distinction was
+                # never about size.
+                if loss_was_ordinary:
+                    history.append(self.factor * med)
                 return True
         history.append(loss_value)
         return False

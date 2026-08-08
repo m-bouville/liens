@@ -221,7 +221,10 @@ def test_an_excursion_prints_even_when_nothing_saved():
     reader would normally use, and it was actively misleading.
     """
     src = source_without_comments(_ROOT / "training/train_lds.py")
-    assert "if log_every_epoch or saved_this_epoch or _excursion:" in src, (
+    # The gate has since grown a STALL clause too, so matching the whole line
+    # pinned the exact set of conditions and broke on an unrelated addition.
+    # The property this test owns is that an excursion is in the gate at all.
+    assert "or _excursion" in src, (
         "the excursion does not break through the throttle"
     )
     assert "val EXCURSION" in src
@@ -424,7 +427,10 @@ def test_the_gradient_norm_is_guarded_separately():
     from training.train_lds import train_lds
     assert "grad_spike_factor" in inspect.signature(train_lds).parameters
     src = source_without_comments(_ROOT / "training/train_lds.py")
-    assert "grad_guard.should_skip(float(_gnorm), band=_band)" in src
+    # Matching the call PREFIX, not the whole line: the signature grew a
+    # loss_was_ordinary argument and an exact match broke a test about a
+    # different property.
+    assert "grad_guard.should_skip(float(_gnorm), band=_band" in src
 
 
 def test_the_guard_uses_the_PRE_clip_norm():
@@ -635,7 +641,7 @@ def test_END_TO_END_a_deadlock_really_rolls_back_and_keeps_training(tmp_path, ca
     real = _SpikeGuard.should_skip
     state = {"epoch_calls": 0}
 
-    def always_skip_after_a_while(self, value, band=None):
+    def always_skip_after_a_while(self, value, band=None, loss_was_ordinary=False):
         state["epoch_calls"] += 1
         if state["epoch_calls"] > 12:       # a few real epochs first, so a checkpoint exists
             self.n_skipped += 1
@@ -702,7 +708,7 @@ def test_END_TO_END_an_exhausted_rollback_budget_stops_without_raising(tmp_path,
     real = _SpikeGuard.should_skip
     state = {"n": 0}
 
-    def skip_everything_after_a_while(self, value, band=None):
+    def skip_everything_after_a_while(self, value, band=None, loss_was_ordinary=False):
         state["n"] += 1
         if state["n"] > 12:
             self.n_skipped += 1
@@ -819,7 +825,10 @@ def test_stage45_has_both_guards():
 
     src = source_without_comments(_ROOT / "training/train_refinement.py")
     assert "spike_guard.should_skip(float(loss.detach()), band=_band)" in src
-    assert "grad_guard.should_skip(float(_gnorm), band=_band)" in src
+    # Matching the call PREFIX, not the whole line: the signature grew a
+    # loss_was_ordinary argument and an exact match broke a test about a
+    # different property.
+    assert "grad_guard.should_skip(float(_gnorm), band=_band" in src
 
 
 def test_stage45_reads_the_loss_BEFORE_backward():
@@ -921,7 +930,7 @@ def test_END_TO_END_stage45_guard_skips_and_reports(tmp_path, capsys,
     real = _SpikeGuard.should_skip
     state = {"n": 0}
 
-    def skip_a_few(self, value, band=None):
+    def skip_a_few(self, value, band=None, loss_was_ordinary=False):
         state["n"] += 1
         if 3 <= state["n"] <= 5:          # a handful, not all: no deadlock
             self.n_skipped += 1
@@ -977,7 +986,7 @@ def test_END_TO_END_stage45_deadlock_stops_without_raising(tmp_path, capsys,
     real = _SpikeGuard.should_skip
     state = {"n": 0}
 
-    def skip_everything_after_a_while(self, value, band=None):
+    def skip_everything_after_a_while(self, value, band=None, loss_was_ordinary=False):
         state["n"] += 1
         if state["n"] > 6:                 # a couple of real epochs first
             self.n_skipped += 1
@@ -1740,3 +1749,136 @@ def test_train_lds_uses_the_reporter_and_feeds_it_nonfinite_counts():
         "suppressed as marginal"
     )
     assert "grad_guard.n_nonfinite" in src and "spike_guard.n_nonfinite" in src
+
+
+def test_a_band_whose_batches_all_skip_does_not_freeze_out():
+    """
+    THE PERMANENT-EXCLUSION BUG. history.append sat only on the accept path,
+    so a band whose every batch exceeded the threshold never updated its own
+    median: the threshold froze, and the band was excluded from training for
+    the rest of the run.
+
+    Measured on stage 3b -- the same ~3 of 8 batches at the top dt skipped
+    every epoch for hundreds of epochs, while the loss on those windows never
+    improved because it never received a gradient. That population is not
+    noise: the gradient carries a dt^2 factor, so the longest-dt batches are
+    structurally the largest, and a fixed multiple of a stale median rejects
+    them by construction.
+    """
+    from training.spike_guard import _SpikeGuard
+    g = _SpikeGuard(factor=10.0, window=200, min_history=50)
+    for _ in range(60):
+        g.should_skip(1.0, band=3, loss_was_ordinary=True)
+
+    # ORDINARY LOSS with a large gradient: the structural case. The real 3b
+    # skips ran 33x to 625x their band median, so no magnitude cutoff would
+    # have covered them -- the loss verdict is what distinguishes.
+    skips = sum(g.should_skip(100.0, band=3, loss_was_ordinary=True)
+                for _ in range(200))
+    assert skips < 120, (
+        f"skipped {skips}/200 batches of a band that has genuinely shifted -- "
+        f"the median is not following, so the band is frozen out"
+    )
+    hist = sorted(g.history(3))
+    assert hist[len(hist) // 2] > 10.0, (
+        f"band median {hist[len(hist) // 2]} has not tracked the shift"
+    )
+
+
+def test_a_one_off_catastrophe_is_still_skipped_and_does_not_poison_the_median():
+    """The case the guard exists for. Recording the THRESHOLD rather than the
+    value is what keeps both properties: the band can follow a real shift,
+    while a 1e6 spike contributes a bounded amount instead of a value that
+    would raise the threshold forever."""
+    from training.spike_guard import _SpikeGuard
+    g = _SpikeGuard(factor=10.0, window=200, min_history=50)
+    for _ in range(60):
+        g.should_skip(1.0, band=3)
+
+    assert g.should_skip(1e6, band=3) is True
+    hist = sorted(g.history(3))
+    assert hist[len(hist) // 2] == 1.0, (
+        "the median moved on a single outlier, so one catastrophic batch "
+        "raises the bar for every batch after it"
+    )
+    assert g.should_skip(1.0, band=3) is False
+
+
+def test_the_recorded_value_is_bounded_by_the_threshold():
+    """Not the raw value: appending it would put the band's median beyond
+    anything real within `window` batches."""
+    from training.spike_guard import _SpikeGuard
+    g = _SpikeGuard(factor=10.0, window=200, min_history=50)
+    for _ in range(60):
+        g.should_skip(2.0, band=1, loss_was_ordinary=True)
+    g.should_skip(1e9, band=1, loss_was_ordinary=True)
+    assert max(g.history(1)) <= 10.0 * 2.0 + 1e-9, (
+        f"recorded {max(g.history(1))} for a skipped batch; it must be capped "
+        f"at factor x median"
+    )
+
+
+def test_a_DIVERGING_band_is_not_adapted_to():
+    """
+    The distinction the adaptation rests on. A band that has genuinely shifted
+    sits a small multiple past a stale threshold; a diverging run sits orders
+    beyond it. Measured: 2.7x for the real 3b skips, 20000x for the divergence
+    the guard was built for. Adapting to the second would raise the bar until
+    spikes read as normal and the guard silently stopped guarding.
+    """
+    from training.spike_guard import _SpikeGuard
+    g = _SpikeGuard(factor=10.0, window=200, min_history=50)
+    for _ in range(60):
+        g.should_skip(1.0, band=3, loss_was_ordinary=True)
+    # loss_was_ordinary=False (the default): the loss guard flagged this batch
+    # too, which is what divergence looks like -- both quantities elevated.
+    skips = sum(g.should_skip(1e6, band=3) for _ in range(200))
+    assert skips == 200, f"only {skips}/200 diverging batches were skipped"
+    hist = sorted(g.history(3))
+    assert hist[len(hist) // 2] == 1.0, (
+        f"median moved to {hist[len(hist) // 2]} on a diverging band -- the "
+        f"guard is adapting itself out of existence"
+    )
+
+
+def test_both_stages_tell_the_gradient_guard_the_loss_was_ordinary():
+    """
+    THE WHOLE MECHANISM HANGS ON THIS ARGUMENT. Without it the default is
+    False, nothing ever adapts, and the top-dt band is frozen out again --
+    silently, since every test of the guard in isolation still passes. A
+    mutation removing it from the call site did exactly that.
+
+    The gradient guard is only REACHED when the loss guard declined to skip,
+    so passing True there is a statement of fact about the control flow, not
+    an assumption.
+    """
+    import pathlib
+
+    from conftest import source_without_comments
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for stage in ("training/train_lds.py", "training/train_refinement.py"):
+        src = source_without_comments(root / stage)
+        assert "grad_guard.should_skip" in src, f"{stage} has no gradient guard"
+        call = src[src.index("grad_guard.should_skip"):]
+        assert "loss_was_ordinary=True" in call[:200], (
+            f"{stage} does not tell the gradient guard the loss was ordinary, "
+            f"so its band can never adapt and long-dt batches are excluded "
+            f"permanently"
+        )
+
+
+def test_the_loss_guard_itself_never_claims_an_ordinary_loss():
+    """It has no second opinion to appeal to: for the loss guard, the value
+    under test IS the loss. Passing True there would let a diverging run
+    adapt its own threshold away."""
+    import pathlib
+
+    from conftest import source_without_comments
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for stage in ("training/train_lds.py", "training/train_refinement.py"):
+        src = source_without_comments(root / stage)
+        call = src[src.index("spike_guard.should_skip"):]
+        assert "loss_was_ordinary" not in call[:200], (
+            f"{stage}'s LOSS guard passes loss_was_ordinary; only the gradient "
+            f"guard has an independent verdict to report"
+        )

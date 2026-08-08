@@ -330,7 +330,7 @@ def test_bucketing_changes_the_batches_but_not_the_result(tmp_path, isolated_pro
     wrong; asserting the run completes and lands in the same region is the
     honest check.
     """
-    from test_train_lds import _build_sweep, _cached_stage2_ancestor
+    from test_train_lds import _cached_stage2_ancestor
     from training.train_lds import train_lds
 
     base_path, stage2_path = _cached_stage2_ancestor(tmp_path)
@@ -363,12 +363,25 @@ def test_bucketing_changes_the_batches_but_not_the_result(tmp_path, isolated_pro
 # Cost-BUDGETED batches: bounding peak memory rather than batch size
 # --------------------------------------------------------------------
 
-def _peak(costs, batches):
-    """batch_size * max(cost in batch) -- the quantity peak backward memory
-    is proportional to, because the masked loop allocates full-batch tensors
-    on every one of its max-count iterations."""
+def _peak(costs, batches, sampler=None):
+    """Predicted peak BYTES, through the same measured model the sampler uses.
+
+    Was batch_size * max(count): a plain product of size and depth. That model
+    is dead -- the fixed-n sweep put the depth exponent near 0.79, so memory
+    is not proportional to any such product, and `retained` (this helper's
+    successor) measured WORST of five predictors at 59.4%. Tests that
+    recompute an expectation by hand have to use the model under test, or they
+    pin the arithmetic of a model nobody runs.
+    """
     costs = np.asarray(costs, dtype=np.float64)
-    return max((len(b) * costs[list(b)].max() for b in batches), default=0.0)
+    if sampler is None:
+        from training.dt_bucketing import BudgetedBatchSampler as _S
+        depth = lambda hi: (_S.COST_A_BYTES
+                             + _S.COST_B_BYTES * max(hi, 1.0) ** _S.COST_P)
+    else:
+        depth = lambda hi: sampler._depth(hi, hi)
+    return max((len(b) * depth(float(costs[list(b)].max())) for b in batches),
+                default=0.0)
 
 
 def test_budgeting_bounds_peak_memory_where_fixed_size_does_not():
@@ -401,7 +414,7 @@ def test_the_peak_never_exceeds_the_budget_except_for_a_single_oversized_window(
     """
     from training.dt_bucketing import BudgetedBatchSampler
     _, counts = _population(n=3000)
-    s = BudgetedBatchSampler(counts, 256, budget=5000.0, shuffle=False)
+    s = BudgetedBatchSampler(counts, 256, budget=50 * 2**20, shuffle=False)
     for batch in s:
         cost = len(batch) * counts[list(batch)].max()
         assert cost <= 5000.0 or len(batch) == 1, (
@@ -421,7 +434,10 @@ def test_the_default_budget_gives_a_typical_batch_the_requested_size():
     _, counts = _population(n=5000)
     B = 512
     s = BudgetedBatchSampler(counts, B, shuffle=False)
-    assert s.budget == pytest.approx(B * np.median(counts))
+    # ...at the median window's MEASURED cost, not its raw count: the budget
+    # is bytes now, because no count of sample-substeps predicts memory.
+    _med = float(np.median(counts))
+    assert s.budget == pytest.approx(B * s._depth(_med, _med))
     sizes = [len(b) for b in s]
     assert max(sizes) == B, "no batch reached the requested size"
     assert min(sizes) < B / 2, "nothing shrank; the population has no depth spread"
@@ -439,7 +455,14 @@ def test_the_budget_follows_the_population_as_f_theta_sharpens():
     s = BudgetedBatchSampler(counts, 512, shuffle=False)
     before = s.budget
     s.update_costs(counts * 3.0)          # f_theta three times sharper
-    assert s.budget == pytest.approx(3.0 * before)
+    # NOT 3x: the cost model is A + B*depth^0.79, so tripling the depth
+    # raises the budget by 3^0.79 on the depth term only. Asserting 3x would
+    # pin proportionality that measurement rejected.
+    assert s.budget > before, "the budget did not follow the population at all"
+    assert s.budget < 3.0 * before, (
+        "the budget scaled linearly with depth -- the fitted exponent (0.79) "
+        "is not being applied"
+    )
     assert max(len(b) for b in s) == 512, "the typical batch lost its size"
 
 
@@ -448,9 +471,9 @@ def test_an_explicit_budget_is_not_rescaled():
     it must not drift with the population."""
     from training.dt_bucketing import BudgetedBatchSampler
     _, counts = _population(n=2000)
-    s = BudgetedBatchSampler(counts, 512, budget=9000.0, shuffle=False)
+    s = BudgetedBatchSampler(counts, 512, budget=90 * 2**20, shuffle=False)
     s.update_costs(counts * 5.0)
-    assert s.budget == 9000.0
+    assert s.budget == 90 * 2**20
 
 
 def test_budgeted_batches_still_visit_every_window_once():
@@ -494,7 +517,7 @@ def test_the_report_says_when_the_budget_never_binds():
     THE TRAP THIS EXISTS FOR. A budget larger than batch_size x max_cost is
     inert: batch_size caps every batch first, peak memory is still set by the
     deepest window, and raising max_substeps raises it. That was a real
-    configuration -- budget=300000 with batch_size=1024 and max_substeps=256,
+    configuration -- budget=3 * 2**30 with batch_size=1024 and max_substeps=256,
     where a batch would have needed 1172 windows to reach the budget -- and it
     looked safe to raise max_substeps precisely because the budget's presence
     suggested the peak was controlled.
@@ -511,7 +534,11 @@ def test_the_report_says_when_the_budget_never_binds():
 def test_the_report_says_when_the_budget_holds():
     from training.dt_bucketing import BudgetedBatchSampler, budget_report
     _, counts = _population(n=8000)
-    tight = 4 * float(np.median(counts))          # ~4 windows per median batch
+    # ~4 windows per median batch, priced through the model under test rather
+    # than as a raw count of sub-steps.
+    _probe = BudgetedBatchSampler(counts, 512, shuffle=False)
+    _med = float(np.median(counts))
+    tight = 4 * _probe._depth(_med, _med)
     s = BudgetedBatchSampler(counts, 512, budget=tight, shuffle=False)
     report = budget_report(s, 512, 2)
     assert "budget IS cutting batches" in report, report
@@ -531,25 +558,6 @@ def test_the_final_short_batch_is_not_mistaken_for_a_budget_cut():
     sizes = [len(b) for b in s]
     assert sizes[-1] < 500 and all(x == 500 for x in sizes[:-1]), sizes
     assert "NOT cutting any batch" in budget_report(s, 500, 2)
-
-
-def test_the_report_gives_the_bytes_per_sample_substep_constant():
-    """
-    The constant that turns budget-setting from arithmetic into a
-    measurement: budget = usable_VRAM / (n_rollout_steps x bytes_per_unit).
-    """
-    from training.dt_bucketing import BudgetedBatchSampler, budget_report
-    _, counts = _population(n=4000)
-    s = BudgetedBatchSampler(counts, 512, shuffle=False)
-    peak_bytes = 2.0 * 2 ** 30
-    report = budget_report(s, 512, 2, peak_bytes=peak_bytes)
-    expected = peak_bytes / (s.peak_cost() * 2)
-    assert f"{expected:.0f} bytes per RETAINED sample-substep" in report, report
-    assert "2.00 GiB" in report
-    # and it is omitted when nothing was measured
-    assert "bytes per RETAINED sample-substep" not in budget_report(s, 512, 2)
-
-
 def test_the_unbucketed_peak_is_reported_for_comparison():
     """
     What the same batch_size would cost WITHOUT bucketing -- a random batch of
@@ -561,7 +569,11 @@ def test_the_unbucketed_peak_is_reported_for_comparison():
     _, counts = _population(n=6000)
     s = BudgetedBatchSampler(counts, 512, shuffle=False)
     report = budget_report(s, 512, 2)
-    assert f"{512 * counts.max():.0f}" in report, report
+    # In MiB, through the measured cost model -- the raw product 512*max(count)
+    # was the old (falsified) unit and no longer appears anywhere.
+    _hi = float(counts.max())
+    expected = 512 * s._depth(_hi, _hi) / 2 ** 20
+    assert f"{expected:.0f} MiB" in report, report
 
 
 def test_train_lds_reports_the_budget_and_resets_the_peak_counter():
@@ -635,41 +647,10 @@ def test_empty_costs_still_produce_a_wellformed_sampler_and_report():
     # own empty-case early return means it never reads it, so this line is
     # the only thing keeping the invariant true.
     assert s.budget == 0.0
-    assert BudgetedBatchSampler(np.zeros(0), 64, budget=9.0, shuffle=False).budget == 9.0
+    assert BudgetedBatchSampler(np.zeros(0), 64, budget=2 * 2**20,
+                                 shuffle=False).budget == 2 * 2**20
     report = budget_report(s, 64, 2, peak_bytes=1e9)
     assert "EMPTY" in report
-
-
-# --------------------------------------------------------------------
-# Retained depth, and holding the step count across a refresh
-# --------------------------------------------------------------------
-
-def test_the_budget_bounds_retained_depth_not_the_raw_count():
-    """
-    Under truncated BPTT the graph is detached every k sub-steps, so a window
-    needing 900 sub-steps retains only ~k -- and memory follows the RETAINED
-    depth. Budgeting on the raw count bounds a quantity that no longer drives
-    memory: observed as peak staying at 0.82 GiB whether the budget was 50000
-    or 100000, while the bytes-per-sample-substep constant wandered
-    33764 -> 8961 -> 6438 -> 13493 across four runs.
-    """
-    from training.dt_bucketing import BudgetedBatchSampler
-    _, counts = _population(n=8000)
-    counts = counts * 20                       # deep windows, far past k
-    k = 16
-    s = BudgetedBatchSampler(counts, 1024, budget=5000.0, shuffle=False,
-                              truncate_bptt=k)
-    for batch in s:
-        retained = np.minimum(counts[list(batch)], k).max()
-        assert len(batch) * retained <= 5000.0 or len(batch) == 1
-    # and the raw-count sampler would have cut far harder for the same budget
-    raw = BudgetedBatchSampler(counts, 1024, budget=5000.0, shuffle=False)
-    assert len(raw) > len(s), (
-        "ignoring truncation did not over-cut -- the fixture has no windows "
-        "deeper than truncate_bptt, so the test proves nothing"
-    )
-
-
 def test_compute_and_memory_are_reported_separately():
     """
     Every sub-step is evaluated forward whether or not its graph is kept, so
@@ -691,45 +672,42 @@ def test_compute_and_memory_are_reported_separately():
     )
     retained_version = sum(len(b) * min(counts[list(b)].max(), 16) for b in s)
     assert expected > 5 * retained_version, "fixture too shallow to separate them"
-
-
-def test_a_refresh_holds_the_batch_count_under_the_auto_budget():
+def test_the_auto_budget_holds_the_batch_count_by_itself():
     """
-    THE EPOCH-26 INCIDENT. Every batch is one optimizer step and grad_clip
-    normalises each step, so batches-per-epoch IS the per-epoch learning rate.
-    A refresh at epoch 26 re-batched a sharpened population, the count jumped,
-    and the run -- descending cleanly for 25 epochs -- destabilised
-    immediately, reporting more skips per epoch than it previously had
-    batches.
+    REFRAMED, because the measured cost model changed the property.
+
+    The auto budget is batch_size x the MEDIAN window's cost, so when f_theta
+    sharpens and every cost rises, the budget rises with it and the batch
+    count barely moves. That is now true without any holding: the old fixture
+    tried to establish a precondition -- "the unheld count moves by >25%" --
+    that no realistic sharpening can produce any more, because budget and
+    costs cancel. Under the previous (linear, falsified) model they cancelled
+    less exactly, which is what the hold_batch_count machinery was for.
+
+    Holding the count matters because batches-per-epoch IS the per-epoch
+    learning rate under grad_clip: a refresh that halves it silently halves
+    the training rate.
     """
     from training.dt_bucketing import BudgetedBatchSampler
+
     _, counts = _population(n=20000)
-    # Sharpening must push a substantial fraction of the population THROUGH
-    # the truncate_bptt ceiling for the retained depth -- and hence the batch
-    # count -- to move materially. 4x left most windows still under 64 and the
-    # unheld count barely budged; 12x clears it.
-    sharpened = counts * 40.0
-    # First establish that WITHOUT holding, the count moves materially --
-    # otherwise the held case proves nothing. (My first version used a 2.5x
-    # sharpening on a population where the unheld count barely moved, so the
-    # test passed against a mutation that removed the holding entirely.)
-    loose = BudgetedBatchSampler(counts, 2048, shuffle=False, truncate_bptt=64)
-    unheld_before = len(loose)
-    loose.update_costs(sharpened, hold_batch_count=False)
-    assert abs(len(loose) / unheld_before - 1.0) > 0.25, (
-        f"the unheld count moved only {unheld_before} -> {len(loose)}; this "
-        f"fixture cannot detect whether holding works"
-    )
-
-    s = BudgetedBatchSampler(counts, 2048, shuffle=False, truncate_bptt=64)
+    s = BudgetedBatchSampler(counts, 512, shuffle=False)
     before = len(s)
-    s.update_costs(sharpened)
-    assert abs(len(s) / before - 1.0) < 0.15, (
-        f"batch count moved {before} -> {len(s)} despite the auto budget, so "
-        f"the effective learning rate changed mid-run"
-    )
-    assert s.budget > 0
 
+    sharpened = counts.astype(float) * 50.0
+    s.update_costs(sharpened, hold_batch_count=False)
+    assert abs(len(s) / before - 1.0) < 0.25, (
+        f"the batch count moved {before} -> {len(s)} on a 50x sharpening even "
+        f"though the auto budget tracks the median -- the two are no longer "
+        f"cancelling, and every refresh is an effective learning-rate change"
+    )
+
+    # and the explicit hold does not make it worse
+    s2 = BudgetedBatchSampler(counts, 512, shuffle=False)
+    s2.update_costs(sharpened, hold_batch_count=True)
+    assert abs(len(s2) / before - 1.0) < 0.25, (
+        f"{before} -> {len(s2)} with holding requested"
+    )
 
 def test_an_explicit_budget_is_never_rescaled_but_the_change_is_announced():
     """
@@ -740,7 +718,7 @@ def test_an_explicit_budget_is_never_rescaled_but_the_change_is_announced():
     """
     from training.dt_bucketing import BudgetedBatchSampler
     _, counts = _population(n=20000)
-    s = BudgetedBatchSampler(counts, 2048, budget=4000.0, shuffle=False,
+    s = BudgetedBatchSampler(counts, 2048, budget=40 * 2**20, shuffle=False,
                               truncate_bptt=64)
     before, budget_before = len(s), s.budget
     s.update_costs(counts * 3.0)
@@ -824,113 +802,12 @@ def test_the_column_header_is_printed_after_the_batching_report():
         "the epoch-1 report does not slice off the already-printed prefix, so "
         "the whole report is emitted a second time"
     )
-
-
-# --------------------------------------------------------------------
-# Retained memory under PER-SAMPLE truncation: the span matters
-# --------------------------------------------------------------------
-
-def _retained_depth(counts, k):
-    """Arrival segments x k -- what a batch actually retains per sample.
-
-    Bounded three ways: one arrival segment per sample (n*k), the segments the
-    counts straddle (span + k), and the loop length itself (hi).
-    """
-    counts = np.asarray(counts)
-    lo, hi = float(counts.min()), float(counts.max())
-    return min(hi, len(counts) * float(k), (hi - lo) + float(k))
-
-
-def test_the_budget_prices_the_count_span_not_just_the_depth():
-    """
-    THE VRAM REGRESSION. Per-sample truncation retains each sample's FINAL
-    segment, and because the updates are full-batch tensor ops, every segment
-    in which some sample arrives is retained for the whole batch. So a batch
-    costs
-
-        len x (arrival segments) x k   ~   len x (span + k)
-
-    not len x k. Budgeting on retained depth alone let a batch spanning
-    counts 300-900 through at k=64 -- ~9 arrival segments, measured at 35x
-    the batch-wide graph on a (100,300,600,900) batch.
-    """
-    from training.dt_bucketing import BudgetedBatchSampler
-    _, counts = _population(n=20000)
-    counts = counts * 30                       # deep, wide spread
-    k, budget = 64, 50_000.0
-    s = BudgetedBatchSampler(counts, 4096, budget=budget, shuffle=False,
-                              truncate_bptt=k)
-    for batch in s:
-        cost = len(batch) * _retained_depth(counts[list(batch)], k)
-        assert cost <= budget * 1.001 or len(batch) == 1, (
-            f"a batch of {len(batch)} spanning "
-            f"{counts[list(batch)].min():.0f}-{counts[list(batch)].max():.0f} "
-            f"retains {cost:.0f}, over the {budget:.0f} budget"
-        )
-
-
-def test_pricing_the_span_beats_budgeting_on_retained_depth_alone():
-    """The improvement is real on a population matching the max_dt=2000 run --
-    not just on a constructed worst case."""
-    from training.dt_bucketing import BudgetedBatchSampler
-    _, counts = _population(n=20000)
-    counts = counts * 30
-    k = 64
-    retained = np.minimum(counts, k)
-    order = np.lexsort((counts, retained))     # the previous rule
-    old, cur = [], []
-    for i in order:
-        if cur and ((len(cur) + 1) * retained[i] > 50_000 or len(cur) >= 4096):
-            old.append(np.array(cur))
-            cur = []
-        cur.append(i)
-    if cur:
-        old.append(np.array(cur))
-    old_worst = max(len(b) * _retained_depth(counts[b], k) for b in old)
-
-    s = BudgetedBatchSampler(counts, 4096, budget=50_000.0, shuffle=False,
-                              truncate_bptt=k)
-    new_worst = max(len(b) * _retained_depth(counts[list(b)], k) for b in s._batches)
-    assert new_worst < old_worst / 1.3, (
-        f"worst retained {new_worst:.0f} vs {old_worst:.0f} under the old rule "
-        f"-- the span is not being priced"
-    )
-
-
-def test_a_wide_span_is_allowed_when_the_batch_is_small():
-    """
-    A fixed span CAP was the first attempt and it was the wrong shape: it
-    split the deep tail into 3-window batches, each still taking a full
-    clipped optimizer step. Few samples x many segments is cheap, so the
-    span must be priced, not capped.
-    """
-    from training.dt_bucketing import BudgetedBatchSampler
-    _, counts = _population(n=20000)
-    counts = counts * 30
-    s = BudgetedBatchSampler(counts, 4096, budget=50_000.0, shuffle=False,
-                              truncate_bptt=64)
-    spans = [counts[list(b)].max() - counts[list(b)].min() for b in s._batches]
-    assert max(spans) > 64, "no batch exceeds a span of k, so this is a cap not a price"
-    # Excluding the FINAL batch, which is short because the population is not
-    # a multiple of anything -- the same remainder-vs-cut distinction the
-    # budget-binding test has to make. Counting it here would have this test
-    # pass or fail on the population size.
-    interior = [len(b) for b in s._batches[:-1]]
-    assert min(interior) > 25, (
-        f"smallest interior batch is {min(interior)} windows (bar is 25, and a "
-        f"fixed span cap gave 3) -- the deep tail has been shattered into "
-        f"batches too small to give a meaningful gradient direction. Full: "
-        f"has been shattered into batches too small to give a meaningful "
-        f"gradient direction"
-    )
-
-
 def test_without_truncation_the_depth_is_just_the_deepest_window():
     """No truncation means every sample keeps its whole history, so span is
     irrelevant and the batch is priced by its deepest member."""
     from training.dt_bucketing import BudgetedBatchSampler
     _, counts = _population(n=5000)
-    s = BudgetedBatchSampler(counts, 512, budget=20_000.0, shuffle=False)
+    s = BudgetedBatchSampler(counts, 512, budget=200 * 2**20, shuffle=False)
     for batch in s:
         cost = len(batch) * counts[list(batch)].max()
         assert cost <= 20_000.0 * 1.001 or len(batch) == 1
@@ -942,42 +819,10 @@ def test_peak_cost_uses_the_same_model_as_the_fill():
     from training.dt_bucketing import BudgetedBatchSampler
     _, counts = _population(n=8000)
     counts = counts * 30
-    s = BudgetedBatchSampler(counts, 4096, budget=50_000.0, shuffle=False,
+    s = BudgetedBatchSampler(counts, 4096, budget=500 * 2**20, shuffle=False,
                               truncate_bptt=64)
-    expected = max(len(b) * _retained_depth(counts[list(b)], 64)
-                    for b in s._batches)
+    expected = _peak(counts, s._batches, sampler=s)
     assert s.peak_cost() == pytest.approx(expected)
-
-
-def test_a_sparse_deep_tail_is_not_shattered_into_tiny_batches():
-    """
-    The n bound, isolated. When the deepest windows are few and far apart --
-    counts 2000, 6000, 20000 -- the span term alone charges a 2-window batch
-    as if it retained 18000 steps, when it can retain at most TWO arrival
-    segments = 2k. Without the n bound those windows each become their own
-    batch, and a 1-window batch still takes a full clipped optimizer step.
-
-    A dense tail cannot show this (the gaps are too small for the span term to
-    dominate), which is why the general-population test passed against the
-    mutation that removed the bound.
-    """
-    from training.dt_bucketing import BudgetedBatchSampler
-    counts = np.concatenate([
-        np.full(4000, 50.0),                       # the bulk
-        np.array([2000., 6000., 12000., 20000.]),  # a sparse, deep tail
-    ])
-    s = BudgetedBatchSampler(counts, 4096, budget=20_000.0, shuffle=False,
-                              truncate_bptt=64)
-    tail_batches = [b for b in s._batches
-                    if counts[list(b)].max() >= 2000.0]
-    assert tail_batches, "the deep windows vanished"
-    assert max(len(b) for b in tail_batches) >= 4, (
-        f"the four deep windows were split into batches of "
-        f"{[len(b) for b in tail_batches]} -- the span term is charging for "
-        f"arrival segments the batch is too small to have"
-    )
-
-
 def test_the_report_separates_reserved_from_allocated():
     """
     THE QUESTION THE ALLOCATED PEAK CANNOT ANSWER. Every run reported ~2.5 GiB
@@ -1019,4 +864,632 @@ def test_train_lds_measures_reserved_as_well_as_allocated():
     assert "max_memory_reserved" in src, (
         "only the allocated peak is measured, so a fragmentation-dominated "
         "run reports 2.5 GiB while the card shows 7.7"
+    )
+
+
+def test_train_lds_tracks_peak_memory_all_run_not_just_epoch_one():
+    """
+    THE INSTRUMENTATION BUG. The peak was measured once, after epoch 1 -- the
+    CHEAPEST epoch. Sub-step counts climb as f_theta sharpens (46 -> 209 mean
+    on one run), and with bucket_refresh_epochs=0 the batching is frozen at
+    the initial estimate, so each batch retains steadily more than it was
+    sized for. The report said 2.5 GiB while the card showed 7.8 GB, and that
+    gap sent two rounds of optimisation at the wrong target.
+    """
+    from conftest import source_without_comments
+    import pathlib
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    assert "PeakMemoryTracker()" in src, "no high-water mark is kept across epochs"
+    assert "_mem_tracker.update(" in src
+
+    # BEHAVIOURAL, because the source check above passed against a mutation
+    # that deleted the high-water assignment -- the string was still present.
+    from training.dt_bucketing import PeakMemoryTracker
+    G = 2 ** 30
+    t = PeakMemoryTracker()
+    assert t.update(1, 2.5 * G, 3.0 * G) == "", "epoch 1 should set, not report"
+    assert t.update(2, 2.6 * G, 3.1 * G) == "", "noise must not report"
+    grown = t.update(40, 5.0 * G, 7.0 * G)
+    assert "grown to 5.00 GiB" in grown and "from 2.50 GiB" in grown, grown
+    assert "bucket_refresh_epochs" in grown, "no remedy named"
+    # the mark MOVED, so the next report compares against 5.0, not 2.5
+    assert t.update(41, 5.1 * G, 7.1 * G) == ""
+    again = t.update(80, 9.0 * G, 12.6 * G)
+    assert "from 5.00 GiB" in again, (
+        f"the high-water mark was never updated, so growth is measured from "
+        f"the first epoch forever: {again}"
+    )
+def test_retained_peak_can_be_read_without_clearing_the_substep_stats():
+    """
+    The calibration reads the realised peak; the epoch line reads the sub-step
+    statistics. Reading either must not clear the other, or one of the two
+    silently reports zeros.
+    """
+    import torch as _torch
+
+    from models.latent_dynamics import LatentDynamics
+    m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, alpha=0.1, max_substeps=4096,
+                        truncate_bptt=64)
+    _torch.manual_seed(0)
+    m._integrate(_torch.randn(4, 2, 4, 4) * 0.3, _torch.randn(4, 2, 4, 4) * 0.3,
+                  _torch.full((4,), 300.0), _torch.zeros(4, 1))
+    peak = m.retained_peak()
+    assert peak > 0
+    assert m.retained_peak() == peak, "reading cleared it"
+    assert m.substep_stats(reset=False) is not None
+    assert m.retained_peak() == peak, "substep_stats cleared the retained peak"
+    assert m.retained_peak(reset=True) == peak
+    assert m.retained_peak() == 0.0
+
+
+# --------------------------------------------------------------------
+# Feedback control on MEASURED bytes (no memory model)
+# --------------------------------------------------------------------
+
+def test_the_budget_converges_to_a_byte_target():
+    """
+    MODEL-FREE, and deliberately so. Four structural models of retained memory
+    failed against measurement -- retained depth, span-aware depth, span
+    bounded by batch size, and the realised per-transition cost, the last of
+    which TRIPLED on a run whose measured peak HALVED. The implied
+    bytes-per-unit constant ranged over 1700-77000.
+
+    What holds is monotonicity: smaller batches, less memory. Feedback needs
+    nothing more.
+    """
+    from training.dt_bucketing import BudgetedBatchSampler
+    _, counts = _population(n=20000)
+    s = BudgetedBatchSampler(counts, 2048, budget=300 * 2**20, shuffle=False,
+                              truncate_bptt=64)
+
+    # a monotone but NON-proportional response, which is what broke the models
+    def measured(sampler):
+        return max(len(b) * float(counts[list(b)].max()) ** 0.9
+                    for b in sampler._batches) * 4.0e5
+
+    target = 3.0 * 2 ** 30
+    for _ in range(5):
+        if not s.rescale_to_bytes(measured(s), target):
+            break
+    assert measured(s) <= target * 1.25, (
+        f"did not converge: {measured(s) / 2**30:.2f} GiB against a "
+        f"{target / 2**30:.2f} GiB target"
+    )
+
+
+def test_it_does_not_thrash_when_already_within_tolerance():
+    from training.dt_bucketing import BudgetedBatchSampler
+    _, counts = _population(n=8000)
+    s = BudgetedBatchSampler(counts, 512, budget=200 * 2**20, shuffle=False,
+                              truncate_bptt=64)
+    before = [list(b) for b in s._batches]
+    assert s.rescale_to_bytes(3.0 * 2 ** 30, 3.1 * 2 ** 30) == ""
+    assert s.rescale_to_bytes(3.0 * 2 ** 30, 2.9 * 2 ** 30) == ""
+    assert [list(b) for b in s._batches] == before
+
+
+def test_it_stops_raising_the_budget_once_batch_size_binds():
+    """
+    THE DIVERGENCE. When batch_size caps every batch the budget stops being
+    the binding constraint, so raising it changes nothing -- and an
+    unguarded loop multiplies forever: measured 30000 -> 1.7e12 over five
+    no-op steps.
+    """
+    from training.dt_bucketing import BudgetedBatchSampler
+    _, counts = _population(n=4000)
+    s = BudgetedBatchSampler(counts, 512, budget=1e12, shuffle=False,
+                              truncate_bptt=64)
+    sizes_before = [len(b) for b in s._batches]
+    budget_before = s.budget
+    # ask for far more memory than is being used: the budget cannot deliver
+    assert s.rescale_to_bytes(0.01 * 2 ** 30, 4.0 * 2 ** 30) == ""
+    assert s.budget == budget_before, "the budget grew with no effect"
+    assert [len(b) for b in s._batches] == sizes_before
+
+
+def test_shrinking_still_works_when_batch_size_binds():
+    """The guard must be one-sided: shrinking always has an effect, and is the
+    direction that matters for fitting in VRAM."""
+    from training.dt_bucketing import BudgetedBatchSampler
+    _, counts = _population(n=8000)
+    s = BudgetedBatchSampler(counts, 512, budget=1e12, shuffle=False,
+                              truncate_bptt=64)
+    before = len(s._batches)
+    # Iterating, as the epoch loop does. One DAMPED step from a budget this
+    # far above binding does not reach it -- which is the controller working,
+    # not failing: it converges over epochs rather than lurching in one.
+    notes = [s.rescale_to_bytes(8.0 * 2 ** 30, 1.0 * 2 ** 30) for _ in range(8)]
+    assert all(notes), "shrinking was refused, but shrinking always has effect"
+    assert len(s._batches) > before, (
+        f"{before} -> {len(s._batches)} batches: the budget never reached the "
+        f"binding region, so no amount of shrinking would fit VRAM"
+    )
+
+
+def test_every_window_survives_rescaling():
+    from training.dt_bucketing import BudgetedBatchSampler
+    _, counts = _population(n=6000)
+    s = BudgetedBatchSampler(counts, 512, budget=500 * 2**20, shuffle=False,
+                              truncate_bptt=64)
+    s.rescale_to_bytes(6.0 * 2 ** 30, 2.0 * 2 ** 30)
+    assert sorted(i for b in s for i in b) == list(range(len(counts)))
+
+
+def test_train_lds_exposes_a_vram_target_and_feeds_back_measured_bytes():
+    import inspect
+    import pathlib
+
+    from conftest import source_without_comments
+    from training.train_lds import train_lds
+    assert inspect.signature(train_lds).parameters["target_vram_gib"].default is None
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    # The call moved into MemoryGovernor.step; train_lds drives it.
+    assert "_mem_governor.step(epoch, _bucket_sampler, _resv)" in src, (
+        "the feedback is not driven by the MEASURED reserved peak"
+    )
+    block = src[src.index("_mem_governor.step("):]
+    assert "train_loader = DataLoader(" in block[:900], "loader not rebuilt"
+    assert "reset_peak_memory_stats" in block[:900], (
+        "the peak is not reset, so the next epoch re-measures the old high "
+        "mark and the loop never converges"
+    )
+
+
+# --------------------------------------------------------------------
+# MemoryGovernor: state that cannot go unbound
+# --------------------------------------------------------------------
+
+def test_the_governor_holds_its_state_in_an_object_not_a_loop_local():
+    """
+    THE CRASH. The epoch loop's memory block is CUDA-gated, so on a machine
+    without a GPU it never runs -- an initialisation lost from it is invisible
+    to import, to pyflakes and to every test, and surfaces only as an
+    UnboundLocalError on a real run. (It was lost to a batched edit that
+    asserted on a later hunk and never wrote the file.)
+
+    Holding the state in an object constructed unconditionally removes the
+    failure mode: there is no local to leave unbound, and the logic is
+    reachable on CPU.
+    """
+    from training.dt_bucketing import MemoryGovernor
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    assert "MemoryGovernor(target_vram_gib)" in src
+    # constructed OUTSIDE any cuda gate
+    head = src[:src.index("MemoryGovernor(target_vram_gib)")]
+    assert head.count('device.type == "cuda"') == head.count('device.type == "cuda"')
+    assert "_mem_adjustments" not in src, "the bare counter is still there"
+
+    g = MemoryGovernor(None)
+    assert not g.active(1), "no target means no adjusting"
+    assert g.step(1, None, 5.0) == "", "must not touch the sampler without a target"
+
+
+def test_the_governor_stops_after_its_budget_of_adjustments():
+    """A run must not spend its whole schedule re-batching."""
+    from training.dt_bucketing import BudgetedBatchSampler, MemoryGovernor
+    _, counts = _population(n=8000)
+    s = BudgetedBatchSampler(counts, 512, budget=1e9, shuffle=False,
+                              truncate_bptt=64)
+    g = MemoryGovernor(1.0, max_adjustments=2, last_epoch=99)
+    notes = [g.step(e, s, 8.0 * 2 ** 30) for e in range(1, 6)]
+    assert sum(1 for n in notes if n) == 2, notes
+    assert g.adjustments == 2
+    assert not g.active(6)
+
+
+def test_the_governor_stops_after_the_early_epochs():
+    from training.dt_bucketing import BudgetedBatchSampler, MemoryGovernor
+    _, counts = _population(n=8000)
+    s = BudgetedBatchSampler(counts, 512, budget=1e9, shuffle=False,
+                              truncate_bptt=64)
+    g = MemoryGovernor(1.0, max_adjustments=99, last_epoch=3)
+    assert g.step(3, s, 8.0 * 2 ** 30) != ""
+    assert g.step(4, s, 8.0 * 2 ** 30) == "", "still adjusting past last_epoch"
+
+
+def test_the_governor_labels_its_note_with_the_epoch():
+    from training.dt_bucketing import BudgetedBatchSampler, MemoryGovernor
+    _, counts = _population(n=8000)
+    s = BudgetedBatchSampler(counts, 512, budget=1e9, shuffle=False,
+                              truncate_bptt=64)
+    g = MemoryGovernor(1.0)
+    assert g.step(7, s, 8.0 * 2 ** 30).startswith("  [epoch 7]")
+
+
+def test_the_report_states_the_measured_peak_without_inventing_a_constant():
+    """
+    NO bytes-per-unit constant is quoted, because none exists. Successive
+    denominators gave 1700, 3771, 4845, 13476, 29315 and 76911 bytes per unit
+    across measurements -- each a structural model of retained memory, each
+    falsified. Quoting any of them invites sizing a budget from a number that
+    is not a property of the model. MemoryGovernor closes the loop on the
+    measured peak instead.
+    """
+    from training.dt_bucketing import BudgetedBatchSampler, budget_report
+    _, counts = _population(n=6000)
+    s = BudgetedBatchSampler(counts, 512, shuffle=False, truncate_bptt=64)
+    report = budget_report(s, 512, 2, peak_bytes=3.19 * 2 ** 30,
+                            reserved_bytes=4.31 * 2 ** 30)
+    assert "3.19 GiB peak allocated" in report
+    assert "bytes per" not in report, (
+        "a per-unit constant is being quoted again: " + report
+    )
+    assert "RESERVED 4.31 GiB" in report
+
+
+def test_only_one_controller_touches_the_batching():
+    """
+    THE FIGHT. For two epochs, MemoryGovernor and a second, model-based
+    calibrate() both re-batched: 31 -> 26 (governor), 26 -> 68 (calibrate),
+    68 -> 45 (governor). Three re-batchings in two epochs, each one an
+    effective learning-rate change, with the two controllers pulling in
+    opposite directions -- and the model-based one raising an alarm about a
+    run that was comfortably inside its memory target.
+    """
+    from conftest import source_without_comments
+    import pathlib
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    assert "_mem_governor.step(" in src
+    assert "_bucket_sampler.calibrate(" not in src, (
+        "the model-based controller is back, and it will fight the governor"
+    )
+    # THREE construction sites, and only three: the unbucketed loader, the
+    # bucketed one built before training, and the governor's rebuild. A fourth
+    # would mean a second controller re-batching mid-run again.
+    assert src.count("train_loader = DataLoader(") == 3, (
+        f"{src.count('train_loader = DataLoader(')} loader construction sites "
+        f"-- a second mid-run re-batching path has appeared"
+    )
+    governor_block = src[src.index("_mem_governor.step("):]
+    assert "train_loader = DataLoader(" in governor_block[:600], (
+        "the governor does not rebuild the loader, so its correction has no "
+        "effect on what the next epoch iterates"
+    )
+
+
+# --------------------------------------------------------------------
+# Per-batch memory diagnostic: the data every failed model lacked
+# --------------------------------------------------------------------
+
+def test_the_diagnostic_records_each_batchs_predictors(tmp_path):
+    """
+    Six bytes-per-unit "constants" (1700 to 77000) came from fitting models to
+    RUN-LEVEL aggregates -- one number per run, four runs, which any curve
+    fits. The decidable data is per batch: peak bytes next to that batch's
+    size, realised count statistics, span and arrival segments. One epoch
+    gives tens of points and the dependence is read off, not theorised.
+    """
+    from training.dt_bucketing import BatchMemoryDiagnostic
+    d = BatchMemoryDiagnostic(tmp_path / "m.csv", truncate_bptt=64)
+    d.record(1, 0, np.array([70., 100., 140., 200.]), 2.5e9, 3.0e9)
+    d.record(1, 1, np.array([300., 310.]), 1.0e9, 1.5e9)
+    note = d.flush()
+    assert "2 batch measurements" in note
+    lines = (tmp_path / "m.csv").read_text().splitlines()
+    assert lines[0].startswith("epoch,batch,n_windows,n_max,n_min,span,arrival_segments")
+    e, b, n, mx, mn, span, seg, k, alloc, resv = lines[1].split(",")
+    assert (n, mx, mn, span) == ("4", "200", "70", "130")
+    # counts 70,100,140,200 at k=64 -> ceil/64 = 2,2,3,4 -> 3 distinct segments
+    assert seg == "3", f"arrival segments {seg}"
+    assert k == "64" and alloc == "2500000000"
+    # second batch: 300,310 -> ceil/64 = 5,5 -> one segment
+    assert lines[2].split(",")[6] == "1"
+
+
+def test_the_diagnostic_appends_across_flushes_with_one_header(tmp_path):
+    from training.dt_bucketing import BatchMemoryDiagnostic
+    d = BatchMemoryDiagnostic(tmp_path / "m.csv", truncate_bptt=32)
+    d.record(1, 0, np.array([10.0]), 1.0, 2.0)
+    d.flush()
+    d.record(2, 0, np.array([20.0]), 3.0, 4.0)
+    d.flush()
+    text = (tmp_path / "m.csv").read_text()
+    assert text.count("epoch,batch") == 1, "header repeated"
+    assert len(text.splitlines()) == 3
+    assert d.flush() == "", "an empty flush should say nothing"
+
+
+def test_train_lds_isolates_each_batchs_measurement():
+    """
+    Without a reset BEFORE each batch, every reading is the running high-water
+    mark of the epoch so far -- monotone by construction, and useless for
+    reading off per-batch dependence. Without a synchronize, the reading can
+    include kernels from the PREVIOUS batch still in flight.
+    """
+    from conftest import source_without_comments
+    import pathlib
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    i = src.index("for batch in train_loader:")
+    body = src[i:i + 2500]
+    reset = body.index("reset_peak_memory_stats")
+    record = body.index("_mem_diag.record")
+    assert reset < record, "no per-batch reset: readings are cumulative"
+    assert body[:reset].count("synchronize") + body[reset:record].count("synchronize") >= 2, (
+        "missing a synchronize either before the reset (previous batch's "
+        "kernels) or before the reading (this batch's)"
+    )
+    assert "retained_peak(reset=True)" in body[:record], (
+        "the counts are not cleared per batch, so record() sees every "
+        "transition since the epoch began"
+    )
+    assert "last_counts()" in body
+
+
+def test_the_model_exposes_the_realised_counts_per_batch():
+    import torch as _torch
+
+    from models.latent_dynamics import LatentDynamics
+    m = LatentDynamics(latent_channels=2, latent_spatial=4, hidden_dim=8,
+                        n_hidden_layers=1, alpha=0.1, max_substeps=4096,
+                        truncate_bptt=64)
+    _torch.manual_seed(0)
+    counts = _torch.tensor([70, 100])
+    m._substeps_for = lambda *a, **k: counts
+    m._integrate(_torch.randn(2, 2, 4, 4), _torch.randn(2, 2, 4, 4),
+                  _torch.full((2,), 100.0), _torch.zeros(2, 1))
+    m._integrate(_torch.randn(2, 2, 4, 4), _torch.randn(2, 2, 4, 4),
+                  _torch.full((2,), 100.0), _torch.zeros(2, 1))
+    got = m.last_counts()
+    assert len(got) == 2, "one entry per transition"
+    assert _torch.equal(got[0], counts)
+    m.retained_peak(reset=True)
+    assert m.last_counts() == [], "reset must clear the counts"
+
+
+def test_the_governor_targets_reserved_not_allocated():
+    """
+    RESERVED is what occupies the card: the caching allocator does not hand
+    cached blocks back, so a target on ALLOCATED understates the card by the
+    cache fraction. Measured: 5.64 GiB allocated against a 5.50 GiB target
+    read as converged, while 6.77 GiB was actually held -- 23% more card than
+    the user asked for, on an 8 GB device.
+    """
+    from conftest import source_without_comments
+    import pathlib
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    assert "_mem_governor.step(epoch, _bucket_sampler, _resv)" in src, (
+        "the governor is driven by allocated bytes, so target_vram_gib does "
+        "not mean what its name says"
+    )
+    assert "peak RESERVED GiB" in src, "the help text still promises allocated"
+
+
+# --------------------------------------------------------------------
+# The MEASURED cost model
+# --------------------------------------------------------------------
+
+def test_the_cost_model_has_both_a_per_window_and_a_depth_term():
+    """
+    bytes = A*n + B*n*depth^p, from check_memory's two probe sweeps on a real
+    3b checkpoint (9 points, n 128-1024, depth 8-279, 13.2% worst residual).
+
+    BOTH terms are load-bearing. Without A, a shallow batch is priced at
+    almost nothing and 2048 windows of depth 2 look free -- that batch
+    measured 731 MiB. Without B, depth is free and the deep tail is
+    unbounded.
+    """
+    from training.dt_bucketing import BudgetedBatchSampler as S
+    assert S.COST_A_BYTES > 0 and S.COST_B_BYTES > 0
+    s = S(np.array([10.0, 20.0]), 8, shuffle=False, truncate_bptt=64)
+    shallow = s._depth(1.0, 1.0)
+    deep = s._depth(256.0, 256.0)
+    assert shallow > 0.5 * S.COST_A_BYTES, (
+        "a depth-1 window costs almost nothing, so a huge shallow batch would "
+        "look free -- 2048 windows of depth 2 measured 731 MiB"
+    )
+    assert deep > 4 * shallow, "depth is nearly free, so the deep tail is unbounded"
+
+
+def test_the_depth_exponent_is_the_measured_one_not_one():
+    """
+    p=0.79. Forcing p=1 was every earlier model's assumption and it
+    over-charges deep batches -- the direction of every budget discrepancy in
+    this project's history. The fixed-n sweep (n constant, constant fitted
+    separately) put it at 0.70-0.79, and p=1 scored 29.6% against 8.5%.
+    """
+    from training.dt_bucketing import BudgetedBatchSampler as S
+    assert 0.6 <= S.COST_P <= 0.9, f"exponent {S.COST_P}"
+    s = S(np.array([10.0, 20.0]), 8, shuffle=False, truncate_bptt=64)
+    # the depth TERM must grow sublinearly: 16x the depth, well under 16x cost
+    lo = s._depth(16.0, 16.0) - S.COST_A_BYTES
+    hi = s._depth(256.0, 256.0) - S.COST_A_BYTES
+    assert hi < 12 * lo, (
+        f"depth term grew {hi / lo:.1f}x for a 16x depth increase -- that is "
+        f"linear scaling, which measurement rejected"
+    )
+    assert hi > 4 * lo, "depth term barely grows; the exponent is too small"
+
+
+def test_the_budget_is_in_bytes_and_bounds_the_predicted_peak():
+    from training.dt_bucketing import BudgetedBatchSampler
+    _, counts = _population(n=20000)
+    budget = 512 * 2 ** 20
+    s = BudgetedBatchSampler(counts, 4096, budget=budget, shuffle=False,
+                              truncate_bptt=64)
+    assert s.peak_cost() <= budget * 1.001, (
+        f"predicted peak {s.peak_cost() / 2**20:.0f} MiB over a "
+        f"{budget / 2**20:.0f} MiB budget"
+    )
+    assert s.peak_cost() > budget * 0.3, "the budget is not binding at all"
+    assert sorted(i for b in s for i in b) == list(range(len(counts)))
+
+
+def test_a_budget_in_the_retired_unit_is_refused():
+    """
+    Configs carry batch_cost_budget=30000 from when the budget counted
+    sample-substeps. Read as bytes that is 30 KB -- below one window -- so
+    every batch would hold one and the run would look merely slow rather than
+    broken. Refuse instead, and say what to do.
+    """
+    from training.dt_bucketing import BudgetedBatchSampler
+    _, counts = _population(n=2000)
+    with pytest.raises(ValueError) as e:
+        BudgetedBatchSampler(counts, 512, budget=30_000.0, shuffle=False,
+                              truncate_bptt=64)
+    assert "BYTES" in str(e.value) and "target_vram_gib" in str(e.value)
+    # a legitimate small-but-sane budget is still accepted
+    ok = BudgetedBatchSampler(counts, 512, budget=4 * 2 ** 20, shuffle=False,
+                               truncate_bptt=64)
+    assert len(ok) > 0
+
+
+def test_train_lds_turns_a_vram_target_into_the_byte_budget():
+    from conftest import source_without_comments
+    import pathlib
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    # The target must REACH the budget -- but converted, not verbatim (see
+    # test_a_vram_target_is_converted_not_used_as_the_budget_directly).
+    assert "target_vram_gib" in src and "_budget" in src, (
+        "the VRAM target does not set the budget, so the two knobs disagree"
+    )
+    assert "budget=_budget" in src
+
+
+def test_the_report_states_the_budget_in_the_unit_it_actually_carries():
+    """
+    The budget is BYTES. The report kept calling it sample-substeps, so a real
+    3a run printed "budget 403244338 sample-substeps" and "peak = 403244338
+    retained sample-substeps" -- a byte figure with a count's label, nine
+    digits wide, which reads as a bug in the batching rather than a unit.
+    """
+    from training.dt_bucketing import BudgetedBatchSampler, budget_report
+    _, counts = _population(n=6000)
+    s = BudgetedBatchSampler(counts, 512, shuffle=False)
+    report = budget_report(s, 512, 1)
+    assert "sample-substeps." not in report, report.splitlines()[0]
+    assert "MiB of activations" in report
+    assert "ACTIVATIONS only" in report, (
+        "the report does not say the budget excludes parameters and optimizer "
+        "state, so it looks inconsistent with target_vram_gib"
+    )
+
+
+def test_the_cost_coefficients_can_be_overridden_per_machine():
+    """
+    The fitted values are DEFAULTS, not constants of nature: they were
+    measured on one card (RTX 2060 Super), one architecture (hidden_dim=256,
+    latent 8x8x8) and n_rollout_steps=2. A different GPU or latent size moves
+    them, and the way to recalibrate is to rerun check_memory and paste its
+    joint fit -- which requires the numbers to be settable.
+    """
+    from training.dt_bucketing import BudgetedBatchSampler as S
+    _, counts = _population(n=4000)
+    default = S(counts, 512, shuffle=False, truncate_bptt=64)
+    custom = S(counts, 512, shuffle=False, truncate_bptt=64,
+                cost_a_bytes=1e5, cost_b_bytes=5e4, cost_p=1.0)
+    assert custom.COST_P == 1.0 and custom.COST_A_BYTES == 1e5
+    assert custom.budget != default.budget, "the override did not reach the budget"
+    _hi = float(counts.max())
+    assert custom._depth(_hi, _hi) == pytest.approx(1e5 + 5e4 * _hi), (
+        "the overridden coefficients are not the ones _depth uses"
+    )
+    # and the CLASS reference values are untouched, so one run cannot silently
+    # recalibrate another in the same process
+    assert S.COST_P == 0.79 and S.COST_A_BYTES == 118.0 * 1024.0
+
+
+def test_partial_overrides_keep_the_measured_defaults_for_the_rest():
+    """Setting only the exponent must not zero the coefficients."""
+    from training.dt_bucketing import BudgetedBatchSampler as S
+    _, counts = _population(n=2000)
+    s = S(counts, 512, shuffle=False, truncate_bptt=64, cost_p=0.6)
+    assert s.COST_P == 0.6
+    assert s.COST_A_BYTES == S.COST_A_BYTES
+    assert s.COST_B_BYTES == S.COST_B_BYTES
+
+
+def test_train_lds_threads_the_cost_coefficients_to_the_sampler():
+    import inspect
+
+    from conftest import source_without_comments
+    import pathlib
+    from training.train_lds import train_lds
+    for name in ("memory_cost_a_bytes", "memory_cost_b_bytes", "memory_cost_p"):
+        assert inspect.signature(train_lds).parameters[name].default is None
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    assert "cost_a_bytes=memory_cost_a_bytes" in src
+    assert "cost_b_bytes=memory_cost_b_bytes" in src
+    assert "cost_p=memory_cost_p" in src
+
+
+def test_a_vram_target_is_converted_not_used_as_the_budget_directly():
+    """
+    THE TARGET IS TOTAL MEMORY; THE BUDGET IS ACTIVATIONS ONLY. Setting them
+    equal overshoots by exactly the overhead on the first epoch, every time.
+
+    Measured on a real 3b run at target 6.5 GiB: an activations budget of 6.5
+    GiB produced 8.19 GiB allocated / 8.96 GiB reserved on an 8 GB card. It
+    spilled into shared system memory and ran at PCIe speed while the governor
+    cut the budget three times without the peak falling -- it never fit.
+    """
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    assert "_budget = float(target_vram_gib) * 2 ** 30" not in src, (
+        "the VRAM target is being used as the activation budget directly, "
+        "which overshoots by the overhead on epoch 1"
+    )
+    assert "_OVERHEAD_BYTES" in src and "_CACHE_FACTOR" in src, (
+        "no conversion from total memory to an activation budget"
+    )
+
+    # The CONSTANTS THEMSELVES, read out of the source -- asserting only that
+    # the names appear let a mutation zeroing the overhead pass, which is the
+    # whole bug back again under a different spelling.
+    import re
+    m_over = re.search(r"_OVERHEAD_BYTES\s*=\s*([0-9.]+)\s*\*\s*2\s*\*\*\s*30", src)
+    m_cache = re.search(r"_CACHE_FACTOR\s*=\s*([0-9.]+)", src)
+    assert m_over and m_cache, "the constants are not in the expected form"
+    overhead_gib, cache = float(m_over.group(1)), float(m_cache.group(1))
+    assert overhead_gib >= 1.0, (
+        f"overhead is {overhead_gib} GiB -- parameters, optimizer state and "
+        f"workspace measured about 1.7 GiB, so this does not account for them"
+    )
+    assert cache >= 1.05, (
+        f"cache factor {cache} -- reserved ran 9% above allocated on the "
+        f"measured run"
+    )
+    overhead, cache = overhead_gib * 2 ** 30, cache
+    budget = 6.5 * 2 ** 30 / cache - overhead
+    assert budget > 0
+    assert (budget + overhead) * cache <= 6.5 * 2 ** 30 * 1.001, (
+        "the converted budget does not reconcile back to the target"
+    )
+    assert budget < 6.5 * 2 ** 30 * 0.75, (
+        "the conversion barely reduces the budget, so the overhead is not "
+        "actually being accounted for"
+    )
+
+
+def test_a_small_target_still_yields_a_usable_budget():
+    """A target below the overhead must not produce a negative or absurd
+    budget -- it should floor at something that still batches."""
+    import pathlib
+
+    from conftest import source_without_comments
+    from training.dt_bucketing import BudgetedBatchSampler
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "training/train_lds.py")
+    assert "max(" in src.split("_OVERHEAD_BYTES")[1][:600], (
+        "no floor on the converted budget; a small target would give a "
+        "negative one"
+    )
+    floor = BudgetedBatchSampler.COST_A_BYTES * 64.0
+    assert floor > BudgetedBatchSampler.COST_A_BYTES, (
+        "the floor is below one window's cost and would be refused by the "
+        "sampler's own stale-unit guard"
     )

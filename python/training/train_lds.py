@@ -278,11 +278,13 @@ def _load_frozen_encoder(
 # 4 and 5 became a second caller. Kept importable from here so existing
 # callers and tests (tests/test_spike_guard.py) are unaffected.
 from training.dt_bucketing import (  # noqa: E402
-    BudgetedBatchSampler, budget_report, estimate_window_costs,
+    BatchMemoryDiagnostic, BudgetedBatchSampler, MemoryGovernor,
+    PeakMemoryTracker, budget_report,
+    estimate_window_costs,
 )
 from training.spike_guard import (  # noqa: E402,F401
     _SpikeGuard, _record_spike, difficulty_band, early_stop_message, end_epoch_pair,
-    SkipReporter, skip_report,
+    SkipReporter,
 )
 from utils.logging_utils import print_run_parameters
 
@@ -418,7 +420,7 @@ def _resume_f_theta_from_checkpoint(
                        and prev_config.get("alpha") == alpha)
         _reference = float(prev_lds["val_loss"]) if (
             _comparable and prev_lds.get("val_loss") is not None) else None
-        if prev_n_rollout is not None and n_rollout_steps <= prev_n_rollout:
+        if prev_n_rollout is not None and n_rollout_steps < prev_n_rollout:
             print(f"WARNING: resuming from a checkpoint trained at n_rollout_steps="
                   f"{prev_n_rollout}, but this run asks for n_rollout_steps="
                   f"{n_rollout_steps} -- not larger, so this isn't the usual curriculum "
@@ -509,6 +511,10 @@ def train_lds(
     z0_noise_scale: float = 0.0,
     dt_cap: float = float("inf"), n_substeps: int = 1, alpha: float | None = None,
     max_substeps: int = 256, truncate_bptt: int | None = None,
+    target_vram_gib: float | None = None,
+    memory_cost_a_bytes: float | None = None,
+    memory_cost_b_bytes: float | None = None,
+    memory_cost_p: float | None = None, diagnose_memory: bool = False,
     bucket_batches: bool = True,
     bucket_refresh_epochs: int = 25, batch_cost_budget: float | None = None,
     z1_resync: bool = True,
@@ -1003,7 +1009,13 @@ def train_lds(
                 # weight by ~lr regardless.
                 _gnorm = torch.nn.utils.clip_grad_norm_(
                     f_theta.parameters(), grad_clip if grad_clip > 0 else float("inf"))
-                if grad_guard.should_skip(float(_gnorm), band=_band):
+                # loss_was_ordinary=True: this line is only REACHED when the
+                # loss guard declined to skip, so the loss is by construction
+                # within its own band's norm. That is the discriminator
+                # between "structurally large gradient at long dt" and "the
+                # weights are diverging" -- the latter raises both.
+                if grad_guard.should_skip(float(_gnorm), band=_band,
+                                           loss_was_ordinary=True):
                     _record_spike(grad_guard, _gnorm, dt_window, theta)
                     optimizer.zero_grad()
                 else:
@@ -1113,6 +1125,29 @@ def train_lds(
     # for it every epoch buries the ones that are not.
     _skip_reporter = SkipReporter()
     _nonfinite_reported = 0
+    # PEAK MEMORY IS A HIGH-WATER MARK, tracked all run. Measuring it once
+    # after epoch 1 measured the CHEAPEST epoch: sub-step counts climb as
+    # f_theta sharpens (46 -> 209 mean on one run), and with
+    # bucket_refresh_epochs=0 the batching is frozen at the initial estimate,
+    # so each batch retains steadily more than it was sized for. The reported
+    # 2.5 GiB was epoch 1's; the card was showing 7.8 GB by epoch 80, and the
+    # gap sent two rounds of work at the wrong target.
+    _mem_tracker = PeakMemoryTracker()
+    # Adjustments made by the memory feedback loop, capped so a run cannot
+    # spend its whole schedule re-batching.
+    # Constructed UNCONDITIONALLY, even without CUDA and without a target: the
+    # epoch loop's memory block is CUDA-gated, so a bare local initialised
+    # inside it (or lost to a bad edit) is invisible until a real GPU run --
+    # which is exactly how an UnboundLocalError reached the user.
+    _mem_governor = MemoryGovernor(target_vram_gib)
+    # Opt-in per-batch memory measurement -- see BatchMemoryDiagnostic. None
+    # unless requested AND on CUDA AND under adaptive bucketing.
+    _mem_diag = None
+    if diagnose_memory and device.type == "cuda" and alpha is not None:
+        from pathlib import Path as _Path
+        _mem_diag = BatchMemoryDiagnostic(
+            _Path(checkpoint_path).with_name("memory_diagnostic.csv"),
+            truncate_bptt)
     _n_rollbacks = 0
     # Set only when THIS RUN saves. Path.exists() is not the same question:
     # with force=True the previous run's file sits at checkpoint_path until
@@ -1135,10 +1170,36 @@ def train_lds(
     # 5.8x the per-window ideal at batch_size=2048 against ~1.2x bucketed.
     # Fixed n_substeps has no such spread, so this is gated on alpha.
     if epochs > 0 and alpha is not None and bucket_batches:
+        # THE TARGET IS TOTAL MEMORY; THE BUDGET IS ACTIVATIONS ONLY.
+        #
+        # Setting budget = target overshoots by exactly the overhead, every
+        # time, on the very first epoch. Measured on a 3b run at target 6.5
+        # GiB: activations budget 6.5 GiB -> 8.19 GiB allocated -> 8.96 GiB
+        # reserved on an 8 GB card, which spilled into shared system memory
+        # and ran at PCIe speed while the governor cut the budget three times
+        # without the peak falling.
+        #
+        # So convert: subtract the non-activation footprint, then divide by
+        # the allocator's cache factor. Both constants are measured (1.7 GiB
+        # of parameters + optimizer + workspace; reserved/allocated = 1.09 on
+        # that run), and both are deliberately conservative -- the governor
+        # RAISES the budget when there is headroom, so erring low costs a few
+        # epochs of smaller batches, while erring high costs an OOM or a
+        # silent spill.
+        _budget = batch_cost_budget
+        if _budget is None and target_vram_gib:
+            _OVERHEAD_BYTES = 1.7 * 2 ** 30
+            _CACHE_FACTOR = 1.10
+            _budget = max(
+                float(target_vram_gib) * 2 ** 30 / _CACHE_FACTOR - _OVERHEAD_BYTES,
+                BudgetedBatchSampler.COST_A_BYTES * 64.0)
         _bucket_sampler = BudgetedBatchSampler(
             estimate_window_costs(train_set, f_theta, alpha, max_substeps, device),
-            batch_size, budget=batch_cost_budget, seed=seed,
-            truncate_bptt=truncate_bptt)
+            batch_size, budget=_budget, seed=seed,
+            truncate_bptt=truncate_bptt,
+            cost_a_bytes=memory_cost_a_bytes,
+            cost_b_bytes=memory_cost_b_bytes,
+            cost_p=memory_cost_p)
         train_loader = DataLoader(train_set, batch_sampler=_bucket_sampler,
                                    num_workers=num_workers,
                                    persistent_workers=num_workers > 0,
@@ -1146,9 +1207,8 @@ def train_lds(
         print(budget_report(_bucket_sampler, batch_size, n_rollout_steps) + "\n")
         # Reset so the peak measured over epoch 1 is THIS run's training
         # footprint, not whatever the dataset build or the cost estimate left
-        # behind. Reported once, after epoch 1, because the bytes-per-
-        # sample-substep constant it yields is what turns budget-setting from
-        # arithmetic into a measurement -- and it does not change afterwards.
+        # behind. Reported once, after epoch 1: it is the measured baseline
+        # the governor's later corrections are read against.
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
@@ -1189,31 +1249,77 @@ def train_lds(
             _n_train_batches = 0
             for batch in train_loader:
                 _n_train_batches += 1
+                if _mem_diag is not None:
+                    # Per-batch isolation: synchronise so the previous batch's
+                    # kernels have finished, then reset the peak so the next
+                    # reading is THIS batch's alone. This is the measurement
+                    # every failed model lacked -- they were all fitted to one
+                    # run-level number.
+                    torch.cuda.synchronize(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                    f_theta.retained_peak(reset=True)
                 bs = batch[0].size(0)
                 loss, l_1step = step(batch, train=True)
                 train_loss_sum += loss * bs
                 train_1step_sum += l_1step * bs
+                if _mem_diag is not None:
+                    torch.cuda.synchronize(device)
+                    _counts = f_theta.last_counts()
+                    if _counts:
+                        _mem_diag.record(
+                            epoch, _n_train_batches,
+                            torch.cat(_counts).numpy(),
+                            float(torch.cuda.max_memory_allocated(device)),
+                            float(torch.cuda.max_memory_reserved(device)))
             train_loss = (train_loss_sum / n_train).item()
             train_1step = (train_1step_sum / n_train).item()
-            if (_bucket_sampler is not None and epoch == 1
-                    and device.type == "cuda"):
-                # ONLY the newly-measured lines. Re-printing the whole report
-                # repeated four paragraphs the reader had just read, to add one
-                # number -- and buried the epoch lines between two copies of it.
-                _full = budget_report(
-                    _bucket_sampler, batch_size, n_rollout_steps,
-                    peak_bytes=float(torch.cuda.max_memory_allocated(device)),
-                    reserved_bytes=float(torch.cuda.max_memory_reserved(device)))
-                _dry = budget_report(_bucket_sampler, batch_size, n_rollout_steps)
-                _new_lines = _full[len(_dry):].strip("\n")
-                if _new_lines:
-                    print(_new_lines)
+            if _bucket_sampler is not None and device.type == "cuda":
+                _alloc = float(torch.cuda.max_memory_allocated(device))
+                _resv = float(torch.cuda.max_memory_reserved(device))
+                _grown = _mem_tracker.update(epoch, _alloc, _resv)
+                if _grown:
+                    print(_grown)
+                # FEEDBACK CONTROL on measured bytes -- see MemoryGovernor.
+                # Replaces four successive structural models of retained
+                # memory, each of which failed against measurement; the last
+                # tripled on a run whose measured peak halved. Memory is
+                # monotone in the budget, and feedback needs nothing more.
+                # RESERVED, not allocated. Reserved is what the card reports
+                # as in use -- the allocator does not return cached blocks --
+                # so a target on allocated silently understates the card by
+                # the cache fraction: measured 5.64 GiB allocated against a
+                # 5.50 target looked converged while 6.77 GiB was actually
+                # held. target_vram_gib now means what its name says.
+                _note = _mem_governor.step(epoch, _bucket_sampler, _resv)
+                if _note:
+                    print(_note)
+                    train_loader = DataLoader(
+                        train_set, batch_sampler=_bucket_sampler,
+                        num_workers=num_workers,
+                        pin_memory=device.type == "cuda")
+                    torch.cuda.reset_peak_memory_stats(device)
+                if epoch == 1:
+                    # ONLY the newly-measured lines. Re-printing the whole
+                    # report repeated four paragraphs the reader had just
+                    # read, to add one number.
+                    _full = budget_report(
+                        _bucket_sampler, batch_size, n_rollout_steps,
+                        peak_bytes=_alloc, reserved_bytes=_resv)
+                    _dry = budget_report(_bucket_sampler, batch_size,
+                                          n_rollout_steps)
+                    _new_lines = _full[len(_dry):].strip("\n")
+                    if _new_lines:
+                        print(_new_lines)
             # Captured HERE, between the train and val loops, so the reported
             # sub-step drift is measured on TRAINING transitions only. Found
             # by review: the capture used to sit after the val loop, so every
             # epoch's number averaged the (fixed) val population into the
             # train one -- diluting exactly the drift-with-training the report
             # exists to show, and making "transitions" count both.
+            if _mem_diag is not None:
+                _flush_note = _mem_diag.flush()
+                if _flush_note and epoch <= 2:
+                    print(_flush_note)
             _train_substeps = f_theta.substep_stats()
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
@@ -1439,7 +1545,20 @@ def train_lds(
         # the spike that ended it produced no output at all, and the log reads
         # as a clean descent followed by "Early stopping". Only the loss curve
         # showed otherwise.
-        if log_every_epoch or saved_this_epoch or _excursion:
+        #
+        # ...and so does a STALL, every 25 epochs without an improvement.
+        #
+        # Not a fixed epoch grid: log_every_epoch=False is deliberate in
+        # stage 3, where runs go to thousands of epochs, and a row every 10
+        # would be a thousand lines. Gating on epochs_since_improvement means
+        # a healthy run that keeps saving never triggers it at all, while a
+        # stalled one says so about twenty times before patience (500) ends
+        # it. The case that motivated this printed NOTHING for 25 epochs: a
+        # resume under a reference ceiling it never beat, so nothing saved and
+        # nothing spiked, and the run looked hung.
+        _stalled = ((not log_every_epoch) and epochs_since_improvement > 0
+                    and epochs_since_improvement % 25 == 0)
+        if log_every_epoch or saved_this_epoch or _excursion or _stalled:
             _mark = ""
             if _excursion:
                 _ratio = (float("inf") if not math.isfinite(val_loss)
@@ -1617,13 +1736,34 @@ def main():
                               "sub-step count. Needed above ~300 chained sub-steps, where "
                               "float32 overflows and every batch reports an infinite "
                               "gradient norm with a finite loss")
+    parser.add_argument("--diagnose-memory", action="store_true",
+                         help="measure and log EVERY BATCH's peak memory next to its "
+                              "realised sub-step counts, size, span and arrival "
+                              "segments (memory_diagnostic.csv beside the checkpoint). "
+                              "Costs a sync per batch: run a few epochs with it, not a "
+                              "training run. Exists because six successive memory "
+                              "models were fitted to run-level aggregates and all six "
+                              "failed; per-batch data is what can actually decide what "
+                              "memory depends on")
+    parser.add_argument("--target-vram-gib", type=float, default=None,
+                         help="peak RESERVED GiB to aim for -- reserved, because that "
+                              "is what the card reports as in use (the allocator does "
+                              "not hand cached blocks back). The batch budget is "
+                              "rescaled from the MEASURED peak over the first few "
+                              "epochs until it fits -- feedback on bytes, because "
+                              "every structural model of retained memory tried so far "
+                              "failed to predict it")
     parser.add_argument("--batch-cost-budget", type=float, default=None,
-                         help="peak backward memory bound, in sample-substeps "
-                              "(batch_size x the batch's MAX sub-step count -- the max, "
-                              "because the masked loop allocates full-batch tensors every "
-                              "iteration). Default: batch_size x the population's median "
-                              "count, so a typical batch has exactly batch_size windows "
-                              "and deeper ones shrink")
+                         help="peak activation memory bound per batch, in BYTES, "
+                              "priced through the measured cost model "
+                              "(A*n + B*n*depth^p; see BudgetedBatchSampler). "
+                              "Values below one window's cost are refused as stale "
+                              "sample-substep figures from before the unit change. "
+                              "Prefer --target-vram-gib, which sets this and lets "
+                              "MemoryGovernor correct it against measurement. "
+                              "Default: batch_size x the median window's cost, so a "
+                              "typical batch has exactly batch_size windows and "
+                              "deeper ones shrink")
     parser.add_argument("--bucket-refresh-epochs", type=int, default=25,
                          help="re-estimate the per-window cost every N epochs (0 = never). "
                               "The sort ages as f_theta sharpens; a 20%% drift still gives "
@@ -1676,6 +1816,7 @@ def main():
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         dt_cap=args.dt_cap, n_substeps=args.n_substeps, alpha=args.alpha,
         max_substeps=args.max_substeps, truncate_bptt=args.truncate_bptt,
+        target_vram_gib=args.target_vram_gib, diagnose_memory=args.diagnose_memory,
         bucket_batches=args.bucket_batches,
         bucket_refresh_epochs=args.bucket_refresh_epochs,
         batch_cost_budget=args.batch_cost_budget, z1_resync=args.z1_resync,

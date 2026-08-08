@@ -400,7 +400,10 @@ def train_refinement(
                 # structurally cannot see (measured on stage 3a).
                 _gnorm = torch.nn.utils.clip_grad_norm_(
                     trainable_params, grad_clip if grad_clip > 0 else float("inf"))
-                if grad_guard.should_skip(float(_gnorm), band=_band):
+                # See train_lds: reached only when the loss guard passed,
+                # so the loss is ordinary by construction.
+                if grad_guard.should_skip(float(_gnorm), band=_band,
+                                           loss_was_ordinary=True):
                     _record_spike(grad_guard, _gnorm, dt_window, theta)
                     optimizer.zero_grad()
                     # The gradient path ran the SAME forward, so it moved the

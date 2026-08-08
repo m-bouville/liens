@@ -99,6 +99,14 @@ def _convert_value(value: str):
     (e.g. a path) if none apply."""
     if value.lower() in ("true", "false"):
         return value.lower() == "true"
+    if value.lower() == "none":
+        # WITHOUT THIS, "None" is the STRING "None" -- truthy, and not a
+        # number. `memory_cost_a_bytes = None` then reaches float() and
+        # raises; `step_weights = None` silently becomes a non-empty string
+        # that later code treats as "weights were provided". Writing None to
+        # mean "unset" is the obvious reading of a params file, and every
+        # parameter that takes None as its default expects the object.
+        return None
     try:
         return int(value)
     except ValueError:

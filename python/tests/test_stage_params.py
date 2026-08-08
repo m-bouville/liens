@@ -5,15 +5,13 @@ mechanism in _prepare_stage_kwargs (a stage inheriting a value it never
 specified from the file's preamble, while a stage that DOES specify its
 own value still wins) had zero dedicated test coverage before this.
 """
-from pathlib import Path
 
-import pytest
 
 import os
 import time
 
 from orchestration.stage_params import (
-    _backup_before_overwrite, _prepare_stage_kwargs, _resolve_same,
+    _backup_before_overwrite, _prepare_stage_kwargs,
     _strip_unrecognized_params, parse_stage_params, renamed_keys,
     report_unrecognized_global_params,
 )
@@ -354,3 +352,37 @@ def test_strip_without_own_keys_warns_about_everything(capsys):
     globals to inherit from -- everything unrecognized is its own."""
     _strip_unrecognized_params(_f_alpha, {"epochs": 1, "nope": 2}, "Standalone")
     assert "nope" in capsys.readouterr().out
+
+
+def test_None_in_a_params_file_becomes_None_not_the_string():
+    """
+    THE TRAP. `memory_cost_a_bytes = None` parsed as the STRING "None":
+    truthy, and not a number, so it passed the `is not None` guard and then
+    reached float() and raised at sampler construction. `step_weights = None`
+    had the same shape and was quieter -- a non-empty string that later code
+    reads as "weights were provided".
+
+    Writing None to mean "unset" is the obvious reading of a params file, and
+    every parameter whose default is None expects the object.
+    """
+    from orchestration.stage_params import _convert_value
+    assert _convert_value("None") is None
+    assert _convert_value("none") is None
+    assert _convert_value("NONE") is None
+
+
+def test_words_merely_containing_none_are_left_alone():
+    """A path or name is not a None."""
+    from orchestration.stage_params import _convert_value
+    assert _convert_value("nonesuch") == "nonesuch"
+    assert _convert_value("checkpoints/none/x.pt") == "checkpoints/none/x.pt"
+
+
+def test_the_other_conversions_still_hold():
+    from orchestration.stage_params import _convert_value
+    import math
+    assert _convert_value("True") is True and _convert_value("false") is False
+    assert _convert_value("4096") == 4096 and isinstance(_convert_value("4096"), int)
+    assert _convert_value("1.5") == 1.5
+    assert math.isinf(_convert_value("inf"))
+    assert _convert_value("some/path.pt") == "some/path.pt"

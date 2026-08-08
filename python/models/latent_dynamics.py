@@ -270,6 +270,10 @@ class LatentDynamics(nn.Module):
         self._substep_total = 0
         self._substep_batches = 0
         self._substep_max = 0
+        self._retained_peak = 0.0
+        # Raw realised counts of recent transitions, for the per-batch memory
+        # diagnostic. Cleared by retained_peak(reset=True).
+        self._last_counts: list = []
 
         flat_dim = latent_channels * latent_spatial * latent_spatial
         in_dim = 2 * flat_dim + n_theta  # z0 + z1 + theta -- dt is not a network input (see forward())
@@ -410,7 +414,36 @@ class LatentDynamics(nn.Module):
             self._substep_total += int(n.sum())
             self._substep_batches += int(n.numel())
             self._substep_max = max(self._substep_max, int(n.max()))
+            # REALISED retained cost of this transition, in sample-substeps --
+            # the same quantity BudgetedBatchSampler budgets on, but computed
+            # from the counts the integrator ACTUALLY takes rather than from
+            # the pre-epoch estimate. The two diverge because the estimate uses
+            # each window's first state and worst transition, while the counts
+            # are re-derived per transition from the state actually reached;
+            # with bucket_refresh_epochs=0 nothing ever corrects that drift.
+            # Reporting max(realised)/budget is what says whether the budget is
+            # bounding memory at all.
             return n.long()
+
+    def retained_peak(self, reset: bool = False) -> float:
+        """Largest REALISED retained cost (sample-substeps) since the reset.
+
+        Separate from substep_stats because that returns None when no adaptive
+        transition ran, while this is meaningful whenever truncation is on --
+        and because the caller that needs it (the budget calibration) must not
+        clear the sub-step statistics as a side effect of reading it.
+        """
+        value = self._retained_peak
+        if reset:
+            self._retained_peak = 0.0
+            self._last_counts = []
+        return value
+
+    def last_counts(self):
+        """Realised per-sample counts of the transitions since the last
+        retained_peak(reset=True) -- one tensor per _integrate call. For the
+        per-batch memory diagnostic; empty on the fixed-n path."""
+        return list(self._last_counts)
 
     def substep_stats(self, reset: bool = True) -> dict | None:
         """Mean/max realised sub-steps since the last reset, or None if fixed.
@@ -427,15 +460,23 @@ class LatentDynamics(nn.Module):
         which is the definition of dead code rather than a missing test.
         """
         if self._substep_batches == 0:
+            # The retained peak is meaningful even with a FIXED n_substeps
+            # (truncation still applies), and reset must still clear it --
+            # otherwise a fixed-n run accumulates a cumulative maximum for the
+            # whole run and the per-epoch drift it exists to show is lost.
+            if reset:
+                self._retained_peak = 0.0
             return None
         stats = {"mean": self._substep_total / self._substep_batches,
                  "max": self._substep_max, "clamped": self.n_substeps_clamped,
-                 "transitions": self._substep_batches}
+                 "transitions": self._substep_batches,
+                 "retained_peak": self._retained_peak}
         if reset:
             # Per-epoch, not cumulative -- a cumulative mean would flatten the
             # drift this exists to show. n_substeps_clamped is deliberately
             # NOT reset: a clamp that bound once in a run is worth carrying.
             self._substep_total = self._substep_batches = self._substep_max = 0
+            self._retained_peak = 0.0
         return stats
 
     def _integrate(self, z0: torch.Tensor, z1: torch.Tensor, dt: torch.Tensor,
@@ -507,6 +548,31 @@ class LatentDynamics(nn.Module):
         h = dt_r / n_steps.view(-1, 1, 1, 1).to(dt_r.dtype)
         h_capped = torch.clamp(h, max=self.dt_cap)
         n_max = int(n_steps.max().item())
+        # REALISED retained cost of this transition, in sample-substeps -- the
+        # same quantity BudgetedBatchSampler budgets on, but from the counts
+        # the integrator ACTUALLY uses rather than the pre-epoch estimate. The
+        # two drift because the estimate uses each window's first state and
+        # worst transition, while these are re-derived per transition from the
+        # state actually reached; with bucket_refresh_epochs=0 nothing ever
+        # corrects it. max(realised)/budget is what says whether the budget
+        # bounds memory at all.
+        #
+        # Recorded HERE, not in _substeps_for, so it measures what the loop
+        # runs on -- including the fixed-n path, and including any caller that
+        # supplies counts by other means.
+        if self.truncate_bptt is not None:
+            _lo, _hi = float(n_steps.min()), float(n_max)
+            _n = int(n_steps.numel())
+            # The RAW counts of the most recent transition, for the per-batch
+            # memory diagnostic. A list, not a tensor: rollout() calls
+            # _integrate n_rollout_steps times per batch, and the diagnostic
+            # wants all of them -- cleared by retained_peak(reset=True), which
+            # the diagnostic's caller invokes per batch.
+            self._last_counts.append(n_steps.detach().cpu())
+            self._retained_peak = max(
+                self._retained_peak,
+                _n * min(_hi, _n * float(self.truncate_bptt),
+                         (_hi - _lo) + float(self.truncate_bptt)))
         # Arrival accumulators, only under truncation (see the loop). Seeded
         # from the inputs so a sample arriving at step 0 is still covered, and
         # so the tensors exist with the right shape/dtype either way.

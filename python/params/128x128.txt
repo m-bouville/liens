@@ -79,24 +79,32 @@ val_aug_averaging= True
 # Stage 3a
 #   latent dynamics surrogate (1step)
 n_rollout_steps= 1			# always 1 for 3a
-n_substeps     = 1			# always 1 for 3a
-z1_resync      = True		# always True for 3a
+z1_resync       = True		# always True for 3a
 
-# resume_from 	= checkpoints/stage3a/128x128-stage3a-20260805_19h27.pt
+alpha			=  1.5		# adaptative sub-step (higher: more lenient)
+max_substeps    = 512		# default: 256
+target_vram_gib = 6.5		# leave 1 GB as headroom for driver/context
+bucket_refresh_epochs=0
+
+memory_cost_a_bytes= None
+memory_cost_b_bytes= None
+memory_cost_p 	   = None
+
+# resume_from 	= checkpoints/stage3a/128x128-stage3a.pt
 
 rollout_scale = 1e-6
 ae_stats_weight= 1.
 
-use_dt_decade_weights = True
+use_dt_decade_weights = False  # was True before alpha
 
 epochs 		  =10000		# increase?
 patience 	  =  500
 
-num_workers	  =   8   # was 8
-batches		  = 2048
+num_workers	  =   4   # was 8
+batches		  = 4096
 spike_skip_factor= 10
 
-lr 			  = 5e-6  # was 0.2e-3; default: 1.e-3
+lr 			  = 3.e-6  # was 0.2e-3; default: 1.e-3
 z0_noise_scale=   0.02	# was 0.175
 
 dt_cap		  = inf		# for second order
@@ -109,37 +117,40 @@ max_dt        = 2000   # 2000/0.05 = 40'000 time steps
 # Stage 3b
 #   latent dynamics surrogate (rollout)
 n_rollout_steps=  2			# always > 1 for 3b
-z1_resync      = False		# always False for 3b
+z1_resync      = True		# always False for 3b
 
-alpha			=  0.15		# adaptative sub-step
-max_substeps    = 2048		# default: 256
+alpha			= 1.5		# adaptative sub-step
+max_substeps    =  96		# default: 256
 bucket_batches 	= True		# default: True
-batch_cost_budget= 100000	# batch_size × max_cost; default: None
-	# = (usable VRAM) / (n_rollout_steps × bytes_per_sample_substep [≈ 15 kB])
-truncate_bptt = 64
+target_vram_gib = same
+truncate_bptt 	= 64
 bucket_refresh_epochs=0
+
+memory_cost_a_bytes= 120787
+memory_cost_b_bytes= 18469
+memory_cost_p      = 0.79
 
 # resume_from = checkpoints/stage3b/128x128-stage3b-20260806_18h10.pt
 
-rollout_scale  = 1			# was 1e-6
+rollout_scale  = 1.e-6			# was 1e-6
 ae_stats_weight= 1.
-one_step_weight= 0. 		# was 0.5
+one_step_weight= 0.5 		# was 0.5
 
 use_dt_decade_weights = same
 
 epochs 		  = 2000
 patience 	  =  100
 
-num_workers	  = same
+num_workers	  =    4
 batches		  = 4096
-# min_batch_size=  512 		# not implemented
+# min_batch_size=  512 		# not implemented, TODO?
 spike_skip_factor= same
 
 lr 			  =   3.e-6  	# was 3.e-6; default: 1.e-3
 z0_noise_scale=   0.02
 
 dt_cap		  = same		# must be
-max_dt        = 2000 
+max_dt        = 1000 
 
 force 	      = True
 

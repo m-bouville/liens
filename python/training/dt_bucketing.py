@@ -126,9 +126,143 @@ class CostBucketBatchSampler(Sampler):
         return len(self._batches())
 
 
+class PeakMemoryTracker:
+    """High-water mark for GPU memory, reported when it GROWS.
+
+    Measuring once after epoch 1 measures the CHEAPEST epoch. Sub-step counts
+    climb as f_theta sharpens (46 -> 209 mean on one run) and, with
+    bucket_refresh_epochs=0, the batching stays frozen at the initial cost
+    estimate -- so each batch retains steadily more than it was sized for. A
+    run reported 2.5 GiB at epoch 1 while the card showed 7.8 GB by epoch 80,
+    and that gap sent two rounds of optimisation at the wrong target.
+
+    Reports on growth rather than every epoch: the growth is the finding,
+    because it says the frozen estimate no longer describes what the model
+    demands.
+    """
+
+    def __init__(self, growth_factor: float = 1.5):
+        self.growth_factor = growth_factor
+        self.high = 0.0
+
+    def update(self, epoch: int, allocated: float, reserved: float) -> str:
+        """Record a peak; return a line to print, or "" if unremarkable."""
+        if self.high and allocated <= self.high * self.growth_factor:
+            return ""
+        previous, self.high = self.high, max(self.high, allocated)
+        if not previous:
+            return ""
+        return (f"  [epoch {epoch}: peak memory has grown to "
+                f"{allocated / 2**30:.2f} GiB allocated / "
+                f"{reserved / 2**30:.2f} GiB reserved, from "
+                f"{previous / 2**30:.2f} GiB. The sub-step counts have outgrown "
+                f"the cost estimate the batching was built from -- re-estimate "
+                f"(bucket_refresh_epochs) or lower batch_cost_budget.]")
+
+
+class MemoryGovernor:
+    """Feedback controller for the batch budget, driven by MEASURED bytes.
+
+    A CLASS rather than a handful of locals in the epoch loop, because the
+    loop's memory block is CUDA-gated: on a machine without a GPU it never
+    executes, so a missing initialisation is invisible to every test and to
+    import. Exactly that happened -- `_mem_adjustments` lost to a batched edit
+    that aborted before writing, surfacing only as an UnboundLocalError on the
+    user's first real run. State that lives in an object constructed
+    unconditionally cannot go unbound, and can be tested on CPU.
+    """
+
+    def __init__(self, target_gib: float | None, max_adjustments: int = 4,
+                 last_epoch: int = 8):
+        self.target_bytes = (target_gib or 0.0) * 2 ** 30
+        self.max_adjustments = max_adjustments
+        self.last_epoch = last_epoch
+        self.adjustments = 0
+
+    def active(self, epoch: int) -> bool:
+        return (self.target_bytes > 0
+                and self.adjustments < self.max_adjustments
+                and epoch <= self.last_epoch)
+
+    def step(self, epoch: int, sampler, measured_bytes: float) -> str:
+        """Adjust the sampler's budget toward the target; "" if nothing to do.
+
+        `measured_bytes` is peak RESERVED in practice -- reserved is what the
+        card reports as in use, since the caching allocator does not hand
+        blocks back. This parameter was named `allocated_bytes` while the call
+        site fed it reserved, and a name asserting the wrong quantity is how
+        the allocated-vs-reserved bug survived review the first time.
+        """
+        if not self.active(epoch):
+            return ""
+        note = sampler.rescale_to_bytes(measured_bytes, self.target_bytes)
+        if note:
+            self.adjustments += 1
+            return f"  [epoch {epoch}]{note}"
+        return ""
+
+
+class BatchMemoryDiagnostic:
+    """Per-batch memory measurement, next to every candidate predictor.
+
+    WHY PER BATCH. Six successive bytes-per-unit "constants" (1700 to 77000)
+    came from fitting structural models to RUN-LEVEL aggregates -- one
+    allocated-peak number per run, four runs. That cannot distinguish models;
+    any curve fits four points. What can: the per-batch peak alongside that
+    batch's own size, count statistics, span, and arrival-segment count, for
+    every batch of an epoch. One epoch yields tens of points and the
+    dependence is read off directly instead of theorised.
+
+    Records, per batch: n (windows), n_max / n_min / span of the REALISED
+    counts, arrival segments (distinct ceil(count/k) values), rollout steps,
+    and the CUDA peak allocated over that batch alone (counter reset before
+    each batch). Written as CSV so the analysis happens outside the run.
+
+    Costs one cuda.synchronize + reset per batch, so it is opt-in
+    (--diagnose-memory) and meant for a handful of epochs, not a training run.
+    """
+
+    HEADER = ("epoch,batch,n_windows,n_max,n_min,span,arrival_segments,"
+              "k,alloc_bytes,reserved_bytes\n")
+
+    def __init__(self, path, truncate_bptt: int | None):
+        self.path = path
+        self.k = truncate_bptt
+        self._rows = []
+
+    def record(self, epoch: int, batch_idx: int, counts, alloc: float,
+                reserved: float) -> None:
+        import numpy as _np
+        c = _np.asarray(counts, dtype=_np.float64)
+        if c.size == 0:
+            return
+        if self.k:
+            segments = int(_np.unique(_np.ceil(c / float(self.k))).size)
+        else:
+            segments = 1
+        self._rows.append(
+            f"{epoch},{batch_idx},{c.size},{c.max():.0f},{c.min():.0f},"
+            f"{c.max() - c.min():.0f},{segments},{self.k or 0},"
+            f"{alloc:.0f},{reserved:.0f}\n")
+
+    def flush(self) -> str:
+        if not self._rows:
+            return ""
+        new = not self.path.exists()
+        with open(self.path, "a") as f:
+            if new:
+                f.write(self.HEADER)
+            f.writelines(self._rows)
+        n = len(self._rows)
+        self._rows = []
+        return (f"  [memory diagnostic: {n} batch measurements appended to "
+                f"{self.path}]")
+
+
 def budget_report(sampler, batch_size: int, n_rollout_steps: int,
                    peak_bytes: float | None = None,
-                   reserved_bytes: float | None = None) -> str:
+                   reserved_bytes: float | None = None,
+                   realised_peak: float | None = None) -> str:
     """What the budget is actually bounding, and what it costs in bytes.
 
     THE FAILURE THIS PREVENTS: a budget that never binds. If batch_size caps
@@ -141,10 +275,12 @@ def budget_report(sampler, batch_size: int, n_rollout_steps: int,
     which would have doubled the peak and gone straight back to OOM.
 
     So this states BOTH numbers: what bounds each batch, and the resulting
-    peak. With a measured peak_bytes it also reports bytes per sample-substep,
-    which is the constant needed to set the budget from VRAM directly:
-
-        budget = usable_VRAM / (n_rollout_steps * bytes_per_sample_substep)
+    peak. With a measured peak_bytes it states the measured figure plainly and
+    nothing more -- earlier versions derived a bytes-per-sample-substep
+    constant from it, for setting the budget from VRAM directly, and that
+    constant took six different values across six measurements because no
+    such proportionality exists. The budget is set in bytes now (via
+    target_vram_gib) and MemoryGovernor reconciles it against measurement.
     """
     # _batches, NOT iter(sampler): iterating a shuffle=True sampler advances
     # its epoch counter, so each report call would shift every subsequent
@@ -175,16 +311,19 @@ def budget_report(sampler, batch_size: int, n_rollout_steps: int,
     # What an UNBUCKETED fixed-size run would peak at: a random batch of
     # batch_size out of tens of thousands contains a near-deepest window with
     # near-certainty, so its peak really is batch_size * max(cost).
-    unbucketed_peak = (batch_size * float(np.max(sampler._retained))
-                       if len(sampler._retained) else 0.0)
+    unbucketed_peak = (batch_size * sampler._depth(float(np.max(sampler._costs)),
+                                                    float(np.max(sampler._costs)))
+                       if len(sampler._costs) else 0.0)
     lines = [
         f"cost-budgeted batches: {len(sampler)} per epoch, {min(sizes)}-{max(sizes)} "
-        f"windows each, budget {sampler.budget:.0f} sample-substeps.",
-        f"  peak = {peak:.0f} retained sample-substeps x {n_rollout_steps} rollout "
-        f"steps (a batch's size x its own max RETAINED depth"
-        + (f", = min(sub-steps, truncate_bptt={sampler.truncate_bptt})"
-           if sampler.truncate_bptt else "")
-        + f"). Unbucketed at this batch_size it would be {unbucketed_peak:.0f}.",
+        f"windows each, budget {sampler.budget / 2**20:.0f} MiB of activations.",
+        f"  predicted peak = {peak / 2**20:.0f} MiB (a batch's size x its own "
+        f"per-window cost, {sampler.COST_A_BYTES / 1024:.0f} KiB + "
+        f"{sampler.COST_B_BYTES:.0f} B x depth^{sampler.COST_P:g} -- MEASURED, "
+        f"see evaluation/check_memory.py). Unbucketed at this batch_size it "
+        f"would be {unbucketed_peak / 2**20:.0f} MiB. This counts ACTIVATIONS "
+        f"only: parameters, optimizer state and allocator cache add roughly a "
+        f"GiB on top, which is why target_vram_gib is closed on measurement.",
         f"  compute is separate: {sampler.compute_cost():.3e} f_theta evaluations "
         f"per epoch, which scales with the FULL sub-step count -- every sub-step "
         f"is evaluated forward whether or not its graph is kept.",
@@ -196,30 +335,22 @@ def budget_report(sampler, batch_size: int, n_rollout_steps: int,
             "on the ESTIMATED cost -- the estimate uses each window's first state and "
             "worst transition, while the integrator re-derives the count per "
             "transition from the state it actually reaches, so realised memory "
-            "carries some slack over the budget. The measured bytes/sample-substep "
-            "constant below absorbs that slack, which is why setting the budget from "
-            "the MEASURED constant is reliable and setting it from first principles "
-            "is not.")
+            "carries slack over the budget. MemoryGovernor closes that gap against "
+            "the measured bytes when target_vram_gib is set.")
     else:
         lines.append(
             f"  The budget is NOT cutting any batch -- every one is capped by "
             f"batch_size={batch_size} first. Peak memory therefore still scales with the "
             f"deepest window, and raising max_substeps WILL raise it. Set the budget "
-            f"below {peak:.0f} to take control of the peak.")
-    if peak_bytes and peak > 0:
-        per_unit = peak_bytes / (peak * n_rollout_steps)
-        lines.append(
-            f"  measured {peak_bytes / 2**30:.2f} GiB peak = {per_unit:.0f} bytes per "
-            f"RETAINED sample-substep. To fit V bytes: budget = V / "
-            f"({n_rollout_steps} x {per_unit:.0f}).")
-        if sampler.truncate_bptt:
-            lines.append(
-                "  (Before this was measured against the raw sub-step count, the "
-                "constant wandered 33764 -> 8961 -> 6438 -> 13493 across four runs: "
-                "it was dividing real memory by a cost that truncation had stopped "
-                "making predictive. Against retained depth it should now hold "
-                "steady across budgets and batch sizes -- if it still moves, the "
-                "memory model is wrong again.)")
+            f"below {peak / 2**20:.0f} MiB to take control of the peak.")
+    if peak_bytes:
+        # NO bytes-per-unit constant. Every structural denominator tried gave
+        # a different answer -- 1700, 3771, 4845, 13476, 29315, 76911 across
+        # measurements -- because none of them predicted memory. The measured
+        # peak is stated plainly and MemoryGovernor closes the loop on it;
+        # quoting a constant would invite sizing a budget from a number that
+        # does not exist.
+        lines.append(f"  measured {peak_bytes / 2**30:.2f} GiB peak allocated.")
     if reserved_bytes and peak_bytes:
         overhead = reserved_bytes - peak_bytes
         lines.append(
@@ -357,10 +488,41 @@ class BudgetedBatchSampler(Sampler):
 
     def __init__(self, costs, batch_size: int, budget: float | None = None,
                  shuffle: bool = True, seed: int = 0,
-                 truncate_bptt: int | None = None):
+                 truncate_bptt: int | None = None,
+                 cost_a_bytes: float | None = None,
+                 cost_b_bytes: float | None = None,
+                 cost_p: float | None = None):
+        # The fitted coefficients are DEFAULTS, not constants of nature: they
+        # were measured on one card, one architecture and one latent size (see
+        # the class docstring). A different GPU, hidden_dim or latent_spatial
+        # moves them. Overriding is how a new machine is calibrated -- rerun
+        # evaluation/check_memory.py, read the joint fit, put its three
+        # numbers here. Set on the INSTANCE so _depth needs no change and the
+        # class constants stay as the documented reference values.
+        if cost_a_bytes is not None:
+            self.COST_A_BYTES = float(cost_a_bytes)
+        if cost_b_bytes is not None:
+            self.COST_B_BYTES = float(cost_b_bytes)
+        if cost_p is not None:
+            self.COST_P = float(cost_p)
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         self.batch_size = int(batch_size)
+        if budget is not None and 0 < float(budget) < BudgetedBatchSampler.COST_A_BYTES:
+            # THE UNIT CHANGED. The budget used to count sample-substeps, and
+            # values like 30000 or 100000 were normal; it counts BYTES now,
+            # because measurement showed that no count of sample-substeps
+            # predicts memory (the implied constant ranged 1700 to 76911
+            # across runs). Silently reading 30000 as 30 KB gives every window
+            # its own batch -- tens of thousands of optimizer steps an epoch,
+            # and a run that looks merely slow -- so this refuses instead.
+            raise ValueError(
+                f"batch_cost_budget={budget:g} is less than the cost of a SINGLE "
+                f"window, so every batch would hold one. The budget is now "
+                f"in BYTES, not sample-substeps: one window costs about "
+                f"{BudgetedBatchSampler.COST_A_BYTES / 1024:.0f} KiB plus a depth "
+                f"term. Either drop it and set target_vram_gib instead "
+                f"(recommended), or give bytes, e.g. 3 * 2**30 for 3 GiB.")
         self._explicit_budget = budget
         # RETAINED DEPTH, not raw sub-step count. Under truncated BPTT the
         # graph is detached every truncate_bptt sub-steps, so a window needing
@@ -415,38 +577,111 @@ class BudgetedBatchSampler(Sampler):
             batches.append(np.array(current))
         return batches
 
+    # MEASURED cost model, from evaluation/check_memory.py's two probe sweeps
+    # on a real 3b checkpoint (RTX 2060 Super, 128x128, latent 8x8x8,
+    # hidden_dim=256, n_rollout_steps=2):
+    #
+    #     bytes ~= A*n + B*n*depth^p,   A = 118 KiB, B = 18469, p = 0.79
+    #
+    # 13.2% worst residual over 9 points spanning n 128-1024 and depth 8-279.
+    # It is the FIRST model of this memory to survive measurement: six
+    # closed-form predictors were falsified before it, including `retained`
+    # (min(count, k)), which this sampler budgeted on and which measured WORST
+    # of all at 59.4%.
+    #
+    # It survived because the two sweeps were built to identify it. In
+    # ordinary cost-budgeted batches the deep ones are small by construction,
+    # so log(n) and log(depth) correlate at about -0.97 and no fit can
+    # separate a per-window cost from a per-depth one -- fitting this same
+    # form to the batch table returned A = -1088 KiB/window and predicted
+    # NEGATIVE memory at depth 8.
+    #
+    # These are defaults, not constants of nature: they are specific to this
+    # architecture and card. MemoryGovernor corrects the overall scale against
+    # measured bytes, so an error here costs convergence epochs, not an OOM.
+    COST_A_BYTES = 118.0 * 1024.0
+    COST_B_BYTES = 18469.0
+    COST_P = 0.79
+
     def _depth(self, lo: float, hi: float, n: int = 1 << 30) -> float:
-        """Retained depth of a batch whose counts run from `lo` to `hi`.
+        """Per-window BYTES for a batch whose counts run from `lo` to `hi`.
 
-        Without truncation every sample keeps its whole history, so the batch
-        is priced by its DEEPEST member: hi.
+        Returns bytes rather than an abstract count of sample-substeps because
+        no such count predicts memory: the fixed-n sweep (n held constant, a
+        constant fitted separately) put the depth exponent at 0.70-0.79, well
+        below 1, so memory is not proportional to any product of a batch size
+        and a depth. Reporting a "bytes per sample-substep" constant produced
+        six different values across measurements -- 1700 to 76911 -- which is
+        what a non-existent constant looks like.
 
-        With per-sample truncation each sample retains only its own final
-        segment -- but those segments sit at different places in the loop, and
-        the updates are full-batch tensor ops, so every segment in which SOME
-        sample arrives is retained for the whole batch:
-
-            depth ~ (number of arrival segments) x k ~ span + k
-
-        A fixed span cap was the first attempt and it was the wrong shape: it
-        split the deep tail into 3-window batches, each still taking a full
-        clipped optimizer step. Pricing the span instead lets a small batch
-        carry a wide span (few samples x many segments is cheap) while a
-        4096-window batch is forced to stay narrow -- which is the actual
-        constraint.
+        `lo` is unused now and kept for signature compatibility: the span
+        mattered under the arrival-segment model, which measurement rejected
+        (span_aware fitted a -116 MiB intercept, i.e. negative memory at zero
+        cost). Depth alone, with this exponent, does better.
         """
-        if self.truncate_bptt is None:
-            return hi
-        k = float(self.truncate_bptt)
-        # Arrival segments are bounded THREE ways, and the tightest wins:
-        #   n           -- at most one arrival segment per sample, so n*k
-        #   span/k + 1  -- segments the counts actually straddle, so span + k
-        #   hi          -- the loop is only hi steps long
-        # Missing the n bound was my first model, and it charged a 2-window
-        # batch spanning 1000-41000 as if it retained 41k steps when it can
-        # retain at most 2 segments = 2k. That shattered the deep tail into
-        # 1-window batches, each still taking a full clipped optimizer step.
-        return min(hi, n * k, (hi - lo) + k)
+        # RAW depth, not min(depth, truncate_bptt). The coefficients were
+        # fitted against the batch's max COUNT with truncation active, and the
+        # sweep rows at depth 127 and 279 -- both well past k=64 -- measured
+        # 272 and 407 MiB, i.e. memory kept growing after the graph was
+        # supposedly capped. Capping here would contradict the measurement the
+        # model came from, and would price every deep batch identically.
+        return self.COST_A_BYTES + self.COST_B_BYTES * max(hi, 1.0) ** self.COST_P
+
+    def rescale_to_bytes(self, measured_bytes: float, target_bytes: float) -> str:
+        """Scale the budget by the ratio of MEASURED to TARGET memory.
+
+        Model-free, and deliberately so. Four structural models of retained
+        memory have now failed against measurement: retained depth alone, then
+        span-aware depth, then span bounded by batch size, then the realised
+        per-transition cost -- the last of which TRIPLED on a run where the
+        measured peak HALVED. A metric that moves opposite to the quantity it
+        predicts is not a model of it, and the implied bytes-per-unit constant
+        ranged over 1700-77000 across measurements.
+
+        What has held throughout is that peak memory is monotone in the
+        budget: smaller batches, less memory. That is enough for feedback
+        control, and feedback needs no model. One multiplicative step per
+        epoch, converging in two or three.
+        """
+        if measured_bytes <= 0 or target_bytes <= 0 or not self._batches:
+            return ""
+        ratio = target_bytes / measured_bytes
+        if 0.75 <= ratio <= 1.1:
+            return ""
+        # Damped: memory is monotone in the budget but not exactly linear in
+        # it (batch shapes change as the fill re-runs), so a full correction
+        # can overshoot and oscillate.
+        self.budget *= ratio ** 0.8
+        self._explicit_budget = self.budget
+        before = len(self._batches)
+        previous = list(self._batches)
+        self._batches = self._fill(np.argsort(self._costs, kind="stable"))
+        if len(self._batches) == before and ratio > 1.0:
+            # The batching did not respond, so the budget is no longer the
+            # binding constraint -- batch_size is. Raising it further changes
+            # nothing except the number, and the loop would multiply forever
+            # (measured: 30000 -> 1.7e12 over five no-op steps). Revert and
+            # report convergence.
+            self.budget /= ratio ** 0.8
+            self._explicit_budget = self.budget
+            self._batches = previous
+            return ""
+        # SHRINKING MUST BITE WITHIN THIS CALL. A damped step from a budget far
+        # above the binding region does nothing visible, and the caller only
+        # grants a handful of adjustments -- measured, eight steps took 1e12
+        # only to 1.7e6, still above binding, so a run would never converge.
+        # Halve until the batching moves.
+        _guard = 0
+        while len(self._batches) == before and ratio < 1.0 and _guard < 40:
+            self.budget *= 0.5
+            self._explicit_budget = self.budget
+            self._batches = self._fill(np.argsort(self._costs, kind="stable"))
+            _guard += 1
+        return (f"  measured {measured_bytes / 2**30:.2f} GiB against a "
+                f"{target_bytes / 2**30:.2f} GiB target -- budget scaled to "
+                f"{self.budget:.0f} ({before} -> {len(self._batches)} batches "
+                f"per epoch). Under grad_clip the batch count is the per-epoch "
+                f"learning rate, so that changed too.")
 
     def update_costs(self, costs, hold_batch_count: bool = True) -> None:
         """Re-sort and re-batch for a new cost estimate.
@@ -477,11 +712,9 @@ class BudgetedBatchSampler(Sampler):
         """
         previous_count = len(getattr(self, "_batches", []))
         self._costs = np.asarray(costs, dtype=np.float64)
-        # What memory actually scales with. Compute still scales with the full
-        # count (every sub-step is evaluated forward), so _costs is kept for
-        # the compute reporting; _retained is what the budget bounds.
-        self._retained = (np.minimum(self._costs, float(self.truncate_bptt))
-                          if self.truncate_bptt else self._costs)
+        # _costs holds per-window SUB-STEP COUNTS: the input to the byte cost
+        # model (_depth) for memory, and directly the unit of compute (every
+        # sub-step is evaluated forward whether or not its graph is kept).
         if self._costs.size == 0:
             # budget must still exist: budget_report reads it, and an empty
             # dataset should produce an empty (but well-formed) report rather
@@ -489,12 +722,15 @@ class BudgetedBatchSampler(Sampler):
             self.budget = float(self._explicit_budget) if self._explicit_budget else 0.0
             self._batches = []
             return
-        # AUTO BUDGET: the batch_size the caller asked for, at the population's
-        # MEDIAN cost. So a typical batch is exactly batch_size, a window
-        # costing 4x the median gets a quarter of it, and the caller's number
-        # keeps the meaning it had before budgeting existed.
+        # AUTO BUDGET, now in BYTES like the cost model. The caller's
+        # batch_size at the population's MEDIAN per-window cost, so a typical
+        # batch is exactly batch_size and a window costing 4x the median gets
+        # a quarter of it -- the same meaning the number had before budgeting
+        # existed, but denominated in the unit that predicts memory.
+        _median_depth = float(np.median(self._costs))
         self.budget = (float(self._explicit_budget) if self._explicit_budget
-                       else self.batch_size * float(np.median(self._retained)))
+                       else self.batch_size * self._depth(_median_depth,
+                                                           _median_depth))
         # Sorted by FULL count. retained = min(count, truncate_bptt) is
         # monotone in count, so this groups by retained depth exactly as the
         # previous lexsort did -- and it ALSO groups by count SPAN, which is
