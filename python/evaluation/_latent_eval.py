@@ -82,6 +82,14 @@ class _EvaluationResults:
     dz0_abs: np.ndarray
     dz0dt_signed: np.ndarray
     dz0dt_abs: np.ndarray
+    # RAW increment of the deriv stream, dz1 = z1(t+dt) - z1(t), from which
+    # the figure forms d2z0/dt2 by dividing by the GROUP's dt -- exactly as
+    # it forms dz0/dt from dz0. Stored UNDIVIDED for that reason: dividing
+    # per-window here gave mean(dz1/dt) for one row against
+    # mean|dz0|/mean(dt) for the other, two different reductions on two rows
+    # whose whole purpose is to be read against each other.
+    dz1_signed: np.ndarray
+    dz1_abs: np.ndarray
     signed_residual_sum: torch.Tensor
     n_total: int
 
@@ -454,6 +462,7 @@ def _evaluate_windows(dataset, f_theta, ae_decoder, device, decode: bool, euler_
     # the euler_only substitution -- there's only ever one "real" dz0/dt,
     # regardless of which prediction mode is being evaluated.
     abs_steps, dz0_signed, dz0_abs, dz0dt_signed, dz0dt_abs = [], [], [], [], []
+    dz1_signed, dz1_abs = [], []
 
     def _per_sample_l1(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
         """(B, ...) -> (B,) mean absolute error per sample -- matches
@@ -530,6 +539,15 @@ def _evaluate_windows(dataset, f_theta, ae_decoder, device, decode: bool, euler_
             dz0dt_signed_batch = dz0_signed_batch / dt
             dz0_abs_batch = _per_sample_l1(z0_next_true, z0_t)
             dz0dt_abs_batch = dz0_abs_batch / dt
+            # SECOND derivative from the deriv stream's own two frames. The
+            # first-order term of the expansion cannot justify a max_dt --
+            # z1*dt is whatever it is -- but the dt^2/2 term can, and this is
+            # its coefficient.
+            z1_next = window1[:, 1]
+            # UNDIVIDED. The figure divides by the group's dt, matching how
+            # it forms dz0/dt from dz0 -- see _EvaluationResults.dz1_signed.
+            dz1_signed_batch = _per_sample_signed_mean(z1_next, z1_t)
+            dz1_abs_batch = _per_sample_l1(z1_next, z1_t)
 
             # Decoder calls genuinely skipped, not just left unplotted,
             # when decode=False -- these are 3 extra decoder forward
@@ -558,6 +576,8 @@ def _evaluate_windows(dataset, f_theta, ae_decoder, device, decode: bool, euler_
             dz0_abs.extend(dz0_abs_batch.cpu().tolist())
             dz0dt_signed.extend(dz0dt_signed_batch.cpu().tolist())
             dz0dt_abs.extend(dz0dt_abs_batch.cpu().tolist())
+            dz1_signed.extend(dz1_signed_batch.cpu().tolist())
+            dz1_abs.extend(dz1_abs_batch.cpu().tolist())
 
             # SIGNED (not .abs()'d) euler-only residual, summed over the
             # batch dim only -- keeps the full (C, H, W) shape, so
@@ -611,6 +631,8 @@ def _evaluate_windows(dataset, f_theta, ae_decoder, device, decode: bool, euler_
     dz0_signed = np.array(dz0_signed)
     dz0_abs = np.array(dz0_abs)
     dz0dt_signed = np.array(dz0dt_signed)
+    dz1_signed = np.array(dz1_signed)
+    dz1_abs = np.array(dz1_abs)
     dz0dt_abs = np.array(dz0dt_abs)
 
     # euler_only substitution: EVERY panel/fit/print below this point
@@ -640,6 +662,7 @@ def _evaluate_windows(dataset, f_theta, ae_decoder, device, decode: bool, euler_
         latent_losses_signed=latent_losses_signed, euler_losses_signed=euler_losses_signed,
         abs_steps=abs_steps, dz0_signed=dz0_signed, dz0_abs=dz0_abs,
         dz0dt_signed=dz0dt_signed, dz0dt_abs=dz0dt_abs,
+        dz1_signed=dz1_signed, dz1_abs=dz1_abs,
         signed_residual_sum=signed_residual_sum, n_total=n_total,
     )
 

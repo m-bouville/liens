@@ -9,6 +9,8 @@ what the tests pin is precisely the shared-ness: same steps to both
 models, same z1_resync, shared color scales, no per-checkpoint
 truncation.
 """
+import zlib
+
 import numpy as np
 import pytest
 import torch
@@ -124,7 +126,7 @@ def test_the_shared_windows_and_summary_are_reported(monkeypatch, tmp_path, caps
 def test_differing_ae_checkpoints_are_called_out(monkeypatch, tmp_path, capsys):
     """Each model decodes through its own AE; if those differ, part of the
     gap is the AEs' and the figure must say so."""
-    calls = _stub_models(monkeypatch)
+    _stub_models(monkeypatch)
 
     def load(p, d):
         return {"path": p, "ck": {}, "config": {}, "ae": None,
@@ -229,7 +231,8 @@ def _stats_stub(monkeypatch, corr_none_for=()):
     def fake(run_dir, steps, ae, f_theta, ae_config, device, z1_resync):
         is_a = str(f_theta).endswith("a")
         seen.append((str(run_dir), tuple(steps), is_a))
-        rng = np.random.default_rng(abs(hash((str(run_dir), steps[0]))) % 9973)
+        rng = np.random.default_rng(
+            zlib.crc32(f"{run_dir}:{steps[0]}".encode()) % 9973)
         dt = 50.0 * (1 + steps[0] % 40)
         n = len(steps)
         x_t = rng.normal(size=(8, 8))
@@ -252,6 +255,9 @@ def _stats_stub(monkeypatch, corr_none_for=()):
         return real[0], real[-1], pred[-1], real[-1], sum(dts), dts
 
     monkeypatch.setattr(cf, "compute_sample", fake_sample)
+    # collect_stats now also calls the causal baseline; stub it off unless a
+    # test specifically exercises it, so the stats tests stay filesystem-free.
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
     return seen
 
 
@@ -504,6 +510,10 @@ def _traj_stub(monkeypatch, b_scale=3.0):
         return real, pred, [250.0] * (n - 1)
 
     monkeypatch.setattr(cf, "compute_trajectory", fake)
+    # The causal row reads the run directory from disk; stub it off by
+    # default so trajectory tests stay filesystem-free. Tests that care about
+    # the causal row override this.
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
 
 
 def test_the_trajectory_panel_is_three_rows_by_N_plus_one_columns(monkeypatch, tmp_path):
@@ -579,11 +589,60 @@ def test_the_prediction_rows_start_from_the_AE_RECONSTRUCTION(monkeypatch):
     Column 0 of a model row is the decoded z0 of the starting state, not the
     raw snapshot: that is where the model actually begins, so decoder error
     shows in the column it belongs to instead of being absorbed into step 1.
+
+    rollout() already provides it as column 0 of its own output, so it is
+    read from there rather than decoded separately and prepended -- which
+    duplicated frame 0 and shifted every panel one frame behind.
     """
     import inspect
     src = inspect.getsource(cf.compute_trajectory)
-    assert "pred_frames = [ae_decoder(z0_t)[0, 0].cpu().numpy()]" in src, (
-        "the prediction row does not start from the AE reconstruction"
+    assert "for i in range(z0_hat_full.shape[1])" in src
+    assert "pred_frames = [ae_decoder(z0_t)[0, 0].cpu().numpy()]" not in src, (
+        "the start is decoded separately AND included by rollout, so frame 0 "
+        "appears twice and every later column is off by one"
+    )
+
+
+def test_the_trajectory_length_matches_the_window(monkeypatch):
+    """
+    THE OFF-BY-ONE. rollout returns n_steps+1 columns including the input, so
+    prepending a separately-decoded start gave n_steps+2 frames against a
+    window of n_steps+1. The extra entry was silently unplotted: the figure
+    showed columns 0..n_steps of a list that began with a duplicate, so every
+    model panel was one frame BEHIND its real column and the final frame was
+    never shown at all.
+    """
+    from pathlib import Path
+    import types
+
+    n_steps = 5
+
+    class FakeMeta:
+        dt, temperature, T0 = 1.0, 900.0, 800.0
+
+    monkeypatch.setattr(cf.load, "read_metadata", lambda p: FakeMeta())
+    monkeypatch.setattr(cf.load, "snapshot_filename", lambda s: f"s{s}")
+    monkeypatch.setattr(cf.load, "read_phi_half",
+                         lambda p, nx, ny: np.zeros((nx, ny), dtype=np.float32))
+    monkeypatch.setattr(cf, "resolve_stream_configs_from_checkpoint_config",
+                         lambda cfg: (None, "recon"))
+
+    def encoder(x, theta=None):
+        n = x.shape[0]
+        return {"recon": torch.zeros(n, 2, 4, 4), "deriv": torch.zeros(n, 2, 4, 4)}
+
+    def decoder(z):
+        return torch.zeros(z.shape[0], 1, 8, 8)
+
+    ae = types.SimpleNamespace(encoder=encoder, decoder=decoder)
+    f_theta = types.SimpleNamespace(
+        rollout=lambda z0, z1, dts, theta, z1_resync: torch.zeros(
+            1, dts.shape[1] + 1, 2, 4, 4))
+
+    real, pred, _ = cf.compute_trajectory(
+        Path("run"), list(range(n_steps)), ae, f_theta, {"size": 8}, "cpu")
+    assert len(pred) == len(real) == n_steps, (
+        f"{len(pred)} predicted frames for a {len(real)}-frame window"
     )
 
 
@@ -632,9 +691,13 @@ def test_compute_trajectory_decodes_EVERY_frame(monkeypatch):
         return torch.zeros(z.shape[0], 1, 8, 8)
 
     ae = types.SimpleNamespace(encoder=encoder, decoder=decoder)
+    # (B, n_steps+1, ...) with [:, 0] == z0 -- rollout's REAL contract. The
+    # stub previously returned n_steps columns, which is why a test asserting
+    # len(pred) == len(steps) passed while the real code produced one frame
+    # too many and shifted every panel.
     f_theta = types.SimpleNamespace(
         rollout=lambda z0, z1, dts, theta, z1_resync: torch.zeros(
-            1, dts.shape[1], 2, 4, 4))
+            1, dts.shape[1] + 1, 2, 4, 4))
 
     real, pred, dt_per_step = cf.compute_trajectory(
         Path("run"), list(range(n_steps)), ae, f_theta, {"size": 8}, "cpu")
@@ -644,7 +707,7 @@ def test_compute_trajectory_decodes_EVERY_frame(monkeypatch):
         f"intermediate states are not being decoded"
     )
     assert len(dt_per_step) == n_steps - 1
-    # one decode for the start + one per transition
+    # one decode per returned column, which already includes the start
     assert len(decoded) == n_steps
 
 
@@ -719,6 +782,7 @@ def _traj_stub_collapsing(monkeypatch, collapse_at=3):
         return real, pred, [250.0] * (n - 1)
 
     monkeypatch.setattr(cf, "compute_trajectory", fake)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
 
 
 def _titles(monkeypatch, n_frames=5, collapse_at=3):
@@ -785,6 +849,7 @@ def test_each_model_measures_its_delta_from_ITS_OWN_start(monkeypatch):
         return real, [f + offset for f in real], [250.0] * (n - 1)
 
     monkeypatch.setattr(cf, "compute_trajectory", fake)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
     captured = {}
     original = plt.subplots
 
@@ -845,6 +910,7 @@ def test_a_constant_real_delta_still_reports_na(monkeypatch):
         return real, pred, [125.0, 125.0]
 
     monkeypatch.setattr(cf, "compute_trajectory", fake)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
     captured = {}
     original = plt.subplots
 
@@ -971,7 +1037,7 @@ def test_a_wholly_undefined_step_is_reported(monkeypatch, capsys):
     from pathlib import Path
 
     def fake(run_dir, steps, ae, f_theta, ae_config, device, z1_resync):
-        rng = np.random.default_rng(abs(hash(str(run_dir))) % 997)
+        rng = np.random.default_rng(zlib.crc32(str(run_dir).encode()) % 997)
         n = len(steps)
         real = [rng.normal(size=(8, 8)) * (1 + 0.05 * i) for i in range(n)]
         pred = [f + 0.01 for f in real]
@@ -979,6 +1045,7 @@ def test_a_wholly_undefined_step_is_reported(monkeypatch, capsys):
         return real, pred, [250.0] * (n - 1)
 
     monkeypatch.setattr(cf, "compute_trajectory", fake)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
     monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
     monkeypatch.setattr(
         cf, "_select_windows",
@@ -1010,7 +1077,7 @@ def test_a_partly_undefined_step_is_NOT_flagged(monkeypatch, capsys):
     from pathlib import Path
 
     def fake(run_dir, steps, ae, f_theta, ae_config, device, z1_resync):
-        rng = np.random.default_rng(abs(hash(str(run_dir))) % 997)
+        rng = np.random.default_rng(zlib.crc32(str(run_dir).encode()) % 997)
         n = len(steps)
         real = [rng.normal(size=(8, 8)) * (1 + 0.05 * i) for i in range(n)]
         pred = [f + 0.01 for f in real]
@@ -1019,6 +1086,7 @@ def test_a_partly_undefined_step_is_NOT_flagged(monkeypatch, capsys):
         return real, pred, [250.0] * (n - 1)
 
     monkeypatch.setattr(cf, "compute_trajectory", fake)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
     monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
     monkeypatch.setattr(
         cf, "_select_windows",
@@ -1034,21 +1102,33 @@ def _stats_for_figure(monkeypatch, blow_up_every=10, max_dt_a=2000.0,
                        max_dt_b=1000.0):
     def fake(run_dir, steps, ae, f_theta, ae_config, device, z1_resync):
         n = len(steps)
-        i = abs(hash(str(run_dir))) % 997
+        # crc32, NOT hash(): Python salts string hashing per process, so
+        # hash() made this fixture assign different dt values and blow-up
+        # flags on every run. It passed here and failed on another machine
+        # for no reason but the seed -- a flaky test is worse than none.
+        i = zlib.crc32(str(run_dir).encode()) % 997
         rng = np.random.default_rng(i)
         real = [rng.normal(size=(8, 8)) * (1 + 0.05 * k) for k in range(n)]
-        blow = blow_up_every and (i % blow_up_every == 0)
+        # dt comes from i % 8 and the blow-up from i // 8, so the two are
+        # INDEPENDENT. Deriving both from i % 3 and i % 8 correlated them,
+        # and whole dt bins came out entirely diverged -- the medians then
+        # legitimately reached 1e30 and the fixture no longer isolated
+        # "median small, upper quartile huge".
+        blow = blow_up_every and ((i // 8) % blow_up_every == 0)
         pred = [real[k] + (1e15 if (blow and k > 2) else 0.02 * k)
                 for k in range(n)]
-        return real, pred, [250.0 * (1 + i % 4)] * (n - 1)
+        return real, pred, [250.0 * (1 + i % 8)] * (n - 1)
 
     monkeypatch.setattr(cf, "compute_trajectory", fake)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
     a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
     a["max_dt"], b["max_dt"] = max_dt_a, max_dt_b
-    windows = [(f"T{500 + i}_n020_s{i}", list(range(9))) for i in range(40)]
+    # 160 windows over 8 dt values = ~20 per bin, so a 1-in-3 blow-up rate
+    # puts the MEDIAN safely below it and the UPPER QUARTILE safely above.
+    # With 40 windows the bins held ~7 each and sampling noise pushed some
+    # bins past half diverged, making the medians themselves 1e30.
+    windows = [(f"T{500 + i}_n020_s{i}", list(range(9))) for i in range(160)]
     return cf.collect_stats(a, b, windows, "cpu", False), a, b
-
-
 def _figure_axes(monkeypatch, stats, a, b, tmp_path):
     import matplotlib.pyplot as plt
     captured = {}
@@ -1064,67 +1144,577 @@ def _figure_axes(monkeypatch, stats, a, b, tmp_path):
     return captured["axes"]
 
 
-def test_max_dt_is_marked_on_both_dt_panels(monkeypatch, tmp_path):
-    """Each model's own training limit, in its own colour, on every panel
-    whose x axis is dt."""
-    stats, a, b = _stats_for_figure(monkeypatch)
-    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
-    for panel in (axes[1, 0], axes[1, 1]):
-        vlines = sorted(line.get_xdata()[0] for line in panel.get_lines()
-                        if len(set(line.get_xdata())) == 1)
-        assert vlines == [1000.0, 2000.0], (
-            f"panel marks {vlines}, expected both models' max_dt"
-        )
-    labels = [t.get_text() for t in axes[1, 0].get_legend().get_texts()]
-    assert any("max_dt" in t and "per transition" in t for t in labels), (
-        "the marker does not say it bounds a single transition, while the "
-        "axis is the summed dt_total"
-    )
-
-
-def test_the_two_max_dt_lines_collapse_when_equal(monkeypatch, tmp_path):
-    """A second line exactly on top of the first is clutter."""
-    stats, a, b = _stats_for_figure(monkeypatch, max_dt_a=1000.0,
-                                     max_dt_b=1000.0)
-    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
-    vlines = [line.get_xdata()[0] for line in axes[1, 0].get_lines()
-              if len(set(line.get_xdata())) == 1]
-    assert vlines == [1000.0], f"{len(vlines)} lines drawn for one value"
-
-
-def test_the_loss_panels_are_scaled_by_medians_not_quartiles(monkeypatch, tmp_path):
+def test_the_vs_steps_loss_panel_is_scaled_by_medians_not_quartiles(monkeypatch, tmp_path):
     """
-    A single window diverging to 1e15 pushed the quartile band -- and with it
-    the axis -- to 1e15, flattening the decades where the two curves actually
-    differ into a line at the bottom. The bands stay drawn and simply run off
-    the top.
+    The vs-STEPS panel keeps median scaling: a single window diverging to
+    1e15 would otherwise push the quartile band -- and the axis -- to 1e15,
+    flattening the decades where the curves differ. (The vs-DT panel no
+    longer does this: it shares the CDF's full range instead, tested
+    separately.) The band stays drawn and simply runs off the top.
     """
-    # every 3rd window diverges, so the 75th percentile IS the blown value
-    # and the band genuinely reaches 1e15. At 10% it sat below the upper
-    # quartile and the fixture proved nothing.
+    # every 3rd window diverges, so the 75th percentile IS the blown value.
     stats, a, b = _stats_for_figure(monkeypatch, blow_up_every=3)
     axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
-    band_top = max(seg[:, 1].max() for panel in (axes[1, 0], axes[0, 2])
-                    for seg in [panel.collections[0].get_paths()[0].vertices])
+    panel = axes[0, 2]
+    band_top = panel.collections[0].get_paths()[0].vertices[:, 1].max()
     assert band_top > 1e9, (
         f"the quartile band only reaches {band_top:.3g}; the fixture does "
         f"not exercise a band that would blow up the axis"
     )
-    for panel in (axes[1, 0], axes[0, 2]):
-        top = panel.get_ylim()[1]
-        assert top < 1e6, (
-            f"y range reaches {top:.3g} -- the diverging tail is setting the "
-            f"scale, not the medians"
-        )
-        # the band itself is still plotted (it just leaves the view)
-        assert panel.collections, "the quartile band was removed rather than clipped"
+    assert panel.get_ylim()[1] < 1e6, (
+        f"y range reaches {panel.get_ylim()[1]:.3g} -- the diverging tail is "
+        f"setting the scale, not the medians"
+    )
+    assert panel.collections, "the quartile band was removed rather than clipped"
 
 
-def test_a_missing_max_dt_is_simply_not_drawn(monkeypatch, tmp_path):
-    """Older checkpoints may have no data_config; that must not raise."""
-    stats, a, b = _stats_for_figure(monkeypatch)
-    a["max_dt"] = b["max_dt"] = None
+def test_the_two_loss_panels_in_a_row_share_one_y_range(monkeypatch, tmp_path):
+    """
+    The loss CDF and loss-vs-dt sit side by side and are the SAME quantity
+    (end-to-end loss), so they share one y axis and read straight across.
+    The CDF shows the full spread; vs-dt adopts it rather than its own
+    median-clipped range.
+    """
+    stats, a, b = _stats_for_figure(monkeypatch, blow_up_every=3)
     axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
-    vlines = [line.get_xdata()[0] for line in axes[1, 0].get_lines()
-              if len(set(line.get_xdata())) == 1]
-    assert vlines == []
+    assert axes[0, 1].get_ylim() == axes[0, 0].get_ylim(), (
+        "loss CDF and loss-vs-dt do not share a y range, so the row cannot "
+        "be read across"
+    )
+    assert axes[0, 1].get_yscale() == "log"
+def test_correlation_axes_always_span_zero_and_one_hundred(monkeypatch, tmp_path):
+    """
+    Correlation has fixed, meaningful endpoints -- no skill and perfect. A
+    panel autoscaled to 40..92% invites reading a small real difference as a
+    large one, and cannot be compared against the panel beside it.
+    """
+    stats, a, b = _stats_for_figure(monkeypatch, blow_up_every=0)
+    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
+    lo, hi = axes[1, 0].get_ylim()          # CDF now has correlation on Y
+    assert lo <= 0.0 and hi >= 100.0, f"distribution panel spans {lo}..{hi}"
+    for panel in (axes[1, 1], axes[1, 2]):  # correlation on y
+        lo, hi = panel.get_ylim()
+        assert lo <= 0.0 and hi >= 100.0, f"panel spans {lo}..{hi}"
+
+
+def test_dt_axes_are_numbered_more_than_once_per_decade(monkeypatch, tmp_path):
+    """
+    A log axis spanning ~200 to ~5000 gets exactly ONE major tick from the
+    default locator, so the axis carried a single number and no point on it
+    could be placed.
+    """
+    stats, a, b = _stats_for_figure(monkeypatch, blow_up_every=0)
+    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
+    axes[0, 0].figure.canvas.draw()
+    for panel in (axes[0, 1], axes[1, 1]):
+        lo, hi = panel.get_xlim()
+        labelled = [float(t.get_text().replace(",", ""))
+                    for t in panel.get_xticklabels(which="both")
+                    if t.get_text()]
+        inside = [v for v in labelled if lo <= v <= hi]
+        assert len(inside) >= 4, (
+            f"only {len(inside)} numbers on the dt axis between {lo:.0f} and "
+            f"{hi:.0f}: {sorted(inside)}"
+        )
+
+
+def test_no_max_dt_markers_are_drawn(monkeypatch, tmp_path):
+    """
+    ROLLED BACK. max_dt bounds a single transition while the axis is
+    dt_total, the sum over the window, so the line separated nothing: an
+    8-step window at 8 x max_dt is entirely in-distribution.
+    """
+    stats, a, b = _stats_for_figure(monkeypatch, blow_up_every=0)
+    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
+    for panel in (axes[0, 1], axes[1, 1]):
+        vlines = [line.get_xdata()[0] for line in panel.get_lines()
+                  if len(set(line.get_xdata())) == 1]
+        assert vlines == [], f"a vertical marker is still drawn at {vlines}"
+
+
+def test_dt_axis_tick_density_adapts_to_the_span():
+    """
+    A narrow range needs every sub-tick numbered to be readable at all; a
+    four-decade range numbered the same way is a solid black line. The
+    default minor locator already places sub-ticks, so this adaptive choice
+    is what stops a wide axis from being unreadable -- removing it is
+    invisible on a narrow one.
+    """
+    import matplotlib.pyplot as plt
+
+    def n_labels(lo, hi):
+        fig, ax = plt.subplots()
+        ax.set_xscale("log")
+        ax.set_xlim(lo, hi)
+        cf._label_dt_axis(ax)
+        fig.canvas.draw()
+        labels = [t.get_text() for t in ax.get_xticklabels(which="both")
+                  if t.get_text()]
+        inside = [v for v in (float(t.replace(",", "")) for t in labels)
+                  if lo <= v <= hi]
+        plt.close(fig)
+        return len(inside)
+
+    narrow = n_labels(200.0, 2000.0)
+    wide = n_labels(100.0, 1e6)
+    assert narrow >= 4, f"a narrow axis carries only {narrow} numbers"
+    assert wide <= 20, (
+        f"a four-decade axis carries {wide} numbers -- at that density the "
+        f"labels overlap into a solid line"
+    )
+
+
+def test_the_layout_is_metric_by_row_and_view_by_column(monkeypatch, tmp_path):
+    """
+    Rows are the METRIC, columns the VIEW, so every column shares one x axis:
+    the two dt panels sit one above the other and can be read together, as can
+    the two step panels. Before the transpose the dt panels were diagonal from
+    each other.
+    """
+    stats, a, b = _stats_for_figure(monkeypatch, blow_up_every=0)
+    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
+    assert "loss" in axes[0, 0].get_title() and "loss" in axes[0, 1].get_title()
+    assert "correlation" in axes[1, 0].get_title()
+    assert "correlation" in axes[1, 1].get_title()
+    # each column shares an x axis
+    assert axes[0, 1].get_xlabel() == axes[1, 1].get_xlabel() == "dt_total"
+    assert (axes[0, 2].get_xlabel() == axes[1, 2].get_xlabel()
+            == "chained steps applied")
+
+
+def test_the_fixtures_do_not_depend_on_hash_randomisation():
+    """
+    THE FLAKE. Python's string hash is salted per process unless
+    PYTHONHASHSEED is set, so a fixture keyed on it assigned different dt
+    values and blow-up flags on every run: the y-limit test passed here and
+    failed on another machine for no reason but the seed. Fixtures use
+    zlib.crc32 instead.
+    """
+    import pathlib
+
+    # The pattern is ASSEMBLED rather than written out: spelled literally it
+    # would appear in this test's own source and match itself. (Comments are
+    # stripped by source_without_comments; docstrings are not.)
+    pattern = "abs(" + "hash("
+    src = pathlib.Path(__file__).resolve().read_text(encoding="utf-8")
+    assert pattern not in src, (
+        "a fixture is keyed on Python's salted string hash, so its data "
+        "changes between runs"
+    )
+
+
+def test_the_causal_baseline_is_the_second_row(monkeypatch, tmp_path):
+    """
+    Immediately under the truth, because it is the bar every model row has to
+    clear: what the PAST alone predicts, with no model. Measured on real
+    data, it beats z1 outright beyond dt ~ 1e3.
+    """
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+    _traj_stub(monkeypatch)
+    monkeypatch.setattr(cf, "compute_causal_trajectory",
+                         lambda *a, **k: [np.zeros((8, 8)) for _ in range(5)])
+    captured = {}
+    original = plt.subplots
+
+    def spy(*args, **kwargs):
+        fig, axes = original(*args, **kwargs)
+        captured.setdefault("axes", axes)
+        return fig, axes
+
+    monkeypatch.setattr(plt, "subplots", spy)
+    cf._trajectory_figure(Path("T625_n050_s599"), list(range(5)),
+                           _model("128x128-stage3a"), _model("128x128-stage3b"),
+                           "cpu", False, "T", tmp_path / "t.png")
+    axes = captured["axes"]
+    assert axes.shape == (4, 5)
+    labels = [axes[r, 0].get_ylabel().replace("\n", " ") for r in range(4)]
+    assert labels[0] == "real"
+    assert labels[1].startswith("causal")
+    assert labels[2] == "stage 3a" and labels[3] == "stage 3b"
+    # and it carries its own loss/corr like the model rows
+    assert "loss=" in axes[1, 2].get_title()
+
+
+def test_a_window_at_a_runs_first_step_drops_the_causal_row(monkeypatch, tmp_path):
+    """A backward difference needs an EARLIER real frame. Without one the row
+    is omitted rather than faked."""
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+    _traj_stub(monkeypatch)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
+    captured = {}
+    original = plt.subplots
+
+    def spy(*args, **kwargs):
+        fig, axes = original(*args, **kwargs)
+        captured.setdefault("axes", axes)
+        return fig, axes
+
+    monkeypatch.setattr(plt, "subplots", spy)
+    cf._trajectory_figure(Path("r"), list(range(5)), _model("128x128-stage3a"),
+                           _model("128x128-stage3b"), "cpu", False, "T",
+                           tmp_path / "t.png")
+    axes = captured["axes"]
+    assert axes.shape == (3, 5), "the causal row was fabricated without data"
+    assert [axes[r, 0].get_ylabel() for r in range(3)] == [
+        "real", "stage 3a", "stage 3b"]
+
+
+def test_the_causal_estimate_is_backward_not_centered():
+    """
+    A centered difference sees z0(t+dt) and would be scored against that same
+    frame -- it is a smoothness probe, not an achievable predictor. The
+    baseline must use only frames available at prediction time.
+    """
+    import inspect
+    src = inspect.getsource(cf.compute_causal_trajectory)
+    assert "z0_dot_back = (z0_t - z0_prev) / dt_minus" in src
+    assert "saved.index(steps[0]) - 1" in src, (
+        "the earlier frame is not the run's own previous SAVED step"
+    )
+    # frozen and extrapolated: a causal derivative cannot be re-estimated
+    # once the trajectory leaves the data
+    assert "z0_t + z0_dot_back * elapsed" in src
+
+
+def test_metric_keys_travel_with_their_row():
+    """The row->key mapping was derived from the row INDEX, which stopped
+    being readable once the causal row could be present or absent."""
+    import inspect
+    src = inspect.getsource(cf._trajectory_figure)
+    assert "for row, (label, frames, metric_key) in enumerate(rows):" in src
+    assert "metrics[metric_key][col]" in src
+
+
+def _causal_io_stub(monkeypatch, save_steps, seen_reads):
+    import types
+
+    class FakeMeta:
+        dt, temperature, T0 = 1.0, 900.0, 800.0
+
+    FakeMeta.save_steps = save_steps
+    monkeypatch.setattr(cf.load, "read_metadata", lambda p: FakeMeta())
+    monkeypatch.setattr(cf.load, "snapshot_filename", lambda s: f"s{s}")
+
+    def read(path, nx, ny):
+        seen_reads.append(str(path).rsplit("s", 1)[-1])
+        return np.full((nx, ny), float(len(seen_reads)), dtype=np.float32)
+
+    monkeypatch.setattr(cf.load, "read_phi_half", read)
+    monkeypatch.setattr(cf, "resolve_stream_configs_from_checkpoint_config",
+                         lambda cfg: (None, "recon"))
+
+    def encoder(x, theta=None):
+        # z0 = frame index, so the backward difference is exactly 1 per frame
+        n = x.shape[0]
+        vals = torch.arange(n, dtype=torch.float32).view(n, 1, 1, 1)
+        return {"recon": vals.expand(n, 1, 2, 2).clone()}
+
+    decoded = []
+
+    def decoder(z):
+        decoded.append(float(z.flatten()[0]))
+        return torch.zeros(z.shape[0], 1, 8, 8)
+
+    return types.SimpleNamespace(encoder=encoder, decoder=decoder), decoded
+
+
+def test_causal_returns_None_at_a_runs_first_saved_step(monkeypatch):
+    """A backward difference needs an EARLIER saved frame; there is none at
+    the start of a run, and inventing one would fabricate the baseline."""
+    from pathlib import Path
+    reads = []
+    ae, _ = _causal_io_stub(monkeypatch, [100, 200, 300, 400], reads)
+    out = cf.compute_causal_trajectory(Path("r"), [100, 200, 300], ae,
+                                        {"size": 8}, "cpu")
+    assert out is None, "a window at the run's first step produced a baseline"
+    assert reads == [], "frames were read despite there being no earlier one"
+
+
+def test_causal_differences_the_PREVIOUS_saved_step(monkeypatch):
+    """Not the next one, and not a centered pair: only frames available at
+    prediction time."""
+    from pathlib import Path
+    reads = []
+    ae, _ = _causal_io_stub(monkeypatch, [100, 200, 300, 400], reads)
+    out = cf.compute_causal_trajectory(Path("r"), [300, 400], ae,
+                                        {"size": 8}, "cpu")
+    assert out is not None
+    assert reads == ["200", "300"], (
+        f"read frames {reads}; the baseline must difference 300 against the "
+        f"PREVIOUS saved step 200"
+    )
+
+
+def test_causal_freezes_the_slope_and_extrapolates(monkeypatch):
+    """
+    The slope is estimated ONCE from (prev_step, t0) and held: a causal
+    estimate needs two real PAST frames, and there are none once the
+    trajectory leaves the data. Frame k is z0(t0) + slope * elapsed_k, so
+    growth is linear in elapsed time from the start -- NOT re-read from
+    later real frames (that would be teacher-forced, and the frozen baseline
+    already beats both models, so strengthening it is pointless).
+    """
+    from pathlib import Path
+    reads = []
+    ae, decoded = _causal_io_stub(monkeypatch, [0, 100, 200, 300, 400], reads)
+    out = cf.compute_causal_trajectory(Path("r"), [100, 200, 300, 400], ae,
+                                        {"size": 8}, "cpu")
+    assert out is not None and len(out) == 4
+    # Only (prev_step, t0) are read -- the later window frames are NOT, which
+    # is what "frozen" means and what keeps it a fair rollout baseline.
+    assert reads == ["0", "100"], (
+        f"reads {reads}: a frozen causal baseline reads only the two frames "
+        f"before the window, not the window's own later frames"
+    )
+    # z0(prev)=0, z0(t0)=1 over dt_minus=100 -> slope 0.01; elapsed 0,100,200,
+    # 300 -> 1.0, 2.0, 3.0, 4.0
+    assert decoded == pytest.approx([1.0, 2.0, 3.0, 4.0], rel=1e-5), decoded
+
+
+def test_causal_is_a_frozen_extrapolation_not_teacher_forced(monkeypatch):
+    """The slope must not be re-estimated from later real frames: the frozen
+    baseline is the honest apples-to-apples one, and it already wins."""
+    import inspect
+    src = inspect.getsource(cf.compute_causal_trajectory)
+    assert "z0_dot_back = (z0_t - z0_prev) / dt_minus" in src
+    assert "z0_t + z0_dot_back * elapsed" in src
+    assert "z0_real[k - 1:k]" not in src, (
+        "the slope is being re-read from later real frames -- teacher-forced, "
+        "not the frozen rollout baseline"
+    )
+
+
+def _stats_with_causal(monkeypatch, n=40):
+    """a/b collapse; causal predicts a small varying delta on every window."""
+    def traj(run_dir, steps, ae, f_theta, ae_config, device, z1_resync):
+        m = len(steps)
+        i = zlib.crc32(str(run_dir).encode()) % 997
+        rng = np.random.default_rng(i)
+        real = [rng.normal(size=(8, 8)) * (1 + 0.05 * k) for k in range(m)]
+        return real, [real[k] + 0.02 * k for k in range(m)], [250.0] * (m - 1)
+
+    def caus(run_dir, steps, ae, ae_config, device):
+        m = len(steps)
+        i = zlib.crc32(str(run_dir).encode()) % 997
+        rng = np.random.default_rng(i)
+        real = [rng.normal(size=(8, 8)) * (1 + 0.05 * k) for k in range(m)]
+        return [real[k] + 0.05 * rng.normal(size=(8, 8)) for k in range(m)]
+
+    monkeypatch.setattr(cf, "compute_trajectory", traj)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", caus)
+    a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
+    windows = [(f"T{500 + i}_n020_s{i}", list(range(9))) for i in range(n)]
+    return cf.collect_stats(a, b, windows, "cpu", False), a, b
+
+
+def test_stats_collect_a_causal_series_with_its_own_dt(monkeypatch):
+    """The baseline is absent on windows with no pre-window frame, so it
+    carries its own endpoint and dt arrays rather than aligning to a/b."""
+    stats, a, b = _stats_with_causal(monkeypatch)
+    assert len(stats["step_loss_causal"]) == 40
+    assert len(stats["loss_causal"]) == len(stats["dt_causal"]) == 40
+
+
+def test_the_causal_curve_is_on_all_six_stats_panels(monkeypatch, tmp_path):
+    """It is the bar the models must clear, so it belongs on every view --
+    both distributions, both-vs-dt, and both-vs-steps."""
+    import matplotlib.pyplot as plt
+    stats, a, b = _stats_with_causal(monkeypatch)
+    captured = {}
+    original = plt.subplots
+
+    def spy(*args, **kwargs):
+        fig, axes = original(*args, **kwargs)
+        captured.setdefault("axes", axes)
+        return fig, axes
+
+    monkeypatch.setattr(plt, "subplots", spy)
+    cf._stats_figure(stats, a, b, "T", tmp_path / "s.png")
+    axes = captured["axes"]
+    for r in range(2):
+        for c in range(3):
+            legend = axes[r, c].get_legend()
+            labels = [t.get_text() for t in legend.get_texts()]
+            assert any("causal" in t for t in labels), (
+                f"panel [{r},{c}] has no causal curve: {labels}"
+            )
+
+
+def test_the_causal_curve_is_absent_when_no_window_had_a_baseline(monkeypatch, tmp_path):
+    """If every window starts at its run's first step there is no baseline,
+    and the figure must not invent an empty green line."""
+    import matplotlib.pyplot as plt
+    _traj_stub_collapsing(monkeypatch)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
+    a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
+    windows = [(f"run{i}", list(range(5))) for i in range(10)]
+    stats = cf.collect_stats(a, b, windows, "cpu", False)
+    assert stats["step_loss_causal"] == []
+    captured = {}
+    original = plt.subplots
+
+    def spy(*args, **kwargs):
+        fig, axes = original(*args, **kwargs)
+        captured.setdefault("axes", axes)
+        return fig, axes
+
+    monkeypatch.setattr(plt, "subplots", spy)
+    cf._stats_figure(stats, a, b, "T", tmp_path / "s.png")
+    labels = [t.get_text()
+              for t in captured["axes"][0, 2].get_legend().get_texts()]
+    assert not any("causal" in t for t in labels)
+
+
+def test_causal_vs_dt_uses_its_OWN_dt_array(monkeypatch, tmp_path):
+    """
+    The baseline is absent on some windows, so its endpoint list is shorter
+    than a/b's. Binning it against the a/b dt array (one entry per window)
+    would pair causal losses with the wrong dt -- an index shift that
+    silently mislabels every causal point. Its own dt_causal array is the
+    only correct partner.
+    """
+    import matplotlib.pyplot as plt
+
+    calls = {"n": 0}
+
+    def traj(run_dir, steps, ae, f_theta, ae_config, device, z1_resync):
+        n = len(steps)
+        i = zlib.crc32(str(run_dir).encode()) % 997
+        rng = np.random.default_rng(i)
+        real = [rng.normal(size=(8, 8)) * (1 + 0.05 * k) for k in range(n)]
+        # dt rises steeply with the run index, so a one-window shift moves a
+        # causal point into a visibly different dt bin
+        dt = 100.0 * (i % 20 + 1)
+        return real, [real[k] + 0.02 * k for k in range(n)], [dt] * (n - 1)
+
+    def caus(run_dir, steps, ae, ae_config, device):
+        # No baseline for the first few runs -> causal arrays are SHORTER
+        if str(run_dir).endswith(("s0", "s1", "s2")):
+            return None
+        n = len(steps)
+        rng = np.random.default_rng(1)
+        real = [rng.normal(size=(8, 8)) * (1 + 0.05 * k) for k in range(n)]
+        return [real[k] + 0.05 * rng.normal(size=(8, 8)) for k in range(n)]
+
+    monkeypatch.setattr(cf, "compute_trajectory", traj)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", caus)
+    a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
+    windows = [(f"T500_n020_s{i}", list(range(9))) for i in range(20)]
+    stats = cf.collect_stats(a, b, windows, "cpu", False)
+
+    assert len(stats["loss_causal"]) < len(stats["loss_a"]), (
+        "fixture failed to make the causal list shorter"
+    )
+    assert len(stats["loss_causal"]) == len(stats["dt_causal"]), (
+        "causal endpoints and their dt array have drifted out of step"
+    )
+    # the binning must consume exactly as many dt as losses
+    from evaluation.compare_f_theta import _binned
+    c, med, _, _ = _binned(np.array(stats["dt_causal"]),
+                            np.array(stats["loss_causal"]))
+    assert c.size > 0
+
+
+def test_the_cdf_panels_put_the_quantity_on_the_y_axis(monkeypatch, tmp_path):
+    """
+    Flipped so loss and correlation sit on the SAME y axis as the vs-dt and
+    vs-steps panels beside them: the three views of one metric can then be
+    read straight across. Cumulative fraction moves to x.
+    """
+    stats, a, b = _stats_for_figure(monkeypatch, blow_up_every=0)
+    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
+    assert axes[0, 0].get_xlabel() == "cumulative fraction of windows"
+    assert axes[0, 0].get_ylabel() == "end-to-end loss"
+    assert axes[0, 0].get_yscale() == "log"
+    assert axes[1, 0].get_xlabel() == "cumulative fraction of windows"
+    assert axes[1, 0].get_ylabel().startswith("correlation")
+    # and the loss CDF shares its y scale with loss-vs-dt and loss-vs-steps
+    assert axes[0, 1].get_yscale() == "log" and axes[0, 2].get_yscale() == "log"
+
+
+def test_the_two_last_step_aggregations_are_over_different_populations():
+    """
+    The apparent loss-vs-dt / loss-vs-steps disagreement at the last step is
+    NOT a bug: vs-steps medians over ALL windows at step k, vs-dt bins the
+    same endpoints by dt_total, so the rightmost points are medians over
+    different subpopulations. The titles say so, and the endpoint feeding
+    both is provably the same value.
+    """
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/compare_f_theta.py")
+    # endpoint used by the CDF / vs-dt panels is literally the last per-step
+    assert 'row[key] = {"loss": losses_k[-1], "corr": corrs_k[-1]}' in src
+    assert "all windows per step" in src
+
+
+def test_the_whole_correlation_row_shares_one_y_range(monkeypatch, tmp_path):
+    """
+    The CDF [1,0], vs-dt [1,1] and vs-steps [1,2] are all correlation, so
+    they share ONE y range and read straight across -- including the y-min.
+    _corr_axis pins each to span 0..100, but the vs-dt/vs-steps panels dip
+    negative (a model anticorrelated with truth) while the CDF, bounded by
+    its own worst window, need not, so without the union they misaligned at
+    the bottom.
+    """
+    stats, a, b = _stats_for_figure(monkeypatch, blow_up_every=0)
+    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
+    r0, r1, r2 = (axes[1, 0].get_ylim(), axes[1, 1].get_ylim(),
+                   axes[1, 2].get_ylim())
+    assert r0 == r1 == r2, (
+        f"correlation panels have y ranges {r0}, {r1}, {r2} -- the row does "
+        f"not read across"
+    )
+
+
+def test_a_negative_correlation_min_reaches_the_cdf_panel(monkeypatch, tmp_path):
+    """
+    When a model goes anticorrelated the vs-dt panel's y-min is negative; the
+    CDF must inherit that same floor, not stay pinned at 0, or the two panels
+    in the row cannot be compared at the bottom.
+    """
+    def traj(run_dir, steps, ae, f_theta, ae_config, device, z1_resync):
+        n = len(steps)
+        i = zlib.crc32(str(run_dir).encode()) % 997
+        rng = np.random.default_rng(i)
+        real = [rng.normal(size=(8, 8)) * (1 + 0.05 * k) for k in range(n)]
+        # An INTERMEDIATE step is the most anticorrelated -- the endpoint
+        # recovers. The endpoint-based CDF [1,0] therefore never sees the
+        # most negative value, only the vs-steps panel [1,2] does, so the
+        # three panels have DIFFERENT natural floors and min-vs-max matters.
+        pred = []
+        for k in range(n):
+            if k < 2:
+                pred.append(real[k])
+            elif k == n // 2:
+                pred.append(-real[k] * 3.0)          # deep negative, mid-window
+            else:
+                pred.append(real[k] * 0.9)           # endpoint back near +1
+        return real, pred, [400.0 * (1 + i % 6)] * (n - 1)
+
+    monkeypatch.setattr(cf, "compute_trajectory", traj)
+    monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
+    a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
+    windows = [(f"T500_n020_s{i}", list(range(9))) for i in range(60)]
+    stats = cf.collect_stats(a, b, windows, "cpu", False)
+    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
+    # the vs-steps panel dips well below the CDF's own endpoint floor
+    steps_floor = axes[1, 2].get_ylim()[0]
+    assert steps_floor < 0, "fixture did not drive an intermediate step negative"
+    # every panel shares that MOST-negative floor -- a max() union would have
+    # clipped the vs-steps band instead
+    shared_lo = axes[1, 0].get_ylim()[0]
+    assert shared_lo == steps_floor, (
+        f"CDF floor {shared_lo} != vs-steps floor {steps_floor}: the union "
+        f"took max() and the deepest panel was clipped"
+    )
+    for panel in (axes[1, 0], axes[1, 1], axes[1, 2]):
+        for coll in panel.collections:
+            verts = coll.get_paths()[0].vertices
+            assert verts[:, 1].min() >= shared_lo - 1e-6, (
+                "a quartile band extends below the shared floor"
+            )

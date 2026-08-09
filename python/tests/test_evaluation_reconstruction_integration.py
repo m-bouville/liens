@@ -409,3 +409,189 @@ def test_check_reconstruction_derivative_panel_uses_6_cols_with_symmetric_d0(tmp
     assert_figure_was_really_written(output_path)
     axes = captured["axes"]
     assert axes.shape[1] == 6, f"expected 6 columns with a derivative panel, got {axes.shape[1]}"
+
+
+def test_second_derivative_is_the_deriv_streams_own_difference():
+    """
+    d2z0/dt2 = (z1(t+dt) - z1(t)) / dt, from the encoder's deriv stream.
+
+    WHY IT MATTERS. |dz0| saturates with dt, so dz0/dt falls as 1/dt BY
+    CONSTRUCTION and the first-order term z1*dt is bounded -- that argues for
+    no max_dt at all. The dt^2/2 term is multiplied by the SECOND derivative,
+    so it is that curve, not dz0/dt, which can justify a limit.
+    """
+    import inspect
+
+    from evaluation import _latent_eval
+    src = inspect.getsource(_latent_eval._evaluate_windows)
+    assert "z1_next = window1[:, 1]" in src, (
+        "the second derivative is not taken from the deriv stream's own "
+        "next frame"
+    )
+    # UNDIVIDED here: the figure divides by the GROUP's dt, matching how it
+    # forms dz0/dt from dz0.
+    assert "dz1_signed_batch = _per_sample_signed_mean(z1_next, z1_t)" in src
+    assert "dz1_abs_batch = _per_sample_l1(z1_next, z1_t)" in src
+    assert "_per_sample_l1(z1_next, z1_t) / dt" not in src
+
+
+def test_second_derivative_arrays_are_numpy_like_the_others():
+    """The plotting path indexes these with boolean masks; leaving them as
+    Python lists raised 'only integer scalar arrays can be converted'."""
+    import inspect
+
+    from evaluation import _latent_eval
+    src = inspect.getsource(_latent_eval._evaluate_windows)
+    assert "dz1_signed = np.array(dz1_signed)" in src
+    assert "dz1_abs = np.array(dz1_abs)" in src
+
+
+def test_the_dz0_figure_has_a_third_row():
+    import inspect
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/check_parameter_dependence.py")
+    assert "plt.subplots(3, 2" in src, "the dz0 figure still has only two rows"
+    assert '"d2z0/dt2", 2' in src
+
+
+def test_the_ratio_row_divides_grouped_dz0_by_the_group_dt():
+    """
+    |mean dz0| / dt and mean|dz0| / dt -- the row above's two curves, each
+    divided by the group's dt. NOT mean(dz0/dt): averaging per-window ratios
+    is a different quantity whenever dt varies within a group, which it does
+    across every t group.
+    """
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/check_parameter_dependence.py")
+    assert "t_signed_y = np.abs(_t_sig) / _t_dt_mean" in src
+    assert "t_abs_y = t_abs_y / _t_dt_mean" in src
+    assert 'signed_label = f"|mean {name}|"' in src
+    assert 'abs_label = f"mean|{name}|"' in src
+
+
+def test_the_ratio_row_uses_one_log_axis_not_a_twin_pair():
+    """Both curves are positive and share a unit, so a twin pair on two
+    linear scales would hide the ratio between them -- which is how much of
+    the motion cancels across windows, the point of the row."""
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/check_parameter_dependence.py")
+    assert "twin_t = ax_t if one_axis else ax_t.twinx()" in src
+    assert "one_axis = True" in src, "not every panel uses the single axis"
+    # and a log axis cannot take a symmetric-about-zero range, so the
+    # alignment helper must be reached only on the twin-axis rows
+    assert "left_ylim, right_ylim = _symmetric_left_zero_right_ylim(" in src
+    context = src[:src.rindex("_symmetric_left_zero_right_ylim(")][-1200:]
+    assert "if one_axis:" in context and "else:" in context, (
+        "the symmetric-about-zero alignment is applied unconditionally; on a "
+        "log axis its lower bound is -inf"
+    )
+
+
+def test_axis_limits_are_data_driven_not_hardcoded():
+    """
+    The fixed left edges (10 for dt, 1000 for t) left two empty decades on
+    every panel: min_stdev_phi drops the near-uniform early frames, so the
+    first kept step is already ~1e5 and the smallest dt ~700. Empty decades
+    make one decade of data look like a plateau.
+    """
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/check_parameter_dependence.py")
+    assert "_x_left = float(_positive_dts.min()) / 1.5 if len(_positive_dts) else 10" in src
+    assert "_t_left = float(_positive_t.min()) / 1.5 if len(_positive_t) else 1000" in src
+    assert "if dedimensionalize and len(_positive_dts)" not in src
+
+
+def test_every_dz0_panel_uses_the_single_log_axis_form():
+    """
+    All six panels: |mean X| and mean|X| on ONE log axis. Not just the
+    ratio row -- the same comparison (how much cancels across windows) is
+    the point of every row, and a twin linear pair hides it everywhere.
+    """
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/check_parameter_dependence.py")
+    assert "one_axis = True" in src
+    assert "t_signed_y, dt_signed_y = np.abs(_t_sig), np.abs(_dt_sig)" in src, (
+        "the signed curve is not folded to its magnitude, so it cannot share "
+        "a log axis"
+    )
+
+
+def test_legend_entries_are_not_duplicated_on_a_single_axis():
+    """twin_t IS ax_t on these rows, so gathering handles from both listed
+    every curve twice."""
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/check_parameter_dependence.py")
+    assert "([], []) if twin_t is ax_t" in src
+    assert "([], []) if twin_dt is ax_dt" in src
+
+
+def test_dz0_panel_x_limits_come_from_the_plotted_curve():
+    """
+    A global minimum over all windows let one stray small-t window set the
+    left edge, leaving two empty decades on a panel whose curve starts at
+    ~1e5. Each panel is bounded by its own x values.
+    """
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/check_parameter_dependence.py")
+    assert "_finite_t = t_x[np.isfinite(t_x) & (t_x > 0)]" in src
+    assert "_finite_dt = dt_x[np.isfinite(dt_x) & (dt_x > 0)]" in src
+    assert "ax_t.set_xlim(left=_t_left)" not in src
+    assert "ax_dt.set_xlim(left=_x_left)" not in src
+
+
+def test_both_derivative_rows_use_the_same_reduction():
+    """
+    THE INCONSISTENCY. dz0/dt was formed by grouping dz0 and dividing by the
+    GROUP's dt, while d2z0/dt2 was formed by dividing per window and then
+    averaging -- mean|dz0|/mean(dt) against mean(dz1/dt). Those differ
+    whenever dt varies within a group, which it does across every t group:
+    on a group holding dt in {500, 1000, 2000, 4000} with a saturated
+    increment, the two reductions differ by 1.76x.
+
+    Two rows whose entire purpose is to be read against each other cannot be
+    computed two different ways.
+    """
+    import pathlib
+
+    from conftest import source_without_comments
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/check_parameter_dependence.py")
+    assert 'if name in ("dz0/dt", "d2z0/dt2"):' in src, (
+        "only one of the two derivative rows is divided by the group's dt"
+    )
+    # and the rows must feed on the RAW increments, not pre-divided arrays
+    assert '(results.dz0_signed, results.dz0_abs, "dz0/dt", 1)' in src
+    assert '(results.dz1_signed, results.dz1_abs, "d2z0/dt2", 2)' in src
+    assert "results.dz0dt_signed, results.dz0dt_abs" not in src.split(
+        "panel_rows = [")[1][:400]
+
+
+def test_the_two_reductions_really_differ():
+    """Guards the premise: if they agreed, the fix above would be cosmetic."""
+    import numpy as np
+    dt = np.array([500.0, 1000.0, 2000.0, 4000.0])
+    dz0 = np.full(4, 0.13)
+    per_window = float(np.mean(dz0 / dt))
+    grouped = float(np.mean(dz0) / np.mean(dt))
+    assert abs(per_window / grouped - 1.0) > 0.5
