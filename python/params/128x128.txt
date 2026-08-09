@@ -116,14 +116,14 @@ max_dt        = 2000   # 2000/0.05 = 40'000 time steps
 
 # Stage 3b
 #   latent dynamics surrogate (rollout)
-n_rollout_steps=  2			# always > 1 for 3b
-z1_resync      = True		# always False for 3b
+n_rollout_steps=  3			# always > 1 for 3b
+z1_resync      = False		# always False for 3b
 
 alpha			= 1.5		# adaptative sub-step
-max_substeps    =  96		# default: 256
+max_substeps    = 128		# default: 256
 bucket_batches 	= True		# default: True
 target_vram_gib = same
-truncate_bptt 	= 64
+truncate_bptt 	=  64
 bucket_refresh_epochs=0
 
 memory_cost_a_bytes= 120787
@@ -134,7 +134,7 @@ memory_cost_p      = 0.79
 
 rollout_scale  = 1.e-6			# was 1e-6
 ae_stats_weight= 1.
-one_step_weight= 0.5 		# was 0.5
+one_step_weight= 5. 		# was 0.5
 
 use_dt_decade_weights = same
 
@@ -145,12 +145,13 @@ num_workers	  =    4
 batches		  = 4096
 # min_batch_size=  512 		# not implemented, TODO?
 spike_skip_factor= same
+grad_spike_factor = 0        # disable the gradient guard; grad_clip does the bounding
 
 lr 			  =   3.e-6  	# was 3.e-6; default: 1.e-3
 z0_noise_scale=   0.02
 
 dt_cap		  = same		# must be
-max_dt        = 1000 
+max_dt        = 2000 
 
 force 	      = True
 

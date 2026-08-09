@@ -145,6 +145,7 @@ def check_substep_convergence(lds_checkpoint_path: Path,
                                n_windows: int = 256,
                                counts: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64),
                                max_dt: float | None = None,
+                               window_length: int | None = None,
                                latent_cache_dir: Path | str | None = None) -> dict:
     ctx = _load_ae_f_theta_and_dataset(
         lds_checkpoint_path, min_step=None, min_stdev_phi=None,
@@ -152,6 +153,7 @@ def check_substep_convergence(lds_checkpoint_path: Path,
         ae_stats_weight=None, hidden_dim=256, n_hidden_layers=2,
         condition_on_theta=None, euler_only=None, device=device,
         announce_euler_only=False, max_dt=max_dt,
+        window_length_override=window_length,
         latent_cache_dir=latent_cache_dir)
     resolved_device, _, _, _, dataset, _, f_theta = ctx
     f_theta.eval()
@@ -212,6 +214,13 @@ def main() -> None:
     parser.add_argument("--n-windows", type=int, default=256)
     parser.add_argument("--counts", type=str, default="1,2,4,8,16,32,64",
                          help="comma-separated step counts, ascending")
+    parser.add_argument("--window-length", type=int, default=None,
+                         help="override the window length the checkpoint's "
+                              "n_rollout_steps implies. ALSO REQUIRED for comparing "
+                              "checkpoints across stages: a 3a checkpoint builds "
+                              "window_length=2 and a 3b one builds 3, and requiring "
+                              "a second valid transition biases the population "
+                              "toward earlier, faster-evolving states")
     parser.add_argument("--max-dt", type=float, default=None,
                          help="override the checkpoint's own max_dt. REQUIRED for "
                               "comparing two checkpoints: each one's config filters "
@@ -220,7 +229,8 @@ def main() -> None:
     args = parser.parse_args()
     check_substep_convergence(
         args.checkpoint, base_path=args.base_path, size=args.size,
-        device=args.device, n_windows=args.n_windows, max_dt=args.max_dt, 
+        device=args.device, n_windows=args.n_windows, max_dt=args.max_dt,
+        window_length=args.window_length, 
         counts=tuple(int(x) for x in args.counts.split(",")))
 
 

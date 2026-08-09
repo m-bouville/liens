@@ -33,6 +33,7 @@ _SITES = [
     "evaluation/check_rollout.py",
     "training/model_assembly.py",
     "evaluation/compare_rollout_training.py",
+    "evaluation/compare_f_theta.py",
 ]
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 # Parameters that alter what the loaded weights MEAN or how they are applied.

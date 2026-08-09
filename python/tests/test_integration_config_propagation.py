@@ -39,6 +39,7 @@ _REBUILD_SITES = [
     "evaluation/_latent_eval.py",
     "evaluation/compare_rollout_training.py",
     "evaluation/compare_integrators.py",
+    "evaluation/compare_f_theta.py",
 ]
 
 

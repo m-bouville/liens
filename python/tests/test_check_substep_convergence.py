@@ -190,3 +190,30 @@ def test_the_default_warns_that_floors_are_not_comparable():
         "the comparability warning is not printed at run time"
     )
     assert "not comparable" in src
+
+
+def test_window_length_can_be_overridden_for_cross_stage_comparison():
+    """
+    THE SECOND POPULATION CONFOUND, after max_dt. A 3a checkpoint
+    (n_rollout_steps=1) builds window_length=2 and a 3b one builds 3;
+    requiring a second consecutive valid transition selects earlier,
+    faster-evolving -- harder -- windows. So "3a scores 0.1492 where 3b
+    scores 0.1631" compared two different populations, and the degradation
+    claim built on it was unsupported. Passing --window-length 3 to BOTH
+    makes the sets identical.
+    """
+    import inspect
+    import pathlib
+
+    from conftest import source_without_comments
+    from evaluation.check_substep_convergence import check_substep_convergence
+    sig = inspect.signature(check_substep_convergence).parameters
+    assert "window_length" in sig and sig["window_length"].default is None
+
+    src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
+                                   / "evaluation/check_substep_convergence.py")
+    assert "window_length_override=window_length" in src, (
+        "the override never reaches the dataset loader, so both stages still "
+        "build their own window_length and the populations differ"
+    )
+    assert "--window-length" in src and "window_length=args.window_length" in src
