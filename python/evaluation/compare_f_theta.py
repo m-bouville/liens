@@ -44,6 +44,7 @@ tool itself prints, for a repeatable rerun on later checkpoints.
 """
 import argparse
 import re
+import contextlib
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -140,8 +141,15 @@ def _select_windows(model: dict, n_samples: int, n_steps: int, seed: int,
         min_stdev_phi=data_config.get("min_stdev_phi"),
     )
     if len(dataset) < n_samples:
-        raise ValueError(f"only {len(dataset)} windows available for "
-                          f"{n_samples} samples at window_length={n_steps + 1}")
+        # CLAMP, don't abort. "Give me 5000" means "give me as many as you
+        # have" -- the whole population is the best answer to that, and
+        # aborting after the dataset is already built throws the work away.
+        # The count is printed so the figure's window count is never a
+        # surprise.
+        print(f"  only {len(dataset)} windows available at "
+              f"window_length={n_steps + 1} (asked for {n_samples}); "
+              f"using all of them")
+        n_samples = len(dataset)
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(len(dataset), generator=generator)[:n_samples].tolist()
     windows = []
@@ -162,7 +170,7 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
     """
     recon_loss = ReconLoss()
     out = {"loss_a": [], "loss_b": [], "corr_a": [], "corr_b": [],
-            "dt": [], "n_corr_undefined": 0,
+            "dt": [], "temperature": [], "n_corr_undefined": 0,
             # PER-STEP: index k holds every window's value after k chained
             # applications. The collapse is counted in APPLICATIONS, not in
             # elapsed time -- two runs with different per-step dt broke at the
@@ -175,7 +183,12 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
             # carries its OWN endpoint and dt arrays rather than aligning to
             # the a/b ones, which cover every window.
             "step_loss_causal": [], "step_corr_causal": [],
-            "loss_causal": [], "corr_causal": [], "dt_causal": []}
+            "loss_causal": [], "corr_causal": [], "dt_causal": [],
+            "temp_causal": [],
+            # Stage 2 alone (z0 + z1*dt, no f_theta) -- present for every
+            # window, unlike causal, so it needs no separate dt/T arrays.
+            "step_loss_stage2": [], "step_corr_stage2": [],
+            "loss_stage2": [], "corr_stage2": []}
 
     def _series(real_frames, pred_frames):
         losses_k, corrs_k = [], []
@@ -204,6 +217,19 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
             # two views of the same run cannot disagree.
             row[key] = {"loss": losses_k[-1], "corr": corrs_k[-1]}
 
+        # Per-window temperature, read once from the run's own metadata (the
+        # same file the trajectory paths came from), used by the vs-T panels.
+        meta = load.read_metadata(Path(run_dir) / "metadata.txt")
+        temperature = meta.temperature
+
+        stage2 = compute_stage2_trajectory(run_dir, steps, a["ae"],
+                                            a["ae_config"], device)
+        s2_loss, s2_corr = _series(real_frames, stage2)
+        out["step_loss_stage2"].append(s2_loss)
+        out["step_corr_stage2"].append(s2_corr)
+        out["loss_stage2"].append(s2_loss[-1])
+        out["corr_stage2"].append(s2_corr[-1])
+
         causal = compute_causal_trajectory(run_dir, steps, a["ae"],
                                             a["ae_config"], device)
         if causal is not None:
@@ -213,7 +239,9 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
             out["loss_causal"].append(c_loss[-1])
             out["corr_causal"].append(c_corr[-1])
             out["dt_causal"].append(dt_total)
+            out["temp_causal"].append(temperature)
         out["dt"].append(dt_total)
+        out["temperature"].append(temperature)
         for key in ("a", "b"):
             out[f"loss_{key}"].append(row[key]["loss"])
             out[f"corr_{key}"].append(row[key]["corr"])
@@ -262,6 +290,61 @@ def _binned(dt: np.ndarray, values: np.ndarray, n_bins: int = 8):
     return (np.array(centres), np.array(med), np.array(lo), np.array(hi))
 
 
+def _moving_window(x: np.ndarray, values: np.ndarray, half_width: int = 2):
+    """Moving window over the DISTINCT x values -- no binning.
+
+    For each distinct temperature T, the reported set is every window whose
+    temperature is T or one of the `half_width` distinct values either side
+    of it. Bins would impose arbitrary edges on a narrow, densely-sampled
+    range and let a bin's population change discontinuously; a window that
+    slides one sweep value at a time keeps every point on a real temperature
+    and makes neighbouring points overlap smoothly.
+
+    Returns (x, MEDIAN, q25, q75, N) -- N being how many windows each point
+    rests on, so a quartile band computed from two or three windows can be
+    told apart from one computed from fifty. MEDIAN, not mean: the loss distribution
+    is heavy-tailed enough that one diverged window in six drags the mean
+    ~17 decades above the 75th percentile, so a mean would be plotted
+    outside its own quartile band. The median is bracketed by the band by
+    construction, and matches the reduction every other panel uses.
+    """
+    good = np.isfinite(x) & np.isfinite(values)
+    x, values = x[good], values[good]
+    empty = np.array([])
+    if x.size == 0:
+        # FIVE values on every path -- the count array is part of the
+        # contract, and returning four here raised only when a panel had no
+        # finite data at all.
+        return empty, empty, empty, empty, empty
+    counts = []
+    uniq = np.unique(x)
+    centres, med, lo, hi = [], [], [], []
+    # ONLY FULL WINDOWS. The first and last `half_width` values can only draw
+    # on a truncated set (3 temperatures instead of 5), so their point is a
+    # different, noisier statistic plotted on the same line -- exactly at the
+    # ends of the range where the interesting behaviour is. Dropped rather
+    # than shown alongside full-window points.
+    # If trimming would leave nothing (fewer than 2*half_width+1 distinct
+    # values -- e.g. a single-temperature sweep), fall back to every value
+    # with whatever window it has: an empty panel hides the data entirely,
+    # which is worse than a partial window honestly labelled.
+    trim = half_width if len(uniq) > 2 * half_width else 0
+    for i in range(trim, len(uniq) - trim):
+        v = uniq[i]
+        window = uniq[max(0, i - half_width):i + half_width + 1]
+        sel = np.isin(x, window)
+        if not sel.any():
+            continue
+        vals = values[sel]
+        centres.append(float(v))
+        counts.append(int(vals.size))
+        med.append(float(np.median(vals)))
+        lo.append(float(np.percentile(vals, 25)))
+        hi.append(float(np.percentile(vals, 75)))
+    return (np.array(centres), np.array(med), np.array(lo), np.array(hi),
+            np.array(counts))
+
+
 def _label_dt_axis(ax) -> None:
     """Number the dt axis at 2/3/5 x each decade, not once per decade.
 
@@ -291,6 +374,9 @@ def _label_dt_axis(ax) -> None:
     ax.tick_params(axis="x", which="minor", labelsize=7)
 
 
+_CORR_FLOOR = -20.0
+
+
 def _corr_axis(ax, vertical: bool = True) -> None:
     """Pin the correlation axis to span 0 and 100%.
 
@@ -301,7 +387,23 @@ def _corr_axis(ax, vertical: bool = True) -> None:
     setter = ax.set_ylim if vertical else ax.set_xlim
     getter = ax.get_ylim if vertical else ax.get_xlim
     lo, hi = getter()
-    setter(min(lo, -2.0), max(hi, 100.0))
+    # FLOOR AT -20%. A model can go arbitrarily anticorrelated once it leaves
+    # the manifold, and letting one such window set the axis to -300%
+    # squeezes the 0..100 band -- where every meaningful difference lives --
+    # into the top sliver of the panel. Curves below -20% run off the bottom.
+    setter(max(min(lo, -2.0), _CORR_FLOOR), max(hi, 100.0))
+
+
+def _temperature_axis(ax) -> None:
+    """Always show T = 1 on the axis.
+
+    T = 1 is the physically meaningful endpoint of the sweep, and the SMA
+    trims the last two sweep values, so the plotted points stop short of it.
+    Without the endpoint pinned, a panel ending at 0.97 looks like it covers
+    the whole range and the gap to T = 1 is invisible.
+    """
+    lo, hi = ax.get_xlim()
+    ax.set_xlim(lo, max(hi, 1.0))
 
 
 def _ylim_from_medians(ax, medians) -> None:
@@ -322,11 +424,25 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
                    output_path: Path) -> Path:
     """Four panels: loss and correlation, as distributions and against dt."""
     dt = np.array(stats["dt"], dtype=float)
-    fig, axes = plt.subplots(2, 3, figsize=(19, 9))
-    colours = {"a": "tab:blue", "b": "tab:red", "causal": "tab:green"}
+    fig, axes = plt.subplots(2, 4, figsize=(25, 9))
+    colours = {"a": "tab:blue", "b": "tab:red", "causal": "tab:green",
+                "stage2": "tab:purple"}
     labels = {"a": a["label"], "b": b["label"],
-              "causal": "causal (frozen dz0/dt)"}
+              "causal": "causal (frozen dz0/dt)",
+              "stage2": "stage 2 (z0 + z1 dt)"}
     has_causal = bool(stats.get("step_loss_causal"))
+    has_stage2 = bool(stats.get("step_loss_stage2"))
+
+    def _keys():
+        """Curves in the SAME order as the trajectory figure's rows:
+        causal, stage 2, 3a, 3b -- ordered by how much machinery each uses,
+        so the legends of the two figures read alike."""
+        out = []
+        if has_causal:
+            out.append("causal")
+        if has_stage2:
+            out.append("stage2")
+        return tuple(out) + ("a", "b")
 
     # LAYOUT: rows are the METRIC (loss, then correlation), columns the
     # VIEW (distribution, against dt, against number of steps). Transposed
@@ -342,7 +458,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     # with the loss-vs-dt and loss-vs-steps panels beside it and the three
     # can be read across at a glance. (A CDF with the value on y is the
     # quantile function; same curve, transposed.)
-    for key in (("a", "b", "causal") if has_causal else ("a", "b")):
+    for key in _keys():
         v = np.sort(np.array(stats[f"loss_{key}"], dtype=float))
         v = v[np.isfinite(v) & (v > 0)]
         if v.size:
@@ -357,7 +473,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
 
     # (1,0) correlation distribution
     ax = axes[1, 0]
-    for key in (("a", "b", "causal") if has_causal else ("a", "b")):
+    for key in _keys():
         v = np.array([c for c in stats[f"corr_{key}"] if c is not None],
                       dtype=float)
         if v.size:
@@ -373,7 +489,8 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
 
     # (0,1) loss against dt
     ax = axes[0, 1]
-    for key in (("a", "b", "causal") if has_causal else ("a", "b")):
+    dt_loss_medians = []
+    for key in _keys():
         key_dt = dt if key != "causal" else np.array(stats["dt_causal"],
                                                        dtype=float)
         c, med, lo, hi = _binned(key_dt, np.array(stats[f"loss_{key}"],
@@ -381,25 +498,26 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
         if c.size:
             ax.plot(c, med, "o-", color=colours[key], label=labels[key])
             ax.fill_between(c, lo, hi, color=colours[key], alpha=0.15)
+            dt_loss_medians.append(med)
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("dt_total")
+    ax.set_xlabel("dt_total (binned)")
     ax.set_ylabel("median loss (band: quartiles)")
     ax.set_title("loss vs dt")
-    # SHARE the loss CDF's y range (col 1, row 0), so the two loss panels in
-    # this row read straight across on one axis. The CDF shows the full
-    # spread of end-to-end losses; matching to it (rather than to these
-    # medians, whose diverged tail otherwise sets an axis 20 decades tall)
-    # keeps both panels legible AND aligned.
+    # loss-vs-dt is the REFERENCE range for the whole loss row: it is scaled
+    # to its medians (via the shared _ylim call at the end of the row), so
+    # the decades where the curves actually differ stay legible instead of
+    # being flattened by one window's diverged tail. The CDF and loss-vs-T
+    # adopt THIS range -- the row is matched to col 1 (vs dt), even though
+    # the CDF then loses its own tail off the top.
     axes[0, 1].set_yscale("log")
-    axes[0, 1].set_ylim(axes[0, 0].get_ylim())
     _label_dt_axis(ax)
     ax.grid(alpha=0.3, which="both")
     ax.legend()
 
     # (1,1) correlation against dt
     ax = axes[1, 1]
-    for key in (("a", "b", "causal") if has_causal else ("a", "b")):
+    for key in _keys():
         corr = np.array([np.nan if c is None else c
                           for c in stats[f"corr_{key}"]], dtype=float)
         key_dt = dt if key != "causal" else np.array(stats["dt_causal"],
@@ -409,7 +527,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
             ax.plot(c, med, "o-", color=colours[key], label=labels[key])
             ax.fill_between(c, lo, hi, color=colours[key], alpha=0.15)
     ax.set_xscale("log")
-    ax.set_xlabel("dt_total")
+    ax.set_xlabel("dt_total (binned)")
     ax.set_ylabel("median correlation (%) (band: quartiles)")
     ax.set_title("correlation vs dt")
     _corr_axis(ax)
@@ -417,13 +535,63 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     ax.grid(alpha=0.3, which="both")
     ax.legend()
 
-    # (0,2) and (1,2): against the NUMBER OF CHAINED STEPS. The trajectory
+    # (0,2) and (1,2): the SAME endpoints against TEMPERATURE. dt and T are
+    # collinear in this sweep (later frames are both larger dt and, through
+    # the run, a different T), so binning the identical endpoints by T
+    # instead of dt shows how much of the dt trend is really a T trend. The
+    # 40x swing in the Taylor-residual dt* across the T<0.9 / T>=0.9 split is
+    # the reason to look: error is a strong function of T here.
+    temp = np.array(stats["temperature"], dtype=float)
+    ax = axes[0, 2]
+    for key in _keys():
+        key_temp = (temp if key != "causal"
+                    else np.array(stats["temp_causal"], dtype=float))
+        c, med, lo, hi, n_win = _moving_window(
+            key_temp, np.array(stats[f"loss_{key}"], dtype=float))
+        if c.size:
+            ax.plot(c, med, "o-", color=colours[key], label=labels[key])
+            ax.fill_between(c, lo, hi, color=colours[key], alpha=0.15)
+            # How thin the tails get is not visible on the panel, and a
+            # quartile band over 2-3 windows is not a quartile band. Report
+            # it once per model rather than cluttering the figure.
+            print(f"  vs-T {labels[key]}: {n_win.min()}-{n_win.max()} windows "
+                  f"per point (median {int(np.median(n_win))}); "
+                  f"thinnest at T={c[int(np.argmin(n_win))]:.3f}")
+    ax.set_xlabel("temperature (SMA)")
+    _temperature_axis(ax)
+    ax.set_ylabel("median loss (band: quartiles)")
+    ax.set_title("loss vs temperature (moving window: T +/- 2 sweep values)")
+    # Same y range as the other loss panels in the row, so all three read
+    # across; the CDF sets it (see below, after that panel's range is fixed).
+    ax.set_yscale("log")
+    ax.grid(alpha=0.3, which="both")
+    ax.legend()
+
+    ax = axes[1, 2]
+    for key in _keys():
+        corr = np.array([np.nan if c is None else c
+                          for c in stats[f"corr_{key}"]], dtype=float)
+        key_temp = (temp if key != "causal"
+                    else np.array(stats["temp_causal"], dtype=float))
+        c, med, lo, hi, _n = _moving_window(key_temp, corr)
+        if c.size:
+            ax.plot(c, med, "o-", color=colours[key], label=labels[key])
+            ax.fill_between(c, lo, hi, color=colours[key], alpha=0.15)
+    ax.set_xlabel("temperature (SMA)")
+    _temperature_axis(ax)
+    ax.set_ylabel("median correlation (%) (band: quartiles)")
+    ax.set_title("correlation vs temperature (moving window: T +/- 2 sweep values)")
+    _corr_axis(ax)
+    ax.grid(alpha=0.3, which="both")
+    ax.legend()
+
+    # (0,3) and (1,3): against the NUMBER OF CHAINED STEPS. The trajectory
     # panels showed two runs with different per-step dt collapsing at the
     # same frame INDEX, so the failure is counted in applications rather
     # than elapsed time -- this is that axis, over the whole sample.
     step_loss_medians = []
-    step_keys = ("a", "b", "causal") if has_causal else ("a", "b")
-    for panel, kind in ((axes[0, 2], "loss"), (axes[1, 2], "corr")):
+    step_keys = _keys()
+    for panel, kind in ((axes[0, 3], "loss"), (axes[1, 3], "corr")):
         for key in step_keys:
             series = stats.get(f"step_{kind}_{key}") or []
             if not series:
@@ -451,33 +619,60 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
         panel.set_xlabel("chained steps applied")
         panel.grid(alpha=0.3, which="both")
         panel.legend()
-    axes[0, 2].set_yscale("log")
-    axes[0, 2].set_ylabel("median loss (band: quartiles)")
+    axes[0, 3].set_yscale("log")
+    axes[0, 3].set_ylabel("median loss (band: quartiles)")
     # NOTE for the reader: this x axis is the CHAINED-STEP INDEX over ALL
     # windows, whereas loss-vs-dt bins the SAME endpoints by dt_total. The
     # rightmost point here (step 8, every window) and the rightmost point
     # there (top dt bin only) are medians over DIFFERENT subpopulations, so
     # they need not match even though both are "the 8-step endpoint".
-    axes[0, 2].set_title("loss vs number of steps (all windows per step)")
-    _ylim_from_medians(axes[0, 2], step_loss_medians)
-    axes[1, 2].set_ylabel("median correlation (%) (band: quartiles)")
-    axes[1, 2].set_title("correlation vs number of steps (all windows per step)")
-    _corr_axis(axes[1, 2])
+    axes[0, 3].set_title("loss vs number of steps (all windows per step)")
+    # OWN median scaling, NOT the loss row's shared range: this panel starts
+    # at the near-zero step-0 loss and spans decades the endpoint-based
+    # panels never reach, so forcing it onto their scale crushed its low end.
+    _ylim_from_medians(axes[0, 3], step_loss_medians)
+    axes[1, 3].set_ylabel("median correlation (%) (band: quartiles)")
+    axes[1, 3].set_title("correlation vs number of steps (all windows per step)")
+    _corr_axis(axes[1, 3])
 
-    # SHARE one y range across the whole correlation row, INCLUDING the CDF
-    # [1,0]. _corr_axis pins each panel to span 0..100, but the vs-dt and
-    # vs-steps panels dip negative (a model anticorrelated with the truth),
-    # and the CDF -- bounded below by its own worst window -- did not, so the
-    # three did not line up at the bottom. Take the union so the row reads
-    # straight across, negative y-min and all.
-    corr_panels = [axes[1, 0], axes[1, 1], axes[1, 2]]
-    corr_lo = min(ax.get_ylim()[0] for ax in corr_panels)
+    # The three ENDPOINT loss panels -- CDF [0,0], vs-dt [0,1], vs-T [0,2] --
+    # share one y range, set by loss-vs-dt's MEDIANS. The CDF used to set the
+    # range and show its full tail; now it takes the median-scaled range and
+    # loses the tail off the top, so the decades where the curves differ are
+    # legible across all three. loss-vs-steps [0,3] is NOT included: it plots
+    # every step, starting from the near-zero step-0 loss, so it spans
+    # decades these three never reach and keeps its own scale.
+    _ylim_from_medians(axes[0, 1], dt_loss_medians)
+    loss_ref = axes[0, 1].get_ylim()
+    for ax in (axes[0, 0], axes[0, 2]):
+        ax.set_yscale("log")
+        ax.set_ylim(loss_ref)
+
+    # CORRELATION ROW shares one y range across ALL FOUR panels. _corr_axis
+    # pins each to span 0..100, but the vs-dt/vs-T/vs-steps panels dip
+    # negative (a model anticorrelated with the truth) while the CDF, bounded
+    # below by its own worst window, need not, so without the union they
+    # misaligned at the bottom. Take the union so the row reads across.
+    corr_panels = [axes[1, 0], axes[1, 1], axes[1, 2], axes[1, 3]]
+    # The clamp here is belt-and-braces: every panel above already went
+    # through _corr_axis, so the minimum is >= _CORR_FLOOR already. It stays
+    # so that a panel added later without _corr_axis cannot silently
+    # re-impose a -300% range on the whole row.
+    corr_lo = max(min(ax.get_ylim()[0] for ax in corr_panels), _CORR_FLOOR)
     corr_hi = max(ax.get_ylim()[1] for ax in corr_panels)
     for ax in corr_panels:
         ax.set_ylim(corr_lo, corr_hi)
 
     n = len(stats["dt"])
     note = f"{n} windows"
+    # How many DISTINCT values each binned/smoothed axis actually has -- the
+    # thing a reader cannot see from the panels, and what decides whether 8
+    # bins is over- or under-resolving dt_total.
+    n_dt = len(np.unique(np.array(stats["dt"], dtype=float)))
+    n_temp = len(np.unique(np.array(stats["temperature"], dtype=float)))
+    temps_all = np.array(stats["temperature"], dtype=float)
+    note += (f"; {n_dt} distinct dt_total, {n_temp} distinct temperatures "
+              f"({temps_all.min():g}-{temps_all.max():g})")
     if stats["n_corr_undefined"]:
         note += (f"; {stats['n_corr_undefined']} dropped from the correlation "
                   f"panels (undefined: a quiet window's real dx has ~zero std)")
@@ -487,6 +682,206 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     fig.savefig(output_path, dpi=110)
     plt.close(fig)
     return output_path
+
+
+def sweep_f_theta_scale(model: dict, windows: list[tuple], device,
+                         z1_resync: bool, scales=(0.0, 0.25, 0.5, 1.0)) -> dict:
+    """End-to-end loss and correlation as f_theta is scaled from 0 to 1.
+
+    scale=0 IS stage 2 (see scaled_f_theta), scale=1 is the model as trained,
+    and the trajectory is otherwise identical -- same windows, same z0 start,
+    same integrator. Any difference is attributable to f_theta's magnitude
+    alone.
+
+    Reported as medians over the shared window set, so one diverged window
+    cannot decide the shape of the curve.
+    """
+    recon_loss = ReconLoss()
+    out = {"scales": list(scales), "loss": [], "corr": []}
+    for scale in scales:
+        losses, corrs = [], []
+        with scaled_f_theta(model["f_theta"], scale):
+            for run_dir, steps in windows:
+                real_frames, pred_frames, _dts = compute_trajectory(
+                    run_dir, steps, model["ae"], model["f_theta"],
+                    model["ae_config"], device, z1_resync=z1_resync)
+                losses.append(recon_loss(
+                    torch.from_numpy(pred_frames[-1])[None, None],
+                    torch.from_numpy(real_frames[-1])[None, None]).item())
+                c = _correlation_pct(pred_frames[-1] - pred_frames[0],
+                                      real_frames[-1] - real_frames[0])
+                if c is not None:
+                    corrs.append(c)
+        finite = [v for v in losses if np.isfinite(v)]
+        out["loss"].append(float(np.median(finite)) if finite else float("nan"))
+        out["corr"].append(float(np.median(corrs)) if corrs else float("nan"))
+        print(f"  f_theta x {scale:<5g} median loss {out['loss'][-1]:.4g}  "
+              f"median corr {out['corr'][-1]:.1f}%")
+    return out
+
+
+@contextlib.contextmanager
+def overridden_alpha(f_theta, alpha: float, max_substeps: int | None = None):
+    """Temporarily replace the alpha substep criterion (and optionally the
+    substep cap).
+
+    Smaller alpha means more substeps: n ~ f*dt/(alpha*|z1|), so sweeping
+    alpha downward is the h -> 0 limit at FIXED learned field. That limit
+    separates the two explanations for the rollout blowup:
+
+      scheme instability  -> the blowup VANISHES as h shrinks (the explicit
+                             Heun step moves inside its stability region);
+      unstable f_theta    -> the blowup PERSISTS: the exact solution of
+                             z1' = f_theta diverges, and refining h just
+                             computes that divergence more accurately.
+
+    Only valid because THIS f_theta was trained with alpha-substepping, i.e.
+    as a vector field -- for a model trained at fixed n_substeps=1, f is a
+    dt-averaged algebraic corrector and h -> 0 is not a meaningful limit
+    (established when sub-stepping a 3a trained that way made things
+    monotonically worse).
+
+    max_substeps matters: the count saturates there and h stops shrinking,
+    so the sweep must either raise it or report the clamp rate -- a
+    "converged" verdict at saturated substeps would be an artifact.
+    """
+    orig_alpha = f_theta.alpha
+    orig_max = f_theta.max_substeps
+    f_theta.alpha = alpha
+    if max_substeps is not None:
+        f_theta.max_substeps = max_substeps
+    try:
+        yield
+    finally:
+        f_theta.alpha = orig_alpha
+        f_theta.max_substeps = orig_max
+
+
+def sweep_alpha(model: dict, windows: list[tuple], device,
+                z1_resync: bool, alphas=(1.5, 0.5, 0.15, 0.05),
+                max_substeps: int = 4096) -> dict:
+    """Endpoint loss/correlation as alpha shrinks -- the h -> 0 limit.
+
+    Medians over the shared window set. The substep-clamp counter is reset
+    per alpha and reported: a clamp rate near 100% means h has stopped
+    shrinking and that alpha's point does not probe a smaller step.
+    """
+    f_theta = model["f_theta"]
+    if f_theta.alpha is None:
+        print(f"  {model['label']}: trained at fixed n_substeps="
+              f"{f_theta.n_substeps}, not with alpha -- h -> 0 is not "
+              f"meaningful for it (f is a dt-averaged corrector, not a "
+              f"vector field); skipping")
+        return {}
+    recon_loss = ReconLoss()
+    out = {"alphas": list(alphas), "loss": [], "corr": [], "clamped": []}
+    for alpha in alphas:
+        losses, corrs = [], []
+        with overridden_alpha(f_theta, alpha, max_substeps=max_substeps):
+            f_theta.n_substeps_clamped = 0
+            for run_dir, steps in windows:
+                real_frames, pred_frames, _dts = compute_trajectory(
+                    run_dir, steps, model["ae"], f_theta,
+                    model["ae_config"], device, z1_resync=z1_resync)
+                losses.append(recon_loss(
+                    torch.from_numpy(pred_frames[-1])[None, None],
+                    torch.from_numpy(real_frames[-1])[None, None]).item())
+                c = _correlation_pct(pred_frames[-1] - pred_frames[0],
+                                      real_frames[-1] - real_frames[0])
+                if c is not None:
+                    corrs.append(c)
+            clamped = f_theta.n_substeps_clamped
+        finite = [v for v in losses if np.isfinite(v)]
+        out["loss"].append(float(np.median(finite)) if finite else float("nan"))
+        out["corr"].append(float(np.median(corrs)) if corrs else float("nan"))
+        out["clamped"].append(int(clamped))
+        print(f"  alpha {alpha:<5g} median loss {out['loss'][-1]:.4g}  "
+              f"median corr {out['corr'][-1]:.1f}%  "
+              f"substep-cap hits {clamped}")
+    return out
+
+
+@contextlib.contextmanager
+def scaled_f_theta(f_theta, scale: float):
+    """Temporarily multiply f_theta's output by `scale`.
+
+    scale=0 recovers STAGE 2 exactly -- the integrator's z0 += z1*h + f*h^2/2
+    and z1 += (f+f')*h/2 both collapse to the first-order step -- and scale=1
+    is the model as trained. Sweeping between them interpolates along the
+    line in function space that connects the two, WITHOUT retraining.
+
+    That is the whole point: stage 2 is nested inside stage 3 (f == 0), so a
+    stage-3 model doing worse than stage 2 under propagation cannot be
+    explained by the hypothesis class. The sweep asks whether the damage is
+    monotone in how much f_theta is applied -- if it is, f_theta is pure harm
+    at rollout and belongs out of the propagation path; if there is an
+    interior minimum, a damped f_theta is worth having and the fix is
+    regularization toward zero rather than deletion.
+
+    Wraps f() rather than the integrator so the sub-stepping, the alpha
+    criterion and the trapezoidal corrector all see the scaled value and
+    stay self-consistent.
+    """
+    original = f_theta.f
+    f_theta.f = lambda z0, z1, theta: original(z0, z1, theta) * scale
+    try:
+        yield
+    finally:
+        f_theta.f = original
+
+
+def compute_stage2_trajectory(run_dir: Path, steps: list[int], ae,
+                               ae_config: dict, device):
+    """Stage 2 alone, CAUSAL -- only frame t0 is ever read.
+
+        z0(t+(n+1)dt) = z0(t+n dt) + z1(t+n dt) dt
+        x (t+(n+1)dt) = D[z0(t+(n+1)dt)]
+        z1(t+(n+1)dt) = E[x(t+(n+1)dt)]        (deriv stream)
+
+    No f_theta and no resync: the derivative for the next step is re-derived
+    from the model's OWN predicted state by decoding and re-encoding it, not
+    read from the real frame at that time. That is what puts this row on the
+    same footing as 3a/3b, which likewise see only t0 and advance z1
+    internally -- the difference being that they advance it with f_theta
+    while this advances it through the autoencoder.
+
+    An earlier version took z1 from the real frame at each step. It looked
+    stable for a reason that had nothing to do with stage 2 being good: with
+    a correct derivative supplied every step, errors cannot compound, so the
+    curve was flat by construction. This version can drift, and the drift is
+    the honest measurement.
+
+    The decode/encode round trip is the cost of the causal version, and its
+    error is part of what is being measured: stage 2 has no way to advance
+    z1 without going back through pixel space.
+    """
+    metadata = load.read_metadata(run_dir / "metadata.txt")
+    nx, ny = ae_config["size"], ae_config["size"]
+    theta_val = metadata.temperature - metadata.T0
+    with torch.no_grad():
+        _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+        ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+        ae_decoder = (ae.pathways[recon_stream_name].decoder if hasattr(ae, "pathways")
+                      else ae.decoder)
+        # ONLY the starting frame is read from disk.
+        x0 = torch.from_numpy(
+            load.read_phi_half(run_dir / load.snapshot_filename(steps[0]), nx, ny)
+        ).unsqueeze(0).unsqueeze(0).to(device)
+        theta_encode = torch.full((1, 1), theta_val, dtype=torch.float32,
+                                   device=device)
+        encoded = ae_encoder(x0, theta=theta_encode)
+        z0 = encoded[recon_stream_name]
+        z1 = encoded["deriv"]
+
+        out = [ae_decoder(z0)[0, 0].cpu().numpy()]
+        for k in range(len(steps) - 1):
+            dt = (steps[k + 1] - steps[k]) * metadata.dt
+            z0 = z0 + z1 * dt
+            x_pred = ae_decoder(z0)
+            out.append(x_pred[0, 0].cpu().numpy())
+            # z1 for the NEXT step, from the predicted state alone.
+            z1 = ae_encoder(x_pred, theta=theta_encode)["deriv"]
+    return out
 
 
 def compute_causal_trajectory(run_dir: Path, steps: list[int], ae,
@@ -618,6 +1013,11 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     # rather than a rollout competitor, and the row label says so.
     causal = compute_causal_trajectory(run_dir, steps, a["ae"], a["ae_config"],
                                         device)
+    # STAGE 2 alone -- z0 + z1*dt, no f_theta. Sits between the causal
+    # baseline and the models: it uses the encoder's own derivative rather
+    # than a backward difference, but has no dt^2/2 correction.
+    stage2 = compute_stage2_trajectory(run_dir, steps, a["ae"], a["ae_config"],
+                                        device)
     n_cols = len(steps)
     # (label, frames, metrics-key) -- the key is carried WITH the row rather
     # than derived from its index, which stopped being readable the moment
@@ -625,6 +1025,7 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     rows = [("real", real_frames, None)]
     if causal is not None:
         rows.append(("causal\n(backward dz0/dt)", causal, "causal"))
+    rows.append(("stage 2\n(z0 + z1 dt)", stage2, "stage2"))
     rows += [(a["label"], pred_a, "a"), (b["label"], pred_b, "b")]
 
     # Per-frame loss and correlation, against the SAME real frame the panel
@@ -636,7 +1037,7 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     # comparable between the two figures.
     recon_loss = ReconLoss()
     metrics = {}
-    metric_sources = [("a", pred_a), ("b", pred_b)]
+    metric_sources = [("a", pred_a), ("b", pred_b), ("stage2", stage2)]
     if causal is not None:
         metric_sources.append(("causal", causal))
     for key, frames in metric_sources:
@@ -676,6 +1077,15 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     fig, axes = plt.subplots(len(rows), n_cols,
                               figsize=(3.1 * n_cols, 3.4 * len(rows)),
                               squeeze=False)
+    # ABSOLUTE time in the header, with the offset in brackets: "t = 650 (t0)"
+    # then "t = 750 (t0 + 100)". The bare "t + 100" gave no way to place a
+    # frame in the run without going back to the title's step numbers.
+    # metadata.dt is recovered from the data already in hand -- dt_per_step[i]
+    # is (steps[i+1] - steps[i]) * metadata.dt -- rather than re-reading the
+    # metadata file.
+    sim_dt = (dt_per_step[0] / (steps[1] - steps[0])
+              if len(steps) > 1 and steps[1] != steps[0] else 0.0)
+    t0 = steps[0] * sim_dt
     elapsed = 0.0
     for col in range(n_cols):
         for row, (label, frames, metric_key) in enumerate(rows):
@@ -686,7 +1096,8 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
             if col == 0:
                 ax.set_ylabel(label, fontsize=10)
             if metric_key is None:
-                head = "t" if col == 0 else f"t + {elapsed:g}"
+                offset = "t0" if col == 0 else f"t0 + {elapsed:g}"
+                head = f"t = {t0 + elapsed:g} ({offset})"
                 ax.set_title(head, fontsize=9)
             else:
                 # Model rows carry their own numbers per frame, so the frame
@@ -714,6 +1125,7 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
                      n_steps: int = 2, seed: int = 0,
                      fixed_windows: list[str] | None = None,
                      max_dt: float | None = None, z1_resync: bool = False,
+                     f_scale_sweep: bool = False, alpha_sweep: bool = False,
                      n_stats: int = 0, trajectory: bool = False,
                      output_path: Path | None = None,
                      device: str | None = None) -> tuple[Path, list[str]]:
@@ -770,7 +1182,7 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
     # which was which.
     n_steps_used = len(windows[0][1]) - 1
     regime = (f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}, "
-              f"z1 {'resynced at each real frame' if z1_resync else 'propagated'}")
+              f"z1 {'resynced at each real frame' if z1_resync else 'not resynchronized'}")
     title = (f"{prefix}: {a['label']} vs. {b['label']}" if prefix
               else f"{a['label']} vs. {b['label']}")
     title = f"{title}\n{regime}"
@@ -914,6 +1326,23 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
         print(f"\ncollecting statistics over {len(stat_windows)} windows "
               f"(both models, same windows)...")
         stats = collect_stats(a, b, stat_windows, device, z1_resync)
+        if alpha_sweep:
+            # THE h -> 0 TEST at fixed learned field: scheme instability
+            # vanishes as h shrinks, an unstable f_theta persists.
+            for key, m in (("a", a), ("b", b)):
+                print(f"\nalpha sweep -- {m['label']} (smaller alpha == "
+                      f"smaller substeps, h -> 0):")
+                sweep_alpha(m, stat_windows, device, z1_resync)
+        if f_scale_sweep:
+            # HOW MUCH f_theta, from none (== stage 2) to all of it. Stage 2
+            # is nested inside stage 3 at f == 0, so a stage-3 model losing
+            # to stage 2 cannot be a hypothesis-class problem; this asks
+            # whether the damage is monotone in the amount of f_theta
+            # applied.
+            for key, m in (("a", a), ("b", b)):
+                print(f"\nf_theta scale sweep -- {m['label']} "
+                      f"(scale 0 == stage 2):")
+                sweep_f_theta_scale(m, stat_windows, device, z1_resync)
         for key, m in (("a", a), ("b", b)):
             losses_k = np.array(stats[f"loss_{key}"], dtype=float)
             corrs_k = np.array([c for c in stats[f"corr_{key}"]
@@ -962,6 +1391,22 @@ def main() -> None:
                               "and save a second four-panel figure. The six "
                               "image rows are for looking at; this is what a "
                               "verdict should rest on")
+    parser.add_argument("--alpha-sweep", action="store_true",
+                         help="with --n-stats, re-run the rollout at alpha "
+                              "1.5, 0.5, 0.15 and 0.05 (the h -> 0 limit at "
+                              "fixed f_theta). Scheme instability vanishes "
+                              "as h shrinks; an unstable learned field "
+                              "persists. Substep-cap hits are reported -- a "
+                              "clamped point does not probe a smaller step")
+    parser.add_argument("--f-scale-sweep", action="store_true",
+                         help="with --n-stats, also report end-to-end loss and "
+                              "correlation with f_theta scaled by 0, 0.25, "
+                              "0.5 and 1. Scale 0 IS stage 2, so this walks "
+                              "the line between stage 2 and the trained model "
+                              "without retraining: monotone damage means "
+                              "f_theta does not belong in the propagation "
+                              "path, an interior minimum means a damped one "
+                              "is worth keeping")
     parser.add_argument("--z1-resync", action="store_true",
                          help="resync z1 at each real frame for BOTH models; "
                               "default is propagation, the inference regime")
@@ -972,6 +1417,8 @@ def main() -> None:
                      n_samples=args.n_samples, n_steps=args.steps,
                      seed=args.seed, fixed_windows=args.fixed_windows,
                      max_dt=args.max_dt, z1_resync=args.z1_resync,
+                     f_scale_sweep=args.f_scale_sweep,
+                     alpha_sweep=args.alpha_sweep,
                      n_stats=args.n_stats, trajectory=args.trajectory,
                      output_path=args.output, device=args.device)
 

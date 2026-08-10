@@ -81,16 +81,17 @@ val_aug_averaging= True
 n_rollout_steps= 1			# always 1 for 3a
 z1_resync       = True		# always True for 3a
 
-alpha			=  1.5		# adaptative sub-step (higher: more lenient)
-max_substeps    = 512		# default: 256
+alpha			=  0.5		# adaptative sub-step (higher: more lenient)
+max_substeps    = 1024		# default: 256
 target_vram_gib = 6.5		# leave 1 GB as headroom for driver/context
+truncate_bptt 	=  64
 bucket_refresh_epochs=0
 
 memory_cost_a_bytes= None
 memory_cost_b_bytes= None
 memory_cost_p 	   = None
 
-# resume_from 	= checkpoints/stage3a/128x128-stage3a.pt
+resume_from 	= checkpoints/stage3a/128x128-stage3a.pt
 
 rollout_scale = 1e-6
 ae_stats_weight= 1.
@@ -101,22 +102,22 @@ epochs 		  =10000		# increase?
 patience 	  =  500
 
 num_workers	  =   4   # was 8
-batches		  = 4096
+batches		  = 2048
 spike_skip_factor= 10
 
 lr 			  = 3.e-6  # was 0.2e-3; default: 1.e-3
 z0_noise_scale=   0.02	# was 0.175
 
 dt_cap		  = inf		# for second order
-max_dt        = 2000   # 2000/0.05 = 40'000 time steps
+max_dt        = 5000   # 2000/0.05 = 40'000 time steps
 
-# force 	      = True
+force 	      = True
 
 
 
 # Stage 3b
 #   latent dynamics surrogate (rollout)
-n_rollout_steps=  3			# always > 1 for 3b
+n_rollout_steps=  6			# always > 1 for 3b
 z1_resync      = False		# always False for 3b
 
 alpha			= 1.5		# adaptative sub-step
