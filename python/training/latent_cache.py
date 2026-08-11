@@ -51,18 +51,30 @@ def encoder_fingerprint(encoder: torch.nn.Module) -> str:
 
 
 def cache_path_for_run(cache_root: Path, fingerprint: str, run_dir: Path,
-                        steps: list[int], encode_both_streams: bool) -> Path:
+                        steps: list[int], encode_both_streams: bool,
+                        size: int | None = None) -> Path:
     """Where this run's latents live, for this encoder and this step list.
 
     `steps` is part of the key, not just the run: the max_dt truncation makes
     the encoded prefix depend on max_dt, and a shorter cached prefix must not
     satisfy a later request for a longer one. Hashed rather than spelled out
     because the list can hold 70+ entries and the result is a filename.
+
+    The directory is named `<size>x<size>-<fingerprint>` when `size` is
+    known. The fingerprint alone is opaque -- a directory listing said
+    nothing about which resolution a cache belonged to, so a 32x32 test
+    cache and a 128x128 training cache were indistinguishable without
+    opening one. The size is a LABEL, not part of the key: the fingerprint
+    already separates encoders, and two encoders at different resolutions
+    cannot collide because their weight shapes differ and shapes are hashed.
+    Omitting size falls back to the bare fingerprint, so existing caches
+    stay readable.
     """
+    directory = f"{size}x{size}-{fingerprint}" if size is not None else fingerprint
     step_digest = hashlib.blake2b(
         ",".join(str(s) for s in steps).encode("utf-8"), digest_size=8).hexdigest()
     suffix = "both" if encode_both_streams else "state"
-    return cache_root / fingerprint / f"{run_dir.name}-{step_digest}-{suffix}.pt"
+    return cache_root / directory / f"{run_dir.name}-{step_digest}-{suffix}.pt"
 
 
 def load_cached(path: Path) -> tuple[torch.Tensor, torch.Tensor | None] | None:

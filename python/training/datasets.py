@@ -1366,7 +1366,8 @@ class MicrostructureEvolutionDataset(Dataset):
                     cached = latent_cache.load_cached(
                         latent_cache.cache_path_for_run(
                             self._latent_cache_root, self._encoder_fingerprint, run_dir,
-                            kept_steps, self.encode_both_streams))
+                            kept_steps, self.encode_both_streams,
+                            size=metadata.nx))
                     if cached is not None:
                         # Skips the READ as well as the encode -- at 128x128 a
                         # frame is 32 KB against a 2 KB latent, so the disk
@@ -1414,7 +1415,8 @@ class MicrostructureEvolutionDataset(Dataset):
                                     latent_cache.cache_path_for_run(
                                         self._latent_cache_root, self._encoder_fingerprint,
                                         pending_meta[pos][0], pending_meta[pos][2],
-                                        self.encode_both_streams),
+                                        self.encode_both_streams,
+                                        size=pending_meta[pos][1].nx),
                                     latents, deriv)
                         buffer_run_indices = []
                 else:
@@ -1433,7 +1435,8 @@ class MicrostructureEvolutionDataset(Dataset):
                             latent_cache.cache_path_for_run(
                                 self._latent_cache_root, self._encoder_fingerprint,
                                 pending_meta[pos][0], pending_meta[pos][2],
-                                self.encode_both_streams),
+                                self.encode_both_streams,
+                                size=pending_meta[pos][1].nx),
                             latents, deriv)
                 buffer_run_indices = []
 

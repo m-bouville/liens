@@ -33,6 +33,54 @@ class ReconLoss(nn.Module):
         return self.loss_fn(x_recon, x)
 
 
+class InterpLoss(nn.Module):
+    """
+    L_interp: linear interpolation between two encodings must land on the
+    real intermediate frame's encoding.
+
+        z_hat = (1 - alpha) * z1 + alpha * z3,   alpha = (t2-t1)/(t3-t1)
+        L     = || z_hat - z2 ||^2
+
+    i.e. the z0 trajectory should be locally STRAIGHT in time. This
+    attacks two separately measured terms: eps (z0's frame-to-frame
+    encoding inconsistency, the 1/dt term in the Taylor fit) and z0_ddot
+    (curvature, the C coefficient) -- and check_z2_measurability found the
+    latent trajectory carries frame-scale roughness that makes a curvature
+    target unmeasurable, which is exactly the artifact this penalises.
+
+    alpha is DT-WEIGHTED, not 0.5: the save schedule is geometric, so t2
+    is not the midpoint of [t1, t3] and a midpoint blend would ask the
+    encoding to be wrong by exactly the spacing asymmetry.
+
+    THE DEGENERATE MINIMUM (see the plan doc): L_interp is trivially
+    satisfied by ANY z0 affine in t -- including a CONSTANT z0. Nothing
+    here prevents that collapse; only L_recon0 does. So this must stay a
+    small auxiliary weight and recon0 needs watching from epoch 1. The
+    loss is deliberately given no self-protection against this, because
+    any such guard would hide the collapse rather than prevent it.
+
+    Computed in LATENT space, on the recon stream's z0. Comparing decoded
+    pixels instead would confound the encoder's geometry with the
+    decoder's, and it is z0's own straightness that every downstream
+    Taylor term is written in terms of.
+    """
+
+    def __init__(self, kind: str = "l2"):
+        super().__init__()
+        if kind not in ("l1", "l2"):
+            raise ValueError(f"kind must be 'l1' or 'l2', got '{kind}'")
+        self.kind = kind
+        self.loss_fn = nn.L1Loss() if kind == "l1" else nn.MSELoss()
+
+    def forward(self, z1: torch.Tensor, z2: torch.Tensor, z3: torch.Tensor,
+                 alpha: torch.Tensor) -> torch.Tensor:
+        # alpha is (B,) -- reshape to broadcast over (B, C, H, W) rather
+        # than relying on trailing-dimension broadcasting, which would
+        # silently align it against W.
+        a = alpha.reshape(-1, *([1] * (z1.dim() - 1)))
+        return self.loss_fn((1.0 - a) * z1 + a * z3, z2)
+
+
 def centered_deriv_target(z0_before: torch.Tensor, z0_t: torch.Tensor, z0_after: torch.Tensor,
                            dt_minus: torch.Tensor, dt_plus: torch.Tensor) -> torch.Tensor:
     """

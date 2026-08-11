@@ -92,6 +92,7 @@ def test_check_deriv_temperature_runs_end_to_end(tmp_path, isolated_project_root
     assert isinstance(result, dict) and result, "expected a non-empty dict of fitted coefficients"
 
 
+@pytest.mark.slow
 def test_check_deriv_temperature_rejects_a_checkpoint_with_no_deriv_stream(
     tmp_path, isolated_project_root,
 ):
@@ -123,6 +124,7 @@ def test_check_deriv_temperature_rejects_a_checkpoint_with_no_deriv_stream(
         check_deriv_temperature(stage2_checkpoint_path=stage1_path, min_step=0, device="cpu")
 
 
+@pytest.mark.slow
 def test_filtering_round_trips_from_the_checkpoints_own_data_config(tmp_path, isolated_project_root,
                                                                     monkeypatch, capsys):
     """
@@ -200,6 +202,7 @@ def test_filtering_round_trips_from_the_checkpoints_own_data_config(tmp_path, is
     )
 
 
+@pytest.mark.slow
 def test_explicitly_passed_filtering_still_overrides_the_checkpoint(tmp_path, isolated_project_root,
                                                                      monkeypatch):
     """The checkpoint is a DEFAULT, not a lock-in -- an explicit argument

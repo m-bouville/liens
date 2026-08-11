@@ -139,6 +139,7 @@ def _build_lds_checkpoint(path: Path):
     torch.save(checkpoint, path)
 
 
+@pytest.mark.slow
 def test_train_refinement_stage4_runs_end_to_end(tmp_path, isolated_project_root):
     base_path = _build_sweep(tmp_path, n_runs=6)
     ae_checkpoint_path = tmp_path / "fake-stage2.pt"
@@ -168,6 +169,7 @@ def test_train_refinement_stage4_runs_end_to_end(tmp_path, isolated_project_root
     assert saved["stats_head_state"] is not None
 
 
+@pytest.mark.slow
 def test_train_refinement_stage5_trainable_decoder(tmp_path, isolated_project_root):
     """freeze_decoder=False (stage 5) should still run fine, and the
     saved checkpoint should correctly record that D was trainable."""
@@ -191,6 +193,7 @@ def test_train_refinement_stage5_trainable_decoder(tmp_path, isolated_project_ro
     assert saved["stage45_config"]["freeze_decoder"] is False
 
 
+@pytest.mark.slow
 def test_train_refinement_without_ancestor_stats_head_warns_and_skips(tmp_path, capsys, isolated_project_root):
     """If the ancestor AE has no stats_head at all, asking for
     stats0_weight>0 should print a warning and skip L_stats gracefully,
@@ -218,6 +221,7 @@ def test_train_refinement_without_ancestor_stats_head_warns_and_skips(tmp_path, 
     assert saved["stats_config"] is None
 
 
+@pytest.mark.slow
 def test_train_refinement_mismatched_ancestors_raises_before_training(tmp_path, isolated_project_root):
     """The cross-ancestor validation from checkpoint_components should
     fire here too, at load time -- not partway through training."""
@@ -247,6 +251,7 @@ def test_train_refinement_mismatched_ancestors_raises_before_training(tmp_path, 
         )
 
 
+@pytest.mark.slow
 def test_train_refinement_requires_min_step(tmp_path, isolated_project_root):
     """Only min_step is genuinely required to be non-None -- see the
     next test for confirmation that min_stdev_phi=None is fine."""
@@ -264,6 +269,7 @@ def test_train_refinement_requires_min_step(tmp_path, isolated_project_root):
         )
 
 
+@pytest.mark.slow
 def test_train_refinement_min_stdev_phi_none_does_not_raise(tmp_path, isolated_project_root):
     """
     Regression test for the exact bug the test suite caught: min_step
@@ -291,6 +297,7 @@ def test_train_refinement_min_stdev_phi_none_does_not_raise(tmp_path, isolated_p
     )
 
 
+@pytest.mark.slow
 def test_epochs_zero_actually_writes_a_checkpoint_stage4(tmp_path, isolated_project_root, capsys):
     """Same regression test as every earlier stage's own, for
     train_refinement -- this is the stage that would have been hit

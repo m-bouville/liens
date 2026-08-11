@@ -385,3 +385,72 @@ def test_the_scatter_filters_on_isfinite_not_on_positivity():
     assert src.count("math.isfinite(v)") >= 2, (
         "both all_x and all_y must be filtered to finite values"
     )
+
+
+def _hist(names):
+    return {n: {"train": [1.0, 0.9], "val": [1.1, 1.0], "best_so_far": [1.1, 1.0]}
+            for n in names}
+
+
+def _grid(monkeypatch, names, tmp_path):
+    import matplotlib.pyplot as plt
+    from utils.plots import loss_component_scatter
+    captured = {}
+    original = plt.subplots
+
+    def spy(*args, **kwargs):
+        fig, ax = original(*args, **kwargs)
+        captured.setdefault("ax", ax)
+        return fig, ax
+
+    monkeypatch.setattr(plt, "subplots", spy)
+    loss_component_scatter([1, 2], _hist(names), tmp_path / "s.png")
+    return captured["ax"]
+
+
+def test_components_are_laid_out_as_a_lower_triangle(monkeypatch, tmp_path):
+    """
+    Row r is ALWAYS the y variable, column c ALWAYS the x variable, so every
+    panel in a row shares a y quantity and every panel in a column shares an
+    x quantity.
+
+    The previous flat wrap put (recon0,stats0) and (stats0,deriv) in
+    different rows with different axes, so nothing lined up and the axis
+    labels had to be re-read on all six panels.
+    """
+    names = ["recon0", "stats0", "deriv", "interp"]
+    ax = _grid(monkeypatch, names, tmp_path)
+    assert ax.shape == (3, 3), ax.shape
+    for r in range(3):
+        for c in range(3):
+            panel = ax[r][c]
+            if c > r:
+                assert not panel.get_visible(), (
+                    f"[{r},{c}] is in the upper triangle -- the redundant "
+                    f"transpose -- and should be hidden"
+                )
+            else:
+                assert panel.get_xlabel() == names[c]
+                assert panel.get_ylabel() == names[r + 1]
+
+
+def test_every_pair_appears_exactly_once(monkeypatch, tmp_path):
+    """The triangle must not drop or duplicate a pair as the component count
+    changes -- n components give n(n-1)/2 panels."""
+    for names in (["a", "b"], ["a", "b", "c"], ["a", "b", "c", "d"],
+                   ["a", "b", "c", "d", "e"]):
+        ax = _grid(monkeypatch, names, tmp_path)
+        seen = [(ax[r][c].get_xlabel(), ax[r][c].get_ylabel())
+                for r in range(ax.shape[0]) for c in range(ax.shape[1])
+                if ax[r][c].get_visible()]
+        expected = {(names[i], names[j])
+                    for i in range(len(names)) for j in range(i + 1, len(names))}
+        assert len(seen) == len(expected) == len(names) * (len(names) - 1) // 2
+        assert set(seen) == expected, (names, sorted(set(seen) ^ expected))
+
+
+def test_a_single_component_draws_nothing(tmp_path):
+    """One component has no pair to plot; the figure is skipped rather than
+    written empty."""
+    from utils.plots import loss_component_scatter
+    assert loss_component_scatter([1, 2], _hist(["only"]), tmp_path / "s.png") is None

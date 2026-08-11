@@ -181,6 +181,7 @@ def _ref_row_ancestor(tmp_path):
 # epoch-0 reference row on resume
 # --------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_reference_row_is_printed_when_resuming(tmp_path, capsys):
     """
     A resumed run's epoch 1 has nothing to be compared against without this.
@@ -197,6 +198,7 @@ def test_reference_row_is_printed_when_resuming(tmp_path, capsys):
     assert "(before this run)" in out
 
 
+@pytest.mark.slow
 def test_no_reference_row_without_a_resume(tmp_path, capsys):
     """
     GUARDS printing it unconditionally. With nothing resumed the model is
@@ -216,6 +218,7 @@ def test_no_reference_row_without_a_resume(tmp_path, capsys):
     assert " ref|" not in capsys.readouterr().out
 
 
+@pytest.mark.slow
 def test_reference_row_does_not_change_the_training_trajectory(tmp_path, capsys):
     """
     GUARDS omitting the RNG save/restore. The reference pass advances torch's
@@ -314,6 +317,7 @@ def test_reference_row_does_not_change_the_training_trajectory(tmp_path, capsys)
     )
 
 
+@pytest.mark.slow
 def test_reference_row_components_sum_to_its_total(tmp_path, capsys):
     """
     GUARDS printing the ref row's components RAW while the epoch rows print
@@ -392,6 +396,7 @@ def test_stage1_warmup_is_clamped_so_a_short_run_can_still_save():
     assert clamp_grace_epochs(5, 1) == 0
 
 
+@pytest.mark.slow
 def test_no_epoch_inside_the_warmup_window_can_save(tmp_path, capsys):
     """
     The behaviour, end to end: no epoch within the warmup window may save, so

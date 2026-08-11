@@ -31,7 +31,8 @@ from training.checkpoint_criterion import (
 from training.checkpoint_components import cross_check_ancestor_config
 from training.extend_encoder import extend_state_checkpoint_with_deriv_stream
 from training.datasets import VAL_DECORRELATED_AUG_INDICES, MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
-from training.losses import ReconLoss, StatsLoss, centered_deriv_target, dt_weighted_deriv_loss
+from training.losses import (ReconLoss, StatsLoss, InterpLoss, centered_deriv_target,
+                              dt_weighted_deriv_loss)
 from training.stats_head import StatsHead
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
@@ -82,6 +83,7 @@ def train_stage2(
     deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats0_weight: float = 0.0,
     stats1_weight: float = 0.0, z0_from_deriv_weight: float = 0.0,
     deriv_dt_weight_exponent: float = 0.0, deriv_target_centered: bool = False,
+    interp_weight: float = 0.0, interp_scale: float = 1.0,
     val_aug_averaging: bool = False,
     recon0_scale: float = 1.0,
     stats0_scale: float = 1.0, stats1_scale: float = 1.0, deriv_scale: float = 1.0,
@@ -143,13 +145,27 @@ def train_stage2(
     nominal, weight, so what's logged is always what was actually
     optimized that epoch.
 
-    REPLACES the old L_interp entirely (not summed alongside it) --
-    the design doc's own phrasing reads as substitution, and there was
-    already a standing todo item questioning L_interp's usefulness
-    before this redesign existed. The (t1,t2,t3)-triplet interpolation-
-    consistency CHECK itself (check_interpolation.py) is UNCHANGED and
-    still run as a before/after diagnostic (see below) -- only removed
-    as a TRAINING loss, not as a sanity-check tool.
+    Originally REPLACED the old L_interp entirely (not summed alongside
+    it), the design doc's phrasing reading as substitution. That is no
+    longer true: L_interp is back as an OPTIONAL term (interp_weight,
+    default 0.0 = the old behaviour exactly) and the two now SUM. It
+    returned because check_z2_measurability found the latent trajectory
+    carries frame-scale roughness -- curvature estimates from disjoint
+    stencils anti-correlate (-0.076, 67% of windows negative) and
+    E|z2|*dt^2 is flat across five decades of E|z2|, the signature of
+    pure encoding noise -- which is exactly the representation artifact
+    L_interp penalises and L_deriv does not.
+
+    Both terms share ONE activation epoch (deriv_switch_epoch, from
+    deriv_weight_warmup_epochs): L_interp needs the same 3-frame window
+    the centered target does, so gating them together means there is no
+    way to configure one active without the other's data.
+
+    The (t1,t2,t3)-triplet interpolation-consistency CHECK
+    (check_interpolation.py) was UNCHANGED throughout and is still run
+    as a before/after diagnostic -- it now measures a quantity that is
+    once again also trained on, so it stops being an independent probe
+    when interp_weight > 0.
 
     Full loss: L_recon0 + recon0_weight*L_stats0 + stats1_weight*L_stats1
     + effective_deriv_weight*L_deriv (last two default to 0 except
@@ -204,9 +220,11 @@ def train_stage2(
     disk). Raises clearly if the ancestor has more than one non-recon
     stream (L_deriv has no meaning without exactly one to compare z0's
     own trajectory against) -- a direct, unavoidable consequence of
-    replacing the old L_interp (which worked for any single-stream
-    checkpoint) with a loss that's inherently about the C0/C1 split,
-    not a separate design choice made here.
+    L_DERIV being inherently about the C0/C1 split, unlike the old
+    L_interp (which worked for any single-stream checkpoint) -- not a
+    separate design choice made here. Note L_interp is once again
+    available alongside it (interp_weight), and still carries no such
+    restriction itself; the requirement comes from L_deriv alone.
 
     stats_head is loaded from the checkpoint but FROZEN here (not
     trained) -- used only as a fixed measuring instrument for the
@@ -602,6 +620,16 @@ def train_stage2(
     std = stats_config["stats_std"].to(device)
     stats_loss_fn = StatsLoss(mean, std, stat_names=stat_names)
     recon_loss = ReconLoss()
+    interp_loss_fn = InterpLoss()
+    if interp_weight > 0 and not deriv_target_centered:
+        # L_interp needs the (t-, t, t+) triplet, which only the centered
+        # branch encodes; the one-sided path loads window_length=2 and has
+        # no middle frame to interpolate TO. Refusing loudly beats silently
+        # contributing nothing to the objective the caller asked for.
+        raise ValueError(
+            f"interp_weight={interp_weight} requires deriv_target_centered=True "
+            f"(L_interp needs the 3-frame window the centered target already "
+            f"loads; the one-sided path has window_length=2)")
 
     if checkpoint_path is None:
         name = ae_checkpoint_name(size, model_cfg["latent_channels"], ancestor_stats_weight)
@@ -623,6 +651,7 @@ def train_stage2(
 
     epoch_history: list[int] = []
     loss_curve_events: list[tuple[float, str]] = []
+    loss_curve_levels: list[tuple[float, str]] = []
     train_loss_history: list[float] = []
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
@@ -885,6 +914,11 @@ def train_stage2(
         # but its gradient w.r.t. x is exactly `weight`, not the full
         # 1.0 an un-detached x would give -- a genuinely controllable
         # dial, not just an on/off switch.
+        # Defined on BOTH branches: the one-sided path has no middle frame,
+        # so L_interp is structurally unavailable there. interp_weight > 0
+        # with a one-sided target is refused at construction, so this zero
+        # is only ever reached with interp_weight == 0.
+        interp = torch.tensor(0.0, device=device)
         if deriv_target_centered and use_centered:
             if z0_from_deriv_weight > 0:
                 z0_before = ae.encoders["shared"](x_before, theta=theta)[recon_stream_name]
@@ -907,6 +941,24 @@ def train_stage2(
             # assumes dt_minus == dt_plus.
             target_deriv = centered_deriv_target(z0_before_for_deriv, z0_t_for_deriv, z0_after_for_deriv,
                                                   dt_minus, dt_plus)
+            # L_interp, on the SAME triplet the centered target already
+            # encoded -- no second loader, no extra encode, and no RNG
+            # perturbation when disabled. It belongs here rather than in
+            # stage 1 for exactly that reason: stage 1 iterates single
+            # snapshots and would need a parallel triplet loader.
+            #
+            # UNLIKE the deriv target, this uses the UNDETACHED z0s: the
+            # whole point is to shape z0's own geometry through time, so
+            # routing it through z0_*_for_deriv (which detaches unless
+            # z0_from_deriv_weight > 0) would silence it by default.
+            #
+            # alpha = dt_minus / (dt_minus + dt_plus) -- where t sits
+            # BETWEEN its neighbours. Not 0.5: the save schedule is
+            # geometric, so a midpoint blend would ask the encoding to be
+            # wrong by exactly the spacing asymmetry.
+            if interp_weight > 0:
+                alpha_interp = dt_minus / (dt_minus + dt_plus)
+                interp = interp_loss_fn(z0_before, z0_t, z0_after, alpha_interp)
             # dt_minus+dt_plus (the TOTAL span this target draws on),
             # not either half alone -- dt_weighted_deriv_loss's own
             # weighting is about how much a WINDOW should count
@@ -939,7 +991,8 @@ def train_stage2(
         total = (recon / recon0_scale
                  + stats0_weight * stats_loss_val / stats0_scale
                  + stats1_weight * stats1_loss_val / stats1_scale
-                 + deriv_weight_used * deriv_loss / deriv_scale)
+                 + deriv_weight_used * deriv_loss / deriv_scale
+                 + interp_weight * interp / interp_scale)
 
         if train:
             optimizer.zero_grad()
@@ -958,7 +1011,8 @@ def train_stage2(
         # attached. Same fix as train_lds.py's own step() -- see that
         # function's own identical comment for the full rationale.
         return (total.detach(), recon.detach(),
-                stats_loss_val.detach(), stats1_loss_val.detach(), deriv_loss.detach())
+                stats_loss_val.detach(), stats1_loss_val.detach(),
+                deriv_loss.detach(), interp.detach())
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
@@ -973,6 +1027,13 @@ def train_stage2(
     active_terms = [(w, lbl, s) for w, lbl, s in [
         (stats0_weight, stats_label, stats0_scale),
         (stats1_weight, stats1_label, stats1_scale), (deriv_weight, "deriv", deriv_scale),
+        (interp_weight, "interp", interp_scale),
+        # interp belongs here, not just in the total: EVERYTHING that
+        # reports the loss breakdown derives from this list -- the console
+        # formula line, the per-epoch component columns, component_names,
+        # and loss_component_scatter. Omitting it made a run with
+        # interp_weight=0.5 print a three-term breakdown whose parts could
+        # not sum to the total it printed beside them.
     ] if w > 0]
 
     # loss_component_scatter's own bookkeeping -- recon0 (always present)
@@ -1048,11 +1109,12 @@ def train_stage2(
         ref_stats_sum = torch.zeros((), device=device)
         ref_stats1_sum = torch.zeros((), device=device)
         ref_deriv_sum = torch.zeros((), device=device)
+        ref_interp_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0)
-                total, recon, stats, stats1, deriv = step(
+                total, recon, stats, stats1, deriv, interp_val = step(
                     batch, train=False, deriv_weight_used=deriv_weight,
                     use_centered=reference_use_centered)
                 ref_total_sum += total * bs
@@ -1060,6 +1122,7 @@ def train_stage2(
                 ref_stats_sum += stats * bs
                 ref_stats1_sum += stats1 * bs
                 ref_deriv_sum += deriv * bs
+                ref_interp_sum += interp_val * bs
         ref_total = (ref_total_sum / n_val).item()
         # The reference IS the ancestor's val_loss under this run's own
         # objective, and this pass has just measured it -- previously it was
@@ -1087,14 +1150,33 @@ def train_stage2(
         # was a stage-1a checkpoint.
         if resumed_from_stage2:
             tracker.reference_val_loss = ref_total
+        # The same number as a HORIZONTAL line on the loss curve: the bar the
+        # run starts from, measured under this run's own objective. Withheld
+        # when a mid-run target switch is coming, for the reason the ceiling
+        # itself is superseded there -- a reference measured under the
+        # one-sided target is not a fair bar for the centered one, so a flat
+        # line drawn across the switch would invite exactly the false
+        # comparison. In that case the vertical switch marker is the
+        # informative annotation instead; the two are mutually exclusive by
+        # construction, which is what makes the already-centered run (no
+        # marker possible at epoch 1) get a level instead of nothing.
+        switch_lands_mid_run = (
+            bool(deriv_target_centered)
+            and prior_stage2_epochs + 1 < deriv_switch_epoch <= prior_stage2_epochs + epochs
+        )
+        if not switch_lands_mid_run:
+            loss_curve_levels.append(
+                (ref_total, "reference (ancestor, this run's objective)"))
         ref_recon = (ref_recon_sum / n_val).item()
         ref_stats = (ref_stats_sum / n_val).item()
         ref_stats1 = (ref_stats1_sum / n_val).item()
         ref_deriv = (ref_deriv_sum / n_val).item()
+        ref_interp = (ref_interp_sum / n_val).item()
         ref_term_values = {
             stats_label: (stats0_weight, stats0_scale, ref_stats),
             stats1_label: (stats1_weight, stats1_scale, ref_stats1),
             "deriv": (deriv_weight, deriv_scale, ref_deriv),
+            "interp": (interp_weight, interp_scale, ref_interp),
         }
         ref_terms = " ".join(f"+{_compact_loss(w * v / s)}" for lbl, (w, s, v) in ref_term_values.items()
                               if any(lbl == l for _, l, _ in active_terms))
@@ -1173,7 +1255,29 @@ def train_stage2(
             # model. Unmarked, that cliff is the most prominent feature of the
             # figure and reads as a learning event. x at epoch-0.5 so the line
             # sits BETWEEN the last old-target point and the first new one.
-            loss_curve_events.append((epoch - 0.5, "centered L_deriv target"))
+            #
+            # BUT only when epoch > 1: at epoch 1 there IS no earlier point on
+            # THIS run's own curve for the marker to sit between (the epoch-0
+            # reference above is deliberately never added to epoch_history),
+            # regardless of whether the switch is real relative to the loaded
+            # checkpoint. Without this guard, a run that is already past the
+            # switch point at its own epoch 1 -- deriv_target_centered=True
+            # from a fresh run, or an ancestor resumed well past
+            # deriv_switch_epoch -- got a vertical line at epoch 0.5 with
+            # nothing on either side of it: a discontinuity marker for a
+            # discontinuity that isn't in this figure. The print message and
+            # the grace-period reset below are UNCHANGED by this guard -- both
+            # are about comparability against the loaded checkpoint's own
+            # val_loss, which is a real concern at epoch 1 too and stays
+            # correct; only the plotted marker is curve-local.
+            if epoch > 1:
+                # Names BOTH terms when L_interp is on: they share this
+                # switch epoch, so the cliff at it is the sum of two
+                # objective changes and attributing it to the target
+                # change alone would understate what moved.
+                label = ("centered L_deriv + L_interp" if interp_weight > 0
+                          else "centered L_deriv target")
+                loss_curve_events.append((epoch - 0.5, label))
             # grace_epochs derived from val_ema_decay's own effective
             # averaging window (1/(1-decay)) -- max(2, ...) specifically,
             # not max(1, ...): confirmed directly that a single-epoch
@@ -1224,11 +1328,12 @@ def train_stage2(
         train_stats_sum = torch.zeros((), device=device)
         train_stats1_sum = torch.zeros((), device=device)
         train_deriv_sum = torch.zeros((), device=device)
+        train_interp_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
             for batch in train_loader:
                 bs = batch[0].size(0)
-                total, recon, stats, stats1, deriv = step(
+                total, recon, stats, stats1, deriv, interp_val = step(
                     batch, train=True, deriv_weight_used=effective_deriv_weight,
                     use_centered=use_centered_this_epoch)
                 train_total_sum += total * bs
@@ -1236,16 +1341,19 @@ def train_stage2(
                 train_stats_sum += stats * bs
                 train_stats1_sum += stats1 * bs
                 train_deriv_sum += deriv * bs
+                train_interp_sum += interp_val * bs
             train_total = (train_total_sum / n_train).item()
             train_recon = (train_recon_sum / n_train).item()
             train_stats = (train_stats_sum / n_train).item()
             train_stats1 = (train_stats1_sum / n_train).item()
             train_deriv = (train_deriv_sum / n_train).item()
+            train_interp = (train_interp_sum / n_train).item()
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
             # "epoch", rather than a misleading 0.0.
             train_total = train_recon = train_stats = train_stats1 = train_deriv = float("nan")
+            train_interp = float("nan")
 
         ae.eval()
         val_total_sum = torch.zeros((), device=device)
@@ -1253,11 +1361,12 @@ def train_stage2(
         val_stats_sum = torch.zeros((), device=device)
         val_stats1_sum = torch.zeros((), device=device)
         val_deriv_sum = torch.zeros((), device=device)
+        val_interp_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0)
-                total, recon, stats, stats1, deriv = step(
+                total, recon, stats, stats1, deriv, interp_val = step(
                     batch, train=False, deriv_weight_used=val_deriv_weight,
                     use_centered=use_centered_this_epoch)
                 val_total_sum += total * bs
@@ -1265,11 +1374,13 @@ def train_stage2(
                 val_stats_sum += stats * bs
                 val_stats1_sum += stats1 * bs
                 val_deriv_sum += deriv * bs
+                val_interp_sum += interp_val * bs
         val_total = (val_total_sum / n_val).item()
         val_recon = (val_recon_sum / n_val).item()
         val_stats = (val_stats_sum / n_val).item()
         val_stats1 = (val_stats1_sum / n_val).item()
         val_deriv = (val_deriv_sum / n_val).item()
+        val_interp = (val_interp_sum / n_val).item()
 
         # Captured BEFORE update(), which decrements the grace counter and
         # flips in_grace_period to False on the FINAL grace epoch -- an epoch
@@ -1304,6 +1415,7 @@ def train_stage2(
             stats_label: (stats0_weight, stats0_weight, stats0_scale, train_stats, val_stats),
             stats1_label: (stats1_weight, stats1_weight, stats1_scale, train_stats1, val_stats1),
             "deriv": (effective_deriv_weight, val_deriv_weight, deriv_scale, train_deriv, val_deriv),
+            "interp": (interp_weight, interp_weight, interp_scale, train_interp, val_interp),
         }
 
         epoch_history.append(epoch)
@@ -1314,6 +1426,7 @@ def train_stage2(
             loss_curve(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                 loss_curve_path, title="Stage 2 loss", event_epochs=loss_curve_events,
+                reference_levels=loss_curve_levels,
             )
             write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
 
@@ -1406,6 +1519,8 @@ def train_stage2(
                     "augment": augment,
                 },
                 "stage2_config": {"deriv_weight": deriv_weight,
+                                   "interp_weight": interp_weight,
+                                   "interp_scale": interp_scale,
                                    "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
                                    "deriv_dt_weight_exponent": deriv_dt_weight_exponent,
                                    "deriv_target_centered": deriv_target_centered,
@@ -1529,6 +1644,7 @@ def train_stage2(
     loss_curve(
         epoch_history, train_loss_history, val_loss_history, best_so_far_history,
         loss_curve_path, title="Stage 2 loss", event_epochs=loss_curve_events,
+        reference_levels=loss_curve_levels,
     )
     write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
     loss_component_scatter(

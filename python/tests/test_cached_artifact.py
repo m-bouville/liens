@@ -176,3 +176,45 @@ def test_the_rng_is_restored_even_if_the_builder_raises():
     with pytest.raises(RuntimeError):
         cached_artifact(("t_rng_raise", "x"), bad)
     assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_cache_directory_carries_the_size_label():
+    """
+    A bare fingerprint told a directory listing nothing about which
+    resolution a cache belonged to -- a 32x32 test cache and a 128x128
+    training cache were indistinguishable without opening one.
+
+    The size is a LABEL, not part of the key: the fingerprint already
+    separates encoders, and two encoders at different resolutions cannot
+    collide anyway because their weight shapes differ and shapes are hashed.
+    """
+    from pathlib import Path
+    from training.latent_cache import cache_path_for_run
+
+    p = cache_path_for_run(Path("/c"), "abc123", Path("T625_n020_s3"),
+                            [0, 100, 200], False, size=128)
+    assert p.parent.name == "128x128-abc123"
+    # the filename itself is unchanged
+    assert p.name.startswith("T625_n020_s3-")
+    assert p.name.endswith("-state.pt")
+
+
+def test_cache_path_without_a_size_keeps_the_bare_fingerprint():
+    """Back-compat: caches written before the rename stay readable."""
+    from pathlib import Path
+    from training.latent_cache import cache_path_for_run
+
+    p = cache_path_for_run(Path("/c"), "abc123", Path("T625_n020_s3"),
+                            [0, 100, 200], False)
+    assert p.parent.name == "abc123"
+
+
+def test_size_does_not_change_the_cache_key():
+    """Same encoder, same steps, same stream -> same FILE name regardless of
+    the directory label, so the label cannot silently split a cache."""
+    from pathlib import Path
+    from training.latent_cache import cache_path_for_run
+
+    a = cache_path_for_run(Path("/c"), "abc", Path("r"), [0, 1], True, size=128)
+    b = cache_path_for_run(Path("/c"), "abc", Path("r"), [0, 1], True)
+    assert a.name == b.name

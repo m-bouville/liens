@@ -280,9 +280,66 @@ def test_the_switch_records_an_event_between_the_two_epochs():
     """
     from conftest import source_without_comments
     src = source_without_comments(_ROOT / "training/train_stage2.py")
-    assert 'loss_curve_events.append((epoch - 0.5, "centered L_deriv target"))' in src
+    # the LABEL is now built above the call (it names L_interp too when
+    # that term shares the switch epoch), so match the offset and the
+    # append separately rather than one frozen literal.
+    assert "loss_curve_events.append((epoch - 0.5, label))" in src
+    assert '"centered L_deriv target"' in src
     assert "event_epochs=loss_curve_events" in src
 
     src45 = source_without_comments(_ROOT / "training/train_refinement.py")
     assert 'loss_curve_events.append((epoch - 0.5, "rollout ramp complete"))' in src45
     assert "event_epochs=loss_curve_events" in src45
+
+
+def test_reference_levels_are_horizontal_and_stay_in_range(tmp_path, monkeypatch):
+    """
+    A reference level is a loss VALUE, so it is drawn as a horizontal line --
+    unlike event_epochs, which mark an epoch at which something happened and
+    are vertical.
+
+    It also joins the y-range calculation: a resumed run that starts WORSE
+    than its ancestor puts the level above every plotted point, which is
+    exactly the case the level exists to show, and it would be placed
+    off-axis and silently invisible otherwise.
+    """
+    import matplotlib.pyplot as plt
+    from utils.plots import loss_curve
+
+    captured = {}
+    original = plt.subplots
+
+    def spy(*args, **kwargs):
+        fig, ax = original(*args, **kwargs)
+        captured.setdefault("ax", ax)
+        return fig, ax
+
+    monkeypatch.setattr(plt, "subplots", spy)
+    # A fixture where the percentile CAP actually fires: 200 points, one
+    # spike, so p99 ~ 3 and the cap lands ~4.65. The level at 50 is above
+    # that cap, so it is only visible if the cap explicitly makes room for
+    # it. (Feeding levels into the percentile does not work -- one value
+    # among hundreds barely moves p99, and the level stayed clipped.)
+    level = 50.0
+    n = 200
+    epochs = list(range(1, n + 1))
+    train = [1e6] + [3.0] * (n - 1)
+    val = [1e6] + [3.1] * (n - 1)
+    best = [1e6] + [3.1] * (n - 1)
+    loss_curve(epochs, train, val, best,
+                tmp_path / "c.png", title="t",
+                reference_levels=[(level, "reference (ancestor)")])
+    ax = captured["ax"]
+    lo, hi = ax.get_ylim()
+    assert lo <= level <= hi, (
+        f"reference level {level} is outside the y range {lo:.3g}..{hi:.3g}, "
+        f"so it was drawn off-axis and is invisible"
+    )
+    labels = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert any("reference" in t for t in labels), labels
+    # a HORIZONTAL line: constant y, spanning the axis in x
+    flat = [ln for ln in ax.get_lines()
+            if len(ln.get_ydata()) == 2 and len(set(ln.get_ydata())) == 1]
+    assert [ln.get_ydata()[0] for ln in flat] == [level], (
+        "the reference level was not drawn as a horizontal line"
+    )

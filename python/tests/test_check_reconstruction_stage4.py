@@ -1,3 +1,4 @@
+import pytest
 import torch
 from pathlib import Path
 from utils import load_datasets as load
@@ -85,6 +86,7 @@ def test_check_reconstruction_loads_flat_stage4_checkpoint(tmp_path, capsys):
     assert (tmp_path / "recon.png").exists()
 
 
+@pytest.mark.slow
 def test_check_reconstruction_loads_a_real_train_refinement_checkpoint(
     tmp_path, isolated_project_root,
 ):

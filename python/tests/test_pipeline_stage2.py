@@ -1,6 +1,8 @@
 import torch
 from pathlib import Path
 
+import pytest
+
 from conftest import cached_sweep
 from utils import load_datasets as load
 from orchestration.pipeline import run_from_params_file
@@ -47,6 +49,7 @@ def _build_sweep_uncached(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
+@pytest.mark.slow
 def test_pipeline_warns_but_ignores_a_stale_stage1b_section(tmp_path, isolated_project_root, capsys):
     """Stage 1b no longer exists as a separate pass -- train_stage2()
     now builds the deriv stream itself, directly from stage 1's own
@@ -112,6 +115,7 @@ epochs = 0
     assert len(stage2_files) == 1, "stage 2 should still have run normally, ignoring the stale section"
 
 
+@pytest.mark.slow
 def test_pipeline_runs_1_then_2_directly(tmp_path, isolated_project_root):
     """THE actual end-to-end claim now in scope: stage 2 resumes DIRECTLY
     from stage 1's own checkpoint, with no stage 1b pass at all --
@@ -178,6 +182,7 @@ stats0_weight = 0.01
     print("Full pipeline (1 -> 2, no stage 1b at all) ran end to end via run_from_params_file")
 
 
+@pytest.mark.slow
 def test_pipeline_stops_after_stage1_without_stage2_section(tmp_path, isolated_project_root):
     """If '# Stage 2' isn't in the params file at all, the pipeline
     should stop at stage 1's own output. Gating moved here from stage
@@ -217,6 +222,7 @@ stats0_weight = 0.0
     print("Correctly stopped after stage 1 -- stage 2 was NOT attempted")
 
 
+@pytest.mark.slow
 def test_pipeline_ignores_global_resume_from_for_pipeline_managed_stages(tmp_path, isolated_project_root, capsys):
     """
     REGRESSION: a global 'resume_from' (e.g. left over from testing a
@@ -284,6 +290,7 @@ epochs = 0
     )
 
 
+@pytest.mark.slow
 def test_pipeline_honors_stage2_specific_resume_from_override(tmp_path, isolated_project_root, capsys):
     """
     A DIFFERENT case from the global one above: resume_from set
@@ -396,6 +403,7 @@ force = true
     )
 
 
+@pytest.mark.slow
 def test_pipeline_backs_up_before_self_resume_overwrite(tmp_path, isolated_project_root, capsys):
     """
     REGRESSION: the actual scenario resume_from's own backup exists
@@ -516,6 +524,7 @@ def _build_sweep(tmp_path, *args, **kwargs):
                         lambda d: _build_sweep_uncached(d, *args, **kwargs))
 
 
+@pytest.mark.slow
 def test_pipeline_sanity_checks_actually_run_at_the_DEFAULT(tmp_path, isolated_project_root, capsys):
     """
     REGRESSION: every other pipeline test in this file passes

@@ -202,6 +202,7 @@ def test_rejects_a_multi_stream_ancestor(tmp_path, stage1a_checkpoint):
         extend_state_checkpoint_with_deriv_stream(resume_from=fake_multi_stream_path, device="cpu")
 
 
+@pytest.mark.slow
 def test_raises_clearly_when_ancestor_has_no_stats_head(tmp_path):
     """Identical contract to stage 1b's own equivalent check --
     L_stats1 needs stats_head0's own stat_names/normalization, not

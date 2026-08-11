@@ -70,6 +70,7 @@ def shared_stage1a_ancestor(tmp_path_factory):
     return base_path, stage1a_path
 
 
+@pytest.mark.slow
 def test_stage2_full_c0c1_loss_end_to_end(shared_stage1a_ancestor, tmp_path, isolated_project_root):
     """The redesigned stage 2, exercised end-to-end from a real stage 1a
     ancestor directly (no stage 1b pass at all -- see
@@ -135,6 +136,7 @@ def test_stage2_full_c0c1_loss_end_to_end(shared_stage1a_ancestor, tmp_path, iso
     print("D0's own inner (unfrozen) layers genuinely trained")
 
 
+@pytest.mark.slow
 def test_zero_weight_terms_omitted_from_console_output(shared_stage1a_ancestor, tmp_path, isolated_project_root, capsys):
     """Regression test for a real, reported clutter issue: with
     stats1_weight=0.0 (the new default -- pure L_deriv training), the
@@ -176,6 +178,7 @@ def test_zero_weight_terms_omitted_from_console_output(shared_stage1a_ancestor, 
     assert "recon0/1.0 +0.01*stats0/1.0 +0.02*stats1/1.0 +1.0*deriv/1.0" in output
 
 
+@pytest.mark.slow
 def test_epochs_zero_actually_writes_a_checkpoint_stage2(shared_stage1a_ancestor, tmp_path, isolated_project_root, capsys):
     """Same regression test as Stage 1a/1b's own, for train_stage2."""
     base_path, stage1a_path = shared_stage1a_ancestor
@@ -199,6 +202,7 @@ def test_epochs_zero_actually_writes_a_checkpoint_stage2(shared_stage1a_ancestor
     assert "train_set: skipped" in output, "train_set must be skipped entirely at epochs=0"
 
 
+@pytest.mark.slow
 def test_augment_is_actually_threaded_through_to_the_train_set_only(
     shared_stage1a_ancestor, tmp_path, isolated_project_root, monkeypatch,
 ):
@@ -271,6 +275,7 @@ def test_gradient_scaling_trick_scales_gradient_exactly():
         )
 
 
+@pytest.mark.slow
 def test_z0_from_deriv_weight_runs_end_to_end_across_its_range(
     shared_stage1a_ancestor, tmp_path, isolated_project_root,
 ):

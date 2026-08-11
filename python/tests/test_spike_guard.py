@@ -902,6 +902,7 @@ def test_the_guard_lives_in_ONE_place():
         assert "class _SpikeGuard" not in src, f"{mod} has its own copy"
 
 
+@pytest.mark.slow
 def test_END_TO_END_stage45_guard_skips_and_reports(tmp_path, capsys,
                                                      isolated_project_root):
     """
@@ -962,6 +963,7 @@ def test_END_TO_END_stage45_guard_skips_and_reports(tmp_path, capsys,
     assert math.isfinite(float(loaded["val_loss"]))
 
 
+@pytest.mark.slow
 def test_END_TO_END_stage45_deadlock_stops_without_raising(tmp_path, capsys,
                                                             isolated_project_root):
     """

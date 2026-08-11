@@ -261,6 +261,7 @@ def test_stage3_does_NOT_seed_from_an_incomparable_ancestor():
     )
 
 
+@pytest.mark.slow
 def test_END_TO_END_a_non_improving_resume_keeps_the_ancestor_byte_for_byte(tmp_path):
     """
     The contract, exercised through a real training run rather than matched in

@@ -136,6 +136,7 @@ def loss_curve(
     secondary_train: list[float] | None = None, secondary_val: list[float] | None = None,
     secondary_label: str = "1step",
     event_epochs: list[tuple[float, str]] | None = None,
+    reference_levels: list[tuple[float, str]] | None = None,
 ) -> Path:
     """
     Called from every stage's epoch loop (see train_stage1.py/
@@ -200,6 +201,16 @@ def loss_curve(
         ax.axvline(event_x, color="tab:red", linestyle=":", linewidth=1.2,
                     alpha=0.8, label=event_label)
 
+    # Reference LEVELS are horizontal: a loss VALUE the curve is measured
+    # against (the ancestor's val_loss under this run's own objective),
+    # not an epoch at which something happened. Drawn only when the
+    # measured quantity is constant across the whole run -- a level from
+    # before a mid-run target switch is not a bar the post-switch curve
+    # can be read against, so the caller withholds it in that case.
+    for level_y, level_label in (reference_levels or []):
+        ax.axhline(level_y, color="tab:purple", linestyle="--", linewidth=1.2,
+                    alpha=0.8, label=level_label)
+
     if secondary_train is not None:
         ax.plot(epochs, secondary_train, label=f"train ({secondary_label})",
                 color="tab:blue", linestyle="--", linewidth=1, alpha=0.5)
@@ -247,7 +258,19 @@ def loss_curve(
         # all-zero/all-tiny case, where capping at 0 would make the plot
         # blank rather than doing nothing useful.
         if observed_max > cap and cap > 0:
-            ax.set_ylim(top=cap)
+            # A reference LEVEL must survive the cap. Feeding levels into the
+            # percentile instead does not work -- one extra value among
+            # hundreds barely moves p99, so a level well above the curves was
+            # still clipped (measured: level 50 against a 4.65 cap). The cap
+            # exists to stop a transient spike stretching the axis, not to
+            # hide an annotation the caller explicitly asked for, so raise
+            # the top to clear the highest level when there is one.
+            top = cap
+            if reference_levels:
+                highest = max(y for y, _ in reference_levels)
+                if highest > top:
+                    top = highest * 1.05
+            ax.set_ylim(top=top)
         # else: leave the top unset -- auto-scale to the real range.
     if not use_log:
         ax.set_ylim(bottom=0)
@@ -345,16 +368,27 @@ def loss_component_scatter(
     resume with different stats0_weight/deriv_weight).
     """
     names = list(component_histories.keys())
-    pairs = [(names[i], names[j]) for i in range(len(names)) for j in range(i + 1, len(names))]
-    if not pairs:
+    if len(names) < 2:
         return None
 
-    n_cols = min(3, len(pairs))
-    n_rows = -(-len(pairs) // n_cols)  # ceil division
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4.5 * n_rows), squeeze=False)
+    # LOWER-TRIANGULAR corner layout, not a wrapped flat list. With four
+    # components the flat 2x3 packing put (recon0,stats0) and (stats0,deriv)
+    # in different rows with different axes, so nothing lined up and the
+    # reader had to re-read the axis labels on all six panels. Here row r
+    # is ALWAYS the y variable names[r+1] and column c is ALWAYS the x
+    # variable names[c]: every panel in a row shares a y quantity, every
+    # panel in a column shares an x quantity, and the empty upper triangle
+    # is the redundant transpose rather than wasted space.
+    n = len(names) - 1
+    fig, axes = plt.subplots(n, n, figsize=(5 * n, 4.5 * n), squeeze=False)
+    for r in range(n):
+        for c in range(n):
+            if c > r:
+                axes[r][c].set_visible(False)
 
-    for idx, (name_x, name_y) in enumerate(pairs):
-        ax = axes[idx // n_cols][idx % n_cols]
+    pairs = [(names[c], names[r + 1], axes[r][c])
+             for r in range(n) for c in range(r + 1)]
+    for name_x, name_y, ax in pairs:
         cx, cy = component_histories[name_x], component_histories[name_y]
 
         # best_so_far is DASHED, and that is not decoration. It coincides
@@ -450,7 +484,7 @@ def loss_component_scatter(
         ax.set_ylim(ylo if ylo else 0, ymax)
         ax.set_xlabel(name_x)
         ax.set_ylabel(name_y)
-        if idx == 0:
+        if ax is pairs[0][2]:
             # "best", not a fixed corner. These trajectories head toward the
             # origin, so they occupy the LOWER-LEFT... except early in a run,
             # when every point is still up and to the right and a hardcoded
@@ -461,10 +495,8 @@ def loss_component_scatter(
             ax.legend(loc="best", fontsize=8)
         ax.grid(alpha=0.25)
 
-    # Unused grid cells (n_rows*n_cols > len(pairs), e.g. 4 pairs in a
-    # 2x3 grid) hidden rather than left as blank axes with tick marks.
-    for idx in range(len(pairs), n_rows * n_cols):
-        axes[idx // n_cols][idx % n_cols].set_visible(False)
+    # (the upper triangle was already hidden above -- it is the redundant
+    #  transpose of the lower one, not an unused remainder.)
 
     if title:
         fig.suptitle(title)

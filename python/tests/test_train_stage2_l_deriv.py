@@ -52,6 +52,7 @@ def _build_sweep_uncached(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
+@pytest.mark.slow
 def test_stage2_rejects_ambiguous_multi_deriv_ancestor(tmp_path, isolated_project_root):
     """L_deriv has no meaning without EXACTLY one deriv-role stream to
     compare z0's own trajectory against -- must raise clearly, not
@@ -112,6 +113,7 @@ def test_stage2_rejects_ambiguous_multi_deriv_ancestor(tmp_path, isolated_projec
         )
 
 
+@pytest.mark.slow
 def test_stage2_accepts_single_stream_ancestor_and_builds_deriv(tmp_path, isolated_project_root):
     """The new, intended behavior this test file's own removed test used
     to explicitly forbid: train_stage2() now resumes DIRECTLY from a
@@ -150,6 +152,7 @@ def test_stage2_accepts_single_stream_ancestor_and_builds_deriv(tmp_path, isolat
     assert saved["stats_head1_state"] is not None
 
 
+@pytest.mark.slow
 def test_epoch0_reference_does_not_perturb_training_rng(tmp_path, isolated_project_root, monkeypatch):
     """
     REGRESSION: the epoch-0 reference row (a pure diagnostic, printed
@@ -228,6 +231,7 @@ def test_epoch0_reference_does_not_perturb_training_rng(tmp_path, isolated_proje
     )
 
 
+@pytest.mark.slow
 def test_stats_head1_genuinely_trains_when_stats1_weight_nonzero(tmp_path, isolated_project_root):
     """Regression test for a real, confirmed bug: stats_head1 is a
     SEPARATE nn.Module from ae (not one of its submodules), left with
@@ -291,6 +295,7 @@ def test_stats_head1_genuinely_trains_when_stats1_weight_nonzero(tmp_path, isola
     )
 
 
+@pytest.mark.slow
 def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_project_root, capsys):
     """deriv_target_centered's own switch epoch is derived from
     deriv_weight_warmup_epochs, not a separate knob (see train_stage2's
@@ -334,6 +339,7 @@ def test_deriv_target_centered_switches_at_ramp_completion(tmp_path, isolated_pr
     assert "[epoch 2: switching to the centered L_deriv target now" in printed
 
 
+@pytest.mark.slow
 def test_deriv_target_centered_resume_skips_completed_warmup(tmp_path, capsys,
                                                             isolated_project_root):
     """REGRESSION: resuming a stage-2 checkpoint that's already well
@@ -423,6 +429,7 @@ def _build_sweep(tmp_path, *args, **kwargs):
                         lambda d: _build_sweep_uncached(d, *args, **kwargs))
 
 
+@pytest.mark.slow
 def test_loss_component_scatter_writes_a_SEPARATE_file_from_loss_curve(tmp_path, isolated_project_root):
     """
     REGRESSION: loss_components_path used to be derived via
@@ -476,6 +483,7 @@ def test_loss_component_scatter_writes_a_SEPARATE_file_from_loss_curve(tmp_path,
     )
 
 
+@pytest.mark.slow
 def test_loss_component_scatter_values_reconstruct_train_total(tmp_path, isolated_project_root, monkeypatch):
     """The per-component values fed to loss_component_scatter must sum
     (recon0 + stats0 + deriv, all already weight/scale-normalized) to
@@ -599,3 +607,372 @@ def test_the_two_halves_of_the_message_are_consistent():
             f"switch={switch} prior={prior}: message would say 'epoch {own}' and "
             f"'first {count} epochs', which disagree"
         )
+
+
+@pytest.mark.slow
+def test_no_curve_marker_when_already_centered_at_epoch_one(tmp_path, capsys,
+                                                             isolated_project_root):
+    """
+    REGRESSION: a fresh run with deriv_target_centered=True and no warmup
+    (deriv_switch_epoch <= 1) is centered from its own epoch 1. just_switched
+    fires there -- correctly, for the print message and the grace-period
+    reset, which are about comparability against the LOADED checkpoint's
+    val_loss and are real concerns even at epoch 1.
+
+    But the loss curve's own epoch history has no point before epoch 1 (the
+    epoch-0 reference row is deliberately never added to it), so a vertical
+    "centered L_deriv target" marker at epoch 0.5 has nothing on either side
+    of it -- a discontinuity marker for a discontinuity that isn't in this
+    figure. It must not be added.
+    """
+    import training.train_stage2 as train_stage2_module
+
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    capsys.readouterr()
+
+    captured_events = []
+    captured_levels = []
+    real_loss_curve = train_stage2_module.loss_curve
+
+    def _recording_loss_curve(*args, **kwargs):
+        captured_events.append(list(kwargs.get("event_epochs") or []))
+        captured_levels.append(list(kwargs.get("reference_levels") or []))
+        return real_loss_curve(*args, **kwargs)
+
+    train_stage2_module.loss_curve = _recording_loss_curve
+    try:
+        train_stage2(
+            base_path=base_path, resume_from=stage1_path,
+            # warmup=0 -> deriv_switch_epoch <= 1: centered from epoch 1,
+            # nothing before it in THIS run.
+            deriv_weight=1.0, deriv_weight_warmup_epochs=0, stats0_weight=0.01,
+            epochs=3, batch_size=4, num_workers=0,
+            min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / "stage2_centered_from_1.pt", device="cpu",
+            log_every_epoch=True, loss_curve_path=tmp_path / "curve2_from1.png",
+            deriv_target_centered=True,
+        )
+    finally:
+        train_stage2_module.loss_curve = real_loss_curve
+
+    printed = capsys.readouterr().out
+    # the print/grace-period side of just_switched still fires at epoch 1 --
+    # UNCHANGED by this fix, and a real concern (val_loss under the loaded
+    # checkpoint's target isn't a fair bar for the new target either).
+    assert "[epoch 1: switching to the centered L_deriv target now" in printed
+
+    # but no plotted curve ever received an event at epoch 0.5
+    all_events = [e for call_events in captured_events for e in call_events]
+    assert not any(x == 0.5 for x, _ in all_events), (
+        f"a curve marker was drawn at epoch 0.5 with no preceding point on "
+        f"this run's own curve: {all_events}"
+    )
+    # INSTEAD it gets the horizontal reference level: the target is constant
+    # across this whole run, so the ancestor's val_loss under that same
+    # target IS a fair bar to read the curve against.
+    all_levels = [lv for call_levels in captured_levels for lv in call_levels]
+    assert all_levels, (
+        "no reference level either -- an already-centered run should be "
+        "annotated with the bar it started from"
+    )
+    assert any("reference" in label for _, label in all_levels), all_levels
+
+
+@pytest.mark.slow
+def test_curve_marker_is_kept_for_a_genuine_mid_run_switch(tmp_path, capsys,
+                                                            isolated_project_root):
+    """The counterpart: when the switch happens after a real preceding point
+    on THIS run's own curve (deriv_switch_epoch=2, so epoch 1 is plotted
+    on the cheap target before epoch 2 switches), the marker at 1.5 must
+    still be drawn -- the fix must not suppress genuine mid-run switches."""
+    import training.train_stage2 as train_stage2_module
+
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    capsys.readouterr()
+
+    captured_events = []
+    captured_levels = []
+    real_loss_curve = train_stage2_module.loss_curve
+
+    def _recording_loss_curve(*args, **kwargs):
+        captured_events.append(list(kwargs.get("event_epochs") or []))
+        captured_levels.append(list(kwargs.get("reference_levels") or []))
+        return real_loss_curve(*args, **kwargs)
+
+    train_stage2_module.loss_curve = _recording_loss_curve
+    try:
+        train_stage2(
+            base_path=base_path, resume_from=stage1_path,
+            deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
+            epochs=3, batch_size=4, num_workers=0,
+            min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / "stage2_midrun.pt", device="cpu",
+            log_every_epoch=True, loss_curve_path=tmp_path / "curve2_midrun.png",
+            deriv_target_centered=True,
+        )
+    finally:
+        train_stage2_module.loss_curve = real_loss_curve
+
+    all_events = [e for call_events in captured_events for e in call_events]
+    assert any(x == 1.5 for x, _ in all_events), (
+        f"the genuine mid-run switch at epoch 2 lost its curve marker at "
+        f"1.5: {all_events}"
+    )
+    # and NO horizontal reference level here: the reference was measured
+    # under the one-sided target, so a flat line drawn across the switch
+    # would invite comparing post-switch points against a bar computed for
+    # a different quantity. The two annotations are mutually exclusive.
+    all_levels = [lv for call_levels in captured_levels for lv in call_levels]
+    assert not all_levels, (
+        f"a reference level was drawn across a mid-run target switch, where "
+        f"it is not a fair bar: {all_levels}"
+    )
+
+
+@pytest.mark.slow
+def test_interp_weight_requires_the_centered_target(tmp_path, isolated_project_root):
+    """
+    L_interp needs the (t-, t, t+) triplet. Only the centered path loads a
+    3-frame window; the one-sided path has window_length=2 and no middle
+    frame to interpolate TO. Refusing loudly beats silently computing zero
+    -- the silently-ignored-parameter failure mode this project already has
+    a standing todo about.
+    """
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01,
+        stat_names=["avg_phi"], device="cpu", seed=0, log_every_epoch=False,
+    )
+    with pytest.raises(ValueError, match="deriv_target_centered"):
+        train_stage2(
+            base_path=base_path, resume_from=stage1_path,
+            deriv_weight=1.0, stats0_weight=0.01, epochs=1, batch_size=4,
+            num_workers=0, min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / "s2_bad.pt", device="cpu",
+            log_every_epoch=False, deriv_target_centered=False,
+            interp_weight=0.1,
+        )
+
+
+@pytest.mark.slow
+def test_interp_and_centered_target_share_one_switch_epoch(tmp_path, capsys,
+                                                            isolated_project_root):
+    """
+    Both gate on deriv_switch_epoch (from deriv_weight_warmup_epochs), so
+    there is no way to configure one active without the other's data, and
+    the loss-curve marker names BOTH -- the cliff there is the sum of two
+    objective changes, and attributing it to the target change alone would
+    understate what moved.
+    """
+    import training.train_stage2 as train_stage2_module
+
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01,
+        stat_names=["avg_phi"], device="cpu", seed=0, log_every_epoch=False,
+    )
+    capsys.readouterr()
+
+    captured_events = []
+    real_loss_curve = train_stage2_module.loss_curve
+
+    def _recording(*args, **kwargs):
+        captured_events.append(list(kwargs.get("event_epochs") or []))
+        return real_loss_curve(*args, **kwargs)
+
+    train_stage2_module.loss_curve = _recording
+    try:
+        train_stage2(
+            base_path=base_path, resume_from=stage1_path,
+            deriv_weight=1.0, deriv_weight_warmup_epochs=2, stats0_weight=0.01,
+            epochs=3, batch_size=4, num_workers=0,
+            min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / "s2_interp.pt", device="cpu",
+            log_every_epoch=True,
+            loss_curve_path=tmp_path / "curve_interp.png",
+            deriv_target_centered=True, interp_weight=0.1,
+        )
+    finally:
+        train_stage2_module.loss_curve = real_loss_curve
+
+    labels = [lab for call in captured_events for _x, lab in call]
+    assert any("L_interp" in lab for lab in labels), (
+        f"the switch marker does not name L_interp, so the extra cliff it "
+        f"contributes is misattributed: {labels}"
+    )
+
+
+@pytest.mark.slow
+def test_interp_weight_zero_leaves_the_loss_untouched(tmp_path,
+                                                       isolated_project_root):
+    """interp_weight=0.0 must reproduce the old behaviour exactly -- the
+    established pattern for every added term."""
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01,
+        stat_names=["avg_phi"], device="cpu", seed=0, log_every_epoch=False,
+    )
+    import torch as _torch
+    paths = []
+    for weight in (0.0, 0.0):
+        _torch.manual_seed(0)
+        paths.append(train_stage2(
+            base_path=base_path, resume_from=stage1_path,
+            deriv_weight=1.0, deriv_weight_warmup_epochs=0, stats0_weight=0.01,
+            epochs=2, batch_size=4, num_workers=0,
+            min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / f"s2_w{weight}_{len(paths)}.pt",
+            device="cpu", log_every_epoch=False,
+            deriv_target_centered=True, interp_weight=weight,
+        ))
+    a = _torch.load(paths[0], map_location="cpu", weights_only=True)
+    b = _torch.load(paths[1], map_location="cpu", weights_only=True)
+    assert a["val_loss"] == b["val_loss"], (
+        "two identical interp_weight=0 runs disagree, so the added term "
+        "perturbs training even when disabled"
+    )
+
+
+@pytest.mark.slow
+def test_interp_weight_actually_changes_training(tmp_path, isolated_project_root):
+    """
+    A term that is computed, returned and reported but never added to the
+    total would pass every other test here. This is the one that fails if
+    L_interp is inert: the same run at interp_weight 0 vs 0.5 must reach a
+    DIFFERENT model.
+    """
+    import torch as _torch
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01,
+        stat_names=["avg_phi"], device="cpu", seed=0, log_every_epoch=False,
+    )
+    losses = []
+    for weight in (0.0, 0.5):
+        _torch.manual_seed(0)
+        path = train_stage2(
+            base_path=base_path, resume_from=stage1_path,
+            deriv_weight=1.0, deriv_weight_warmup_epochs=0, stats0_weight=0.01,
+            epochs=2, batch_size=4, num_workers=0,
+            min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / f"s2_influence_{weight}.pt",
+            device="cpu", log_every_epoch=False,
+            deriv_target_centered=True, interp_weight=weight,
+        )
+        losses.append(_torch.load(path, map_location="cpu",
+                                   weights_only=True)["val_loss"])
+    assert losses[0] != losses[1], (
+        f"interp_weight 0.0 and 0.5 produced the same val_loss ({losses[0]}), "
+        f"so L_interp is not reaching the optimizer at all"
+    )
+
+
+@pytest.mark.slow
+def test_interp_appears_in_the_printed_loss_breakdown(tmp_path, capsys,
+                                                        isolated_project_root):
+    """
+    REGRESSION: interp_weight=0.5 ran with the term in the TOTAL but absent
+    from active_terms, so the console formula, the per-epoch component
+    columns, component_names and loss_component_scatter all omitted it --
+    a three-term breakdown printed beside a total its parts could not sum
+    to. Everything that reports the breakdown derives from active_terms, so
+    the term must be registered there, not only added into the total.
+    """
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    capsys.readouterr()
+    train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, deriv_weight_warmup_epochs=0, stats0_weight=0.01,
+        interp_weight=0.5, deriv_target_centered=True,
+        epochs=2, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_interp.pt", device="cpu",
+        log_every_epoch=True, loss_curve_path=tmp_path / "curve_interp.png",
+    )
+    printed = capsys.readouterr().out
+    assert "*interp/" in printed, (
+        "the loss-composition header does not mention interp, so a run with "
+        "interp_weight > 0 reports a breakdown missing one of its terms"
+    )
+
+
+@pytest.mark.slow
+def test_interp_weight_zero_leaves_the_breakdown_untouched(tmp_path, capsys,
+                                                            isolated_project_root):
+    """The established pattern: 0.0 must reproduce today's output exactly,
+    so the term is registered only when it is actually active."""
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    capsys.readouterr()
+    train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, deriv_weight_warmup_epochs=0, stats0_weight=0.01,
+        interp_weight=0.0, deriv_target_centered=True,
+        epochs=2, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_nointerp.pt", device="cpu",
+        log_every_epoch=True, loss_curve_path=tmp_path / "curve_nointerp.png",
+    )
+    assert "*interp/" not in capsys.readouterr().out
+
+
+def test_interp_parameters_are_recorded_in_the_checkpoint(tmp_path,
+                                                           isolated_project_root):
+    """
+    REGRESSION (audit finding): every other loss weight is saved in
+    stage2_config (deriv_weight, stats0_weight, stats1_weight) but interp
+    was not -- a checkpoint trained WITH L_interp was indistinguishable
+    from one trained without, which breaks provenance for exactly the
+    before/after comparisons the acceptance tests rely on.
+    """
+    import torch
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    out = tmp_path / "stage2_prov.pt"
+    train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, deriv_weight_warmup_epochs=0, stats0_weight=0.01,
+        interp_weight=0.125, interp_scale=0.005, deriv_target_centered=True,
+        epochs=1, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=out, device="cpu", log_every_epoch=False,
+    )
+    cfg = torch.load(out, map_location="cpu", weights_only=True)["stage2_config"]
+    assert cfg["interp_weight"] == 0.125
+    assert cfg["interp_scale"] == 0.005

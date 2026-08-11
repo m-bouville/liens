@@ -120,6 +120,7 @@ def test_stage3b_resume_DOES_move_when_n_substeps_changes(tmp_path, isolated_pro
     )
 
 
+@pytest.mark.slow
 def test_stage5_resuming_stage4_with_STAGE4_params_reproduces_stage4(tmp_path,
                                                                       isolated_project_root):
     """
@@ -160,6 +161,7 @@ def test_stage5_resuming_stage4_with_STAGE4_params_reproduces_stage4(tmp_path,
     )
 
 
+@pytest.mark.slow
 def test_stage5_resume_DOES_move_when_the_SCALES_change(tmp_path, isolated_project_root):
     """
     The negative twin. Changing rollout_scale must move the reported loss --
@@ -193,6 +195,7 @@ def test_stage5_resume_DOES_move_when_the_SCALES_change(tmp_path, isolated_proje
     )
 
 
+@pytest.mark.slow
 def test_stage2_resuming_stage1_PRESERVES_the_trained_trunk(tmp_path, isolated_project_root):
     """
     Stage 1 and stage 2 val_loss are NOT comparable, even at deriv_weight=0:

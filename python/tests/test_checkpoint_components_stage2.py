@@ -1,3 +1,4 @@
+import pytest
 import torch
 from pathlib import Path
 
@@ -50,6 +51,7 @@ def _build_sweep_uncached(tmp_path, n_runs=6, size=32):
     return tmp_path / "datasets"
 
 
+@pytest.mark.slow
 def test_checkpoint_components_decoder_extraction_from_stage2(tmp_path, isolated_project_root):
     """Regression test for a real, reported crash: build_models_from_
     components() failed with 'Reassembled Autoencoder state_dict

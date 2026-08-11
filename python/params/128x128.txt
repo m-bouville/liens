@@ -15,6 +15,7 @@ recon0_scale  = 0.1e-3
 stats0_scale  = 0.01
 
 deriv_scale   = 0.02e-3
+interp_scale  = 5.e-3			# /!\ to be tuned
 
 # force 	      = True
 
@@ -54,6 +55,7 @@ augment       = False		# takes hours per epoch otherwise
 
 stats0_weight   = 0.25     	# was 0.5; weight of L_stats0 relative to L_recon0
 deriv_weight    = 4.
+interp_weight   = 0.1		# 0.5 was too high /!\ to be tuned
 
 val_ema_decay   = 0.8		# was 0.7 (default)
 
@@ -62,17 +64,19 @@ z0_from_deriv_weight=0.  # was 0.05	# in [0, 1]: 0 means z0 is trained on recons
 deriv_dt_weight_exponent = -0.5
 
 deriv_target_centered=True
-# resume_from	  = checkpoints/stage2/128x128-stage2.pt
+resume_from	  = checkpoints/stage2/128x128-stage2-20260811_09h43.pt
 
 epochs 		  = 100
 patience 	  =  10
-deriv_weight_warmup_epochs= 10  # also switches to symmetric definition of derivative
+deriv_weight_warmup_epochs= 5  # also switches to symmetric definition of derivative
 
 batches 	  = same
 
+lr 			  = 1.e-4  # was 1.e-3, the default
+
 val_aug_averaging= True
 
-# force 	      = True
+force 	      = True
 
 
 
@@ -82,34 +86,34 @@ n_rollout_steps= 1			# always 1 for 3a
 z1_resync       = True		# always True for 3a
 
 alpha			=  0.5		# adaptative sub-step (higher: more lenient)
-max_substeps    = 1024		# default: 256
+max_substeps    = 512		# default: 256
 target_vram_gib = 6.5		# leave 1 GB as headroom for driver/context
-truncate_bptt 	=  64
+truncate_bptt 	=  32
 bucket_refresh_epochs=0
 
 memory_cost_a_bytes= None
 memory_cost_b_bytes= None
 memory_cost_p 	   = None
 
-resume_from 	= checkpoints/stage3a/128x128-stage3a.pt
+# resume_from 	= checkpoints/stage3a/128x128-stage3a.pt
 
 rollout_scale = 1e-6
 ae_stats_weight= 1.
 
 use_dt_decade_weights = False  # was True before alpha
 
-epochs 		  =10000		# increase?
-patience 	  =  500
+epochs 		  = 1000		# increase?
+patience 	  =  100
 
 num_workers	  =   4   # was 8
 batches		  = 2048
 spike_skip_factor= 10
 
 lr 			  = 3.e-6  # was 0.2e-3; default: 1.e-3
-z0_noise_scale=   0.02	# was 0.175
+z0_noise_scale=   0.1	# was 0.175
 
 dt_cap		  = inf		# for second order
-max_dt        = 5000   # 2000/0.05 = 40'000 time steps
+max_dt        = 4000   # 2000/0.05 = 40'000 time steps
 
 force 	      = True
 
@@ -117,14 +121,15 @@ force 	      = True
 
 # Stage 3b
 #   latent dynamics surrogate (rollout)
-n_rollout_steps=  6			# always > 1 for 3b
+n_rollout_steps=  2			# always > 1 for 3b
 z1_resync      = False		# always False for 3b
 
-alpha			= 1.5		# adaptative sub-step
-max_substeps    = 128		# default: 256
+alpha			= same		# adaptative sub-step
+max_substeps    = same		# default: 256
 bucket_batches 	= True		# default: True
+batch_cost_budget = 2000000000     # ~2.8 GiB, i.e. 5.5 GiB / 1.9
 target_vram_gib = same
-truncate_bptt 	=  64
+truncate_bptt 	= same
 bucket_refresh_epochs=0
 
 memory_cost_a_bytes= 120787
@@ -146,10 +151,10 @@ num_workers	  =    4
 batches		  = 4096
 # min_batch_size=  512 		# not implemented, TODO?
 spike_skip_factor= same
-grad_spike_factor = 0        # disable the gradient guard; grad_clip does the bounding
+# grad_spike_factor = 0        # disable the gradient guard; grad_clip does the bounding
 
 lr 			  =   3.e-6  	# was 3.e-6; default: 1.e-3
-z0_noise_scale=   0.02
+z0_noise_scale= same
 
 dt_cap		  = same		# must be
 max_dt        = 2000 
