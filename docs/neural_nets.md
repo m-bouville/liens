@@ -1,46 +1,105 @@
 # Neural networks: autoencoder and surrogate evolution
 
 
-See `./docs/NN-code_structure.md` for more details on the structure of the code.
+See `./docs/NN-code_structure.md` (written by Claude) for more details on the structure of the code.
 
 
-## Autoencoder
 
-### Architecture
-The convolutional autoencoder has a symmetric encoder–decoder architecture. The encoder depth scales with the (square) system size so that the spatial bottleneck remains 8×8: three downsampling stages for 64×64 inputs (64→32→16→8), five for 256×256, and so on. Each resolution level consists of two 3×3 convolutions (circular padding to match periodic boundaries) with ReLU activations, followed by a stride-2 convolution for downsampling (mirrored by learned upsampling in the decoder), with BatchNorm/LayerNorm.
+## Strategy
 
-The encoder terminates with a 1×1 convolution reducing the feature dimension to 16 channels, yielding an 8×8×16 latent representation. This bottleneck retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. Initial runs will use a larger latent space, to ensure that sufficient information is available for reconstruction, before shrinking it to find the lower bound for accuracy.
- 
+### Goal
 
-## Training Stages and loss functions
-
-### Dataset expansion
-From each snapshot, more are created through
-- mirror (horizontal and vertical);
-- rotation by $\pm$90 °, 180°;
-- transposing;
-- translation by (Nx/2, 4), (4, Ny/2), (Nx/2+4, Ny/2+4) thanks to periodic boundaries
-  - +4: shifts by half the size of the latent channels, so the translations are not in phase (to reduce the 8x8 checkerboard artifact).
+Phase-field simulations are used in materials science and engineering (MSE) to study microstructure evolution. They repeatedly solve physical partial differential equations (PDE). The goal is for a neural network (NN) 
+to learn the relationship between successive microstructures to accelerate phase-field simulations while preserving the underlying physics.
 
 
-### Training Stages
+### Predicting in latent space
 
-There are five losses, which can be mixed and matched at the different stages:
+The neural-network surrogate model learns a reduced-order representation of the phase-field state together with a surrogate evolution operator acting in that latent space. 
+Morphological statistics of the microstructure are used to complement pixel fidelity.
+
+Working directly in latent space is faster (it is smaller than real space), but _a priori_ we cannot do arithmetic in it. 
+
+Training the AE (stage 1) ensures that the microstructure (the state) can be reconstructed in real space. This means that the latent representation $z_0$ somehow describes $x$, not that is a smooth and structured coordinate system. 
+
+### Split latent space
+One wants to get a latent representation which could reconstruct, while preserving internal logic. We introduce a split latent channel:
+- C$_0$ encodes the microstructure (the "state", 0th order): $z_0(t)$ is such that $D(z_0(t))$ recovers $x_0(t)$;
+- C$_1$ encodes the time derivative (1st order): $\mathrm{d}z_0 / \mathrm{d}t = \dot{z}_0$ (unlike C$_0$, C$_1$ is not decoded: it works purely in latent space). 
+
+A Taylor expansion of $z_0$ gives
+$$z_0(t + \delta t) = z_0(t) + \dot{z}_0(t)\,\delta t + \ddot{z}_0(t)\,(\delta t^2/2) + o(\delta t^2).$$
+The idea is to replace $\dot{z}_0$ with $z_1$ by training in stage 2, and $\ddot{z}_0$ with $f_\theta$ (stage 3).
+
+
+### A tale of two time steps
+Notations:
+- $\delta t$ is some arbitrary time step,
+- $\Delta t$ is specifically $t_{n+1} - t_n$ in `./datasets/`, it exists only during training.
+
+The idea, in stage 3b, is to mimic inference on an unknown time evolution, where:
+- $\delta t$ can be chosen freely,
+- everything will be recalculated at every time step because there is nothing else available after training.
+
+If $\delta t$ is small enough, error can be contained. Note: at $\delta t \to 0$, the convergence is towards a model, not an underlying truth (e.g. phase field).
+
+
+
+
+## The pipeline at a glance
+
+The stages each build on the previous one(s).
+1. Stage 1 encodes the microstructure ($z_0$, order 0);
+2. Stage 2 encodes the time derivative ($z_1$, order 1);
+3. Stage 3 learns $z(t+\delta t)$ from $z(t)$ ($f_\theta$, order 2);
+4. Stages 4 and 5 put this together, seeking a latent representation balancing reconstruction and dynamics prediction. 
+
+$f_\theta$ is different from $z_0$ and $z_1$:
+- $z_0$ and $z_1$ are supervised directly against data, never in feedback with themselves;
+- $f_\theta$ is a learned corrector: trained through a prediction objective, and its output re-enters its own input at the next sub-step.
+Currently, the first type works more reliably than the other.
+
+
+### Synoptic table
+
+| \# | stage          | input      | output    | aim                        |
+|---|-----------------|------------|-----------|----------------------------|
+| 1 | autoencoder (C$_0$)| $x_0$ | $z_0$ | $D[z_0(t)] \approx x_0(t)$ |
+| 2 | derivative (C$_1$) | $x_0$ | $z_1$ | $z_0(t) + z_1(t)\,\delta t \approx z_0(t+\delta t)$, i.e. $z_1(t) \approx \dot{z}_0(t)$; while maintaining $D[z_0(t)] \approx x_0(t)$ |
+| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^*$ | $z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t)) \, (\Delta t^2/2) \approx z_0(t+\Delta t)$ |
+| 3b | LDS, rollout   |        "        | "    |  as 3a, chained, + $z_1(t) + f_\theta(z_0(t), z_1(t))\,\delta t + g_\theta(z_0(t), z_1(t)) \,(\delta t^2/2) \approx z_1(t+\delta t)$ |
+
+Note:
+${}^*$: not yet implemented.
+
+  
+The asymmetry between C$_0$ and C$_1$ in on the number of channels, not size, in the latent space (still true?).
+
+
+### Stages, losses and checkpoints
+
+There are six losses, which can be mixed and matched at the different stages:
 - reconstruction loss: $L_\mathrm{recon}$,
 - statistics loss: $L_\mathrm{stats}$,
 - derivative loss: $L_\mathrm{deriv}$,
+- interpolation loss: $L_\mathrm{interp}$,
 - one-step latent prediction loss: $L_\mathrm{1step}$,
 - multi-step rollout loss: $L_\mathrm{rollout}$.
+
+For each loss:
+- `*_scale` normalize the loss for it to be around 1 (objective),
+- `*_weight` is the importance given to a certain loss at a certain stage (a choice).
+What is used in the loss function: `*_weight * L_* / *_scale`.
 
 
 | \#| Stage             | Trained | Frozen | Unused | Space | Snapshots | Loss                            |
 |---|-------------------|--------------|------|------|-------|-------|---------------------------------|
-| 1 a| autoencoder (C$_0$)|E, D$_0$, SH$_0$|   | f    | real  | 1    | `L_recon0 + λ L_stats0`           |
-| 2 | derivative (C$_1$) |E${}^*$, D$_0^*$| SH$_0$ | f | both | 3    | `L_recon0 + λ L_stats0 + λ₁ L_deriv` |
-| 3a| LDS               | f       | E, SH$_0$ | D$_0$ | latent| 2    | `L_1step + λ₁ L_deriv`           |
-| 3b| LDS               | f       | E, SH$_0$ | D$_0$ | latent| $n+1$  | `L_rollout + ε L_1step + λ₁ L_deriv` |
-| 4 | encoder refinement| E, f    | D$_0$, SH$_0$|  | latent$^\dagger$|$n+1$|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
-| 5 | end-to-end        | E, f, D$_0$ | SH$_0$  |      | real  | $n+1$ | `L_recon + λ L_stats + λ₂ L_rollout + λ₁ L_deriv` |
+| 1 a| autoencoder (C$_0$)|E, D, SH|   | f    | real  | 1    | `L_recon0 + λ L_stats0`           |
+| 2 | derivative (C$_1$) |E${}^*$, D${}^*$| SH | f | both | 3 | `L_recon0 + λ L_stats0 + λ₁ L_deriv + ε L_interp` |
+| 3a| LDS               | f       | E, SH | D | latent| 2    | `L_1step + λ₁ L_deriv`           |
+| 3b| LDS               | f       | E, SH | D | latent| $n+1$  | `L_rollout + ε L_1step + λ₁ L_deriv` |
+| 4 | encoder refinement| E, f  | D, SH|  | latent$^\dagger$|$n+1$|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
+| 5 | end-to-end        | E, f, D | SH  |      | real  | $n+1$ | `L_recon + λ L_stats + λ₂ L_rollout + λ₁ L_deriv` |
 
 Notes:
 - `L_interp` requires three consecutive snapshots: adding it to stage 1 would double the computational cost (3 E + 1D instead of 1 E + 1 D);
@@ -52,43 +111,39 @@ Notes:
 ![structure of stages and checkpoints](/assets/docs/liens_stage_checkpoint_flow.png "structure of stages and checkpoints")
 
 
+
+## Stage 1: representation
+
+
+### Architecture
+The convolutional autoencoder has a symmetric encoder–decoder architecture. The encoder depth scales with the (square) system size so that the spatial bottleneck remains 8×8: three downsampling stages for 64×64 inputs (64→32→16→8), five for 256×256, and so on. Each resolution level consists of two 3×3 convolutions (circular padding to match periodic boundaries) with ReLU activations, followed by a stride-2 convolution for downsampling (mirrored by learned upsampling in the decoder), with BatchNorm/LayerNorm.
+
+The encoder terminates with a 1×1 convolution reducing the feature dimension to 8 channels, yielding an 8×8×8 latent representation. This bottleneck retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. Initial runs will use a larger latent space, to ensure that sufficient information is available for reconstruction, before shrinking it to find the lower bound for accuracy.
+ 
+
+### Dataset expansion
+From each snapshot, more are created through
+- mirror (horizontal and vertical);
+- rotation by $\pm$90°, 180°;
+- transposing;
+- translation by (Nx/2, 0), (0, Ny/2), (Nx/2, Ny/2) thanks to periodic boundaries
+
+
 ### Reconstruction loss
 Compare $x' = D(E(x))$, the microstructure recovered by the AE, to $x$:
 $$L_\mathrm{recon} = \left\| x' - x \right\|_2^2.$$
 This is done in real space. $L_1$ may be used if sharper interfaces are desired.
 
 
-### Statistics loss
+### Physics-informed statistics loss
 Letting $s_i(x)$ denote the normalized _i_-th (out of $N_s$) microstructural statistic (measured, real), $g_i(z)$ the value of that normalized statistic in the `stats_head` (latent) and $w_i$ its weight,
 $$L_\mathrm{stats} = \sum_{i=1}^{N_s} w_i \left[g_i(z) - s_i(x)\right]^2.$$
-Currently, $w_i \forall i$. 
-
-(See below for more details.)
-
-
-### Derivative loss
-One compares $z_1(t)$ and $[z_0(t+\Delta t) - z_0(t)] / \Delta t$.
-See latent-space derivative (step 2) below. Note: in stage 1 the small dense NN for the statistics is trained along the encoder and decoder, in 2 it is frozen.
-
-
-### One-step latent prediction loss
-Compare the prediction to the ground truth in latent space:
-$$L_\mathrm{1step} = \left\| z_0(t+\Delta t) - [z_0(t) - z_1(t)\, \Delta t] \right\|_2^2.$$
-Doing so in latent space avoids reliance on the decoder, cleanly separating decoder loss and prediction loss.
-
-
-### Multi-step rollout loss
-By having several predictions in a row, we let error accumulate:
-$$z_0(t_{k}) \xrightarrow{f} \hat{z}_0(t_{k+1}) \xrightarrow{f} \hat{z}_0(t_{k+2}) \xrightarrow{f} \hat{z}_0(t_{k+3}) \xrightarrow{f} \ldots.$$
-When starting from the snapshot at time $t_k$, the rollout loss is:
-$$L_\mathrm{rollout} = \sum_{i=1}^{N_r} \left\| \hat{z}_0(t_k + i \delta t) - z_0(t_k + i \delta t) \right\|_2^2,$$
-where $\hat{z}_0(t_k + (i+1) \delta t) = \hat{z}_0(t_k + i \delta t) + z_1(t_k + i \delta t)\,\delta t$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
+(Currently, $w_i \forall i$.) 
+$g_i$ cannot be the statistics of $x$ in the real world, since this would say nothing about latent representation.
 
 
 
-## Physics-informed statistics
-
-### Motivation
+#### Motivation
 The latent representation serves two purposes:
 - recover the microstructure in real space (decoder),
 - predict the microstructure at $t + \Delta t$.
@@ -96,7 +151,7 @@ The latent representation serves two purposes:
 The reconstruction loss alone does not constrain the latent representation to preserve physically meaningful features. Auxiliary losses in the `stats_head`, based on microstructural statistics, nudge the encoder toward latent variables that capture characteristics such as phase fraction, interface density, anisotropy and characteristic length scales. This is expected to improve latent-space organization and, consequently, the accuracy and stability of the learned surrogate dynamics.
 
 
-### Statistics
+#### Statistics
 - Overall metrics:
   - average(OP)
   - stdev(OP)
@@ -109,7 +164,7 @@ The reconstruction loss alone does not constrain the latent representation to pr
   - first peak in autocorrelation: length and strength.
 
 
-### No live calculations
+#### No live calculations
 I just have a small dense net (`stats_head`) with $N_s$ output cells and say: "the values of these must match the statistics calculated in real space", without recalculating the statistics on x' (let alone on $\hat{z}$). Statistics are auxiliary prediction targets rather than differentiable image-derived losses. The statistics head is trained in latent space, only from ground-truth statistics computed offline.
 
 ```text
@@ -121,7 +176,7 @@ Linear(128 → Ns)
 ```
 
 
-### Anisotropy
+#### Anisotropy
 Compute, pixel by pixel, 
 $$J_\sigma = G_\sigma \ast \left(\!\nabla z\ \nabla z^{\!\top}\right),$$
 with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ and eigenvectors $v_1$ and $v_2$. Derive:
@@ -131,58 +186,69 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 - Local orientation (normal direction): $\arctan(v_{1y} / v_{1x})$.	
 
 
-
-## Predicting in latent space
-
-#### Notation
-- $\delta t$ is some arbitrary time step,
-- $\Delta t$ is specifically $t_{n+1} - t_n$ in `/datasets`, it exists only during training.
-
-### Split latent space
-One wants to get a latent representation which could reconstruct, while preserving internal logic. We introduce a split latent channel:
-- C$_0$ encodes the microstructure (the "state", 0th order): $z_0(t)$ is such that $D(z_0(t));
-- C$_1$ encodes the time derivative (1st order): $\mathrm{d}z_0 / \mathrm{d}t = \dot{z}_0$ (unlike C$_0$, C$_1$ is not decoded: it works purely in latent space). 
-
-A Taylor expansion of $z_0$ gives
-$$z_0(t + \delta t) = z_0(t) + \dot{z}_0(t)\,\delta t + \ddot{z}_0(t)\,(\delta t^2/2) + o(\Delta t^2).$$
-The idea is to replace $\dot{z}_0$ with $z_1$ by training in stage 2.
+## Stage 2: latent geometry
 
 
-### Initial training
+### Derivative loss
+The goal of stage 2 is to have a meaningful latent representation of the relationship between C$_0$ and C$_1$, $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against (something like) $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can have the prediction $$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
 
-### stage 2
-Working directly in latent space is faster (it is smaller than real space), but _a priori_ we cannot do arithmetic in it. 
-
-Training the AE (stage 1) ensures that the microstructure (the state) can be reconstructed in real space. This means that the latent representation $z_0$ somehow describes $x$, not that is a smooth and structured coordinate system. 
-
-The goal of stage 2 is to have a meaningful latent representation of the relationship between C$_0$ and C$_1$, $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ (*) directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can have the prediction $$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
-
-This involves adding `L_deriv` to the loss function of stage 1 (with a paired-window dataset for derivative calculation).
+This involves adding `L_deriv` to the loss function of stage 1 (with a paired-window dataset for derivative calculation). Note: in stage 1 the small dense NN for the statistics is trained along the encoder and decoder, in 2 it is frozen.
 
 In stage 2, we are changing the latent representation, while maintaining the reconstruction of C$_0$. We can freeze the outter layers of both encoder and decoder (not those close to the latent space) for regularization.
 
-#### (*) Calculating the derivative
-In fact, we use a symmetric, second-order discretization. We expand $z_0(t+\Delta t_+)$ and $z_0(t-\Delta t_-)$. The weighted sum, $z_0(t+\Delta t_+) / {\Delta t_+}^{\!2} - z_0(t-\Delta t_-) / {\Delta t_-}^{\!2}$, removes the second-order term, and one finally obtains 
+#### Calculating the derivative
+To be precise, we use a symmetric, second-order discretization. We expand $z_0(t+\Delta t_+)$ and $z_0(t-\Delta t_-)$. The weighted sum, $z_0(t+\Delta t_+) / {\Delta t_+}^{\!2} - z_0(t-\Delta t_-) / {\Delta t_-}^{\!2}$, removes the second-order term, and one finally obtains 
 $$\dot{z}_0(t)  =
 {} \frac{z_0(t+\Delta t_+) \, {\Delta t_-}^{\!2} - z_0(t-\Delta t_-) \, {\Delta t_+}^{\!2} - z_0(t) ( {\Delta t_-}^{\!2} - {\Delta t_+}^{\!2}) }{(\Delta t_+ + \Delta t_-)\Delta t_+ \, \Delta t_- }
 {} + o(\Delta t_+) + o(\Delta t_-).$$
 $z_1(t)$ is trained against this.
 
 
-### stage 3 (LDS)
-Provided with $z_0(t)$ and $z_1(t)$, one must learn $z_0(t+\Delta t)$ and $z_1(t+\Delta t)$.
+### Interpolation
+Interpolation in latent space should preserve physical plausibility, not just visual smoothness.
+One takes $t_1 < t_2 < t_3$ three successive time steps in the same simulation, with real states $x_i$ and latent representations $z_i = E(x_i)$. We compare $z_2$ to the interpolated $\tilde{z} = (1-\alpha) z_1 + \alpha z_3$, with $\alpha = (t_2-t_1) / (t_3-t_1)$: `L_interp` is $\|\tilde{z} - z_2\|^2$.
 
-#### fθ and dz1 / dt
-$f_\theta$ does not need to be trained to the first-order term, it only needs to learn $\ddot{z}_0$ (curvature, $\approx \dot{z}_1$), plus the gap between $z_1$ and $\dot{z}_0$. Then $f_\theta(z_0(t), z_1(t))$ should be trained against
+
+### Perturbation
+Let $z_{\varepsilon} = z + \varepsilon \, \eta$, with $\eta \sim \mathcal{N}(0, 1)$. One expects that $\mathrm{stats}(z_{\varepsilon}) \approx \mathrm{stats}(z) + \varepsilon \Delta S$. So a linear regression of $\|\mathrm{stats}(z_{\varepsilon}) - \mathrm{stats}(z)\|$ with several values of $\varepsilon$ can nudge towards:
+- intercept $\approx 0$ (no discontinuity),
+- $R^2 \approx 1$ (e.g. not curvature). 
+Variant: structured perturbations (directional latent shifts) instead of isotropic noise.
+
+Perturbation is currently used as _post-hoc_ diagnostic, not as loss function.
+
+
+
+## Stage 3: latent dynamics (LDS)
+
+Provided with $x(t)$, stage 1 trained the model to make $z_0(t)$ and stage 2 added $z_1(t)$. One must now learn $z_0(t+\Delta t)$ and $z_1(t+\Delta t)$ from them.
+
+Since the autoencoder is frozen in stages 3a and 3b, the latent representation of each microstructure in the `datasets/` can be calculated just once and cached: it will not change in the loop over epochs. This makes this stage run faster (but encoder errors are necessarily inherited).
+
+
+### fθ and dz1 / dt
+$f_\theta$ does not need to be trained to the first-order term, it only needs to learn $\ddot{z}_0$ (curvature, $\approx \dot{z}_1$), plus the gap between $z_1$ and $\dot{z}_0$. Thus $f_\theta(z_0(t), z_1(t))$ should be trained against
 $$[z_0(t + \Delta t) - z_0(t) - z_1(t)\,\Delta t] / (\Delta t^2/2),$$
 with $\theta$ (currently just the temperature) as further input.
 Finally,
-$$z_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t)) \, (\Delta t^2/2) + o(\Delta t^2).$$
+$$z_0(t + \delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(z_0(t), z_1(t)) \, (\delta t^2/2) + o(\delta t^2).$$
 
-In practice, the second order is not multiplied by $\Delta t ^2$ but by  $\min(\Delta t, \Delta t_\mathrm{cap})^2$, to avoid the risk of a blow-up at large $\Delta t$.
+In practice, the second order is not multiplied by $\delta t ^2$ but by  $\min(\delta t, \delta t_\mathrm{cap})^2$, to avoid the risk of a blow-up at large $\delta t$.
 
 
-#### Semi-implicit (predictor-corrector) velocity-Verlet
+### One-step latent prediction loss
+Compare the prediction to the ground truth in latent space:
+$$L_\mathrm{1step} = \left\| z_0(t+\Delta t) - [z_0(t) + z_1(t)\, \Delta t] \right\|_2^2.$$
+Doing so in latent space avoids reliance on the decoder, cleanly separating decoder loss and prediction loss.
+
+### Multi-step rollout loss
+By having several predictions in a row, we let error accumulate:
+$$z_0(t_{k}) \xrightarrow{f} \hat{z}_0(t_{k+1}) \xrightarrow{f} \hat{z}_0(t_{k+2}) \xrightarrow{f} \hat{z}_0(t_{k+3}) \xrightarrow{f} \ldots.$$
+When starting from the snapshot at time $t_k$, the rollout loss is:
+$$L_\mathrm{rollout} = \sum_{i=1}^{N_r} \left\| \hat{z}_0(t_k + i \Delta t) - z_0(t_k + i \Delta t) \right\|_2^2,$$
+where $\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \Delta t)\,\Delta t + f_\theta(t_k + i \Delta t) \, (\delta t^2/2)$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
+
+### Semi-implicit (predictor-corrector) velocity-Verlet
 Integration of the latent state $(z_0,\, z_1)$ over one sub-step $dt$.
 
 $f_\theta(_z0, z_1, \theta)$ approximates $\dot z_1 = \ddot z_0$.
@@ -206,73 +272,63 @@ $$  z_1^{(n+1)} = z_1^{(n)} + \frac{f_n + f_{n+1}}{2}\,\delta t.$$
 
 Stage 3a uses only one step, `L_1step`, whereas stage 3b involves several consecutive steps (`L_rollout`)​.
 
-
-#### `check_alpha.py` — calibrating the Taylor-validity ratio
+### `check_alpha.py` — calibrating the Taylor-validity ratio
 The training (stage 3b) initially used steps $\delta t = \Delta t / n_\mathrm{substeps}$:
 - we ensure that we land on known time steps,
 - we rely on $\Delta t$ to scale sensibly with $t$.
 This could be unstable (low `n_substeps`) or slow (high).
 
-Every sub-step of the latent integrator advances the state by a linear term and a curvature correction, $z_0(t+\delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(t)*\delta t^2/2$. Stability requires that the quadratic term be small enough compared to the linear one: $\delta t \le \alpha \|f_\theta\| / \|z_1\|$.
+Every sub-step of the latent integrator advances the state by a linear term and a curvature correction, $z_0(t+\delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(t)*\delta t^2/2$. Stability requires that the quadratic term be small enough compared to the linear one: $\delta t \le \alpha \|z_1\| / \|f_\theta\|$.
 For stability, `δt` is updated to `min(δt_target, (δt_prev + δt_target)/2)`.
 
 
-
-### Synoptic table
-
-| \# | stage          | input      | output    | aim                        |
-|---|-----------------|------------|-----------|----------------------------|
-| 1 | autoencoder (C$_0$)| $x_0$ | $z_0$ | $D[z_0(t)] \approx x_0(t)$ |
-| 2 | derivative (C$_1$) | $x_0$ | $z_1$ | $z_0(t) + z_1(t)\,\delta t \approx z_0(t+\delta t)$, i.e. $z_1(t) \approx \dot{z}_0(t)$; while maintaining $D[z_0(t)] \approx x_0(t)$ |
-| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^*$ | $z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t)) \, (\Delta t^2/2) \approx z_0(t+\Delta t)$ |
-| 3b | LDS, rollout   |        "        | "    |  as 3a, chained, + $z_1(t) + f_\theta(z_0(t), z_1(t))\,\delta t + g_\theta(z_0(t), z_1(t)) \,(\delta t^2/2) \approx z_1(t+\delta t)$ |
-
-Note:
-${}^*$: not yet implemented.
-
-  
-The asymmetry between C$_0$ and C$_1$ in on the number of channels, not size, in the latent space (still true?).
-
-
-
-### Interpolation and perturbation
-In what follows $\mathrm{stats}(z)$ is the vector of statistics, of norm $\|\mathrm{stats}(z)\|$, calculated by the small dense NN described above. It cannot be the statistics of $x$ in the real world, since this would say nothing about latent representation.
-
-Interpolation in latent space should preserve physical plausibility, not just visual smoothness.
-One takes $t_1 < t_2 < t_3$ three successive time steps in the same simulation, with real states $x_i$ and latent representations $z_i = E(x_i)$. We compare $z_2$ to the interpolated $\tilde{z} = (1-\alpha) z_1 + \alpha z_3$, with $\alpha = (t_2-t_1) / (t_3-t_1)$: we measure and minimize $\|\mathrm{stats}(\tilde{z}) - \mathrm{stats}(z_2)\| \, / \, {\|\mathrm{stats}(z_2)\|}$.
-
-Let $z_{\varepsilon} = z + \varepsilon \, \eta$, with $\eta \sim \mathcal{N}(0, 1)$. One expects that $\mathrm{stats}(z_{\varepsilon}) \approx \mathrm{stats}(z) + \varepsilon \Delta S$. So a linear regression of $\|\mathrm{stats}(z_{\varepsilon}) - \mathrm{stats}(z)\|$ with several values of $\varepsilon$ can nudge towards:
-- intercept $\approx 0$ (no discontinuity),
-- $R^2 \approx 1$ (e.g. not curvature). 
-Variant: structured perturbations (directional latent shifts) instead of isotropic noise.
-
-Interpolation and perturbation are currently used as _post-hoc_ diagnostic, not as loss functions.
-
-
-
-## Encoder refinement (step 4) and end-to-end (stage 5)
+## Stages 4 and 5: encoder refinement and end-to-end
 In stage 1 the autoencoder was trained for reconstruction and stats-accuracy of the state. Stage 2 focus on the relationship between $z_1$ and $z_0$ in latent space. Stage 3 trained `f` to predict dynamics, with E and D frozen. Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). 
 
 D is frozen, even though `L_recon` is in the loss function: this is what distinguishes stage 4 from stage 5. D is a tether keeping E's output compatible with the existing decoder. (Since the encoder is no longer frozen, the latent representation of each sample cannot be cached, unlike in stage 3.)
 
 
+## Miscellaneous
 
-## Training and inference
-Conceptually there are two time steps:
-- `/datasets` $\Delta t$ ($= t_{n+1} - t_n$),
-- $\delta t$ used in prediction.
-Currently they are confused. In stage 3b in particular, there is no overwhelming reason to still use the former. (Whereas stages 2 and 3a need to match the dataset.)
+### Diagnostic tools
 
-If the model works poorly at large $\Delta t$, then the solution may be to separate `/datasets` $\Delta t$ from the $\delta t$ used in prediction (and use only small $\delta t$).
-Cherry on the cake: this is the experiment that breaks the collinearity between $\Delta t$ and $t$.
+See `./docs/NN-code_structure.md` for command-line instructions.
 
 
-The idea, in stage 3b, is to mimic inference on an unknown time evolution, where:
-- $\delta t$ can be chosen freely,
-- everything will be recalculated at every time step because there is nothing else available after training.
+### System size: 64×64 → 512×512
 
-For instance $\delta t = \Delta t / n_\mathrm{substeps}$ in training:
-- we ensure that we land on known time steps,
-- we rely on $\Delta t$ to scale sensibly with $t$.
+Configuration: `base_channels=32`, `latent_channels=8`, `latent_spatial_size=8` (so one extra down/up pair per doubling), `hidden_dim=256`, `n_hidden_layers=2`, 8 stats. Counts are from the `nn.Module`s.
 
-If $\delta t$ is small enough, error can be contained. Note: at $\delta t \to 0$, the convergence is towards a model, not an underlying truth (e.g. phase field).
+Blocks are labelled by index and channel transition. Under same-`dx` scaling, index-aligned blocks operate at the same physical scale in every model, which is why a row is comparable across columns.
+
+| block | 64×64 | 128×128 | 256×256 | 512×512 |
+|---|---:|---:|---:|---:|
+| enc down_blocks[0] (1→32) | 18'944 | 18'944 | 18'944 | 18'944 |
+| enc down_blocks[1] (32→64) | 92'608 | 92'608 | 92'608 | 92'608 |
+| enc down_blocks[2] (64→128) | 369'536 | 369'536 | 369'536 | 369'536 |
+| enc down_blocks[3] (128→256) | — | 1'476'352 | 1'476'352 | 1'476'352 |
+| enc down_blocks[4] (256→512) | — | — | 5'901'824 | 5'901'824 |
+| enc down_blocks[5] (512→1024) | — | — | — | 23'600'128 |
+|---|---:|---:|---:|---:|
+| enc bottleneck (1×1, per stream) | 1'032 | 2'056 | 4'104 | 8'200 |
+| enc theta_conditioner (FiLM) | 8'544 | 16'992 | 33'888 | 67'680 |
+| dec unbottleneck (1×1) | 1'152 | 2'304 | 4'608 | 9'216 |
+|---|---:|---:|---:|---:|
+| dec up_blocks[0] (deepest, new) | 106'944 | 426'880 | 1'705'728 | 6'819'328 |
+| dec up_blocks (all shallower) | 49'600 | 156'544 | 583'424 | 2'288'152 |
+| dec output_conv | 289 | 289 | 289 | 289 |
+|---|---:|---:|---:|---:|
+| `f_θ` (dense MLP) | 460'288 | 460'288 | 460'288 | 460'288 |
+| stats_head (dense) | 8'344 | 8'344 | 8'344 | 8'344 |
+|---|---:|---:|---:|---:|
+| **TOTAL encoder** | **490'664** | **1'976'488** | **7'897'256** | **31'535'272** |
+| **TOTAL decoder** | **157'985** | **586'017** | **2'294'049** | **9'117'985** |
+| **TOTAL AE + stats** | **656'993** | **2'570'849** | **10'199'649** | **40'661'601** |
+| **VRAM: activations MB/sample** | **29** | **115** | **460** | **1'841** |
+| **VRAM: params + Adam MB** | **10** | **39** | **156** | **620** |
+| **Max batch (fp32' 8 GB card)** | **256** | **63** | **15** | **3** |
+| **Max batch (fp16 activations)** | **465** | **115** | **28** | **6** |
+|---|---:|---:|---:|---:|
+|`tau_down` (millions)|0.6|2.5|10|50|
+
+`tau_down​` is the number of phase-field time steps needed for full coarsening. It is an indication of the length of C++ runs needed, and a potential limiting factor. (off-table: `tau_down​` = 80e3 at 32×32.)

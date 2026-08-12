@@ -14,25 +14,25 @@ For details (equations, implementation), see `./docs/phase_field.md`.
 
 
 ## Neural surrogate
-The NN model is trained on phase-field simulation results to predict the microstructure at $t + \Delta t$ based on the microstructure at $t$, i.e. it learns a surrogate that approximates phase-field time evolution operators, without explicitly solving discretized PDEs.
+The NN model is trained on phase-field simulation results to predict the microstructure at $t + \delta t$ based on the microstructure at $t$, i.e. it learns a surrogate that approximates phase-field time evolution operators, without explicitly solving discretized PDEs.
 
-The model uses an autoencoder (AE) based on convolutional neural networks (CNN). The encoder compresses the image of the microstructure, $x(t)$, as a latent representation, $z(t)$. From this the decoder recovers (approximately) the microstructure:
-- encode: $z = E(x)$,
-- decode: $x'= D(z)$, i.e. $D(E(x))$.
+The model uses an autoencoder (AE) based on convolutional neural networks (CNN). The encoder compresses the image of the microstructure, $x(t)$, as a latent representation, $z_0(t)$. From this the decoder recovers (approximately) the microstructure:
+- encode: $z_0 = E(x)$,
+- decode: $x'= D(z_0)$, i.e. $D(E(x_0))$.
 
 The convolutional autoencoder has a symmetric encoder–decoder architecture. The latent representation retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. For details on the architecture of the autoencoder, see `./docs/neural_nets.md` and `./docs/NN-code_structure.md`.
 
 
 ## Latent representation
 The latent representation is split into two streams: 
-- $z_0(t)$, the "state" (which the decoder can recover $x(t)$ from), 
+- $z_0(t)$, the "state" (from which the decoder can recover $x(t)$), 
 - $z_1(t)$, an approximation of $\dot{z}_0(t)$ that exists purely in latent space and is never decoded. 
 
 A Latent Dynamics Surrogate (LDS), $f_\theta$, predicts the next state from both:
-$$z_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t), \theta)\,\Delta t^2/2,$$
-with $\theta$ physical parameters (e.g. temperature). $z_1(t)\,\Delta t$ is the first-order (linear) term; $f_\theta$ predicts the second-order (curvature) correction on top of it. 
+$$z_0(t + \delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(z_0(t), z_1(t), \theta)\,\delta t^2/2,$$
+with $\theta$ physical parameters (e.g. temperature). $z_1(t)\,\delta t$ is the first-order (linear) term; $f_\theta$ predicts the second-order (curvature) correction on top of it. 
 
-As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\Delta t$ a multiple of the phase-field time step) — in practice the second-order term is capped for large $\Delta t$, to avoid a blow-up.
+As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\delta t$ a multiple of the phase-field time step) — in practice the second-order term is capped for large $\delta t$, to avoid a blow-up.
 
 Representing the microstructure in latent space rather than real space has two advantages:
 - it can be much smaller (even a smallish 256×256 image has 65'000 degrees of freedom),
@@ -48,16 +48,9 @@ See `./docs/neural_nets.md` for the full derivation, including the Taylor expans
 
 ## Process
 The process is:
-$$x(t) \xrightarrow{E} z(t) \xrightarrow{f_\theta} z(t+\Delta t) \xrightarrow{D} x(t+\Delta t).$$
+$$x(t) \xrightarrow{E} z(t) \xrightarrow{f_\theta} z(t+\delta t) \xrightarrow{D} x(t+\delta t).$$
 In fact, the encoding occurs only once at the beginning and the decoding once at the end (plus when plots are needed):
-$$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\theta} z(2 \Delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(T).$$
-
-
-## Process
-The process is:
-$$x(t) \xrightarrow{E} z(t) \xrightarrow{f_\theta} z(t+\Delta t) \xrightarrow{D} x(t+\Delta t).$$
-In fact, the encoding occurs only once at the beginning and the decoding once at the end (plus when plots are needed):
-$$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\theta} z(2 \Delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(T).$$
+$$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\theta} z(2 \delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(T).$$
 
 (Writing $z$ loosely for the full latent state $(z_0,\ z_1)$; see `./docs/neural_nets.md` for the actual split-stream mechanics.)
 
@@ -80,7 +73,7 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
           │             └─────┬─────┘
           │                   │
           │                   ▼
-          │                z(t+Δt)
+          │                z(t+δt)
           │                   │
           ▼                   ▼
     ┌───────────┐       ┌───────────┐
@@ -88,16 +81,16 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
     └─────┬─────┘       └─────┬─────┘
           │                   │
           ▼                   ▼
-       x'(t)              x'(t+Δt)
+       x'(t)              x'(t+δt)
 ```
 
 
 
 ## Workflow
-0.	Generate over two thousand phase-field simulations. 
+0.	Generate several thousands of  phase-field simulations. 
 1.	Train a CNN autoencoder on individual microstructures (no time evolution yet) to learn a latent representation that is reconstructive and physically descriptive.
 2.  Train a second latent stream, $z_1$, to represent $\dot{z}_0$ via a derivative loss (see `./docs/neural_nets.md` for more details).
-3.	Freeze the encoder and train the Latent Dynamics Surrogate (LDS) to predict future microstructures in latent space.
+3.	Freeze the encoder and train the Latent Dynamics Surrogate (LDS) to predict future microstructures in latent space. (Two sub-steps: 3a and 3b.)
 4.	Fine-tune the encoder and the LDS for prediction, including a small input from reconstruction.
 5.	Fine-tune the latent representation and the LDS to both predict future microstructures and reconstruct the original microstructure.
 
@@ -107,19 +100,21 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\Delta t) \xrightarrow{f_\t
 
 ```text
 .
-├── cpp/               # phase-field solver
-├── python/            # neural network
+├── cpp/               		# phase-field solver
 ├── datasets/
 │   ├── 64x64/
 │   ├── 128x128/
 │   └── 256x256/
-├── output/
-│   └── stage<N>
 ├── docs/
-│   ├── phase_field.md
-│   ├── neural_nets.md
-│   └── NN-code_structure.md
-└── README.md
+│   ├── phase_field.md 		# written by hand
+│   ├── neural_nets.md 		# written by hand
+│   └── NN-code_structure.md #written automatically by Claude
+├── figures/				# figures selected for inclusion here
+├── output/					# figures generated automatically
+│   └── datasets/			# statistics on phase-field runs
+│   └── stage<N>/
+├── python/            		# neural network
+└── README.md 				# written by hand
 ```
 
 For more details on the structure of the `python` directory, see `./docs/NN-code_structure.md`.

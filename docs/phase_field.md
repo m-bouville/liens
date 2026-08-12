@@ -27,10 +27,18 @@ The parameter sweep is parallelized using `<future>`.
 
 
 ## Parameters
+
+### System size
 The first tests are run on a 64-by-64 grid, for faster debugging. Larger grids (128×128, 256×256, perchance 512×512) are introduced once the solver and neural surrogate are stable. While increasing the grid size merely increases the computational cost of the phase-field simulations, it also requires a deeper convolutional autoencoder, which can be trickier to train. So the decision to switch will not be rushed.
 
-Initial conditions consist of a homogeneous state perturbed by uniform white noise in [$-$`noise`/2, `noise`/2] (the parameter `noise` is set in the configuration file).
+The larger the system the longer computing a single step takes. But larger systems also require more time steps (they can accomodate larger grains, which take longer to evolve). One calls `tau_down​` the number of time steps needed for full coarsening. It is an indication of how long the runs need to be for each system size.
 
+|  			| 32×32 | 64×64 | 128×128 | 256×256 | 512×512 |
+|`tau_down` | 80e3  | 600e3 |  2.5e6  |   10e6  |   50e6  |
+
+
+### Initial conditions
+Initial conditions consist of a homogeneous state perturbed by uniform white noise in [$-$`noise`/2, `noise`/2] (the parameter `noise` is set in the configuration file). Different seeds are also used in `config.txt`.
 
 
 ## Input parameter file
@@ -52,7 +60,7 @@ Simulation results are stored in binary format (no need for human access) readab
 
 There is one subdirectory for each simulation run, containing one binary file per stored snapshot (named by time index). Subdirectories are named by system size, then by parameters (temperature, initial conditions): `/datasets/256x256/T980_n050_s97/t0001100`for $T=0.980$, noise amplitude of 0.050 and 97 for seed. Unlike a single file for the whole trajectory, this allows random access to individual snapshots during autoencoder training while preserving temporal ordering for training the latent surrogate model.
 
-Physics-based statistics are also computed (see `/docs/neural_nets.md` for more details).
+Physics-based statistics are also computed (see `./docs/neural_nets.md` for more details).
 
 
 ### On snapshot schedule

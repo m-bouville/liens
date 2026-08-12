@@ -48,6 +48,34 @@ latent-space consistency loss comparing `z1(t)` against what `z0`'s own trajecto
 its rate of change should be — this is what stage 3's coupled integrator needs primed, and
 is genuinely different from `check_interpolation.py`'s diagnostic (see Evaluation below).
 
+Two stage-2 additions share one schedule:
+
+- **Centered `L_deriv` target** (`deriv_target_centered=True`): the target becomes the
+  second-order-accurate centered difference over a `(t-dt_minus, t, t+dt_plus)` window
+  (`window_length=3` instead of 2). The switch epoch is derived from
+  `deriv_weight_warmup_epochs` (deliberately conflated — one knob, not two), fires
+  `just_switched` for the criterion grace period, and is marked on the loss curve at
+  `switch_epoch - 0.5` (only when a plotted epoch precedes it; a run already past the
+  switch gets the horizontal ancestor-reference line instead — the two annotations are
+  mutually exclusive by construction).
+- **`L_interp`** (`InterpLoss` in `training/losses.py`, weights `interp_weight` /
+  `interp_scale`, both recorded in `stage2_config`): penalizes
+  `||(1-alpha) z0(t1) + alpha z0(t3) - z0(t2)||^2` with the dt-weighted
+  `alpha = dt_minus/(dt_minus+dt_plus)`, on the SAME 3-frame window the centered target
+  already loads — no extra dataset, no extra encodes; `MicrostructureTripletDataset`
+  stays unused. Gated on the same switch epoch; `interp_weight > 0` with
+  `deriv_target_centered=False` raises at construction (no middle frame exists).
+  The residual is EXACTLY `(dt_minus*dt_plus/2) * z0_ddot` (verified to machine
+  precision), so `L_deriv` and `L_interp` are orthogonal components of the same
+  triplet — the first-difference and second-difference directions respectively. Its
+  degenerate minimum is any `z0` affine in t, INCLUDING A CONSTANT; only `L_recon0`
+  prevents that collapse, deliberately (an internal guard would hide the collapse
+  rather than prevent it), so `recon0` must be watched from the switch epoch whenever
+  the weight is raised. First real run (weight 0.1, lr 1e-4): every component improved
+  together — interp -52%, deriv -49%, recon0 flat-at-converged; an earlier run at
+  weight 0.5 / lr 1e-3 degraded recon0 +30%, diagnosed as the learning rate, not the
+  term.
+
 There used to be a separate stage 1b between them, whose job was building this second
 stream. It's gone: `train_stage2()` now builds the deriv stream itself, in memory, directly
 from the stage-1 checkpoint, via `extend_encoder.py`'s
@@ -88,6 +116,27 @@ corrector at `n_substeps=1`, converging to the pointwise `z1_dot` the design
 doc defines as `n_substeps` grows. `n_substeps` is therefore recorded in the
 checkpoint and reported on resume (not fatal: 1 -> N *is* the 3a -> 3b
 handoff).
+
+Fixed `n_substeps` has since been superseded in practice by the ADAPTIVE
+integrator: `alpha` bounds the curvature correction as a fraction of the
+linear term, so the sub-step count is derived per window
+(`n ~ |f| dt / (alpha |z1|)`), capped at `max_substeps`. When the cap binds
+(`CLAMPED ...x` in the log), the alpha criterion is NOT in force on exactly
+the longest-dt windows — the source of one deadlocked run at
+max_dt=5000/max_substeps=512. Memory is governed separately: retained
+autograd depth is bounded by `truncate_bptt` (gradients flow within
+segments), batches are cost-budgeted (`batch_cost_budget`, an ESTIMATE the
+integrator's realised counts can outgrow as |f_theta| grows through
+training — `bucket_refresh_epochs` re-estimates periodically), and a
+measured-VRAM governor (`target_vram_gib`) rescales the epoch's batch count
+after the fact — which under `grad_clip` silently changes the effective
+learning rate, so a binding budget from epoch 1 is preferable. The alpha /
+`n_substeps` distinction also gates evaluation: a vector-field `f_theta`
+(alpha-trained) supports h -> 0 refinement, a fixed-`n_substeps` one is a
+dt-averaged corrector and does not — and resuming an alpha-trained
+checkpoint at a coarser alpha asks a finely-fitted field to act as a
+one-shot corrector, which produced one 3b run at loss ~1e19 (the log's own
+NOTE warns when this mismatch is configured).
 
 ### Stages 4 and 5
 Stages 4 and 5 are similarly one function, `train_refinement()`, selected by
@@ -159,12 +208,11 @@ end.
 #### Datasets (`datasets.py`)
 - `MicrostructureSnapshotDataset` — single frames, for stage 1. Supports D4×translation
   augmentation (32×) via `augment=True`.
-- `MicrostructureTripletDataset` — `(t1, t2, t3)` triples, built for an earlier
-  interpolation loss (`L_interp`) that predated the current C0/C1 (state/deriv) redesign.
-  That loss is gone from training entirely — `check_interpolation.py` now uses the same
-  underlying idea only as a diagnostic (see Evaluation below), not a loss function — and
-  this class isn't used anywhere in the current pipeline; kept for now, not actively
-  maintained against the current architecture.
+- `MicrostructureTripletDataset` — `(t1, t2, t3)` triples, built for the ORIGINAL
+  `L_interp` (pre-C0/C1 redesign). `L_interp` is back in training (stage 2, see above)
+  but does NOT use this class — it reuses the centered-target 3-frame window, which was
+  already loaded. This class remains unused by the pipeline; `check_interpolation.py`
+  uses the same underlying idea as a post-hoc diagnostic.
 - `MicrostructureEvolutionDataset` — the workhorse for stages 2, 3, 4 and 5. Two modes
   selected by whether `encoder` is given: with a frozen encoder, latents are cached once
   upfront (stage 3's fast path); with `encoder=None`, raw pixel windows are returned and
@@ -200,6 +248,9 @@ individual run directories, so it works before a sweep is generated.)
 
 #### Losses (`losses.py`)
 - `ReconLoss`: reconstruction (comparing `D(E(x))` to `x`);
+- `InterpLoss`: stage 2's trajectory-straightness term (see Stages 1 and 2 above) —
+  latent-space, dt-weighted alpha, exact on affine trajectories, NO internal guard
+  against its own degenerate (constant-z0) minimum by design;
 - `StatsLoss`: per-stat normalized — raw statistics span ~800× different scales, e.g. `avg_phi` vs `energy` — the paper-level formula in `neural_nets.md` doesn't show this normalization;
 - `OneStepLoss`;
 - `RolloutLoss`: `return_per_step=True` exposes each chained step's own loss, `step_weights` can reweight individual steps (not currently used);
@@ -379,6 +430,29 @@ Each has a real, importable function (not just CLI logic) so `main.py` can call 
 - **`check_rollout.py`**: multi-step rollout comparison (`state(t)`, `real Δx`, `predicted Δx`, `error`, over the full window chain via `f_theta.rollout()`). Also has `_padded_bounds()` for predictable, comparable color scales across different checkpoints/runs — derived only from the *real* data, never from the prediction, so a bad prediction shows as visible saturation instead of stretching its own scale.
 - **`check_interpolation.py`** and **`check_perturbation.py`** are stage 2's two latent-space  diagnostics (the letter post-hoc only: not used as loss function).
 - **`check_parameter_dependence.py`** scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `pipeline.py`'s stage 3 sanity checks alongside `check_rollout`.
+- **`compare_f_theta.py`** — the maintained model-vs-model comparison: chained-rollout
+  trajectory figures (real / causal frozen-dz0 / stage-2 Euler / 3a / 3b rows, absolute-time
+  headers) and a 2x4 statistics figure (loss + correlation vs CDF / dt_total / temperature-SMA
+  / step count, four baselines everywhere, shared y-ranges on the loss and correlation rows,
+  correlation floored at -20%). Also carries the two diagnostic sweeps that produced stage 3's
+  current verdict: `--f-scale-sweep` (scale `f_theta`'s output by lambda in [0,1]; 0 reproduces
+  stage 2 bit-exactly through the real integrator) and `--alpha-sweep` (h -> 0 refinement;
+  refuses fixed-`n_substeps` checkpoints, whose `f_theta` is a dt-averaged corrector with no
+  h -> 0 meaning).
+- **`check_z2_measurability.py`** — is a second-derivative latent stream learnable at all?
+  Nonuniform 3-point stencils (the uniform formula is ~256% wrong on the geometric schedule)
+  over two DISJOINT frame triplets — (0,1,2)/(3,4,5), sharing no frame, because shared-centre
+  stencils correlate at 2/3 on pure noise by algebra alone. Reports per-window median
+  correlation + uncentred cosine (centring removes a spatially uniform component that may be
+  signal), the variance-weighted pooled number labelled as such, and noise-scaling columns:
+  `E|z2|*dt^2` is constant under stencil noise and grows as dt^2 under real curvature;
+  `E|d1|*dt` is the first-derivative analogue (one power lower — using dt^2 there would make
+  noise read as decaying signal). CAVEAT the tool cannot state for itself: on THIS project's
+  geometric save schedule, real dynamics ALSO give flat `E|d1|*dt` (constant per-frame
+  advance is the schedule's design goal), so that column alone cannot separate velocity
+  signal from noise here — the ratio `E|z2|*dt^2 / E|d1|*dt` (step-to-step change over step
+  size) is the discriminating number: ~0.14-0.30 for a smooth path on this schedule, 2.0 for
+  uncorrelated steps.
 - **`compare_integrators.py`** and **`compare_rollout_training.py`** are one-off exploratory   comparison scripts, not part of the maintained by-stage output/checkpoint conventions; treat as needing an explicit refactor-or-archive decision rather than assuming they stay current automatically.
 
 
@@ -391,7 +465,27 @@ Each has a real, importable function (not just CLI logic) so `main.py` can call 
   existing checkpoint without an explicit override.
 - `plots.py`
   -  `show_snapshot`: raw-snapshot visualization;
-  - `loss_curve()`: shared by all five training stages (y-axis capped so early instability spikes don't squash the rest of the curve).
+  - `loss_curve()`: shared by all five training stages. Y-axis capped so early instability
+    spikes don't squash the rest of the curve. Two annotation kinds, mutually exclusive by
+    construction: vertical `event_epochs` markers at `epoch - 0.5` (a mid-run objective
+    switch; suppressed at epoch 1, where no plotted point precedes it) and horizontal
+    `reference_levels` (the ancestor's val under THIS run's objective; withheld when a
+    mid-run switch makes it an unfair bar; the y-cap explicitly makes room for a level
+    above it — feeding levels into the percentile does not work, one value among hundreds
+    barely moves p99).
+  - `loss_component_scatter()`: per-component train/val trajectories as a LOWER-TRIANGULAR
+    corner plot (row = y variable, column = x variable; the upper triangle is the redundant
+    transpose). Axis padding proportional to the data's own spread (`span**0.15`; a fixed
+    /1.6 ratio left a converged run occupying 10% of a log axis), labels only on the bottom
+    row / left column, minor-tick text suppressed on log axes.
+- `latent_cache.py` (in `training/`) — frozen-encoder latents cached per
+  `(encoder fingerprint, run, step list, stream)`. Directories are named
+  `<size>x<size>-<fingerprint>` (size is a LABEL for humans; the fingerprint is the key,
+  and weight shapes are hashed so cross-resolution collisions are impossible). One
+  directory per exact encoder state — stage 2 training changes the fingerprint every
+  epoch, which is why the cache root accumulates many one-shot directories; a pruning
+  utility (drop directories whose fingerprint matches no checkpoint on disk) is the
+  intended fix, not yet built.
 
 
 
@@ -433,8 +527,20 @@ unhandled; each found a real omission when written:
 
 ### Test speed
 
-The suite runs in ~65 s under `pytest -n 4` (from ~231 s serial). Two things
-made the difference, and both have correctness caveats worth knowing:
+The suite (~1440 tests) runs in ~127 s under `pytest -n 4`. `pytest.ini` (with
+`--strict-markers`, so a typo'd marker is a collection ERROR rather than a silent
+no-op) defines one marker:
+
+- `slow` — the test TRAINS a real model (calls `train_stage2` /
+  `train_autoencoder` / `train_refinement`, or drives the pipeline end to end).
+  The criterion is causal, not duration-based, so it stays correct across
+  machines. 52 node-ids; deselect with `-m "not slow"` for rapid iteration,
+  ALWAYS run the full suite before delivering. Measured honestly: under xdist
+  the wall clock is set by the slowest worker, not total work, so the fast tier
+  saves less than the deselected tests' serial cost suggests.
+
+Two older changes made the bulk of the difference, and both have correctness
+caveats worth knowing:
 
 - **Cached ancestors** (`conftest.cached_artifact`, `cached_stage1_ancestor`).
   Keyed on the FULL kwargs, because a too-coarse key hands a test the wrong
@@ -448,13 +554,77 @@ made the difference, and both have correctness caveats worth knowing:
 
 
 
+
+## Diagnostic tools
+
+### Tests
+`pytest -n 4 tests/ -q`, or `pytest -n 4 tests/ -q -m "not slow"` to skip the longer tests.
+
+### stdev_phi_time (dataset)
+`python -m evaluation.check_stdev_phi_time --base-path ../datasets --size 128 --min-step 1500 --min-run-fraction 0.5`
+
+
+### substep_convergence
+`python -m evaluation.check_substep_convergence checkpoints/stage3b/128x128-stage3b.pt --size 128 --n-windows 256  --max-dt 1000 --window-length 3`
+
+
+### grad_spikes 
+`python -m evaluation.check_grad_spikes checkpoints/stage3b/128x128-stage3b.pt --size 128 --n-windows 256`
+
+
+### memory
+`python -m evaluation.check_memory checkpoints/stage3b/128x128-stage3b.pt --batch-size 2048 --size 128 --device cuda --truncate-bptt 64 --fixed-n 256 --calibrate`
+
+
+### parameter_dependence
+`python -m evaluation.check_parameter_dependence --lds-checkpoint checkpoints/stage4/128x128-stage4.pt --base-path ../datasets --min-step 1500 --min-stdev-phi 0.01 --min-passing-steps 12`
+
+
+### dt_vs_time (returns tables, not figures)
+`python -m evaluation.check_dt_vs_time --lds-checkpoint checkpoints/stage3b/128x128-stage3b.pt --min-step 2000 --min-stdev-phi 0.01 --min-passing-steps 12  --max-dt 1e9`
+
+
+### rollout (returns µstructures for 1 stage)
+`python -m evaluation.check_rollout --lds-checkpoint checkpoints/stage3a/128x128-stage3a.pt --no-z1-resync  --min-step 1500 --min-stdev-phi 0.01`
+
+
+### z1_degeneracy (returns tables, not figures)
+`python -m evaluation.check_z1_degeneracy checkpoints/stage2/128x128-stage2.pt --size 128 --n-windows 515`
+
+
+### f_theta (returns µstructures for N stages)
+`python -m evaluation.compare_f_theta checkpoints/stage3a/128x128-stage3a.pt checkpoints/stage3b/128x128-stage3b.pt --n-samples 6 --steps 2 --seed 0`
+	
+#### find_windows
+`python -m evaluation.find_windows --base ../datasets --size 128   --dt 125 --theta0 -0.28 --min-step 2000 --min-stdev-phi 0.01   --min-passing-steps 12`
+Then
+`python -m evaluation.check_rollout --lds-checkpoint checkpoints/stage3b/128x128-stage3b.pt --no-z1-resync  --min-step 1500 --min-stdev-phi 0.01 --fixed-windows   ..\datasets\128x128\T725_n003_s123:15000:17500:20000 ..\datasets\128x128\T725_n003_s131:15000:17500:20000 ..\datasets\128x128\T725_n003_s191:15000:17500:20000 ..\datasets\128x128\T725_n003_s401:15000:17500:20000 ..\datasets\128x128\T725_n003_s599:15000:17500:20000 ..\datasets\128x128\T725_n003_s79:15000:17500:20000`
+
+
 ## Known issues and to do list
 
-- **Stage 3b is the pipeline's weak link.** Rollout training instability has not been
-  resolved by curriculum (3a→3b, already in place) or by two attempts at a `one_step_weight`
-  regularizer (both made things worse). This is upstream of stages 4 and 5, so their results
-  currently carry uncertainty about how much is the parameter being tested vs. run-to-run
-  variance in the 3b ancestor they are built on, despite being a genuine tunable knob.
+- **`f_theta` as trained does not belong in the propagation path — measured, not
+  suspected.** Two sweeps on real checkpoints (`compare_f_theta.py`): scaling `f_theta`'s
+  output by lambda shows damage MONOTONE in lambda for both 3a and 3b (lambda=0, i.e.
+  stage 2, is best); refining the sub-step h -> 0 (`--alpha-sweep`) shows 3a's blowup had
+  a scheme component (~3300x at the training alpha) but the CONVERGED limit is still
+  ~2500x worse than stage 2, with ~2% correlation — integrating the learned field exactly
+  computes the wrong answer accurately. Independently, the retrained 3a's own correction
+  is worse than euler-only on 82% of windows with a signed bias ~500% of the true
+  curvature, and `check_z2_measurability` explains why: the curvature target `f_theta`
+  fits is not measurable from this encoder (see next item). Stages 4/5 should consume
+  stage-2-style rollouts until stage 3 is redesigned (training `f_theta` as a vector
+  field from the start, multi-step objective).
+- **The latent trajectory is a random walk at frame scale.** The ratio of the per-frame
+  step CHANGE to the step SIZE (`E|z2|*dt^2 / E|d1|*dt`) sits at ~2 — the uncorrelated
+  limit — in three of four dt decades, against 0.14-0.30 for a smooth path on this
+  schedule. Consequences, all measured: `z2` is unmeasurable (disjoint-stencil agreement
+  ~ -0.07, `E|z2|*dt^2` flat across five decades of `E|z2|`); `L_interp` at weight 0.1
+  shrank the walk's amplitude ~25% uniformly without changing its incoherence; and the
+  first-derivative control agrees at only ~ +0.04 across disjoint stencils. No
+  contradiction with the causal baseline's 93%: that uses the LEARNED `z1`, which
+  averages over frame noise. The fix is upstream — `z0` needs temporal coherence stage 1
+  never asks for — not more `interp_weight`.
 - **`compare_integrators.py` is BROKEN, not merely stale** — it calls
   `f_theta.forward_ab2()`, which does not exist on `LatentDynamics`. It cannot
   run. Two tests assert it stays broken, so reviving it forces confronting the
