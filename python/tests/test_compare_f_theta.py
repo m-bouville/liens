@@ -2533,3 +2533,62 @@ def test_alpha_sweep_reports_the_substep_cap_hits(monkeypatch):
     assert sorted(set(calls)) == [0.15, 1.5], (
         f"the trajectory ran at alphas {sorted(set(calls))}, not the sweep's"
     )
+
+
+def test_compare_statistics_runs_without_touching_the_panel_tool(monkeypatch, tmp_path):
+    """
+    The split's point: the statistics tool is independently callable and
+    NEVER draws a panel. It takes n_steps directly, so no panel window is
+    selected just to define a horizon.
+    """
+    from pathlib import Path
+    _stats_stub(monkeypatch)
+    monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
+    monkeypatch.setattr(
+        cf, "_select_windows",
+        lambda m, n, ns, seed, mx, dev: [(Path(f"T{500 + i}_n020_s{i}"),
+                                          list(range(ns + 1)))
+                                         for i in range(max(n, 1))])
+    # if the panel tool were reached it would call plt.subplots(_, 7); make
+    # that a failure
+    import matplotlib.pyplot as plt
+    real_subplots = plt.subplots
+
+    def guard(*a, **k):
+        ncols = (a[1] if len(a) > 1 else k.get("ncols"))
+        assert ncols != 7, "compare_statistics drew the 7-column panel figure"
+        return real_subplots(*a, **k)
+
+    monkeypatch.setattr(plt, "subplots", guard)
+    out, _ = cf.compare_statistics("128x128-stage3a", "128x128-stage3b",
+                                    n_stats=8, n_steps=4, seed=2, device="cpu")
+    written = sorted(p.name for p in out.parent.iterdir())
+    assert written == [out.stem + "-stats.png"], written
+
+
+def test_compare_panels_runs_without_computing_statistics(monkeypatch, tmp_path):
+    """The panel tool draws its figure and never runs collect_stats or the
+    sweeps -- it has no n_stats parameter at all."""
+    from pathlib import Path
+    _stats_stub(monkeypatch)
+    monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
+    monkeypatch.setattr(
+        cf, "_select_windows",
+        lambda m, n, ns, seed, mx, dev: [(Path(f"T{500 + i}_n020_s{i}"),
+                                          list(range(ns + 1)))
+                                         for i in range(max(n, 1))])
+    called = {"stats": False}
+    monkeypatch.setattr(cf, "collect_stats",
+                         lambda *a, **k: called.__setitem__("stats", True))
+    out, _ = cf.compare_panels("128x128-stage3a", "128x128-stage3b",
+                                n_samples=2, n_steps=4, seed=2, device="cpu")
+    assert not called["stats"], "compare_panels computed statistics"
+    assert out.name.endswith(".png") and "-stats" not in out.name
+
+
+def test_stats_only_and_panels_only_flags_are_exclusive(monkeypatch):
+    import sys
+    monkeypatch.setattr(sys, "argv",
+                        ["x", "a", "b", "--panels-only", "--stats-only"])
+    with __import__("pytest").raises(SystemExit):
+        cf.main()

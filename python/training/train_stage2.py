@@ -72,7 +72,8 @@ def _compact_loss(value: float, width: int = 7, precision: int = 4) -> str:
 _STAGE2_PREAMBLE_PARAMS = (
     # See train_lds's _LDS_PREAMBLE_PARAMS for why these are excluded here.
     "deriv_weight", "deriv_weight_warmup_epochs", "stats0_weight", "stats1_weight",
-    "z0_from_deriv_weight", "deriv_dt_weight_exponent", "deriv_target_centered",
+    "z0_from_deriv_weight", "trunk_from_deriv_weight",
+    "deriv_dt_weight_exponent", "deriv_target_centered",
     "val_aug_averaging", "recon0_scale", "epochs", "batch_size", "augment",
     "early_stopping_patience", "n_frozen_stages",
 )
@@ -82,6 +83,7 @@ def train_stage2(
     base_path: Path, resume_from: Path, size: int | None = None,
     deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats0_weight: float = 0.0,
     stats1_weight: float = 0.0, z0_from_deriv_weight: float = 0.0,
+    trunk_from_deriv_weight: float = 1.0,
     deriv_dt_weight_exponent: float = 0.0, deriv_target_centered: bool = False,
     interp_weight: float = 0.0, interp_scale: float = 1.0,
     val_aug_averaging: bool = False,
@@ -566,6 +568,30 @@ def train_stage2(
                                          stream_configs=stream_configs,
                                          decoder_for_stream=decoder_for_stream).to(device)
         ae.load_state_dict(prev["model_state"])
+        # Isolate z0's shared trunk from L_deriv's gradient when asked. The
+        # deriv stream still reads the trunk forward (z1 is still computed
+        # from it); only the gradient L_deriv sends BACK into the trunk is
+        # scaled. 1.0 keeps every prior run bit-identical; 0.0 stops L_deriv
+        # from reshaping z0 (the fix for z0's velocity-coherence collapse in
+        # stage 2). The deriv stream is the one NOT used for reconstruction.
+        if trunk_from_deriv_weight != 1.0:
+            # Only touch the encoder when the knob is off its default, so
+            # every existing single-stream / default run is bit-identical.
+            # NB: reuse deriv_stream_name (the str, bound above); do NOT
+            # rebind deriv_stream, which holds the stream CONFIG object and
+            # is read later for stats_head1 (.channels/.spatial_size).
+            isolatable = [n for n in stream_configs if n != recon_stream_name]
+            if not isolatable:
+                raise ValueError(
+                    "trunk_from_deriv_weight is only meaningful with a deriv "
+                    "stream to isolate; this checkpoint has only the recon "
+                    f"stream {recon_stream_name!r}.")
+            ae.encoders["shared"].set_trunk_grad_scale(
+                deriv_stream_name, trunk_from_deriv_weight)
+            print(f"trunk_from_deriv_weight={trunk_from_deriv_weight}: L_deriv's "
+                  f"gradient into the shared trunk via the '{deriv_stream_name}' "
+                  f"stream is scaled by {trunk_from_deriv_weight} "
+                  f"(1.0=full, 0.0=z0 trunk frozen against L_deriv).")
         frozen_modules = freeze_outer_layers(ae, n_frozen_stages)
         if n_frozen_stages > 0:
             n_trainable = sum(p.numel() for p in ae.parameters() if p.requires_grad)
@@ -1521,6 +1547,7 @@ def train_stage2(
                 "stage2_config": {"deriv_weight": deriv_weight,
                                    "interp_weight": interp_weight,
                                    "interp_scale": interp_scale,
+                                   "trunk_from_deriv_weight": trunk_from_deriv_weight,
                                    "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
                                    "deriv_dt_weight_exponent": deriv_dt_weight_exponent,
                                    "deriv_target_centered": deriv_target_centered,

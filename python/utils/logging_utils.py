@@ -18,6 +18,15 @@ class _Tee:
     def write(self, data):
         for s in self.streams:
             s.write(data)
+            # Flush EVERY write, not just at close. Without this the log
+            # file sits in Python's ~8 KiB buffer and a killed run (Ctrl-C,
+            # an IDE stop button, an OOM kill) discards it entirely -- which
+            # is exactly when the log is most wanted, since a run that ends
+            # normally could have been rerun anyway. A training log emits a
+            # line every few minutes at most, so per-write flushing costs
+            # nothing measurable; the console stream is line-buffered and
+            # already effectively does this.
+            s.flush()
 
     def flush(self):
         for s in self.streams:
@@ -42,7 +51,11 @@ def _log_to_file(log_path: Path):
         try:
             yield
         finally:
+            # Restore FIRST, then flush what the tee already wrote: a
+            # KeyboardInterrupt unwinds through here, and leaving the tee
+            # installed while flushing risks re-entering it.
             sys.stdout, sys.stderr = original_stdout, original_stderr
+            log_file.flush()
 
 
 # Infrastructure, not science: paths, callables, worker/device plumbing and

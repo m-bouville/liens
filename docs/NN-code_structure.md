@@ -560,6 +560,11 @@ caveats worth knowing:
 ### Tests
 `pytest -n 4 tests/ -q`, or `pytest -n 4 tests/ -q -m "not slow"` to skip the longer tests.
 
+### Parameters used to generate a checkpoint
+`python -m evaluation.inspect_checkpoint checkpoints/stage3a/128x128-stage3a.pt`
+`python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` prints just: 0.15
+
+
 ### stdev_phi_time (dataset)
 `python -m evaluation.check_stdev_phi_time --base-path ../datasets --size 128 --min-step 1500 --min-run-fraction 0.5`
 
@@ -592,8 +597,21 @@ caveats worth knowing:
 `python -m evaluation.check_z1_degeneracy checkpoints/stage2/128x128-stage2.pt --size 128 --n-windows 515`
 
 
-### f_theta (returns µstructures for N stages)
-`python -m evaluation.compare_f_theta checkpoints/stage3a/128x128-stage3a.pt checkpoints/stage3b/128x128-stage3b.pt --n-samples 6 --steps 2 --seed 0`
+### z2_measurability (encoder diag, even when run on stage-3 checkpoint)
+`python -m evaluation.check_z2_measurability checkpoints/stage3a/128x128-stage3a.pt --n-windows 512`
+
+
+### compare_panels — per-window microstructure figures
+- `python -m evaluation.compare_f_theta checkpoints/stage3a/128x128-stage3a.pt checkpoints/stage3b/128x128-stage3b.pt --panels-only --n-samples 6 --steps 2 --seed 0` produce a 7-column plot (real / A / B deltas, both errors, B−A), with one row per window.
+- add `--trajectory` for one frame-by-frame figure per window.
+
+### compare_statistics — loss/correlation over many windows
+- `python -m evaluation.compare_f_theta checkpoints/stage3a/128x128-stage3a.pt checkpoints/stage3b/128x128-stage3b.pt --stats-only --n-stats 200 --steps 2 --seed 0`
+- add `--f-scale-sweep` to try f_theta × λ, with λ in [0, 0.25, 0.5, 1] ("λ-sweep"); 0 corresponds to stage 2 and 1 is stage 3.
+- add `--alpha-sweep` for the h→0 test.
+
+The combined `compare_f_theta` (no `--*-only` flag) still runs both.
+
 	
 #### find_windows
 `python -m evaluation.find_windows --base ../datasets --size 128   --dt 125 --theta0 -0.28 --min-step 2000 --min-stdev-phi 0.01   --min-passing-steps 12`

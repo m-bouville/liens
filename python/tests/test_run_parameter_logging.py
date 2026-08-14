@@ -210,3 +210,42 @@ def test_nothing_is_printed_when_everything_is_already_covered(capsys):
 
     assert print_run_parameters(f, {"a": 1, "device": None}, ("a",)) == []
     assert capsys.readouterr().out == ""
+
+
+def test_log_is_readable_before_the_run_ends(tmp_path):
+    """
+    REGRESSION: _Tee wrote to the log file without flushing, so output sat
+    in Python's ~8 KiB buffer until close. A killed run -- Ctrl-C, an IDE
+    stop button, an OOM kill -- discarded the whole log, which is exactly
+    when it is most wanted: a run that ends normally could have been rerun,
+    a run that was killed after 16 hours cannot.
+
+    Also makes the log tail-able while training is in progress.
+    """
+    from utils.logging_utils import _log_to_file
+
+    log_path = tmp_path / "run.log"
+    with _log_to_file(log_path):
+        print("epoch 1 | loss 0.5")
+        mid_run = log_path.read_text()
+    assert "epoch 1 | loss 0.5" in mid_run, (
+        "the log was empty while the run was still going -- output is "
+        "buffered, so a killed run loses everything"
+    )
+
+
+def test_log_survives_an_interrupt(tmp_path):
+    """The realistic failure: KeyboardInterrupt unwinds through the
+    contextmanager's finally, which must leave a complete log behind."""
+    from utils.logging_utils import _log_to_file
+
+    log_path = tmp_path / "run.log"
+    try:
+        with _log_to_file(log_path):
+            print("epoch 1 | loss 0.5")
+            print("epoch 2 | loss 0.4")
+            raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        pass
+    written = log_path.read_text()
+    assert "epoch 1" in written and "epoch 2" in written, written

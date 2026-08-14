@@ -11,11 +11,11 @@ min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
 min_std_deriv = 0.15e-3		# skip time derivatives whose stdev is below this
 min_passing_steps= 12		# any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
-recon0_scale  = 0.1e-3
-stats0_scale  = 0.01
+recon0_scale  = 0.2e-3
+stats0_scale  = 0.02
 
-deriv_scale   = 0.02e-3
-interp_scale  = 5.e-3			# /!\ to be tuned
+deriv_scale   = 2.e-6		# was 0.02e-3
+interp_scale  = 0.01		# was 5.e-3
 
 # force 	      = True
 
@@ -54,21 +54,23 @@ augment       = False		# takes hours per epoch otherwise
 # latent_channels = 8
 
 stats0_weight   = 0.25     	# was 0.5; weight of L_stats0 relative to L_recon0
-deriv_weight    = 4.
-interp_weight   = 0.1		# 0.5 was too high /!\ to be tuned
+deriv_weight    = 0.5		# was 4. (with scale * 10)
+interp_weight   = 0.		# was 0.1
 
 val_ema_decay   = 0.8		# was 0.7 (default)
 
 n_frozen_stages =   0
 z0_from_deriv_weight=0.  # was 0.05	# in [0, 1]: 0 means z0 is trained on reconstruction alone, not `L_deriv`
-deriv_dt_weight_exponent = -0.5
+deriv_dt_weight_exponent = -0.5  # was -0.5: "not just suboptimal, it plausibly has the wrong sign"
 
 deriv_target_centered=True
 resume_from	  = checkpoints/stage2/128x128-stage2-20260811_09h43.pt
 
 epochs 		  = 100
 patience 	  =  10
-deriv_weight_warmup_epochs= 5  # also switches to symmetric definition of derivative
+deriv_weight_warmup_epochs= 0  # also switches to symmetric definition of derivative
+
+trunk_from_deriv_weight=0.  # TEST
 
 batches 	  = same
 
@@ -87,9 +89,9 @@ z1_resync       = True		# always True for 3a
 
 alpha			=  0.5		# adaptative sub-step (higher: more lenient)
 max_substeps    = 512		# default: 256
-target_vram_gib = 6.5		# leave 1 GB as headroom for driver/context
+target_vram_gib = 6.		# leave 1 GB as headroom for driver/context
 truncate_bptt 	=  32
-bucket_refresh_epochs=0
+bucket_refresh_epochs=10
 
 memory_cost_a_bytes= None
 memory_cost_b_bytes= None
@@ -105,15 +107,16 @@ use_dt_decade_weights = False  # was True before alpha
 epochs 		  = 1000		# increase?
 patience 	  =  100
 
+
 num_workers	  =   4   # was 8
 batches		  = 2048
 spike_skip_factor= 10
 
-lr 			  = 3.e-6  # was 0.2e-3; default: 1.e-3
-z0_noise_scale=   0.1	# was 0.175
+lr 			  = 1.e-6  # was 0.2e-3; default: 1.e-3
+z0_noise_scale=   0.15	# was 0.175
 
 dt_cap		  = inf		# for second order
-max_dt        = 4000   # 2000/0.05 = 40'000 time steps
+max_dt        = 2500   # 2500/0.05 = 50'000 time steps (last: 550'000 -> 600'000)
 
 force 	      = True
 
@@ -128,7 +131,7 @@ alpha			= same		# adaptative sub-step
 max_substeps    = same		# default: 256
 bucket_batches 	= True		# default: True
 batch_cost_budget = 2000000000     # ~2.8 GiB, i.e. 5.5 GiB / 1.9
-target_vram_gib = same
+target_vram_gib =  6.
 truncate_bptt 	= same
 bucket_refresh_epochs=0
 
@@ -140,7 +143,7 @@ memory_cost_p      = 0.79
 
 rollout_scale  = 1.e-6			# was 1e-6
 ae_stats_weight= 1.
-one_step_weight= 5. 		# was 0.5
+one_step_weight= 0. 		# was 0.5
 
 use_dt_decade_weights = same
 

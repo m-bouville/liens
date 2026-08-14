@@ -7,7 +7,8 @@ import evaluation.check_z2_measurability as cz2
 
 def _run_with_synthetic_field(tmp_path, monkeypatch, curvature_scale,
                                velocity_scale=1e-3, n_windows=200,
-                               noise=1e-3, record_kwargs=None):
+                               noise=1e-3, record_kwargs=None,
+                               spread_decades=False):
     """Drive check_z2_measurability end to end over a KNOWN latent field.
 
     The tool's own verdict is the thing under test, so everything upstream
@@ -28,8 +29,13 @@ def _run_with_synthetic_field(tmp_path, monkeypatch, curvature_scale,
             rng = np.random.default_rng(0)
             self._items = []
             for i in range(n_windows):
-                dts = [400.0, 460.0, 530.0, 610.0, 700.0]
-                t = np.cumsum([0.0] + dts)
+                # spread_decades: windows cycle through dt decades, so the
+                # per-decade table has more than one row to compare. The
+                # scaled columns are ONLY meaningful across decades.
+                base = 10.0 * (10 ** (i % 3)) if spread_decades else 400.0
+                dts = ([base] * 5 if spread_decades
+                       else [400.0, 460.0, 530.0, 610.0, 700.0])
+                t = np.cumsum([0.0] + list(dts))
                 k = rng.normal(scale=curvature_scale)
                 v = rng.normal(scale=velocity_scale)
                 frames = [(0.5 * k * ti * ti + v * ti) * np.ones((2, 4, 4))
@@ -337,4 +343,59 @@ def test_first_derivative_control_reports_the_cosine(tmp_path, monkeypatch,
         f"a strongly coherent velocity field reported cosine "
         f"{out['per_window_first_deriv']['median_cosine']:+.3f} -- the "
         f"control cannot see persistence that is actually there"
+    )
+
+
+def test_first_difference_noise_invariant_is_magnitude_times_dt():
+    """
+    Noise in a FIRST difference is sqrt(2)*sigma/dt, so E|d1|*dt is constant
+    under the noise hypothesis while E|d1| falls as 1/dt -- one power of dt
+    less than the second difference's invariant. Getting the exponent from
+    the second-derivative case would make a noise-dominated velocity look
+    like a decaying signal.
+    """
+    rng = np.random.default_rng(0)
+    scaled, raw = [], []
+    for h in (10.0, 100.0, 1000.0, 10000.0):
+        z = rng.normal(scale=1.0, size=(20000, 2))
+        d1 = (z[:, 1] - z[:, 0]) / h
+        scaled.append(float(np.abs(d1).mean()) * h)
+        raw.append(float(np.abs(d1).mean()))
+    assert max(scaled) / min(scaled) < 1.1, f"E|d1|*dt not constant: {scaled}"
+    assert raw[0] / raw[-1] > 100, f"E|d1| did not fall with dt: {raw}"
+
+
+def test_velocity_columns_separate_a_real_field_from_noise(tmp_path, monkeypatch,
+                                                            capsys):
+    """
+    The two scaled columns together distinguish two very different
+    diagnoses. Curvature-only noise means a smooth trajectory encoded
+    wiggly -- L_interp's target. Velocity noise TOO means z0's own
+    frame-to-frame encoding noise swamps the dynamics, and the fix is
+    upstream in stage 1 rather than in stage 2's objective.
+    """
+    _run_with_synthetic_field(tmp_path, monkeypatch, curvature_scale=0.0,
+                               velocity_scale=0.0, noise=1e-3,
+                               n_windows=300, spread_decades=True)
+    noise_out = capsys.readouterr().out
+    assert "E|d1|*dt" in noise_out, "the velocity columns are not printed"
+
+    # a REAL velocity must make the scaled column grow, on the same fixture
+    _run_with_synthetic_field(tmp_path, monkeypatch, curvature_scale=0.0,
+                               velocity_scale=1e-4, noise=1e-3,
+                               n_windows=300, spread_decades=True)
+    signal_out = capsys.readouterr().out
+
+    def scaled_column(text):
+        rows = [ln for ln in text.split("\n") if ln.strip().startswith("1e")]
+        return [float(ln.split()[-1]) for ln in rows]
+
+    noise_col, signal_col = scaled_column(noise_out), scaled_column(signal_out)
+    assert len(noise_col) >= 2 and len(signal_col) >= 2
+    # flat under noise, growing under a real velocity
+    assert max(noise_col) / min(noise_col) < 3.0, (
+        f"E|d1|*dt was expected flat on pure noise, got {noise_col}"
+    )
+    assert max(signal_col) / min(signal_col) > 5.0, (
+        f"E|d1|*dt was expected to grow with a real velocity, got {signal_col}"
     )

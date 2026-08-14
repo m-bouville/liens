@@ -976,3 +976,35 @@ def test_interp_parameters_are_recorded_in_the_checkpoint(tmp_path,
     cfg = torch.load(out, map_location="cpu", weights_only=True)["stage2_config"]
     assert cfg["interp_weight"] == 0.125
     assert cfg["interp_scale"] == 0.005
+
+
+
+def test_trunk_isolation_does_not_shadow_the_deriv_stream_config():
+    """
+    REGRESSION (source-level, because the crashing path needs a resume from
+    a stats_head1-bearing stage-2 checkpoint that is costly to stage in a
+    unit test): the trunk-isolation block must NOT bind a local
+    `deriv_stream` -- that name already holds the stream CONFIG object, read
+    later as deriv_stream.channels for stats_head1. Rebinding it to the
+    stream NAME (a str) caused "'str' object has no attribute 'channels'"
+    on any isolation run resuming from a checkpoint with stats_head1.
+
+    Guard the invariant directly: within train_stage2, `deriv_stream` is
+    only ever assigned stream_configs[...], never a bare name.
+    """
+    import ast
+    import inspect
+    from training.train_stage2 import train_stage2
+
+    tree = ast.parse(inspect.getsource(train_stage2))
+    assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)]
+    deriv_assigns = [n for n in assigns
+                     for t in n.targets
+                     if isinstance(t, ast.Name) and t.id == "deriv_stream"]
+    assert deriv_assigns, "no deriv_stream assignment found -- test is stale"
+    for node in deriv_assigns:
+        assert isinstance(node.value, ast.Subscript), (
+            "deriv_stream is assigned something other than stream_configs[...]; "
+            "if it is the stream NAME (a str), the stats_head1 path reads a "
+            "str .channels and crashes"
+        )

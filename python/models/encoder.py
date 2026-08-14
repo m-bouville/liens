@@ -168,6 +168,34 @@ class Encoder(nn.Module):
             for name, cfg in stream_configs.items() if cfg.condition_on_theta
         })
 
+        # Per-stream scale on the gradient each stream sends BACK into the
+        # shared trunk. Forward value is untouched (straight-through); only
+        # the backward flow is scaled. 1.0 = today's behaviour (every stream
+        # trains the trunk fully). Set a stream to 0.0 to let it read the
+        # trunk but not reshape it -- the mechanism for training the deriv
+        # (z1) head against L_deriv WITHOUT that loss's frame-scale noise
+        # roughening z0's own trajectory through the shared trunk (measured:
+        # z0 velocity coherence falls from +0.39 at stage 1 to +0.04 after a
+        # stage-2 run whose only trunk-touching temporal loss is L_deriv).
+        # A plain python dict, not a buffer: it is a training-time control,
+        # not model state, and must not enter the checkpoint or the
+        # architecture fingerprint.
+        self._trunk_grad_scale = {name: 1.0 for name in stream_configs}
+
+    def set_trunk_grad_scale(self, stream_name: str, scale: float) -> None:
+        """Scale the gradient `stream_name` contributes to the shared trunk.
+
+        1.0 leaves training unchanged; 0.0 fully isolates the trunk from that
+        stream's loss (the stream still reads the trunk forward). Intermediate
+        values are a partial leak, for sweeping how much trunk plasticity the
+        stream actually needs.
+        """
+        if stream_name not in self._trunk_grad_scale:
+            raise KeyError(
+                f"unknown stream {stream_name!r}; have "
+                f"{sorted(self._trunk_grad_scale)}")
+        self._trunk_grad_scale[stream_name] = float(scale)
+
     def forward(self, x: torch.Tensor, theta: torch.Tensor | None = None):
         if x.shape[-2] != self.input_size or x.shape[-1] != self.input_size:
             raise ValueError(
@@ -199,7 +227,15 @@ class Encoder(nn.Module):
         # downstream can re-establish it if this is wrong).
         z = {}
         for name, bottleneck in self.bottlenecks.items():
-            feat = self.theta_conditioners[name](x, theta) if name in self.theta_conditioners else x
+            # Straight-through gradient scaling on the trunk features this
+            # stream consumes: forward value == x exactly, backward gradient
+            # == scale * (dL/dx). scale 1.0 is a no-op (the common path);
+            # scale 0.0 makes x_stream = x.detach(), so this stream's loss
+            # cannot move the trunk. See set_trunk_grad_scale.
+            scale = self._trunk_grad_scale[name]
+            x_stream = x if scale == 1.0 else x.detach() + scale * (x - x.detach())
+            feat = self.theta_conditioners[name](x_stream, theta) \
+                if name in self.theta_conditioners else x_stream
             z[name] = bottleneck(feat)
 
         if self.use_skips:

@@ -1121,14 +1121,17 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     return output_path
 
 
-def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
-                     n_steps: int = 2, seed: int = 0,
-                     fixed_windows: list[str] | None = None,
-                     max_dt: float | None = None, z1_resync: bool = False,
-                     f_scale_sweep: bool = False, alpha_sweep: bool = False,
-                     n_stats: int = 0, trajectory: bool = False,
-                     output_path: Path | None = None,
-                     device: str | None = None) -> tuple[Path, list[str]]:
+def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
+                       fixed_windows, max_dt, z1_resync):
+    """Shared prologue for the panel and statistics tools: load both models,
+    resolve the window set and the title/prefix, print the z1_resync banner.
+
+    Returns everything both tools need so neither reloads a checkpoint. The
+    ONE cross-tool coupling that used to exist -- the stats path reaching
+    into the panel window set only to read its horizon length -- is gone:
+    the horizon is n_steps, passed explicitly, so `compare_statistics` no
+    longer needs a panel window drawn just to define it.
+    """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     a = _load_model(path_a, device)
     b = _load_model(path_b, device)
@@ -1140,57 +1143,71 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
               f"any difference below may be the AEs', not f_theta's.")
 
     if fixed_windows:
-        windows = [parse_fixed_window(s) for s in fixed_windows]
-        # NO per-checkpoint truncation -- unlike check_rollout, which trims a
-        # 3-step window to a 3a checkpoint's own window_length=2. Correct for
-        # judging one checkpoint on its own terms; fatal for an A/B figure,
-        # where it would silently put a 1-step prediction beside a 2-step one
-        # in the same row. Both models get every step.
+        windows = [parse_fixed_window(sw) for sw in fixed_windows]
         lens = {len(steps) for _, steps in windows}
         if len(lens) != 1:
             raise ValueError(f"fixed windows have mixed lengths {sorted(lens)}; "
                               f"the comparison needs one common horizon")
     else:
-        # n_samples=0 is legitimate: "statistics only, no image figure". The
-        # image path is skipped below, but the horizon still has to come from
-        # somewhere, so a single window is drawn to define it (and to give
-        # --trajectory something to follow if asked).
         windows = _select_windows(a, max(n_samples, 1), n_steps, seed, max_dt,
                                    device)
-    window_strings = [f"{run_dir}:{':'.join(str(s) for s in steps)}"
+    window_strings = [f"{run_dir}:{':'.join(str(sp) for sp in steps)}"
                        for run_dir, steps in windows]
     print(f"z1_resync={z1_resync} for BOTH models (forced equal; the comparison "
           f"is void if one resyncs and the other propagates).")
-    for s in window_strings:
-        print(f"  {s}")
+    for sw in window_strings:
+        print(f"  {sw}")
 
-    recon_loss = ReconLoss()
-    draw_panels = n_samples != 0 or bool(fixed_windows)
-    n_rows = len(windows)
-    if draw_panels:
-        fig, axes = plt.subplots(n_rows, 7, figsize=(29, 3.2 * n_rows))
-        if n_rows == 1:
-            axes = axes[None, :]
     prefix = a["prefix"] or b["prefix"]
     if a["prefix"] and b["prefix"] and a["prefix"] != b["prefix"]:
-        # e.g. a 32x32 checkpoint against a 128x128 one: say so in the title
-        # rather than silently keeping one side's prefix.
         prefix = f"{a['prefix']} vs {b['prefix']}"
-    # THE REGIME BELONGS IN THE TITLE. --steps 4 without --z1-resync and
-    # --steps 2 with it are different experiments that produced opposite
-    # readings of the same two checkpoints, and nothing on the figure said
-    # which was which.
     n_steps_used = len(windows[0][1]) - 1
     regime = (f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}, "
               f"z1 {'resynced at each real frame' if z1_resync else 'not resynchronized'}")
     title = (f"{prefix}: {a['label']} vs. {b['label']}" if prefix
               else f"{a['label']} vs. {b['label']}")
     title = f"{title}\n{regime}"
-    if draw_panels:
-        fig.suptitle(title, fontsize=13)
+    return device, a, b, windows, window_strings, prefix, title, n_steps_used
+
+
+def _default_output_path(prefix, a, b, seed, n_steps_used, z1_resync,
+                          fixed_windows):
+    sa = a["label"].replace(" ", "")
+    sb = b["label"].replace(" ", "")
+    name = f"{prefix}-{sa}_vs_{sb}" if prefix and " vs " not in prefix \
+        else f"{sa}_vs_{sb}"
+    suffix = "" if fixed_windows else f"-seed{seed}"
+    regime_tag = f"-{n_steps_used}step{'s' if n_steps_used != 1 else ''}"
+    regime_tag += "-resync" if z1_resync else "-propagated"
+    out = (_PYTHON_ROOT.parent / "output" / "rollout_check_png"
+           / f"{name}{regime_tag}{suffix}.png")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
+                    n_steps: int = 2, seed: int = 0,
+                    fixed_windows: list[str] | None = None,
+                    max_dt: float | None = None, z1_resync: bool = False,
+                    trajectory: bool = False, output_path: Path | None = None,
+                    device: str | None = None) -> tuple[Path, list[str]]:
+    """The IMAGE side: the 7-column per-window panel figure, and (with
+    trajectory=True) one frame-by-frame trajectory figure per window. Both
+    operate on the n_samples window set -- the windows chosen to be looked
+    at. For the numbers a verdict rests on, use compare_statistics."""
+    (device, a, b, windows, window_strings, prefix, title,
+     n_steps_used) = _setup_comparison(path_a, path_b, device, n_samples,
+                                         n_steps, seed, fixed_windows, max_dt,
+                                         z1_resync)
+    recon_loss = ReconLoss()
+    n_rows = len(windows)
+    fig, axes = plt.subplots(n_rows, 7, figsize=(29, 3.2 * n_rows))
+    if n_rows == 1:
+        axes = axes[None, :]
+    fig.suptitle(title, fontsize=13)
 
     losses = {"a": [], "b": []}
-    for row, (run_dir, steps) in enumerate(windows if draw_panels else []):
+    for row, (run_dir, steps) in enumerate(windows):
         per = {}
         for key, m in (("a", a), ("b", b)):
             x_t, x_real, x_pred, _x_ae, dt_total, dt_per_step = compute_sample(
@@ -1208,23 +1225,10 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
             per[key]["corr"] = _correlation_pct(per[key]["pred_delta"], real_delta)
 
         state_scale = max(abs(x_t.min()), abs(x_t.max()), 0.1)
-        # One symmetric scale for real AND both predictions, from real alone:
-        # derived from either prediction it would saturate differently per
-        # column and the visual comparison would lie.
         d_lo, d_hi = _padded_bounds(real_delta, 1.0, symmetric=True)
-        # BOTH error columns on ONE scale, set by the worse model -- which
-        # error panel is fuller is the figure's entire question.
         e_lo, e_hi = _padded_bounds(
             np.concatenate([per["a"]["error"].ravel(), per["b"]["error"].ravel()]),
             1.0, symmetric=True)
-        # The B-A column shares the ERROR scale. It equals error_B - error_A
-        # exactly (the shared real_delta cancels), so it belongs to the same
-        # family of quantities and reads directly against the two error
-        # panels beside it -- a seventh independent scale on a seven-column
-        # figure is one more number per row for the reader to hold. The cost
-        # is that a subtle structured change is flattened whenever one
-        # model's error is large; the row's own printed error scale says when
-        # that is happening.
         diff = per["b"]["pred_delta"] - per["a"]["pred_delta"]
         f_lo, f_hi = e_lo, e_hi
 
@@ -1245,9 +1249,6 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
              f"{b['label']} \u2212 {a['label']}\n(= error {b['label']} "
              f"\u2212 error {a['label']})"),
         ]
-        # cell_title, NOT title: `title` is the FIGURE's title, and reusing
-        # the name here rebound it to the last panel's caption -- the stats
-        # figure was then headed "stage 3b - stage 3a (= error ...)".
         for col, (img, lo, hi, cell_title) in enumerate(cells):
             ax = axes[row, col]
             im = ax.imshow(img, cmap="RdBu_r", vmin=lo, vmax=hi)
@@ -1255,59 +1256,28 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
             ax.set_xticks([])
             ax.set_yticks([])
             if col == 6:
-                # ONE colorbar for columns 4, 5 and 6: they share a scale, so
-                # a second bar repeating the same range is clutter on an
-                # already-wide figure. fraction=0.046 attached to a single
-                # axis, as check_rollout does -- a colorbar spanning
-                # axes[row, 4:6] is the construct tight_layout cannot place,
-                # and it warned on every run.
                 fig.colorbar(im, ax=axes[row, 6], fraction=0.046)
 
-    if draw_panels:
-        med_a = float(np.median(losses["a"]))
-        med_b = float(np.median(losses["b"]))
-        print(f"\nmedian end-to-end loss over {n_rows} shared windows: "
-              f"{a['label']}={med_a:.5f}  {b['label']}={med_b:.5f}  "
-              f"({(a['label'] if med_a < med_b else b['label'])} better by "
-              f"{max(med_a, med_b) / max(min(med_a, med_b), 1e-30):.2f}x)")
-        print(f"Medians over {n_rows} windows are indicative only -- rerun "
-              f"with --n-samples 24 (or the RMS tools) before concluding.")
+    med_a = float(np.median(losses["a"]))
+    med_b = float(np.median(losses["b"]))
+    print(f"\nmedian end-to-end loss over {n_rows} shared windows: "
+          f"{a['label']}={med_a:.5f}  {b['label']}={med_b:.5f}  "
+          f"({(a['label'] if med_a < med_b else b['label'])} better by "
+          f"{max(med_a, med_b) / max(min(med_a, med_b), 1e-30):.2f}x)")
+    print(f"Medians over {n_rows} windows are indicative only -- rerun "
+          f"with --n-samples 24 (or the RMS tools) before concluding.")
 
     if output_path is None:
-        # '128x128-stage3a_vs_stage3b-seed0.png' -- the parsed pieces, with
-        # the label's space compacted back out for the filesystem.
-        sa = a["label"].replace(" ", "")
-        sb = b["label"].replace(" ", "")
-        name = f"{prefix}-{sa}_vs_{sb}" if prefix and " vs " not in prefix \
-            else f"{sa}_vs_{sb}"
-        # No seed in the name for --fixed-windows: the seed played no part in
-        # selecting them, and a stamped seed would suggest a rerun with
-        # another seed changes the windows. check_rollout's convention.
-        suffix = "" if fixed_windows else f"-seed{seed}"
-        # The regime goes in the FILENAME too: without it a --steps 4 run
-        # silently overwrote the --steps 2 run it should be compared against,
-        # leaving two different experiments under one name.
-        regime_tag = f"-{n_steps_used}step{'s' if n_steps_used != 1 else ''}"
-        regime_tag += "-resync" if z1_resync else "-propagated"
-        output_path = (_PYTHON_ROOT.parent / "output" / "rollout_check_png"
-                       / f"{name}{regime_tag}{suffix}.png")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if draw_panels:
-        fig.tight_layout()
-        fig.savefig(output_path, dpi=110)
-        plt.close(fig)
-        print(f"saved {output_path}")
+        output_path = _default_output_path(prefix, a, b, seed, n_steps_used,
+                                            z1_resync, fixed_windows)
     else:
-        # --n-samples 0: statistics only. output_path was still constructed,
-        # because the stats and trajectory figures derive their names from it.
-        print("\n--n-samples 0: no comparison panel drawn.")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=110)
+    plt.close(fig)
+    print(f"saved {output_path}")
 
     if trajectory:
-        # ONE FIGURE PER WINDOW, each named by the run it came from. The run
-        # directory name already carries the parameters that identify it --
-        # T925_n035_s5 is temperature, noise and sim seed -- so the figure is
-        # self-describing, and the selection seed (which chose the window set,
-        # not the physics) has no place in the name of a single-window plot.
         for run_dir, steps in windows:
             run_dir = Path(run_dir)
             traj_path = output_path.with_name(
@@ -1316,54 +1286,140 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
                                 title, traj_path)
             print(f"saved {traj_path}")
 
+    return output_path, window_strings
+
+
+def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
+                        n_steps: int = 2, seed: int = 0,
+                        max_dt: float | None = None, z1_resync: bool = False,
+                        f_scale_sweep: bool = False, alpha_sweep: bool = False,
+                        trajectory: bool = False,
+                        output_path: Path | None = None,
+                        device: str | None = None) -> tuple[Path, list[str]]:
+    """The STATISTICS side: loss/correlation over n_stats windows (the 2x4
+    figure), plus the optional f-scale and alpha sweeps, which share that
+    same window set and the same loaded models. No per-window images. This
+    is what a verdict should rest on; the panels are for looking at.
+
+    n_steps is the shared rollout horizon, passed directly -- unlike the old
+    combined function, no panel window is drawn to define it, so n_samples
+    has no meaning here."""
+    (device, a, b, windows, window_strings, prefix, title,
+     n_steps_used) = _setup_comparison(path_a, path_b, device, 0, n_steps,
+                                         seed, None, max_dt, z1_resync)
     if n_stats:
-        # A SEPARATE, LARGER sample: the panel windows were chosen to be
-        # looked at, and six of them disagreed between seed 0 and seed 1 on
-        # the size of the gap. Same selection machinery, same shared windows,
-        # no images.
-        stat_windows = _select_windows(a, n_stats, len(windows[0][1]) - 1,
-                                        seed, max_dt, device)
+        stat_windows = _select_windows(a, n_stats, n_steps, seed, max_dt, device)
         print(f"\ncollecting statistics over {len(stat_windows)} windows "
               f"(both models, same windows)...")
         stats = collect_stats(a, b, stat_windows, device, z1_resync)
-        if alpha_sweep:
-            # THE h -> 0 TEST at fixed learned field: scheme instability
-            # vanishes as h shrinks, an unstable f_theta persists.
-            for key, m in (("a", a), ("b", b)):
-                print(f"\nalpha sweep -- {m['label']} (smaller alpha == "
-                      f"smaller substeps, h -> 0):")
-                sweep_alpha(m, stat_windows, device, z1_resync)
-        if f_scale_sweep:
-            # HOW MUCH f_theta, from none (== stage 2) to all of it. Stage 2
-            # is nested inside stage 3 at f == 0, so a stage-3 model losing
-            # to stage 2 cannot be a hypothesis-class problem; this asks
-            # whether the damage is monotone in the amount of f_theta
-            # applied.
-            for key, m in (("a", a), ("b", b)):
-                print(f"\nf_theta scale sweep -- {m['label']} "
-                      f"(scale 0 == stage 2):")
-                sweep_f_theta_scale(m, stat_windows, device, z1_resync)
+    else:
+        stats = None  # trajectory-only: no stats figure, just the traj plots
+    if alpha_sweep and stats is not None:
         for key, m in (("a", a), ("b", b)):
-            losses_k = np.array(stats[f"loss_{key}"], dtype=float)
-            corrs_k = np.array([c for c in stats[f"corr_{key}"]
-                                 if c is not None], dtype=float)
-            print(f"  {m['label']}: median loss {np.median(losses_k):.5g}, "
-                  f"median corr {np.median(corrs_k):.0f}%")
+            print(f"\nalpha sweep -- {m['label']} (smaller alpha == "
+                  f"smaller substeps, h -> 0):")
+            sweep_alpha(m, stat_windows, device, z1_resync)
+    if f_scale_sweep and stats is not None:
         for key, m in (("a", a), ("b", b)):
-            per_step = stats["n_corr_undefined_per_step"][key]
-            flagged = [k for k, n in enumerate(per_step)
-                        if k > 0 and n == len(stats["dt"])]
-            if flagged:
-                print(f"  {m['label']}: correlation UNDEFINED for EVERY window "
-                      f"at step(s) {flagged}. No property of a single window "
-                      f"explains that -- the predicted delta is constant there "
-                      f"(pred[k] == pred[0]) or the real frames are identical. "
-                      f"Those steps are absent from the correlation panel.")
+            print(f"\nf_theta scale sweep -- {m['label']} "
+                  f"(scale 0 == stage 2):")
+            sweep_f_theta_scale(m, stat_windows, device, z1_resync)
+    for key, m in ((("a", a), ("b", b)) if stats is not None else ()):
+        losses_k = np.array(stats[f"loss_{key}"], dtype=float)
+        corrs_k = np.array([c for c in stats[f"corr_{key}"]
+                             if c is not None], dtype=float)
+        print(f"  {m['label']}: median loss {np.median(losses_k):.5g}, "
+              f"median corr {np.median(corrs_k):.0f}%")
+    for key, m in ((("a", a), ("b", b)) if stats is not None else ()):
+        per_step = stats["n_corr_undefined_per_step"][key]
+        flagged = [k for k, n in enumerate(per_step)
+                    if k > 0 and n == len(stats["dt"])]
+        if flagged:
+            print(f"  {m['label']}: correlation UNDEFINED for EVERY window "
+                  f"at step(s) {flagged}. No property of a single window "
+                  f"explains that -- the predicted delta is constant there "
+                  f"(pred[k] == pred[0]) or the real frames are identical. "
+                  f"Those steps are absent from the correlation panel.")
+    if output_path is None:
+        output_path = _default_output_path(prefix, a, b, seed, n_steps_used,
+                                            z1_resync, None)
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    if trajectory:
+        # trajectory without any panel figure: follow the SETUP windows (the
+        # same set the panel tool would draw), naming each after its run.
+        for run_dir, steps in windows:
+            run_dir = Path(run_dir)
+            traj_path = output_path.with_name(
+                f"{output_path.stem.rsplit('-seed', 1)[0]}-{run_dir.name}.png")
+            _trajectory_figure(run_dir, steps, a, b, device, z1_resync,
+                                title, traj_path)
+            print(f"saved {traj_path}")
+    if stats is not None:
         stats_path = output_path.with_name(output_path.stem + "-stats.png")
         _stats_figure(stats, a, b, title, stats_path)
         print(f"saved {stats_path}")
-
+    # Return the BASE path (not the -stats one): callers derive both the
+    # stats and trajectory names from this stem, as the panel tool's return
+    # is also the base figure the extras hang off.
     return output_path, window_strings
+
+
+def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
+                     n_steps: int = 2, seed: int = 0,
+                     fixed_windows: list[str] | None = None,
+                     max_dt: float | None = None, z1_resync: bool = False,
+                     f_scale_sweep: bool = False, alpha_sweep: bool = False,
+                     n_stats: int = 0, trajectory: bool = False,
+                     output_path: Path | None = None,
+                     device: str | None = None) -> tuple[Path, list[str]]:
+    """Thin orchestrator kept for backward compatibility: runs the panel
+    tool when n_samples != 0 (or fixed windows are given) and the statistics
+    tool when n_stats > 0. The two are independently callable as
+    compare_panels and compare_statistics; this just preserves the single
+    entry point and its return (the panel figure's path, or the stats
+    figure's path when panels are skipped).
+
+    The two tools load the checkpoints separately -- a deliberate trade: the
+    load is trivial beside a 200-window stats pass, and keeping them
+    decoupled is worth one extra torch.load when both are asked for.
+    """
+    draw_panels = n_samples != 0 or bool(fixed_windows)
+    result = None
+    if draw_panels:
+        # The panel tool draws its own trajectories when asked; only hand it
+        # trajectory when panels are actually being drawn.
+        result = compare_panels(
+            path_a, path_b, n_samples=n_samples, n_steps=n_steps, seed=seed,
+            fixed_windows=fixed_windows, max_dt=max_dt, z1_resync=z1_resync,
+            trajectory=trajectory, output_path=output_path, device=device)
+    elif not n_stats:
+        print("\n--n-samples 0: no comparison panel drawn.")
+
+    # Trajectory or stats at n_samples=0 both route through the stats tool,
+    # which can draw trajectories without a panel. Entered when EITHER is
+    # requested (n_stats>0, or trajectory-only with no panels).
+    if n_stats or (trajectory and not draw_panels):
+        want_traj_here = trajectory and not draw_panels
+        stats_result = compare_statistics(
+            path_a, path_b, n_stats=n_stats, n_steps=n_steps, seed=seed,
+            max_dt=max_dt, z1_resync=z1_resync, f_scale_sweep=f_scale_sweep,
+            alpha_sweep=alpha_sweep, trajectory=want_traj_here,
+            output_path=output_path, device=device)
+        if result is None:
+            result = stats_result
+
+    if result is None:
+        device_r = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        (_d, a, b, _w, window_strings, prefix, _t,
+         n_steps_used) = _setup_comparison(path_a, path_b, device_r, n_samples,
+                                            n_steps, seed, fixed_windows,
+                                            max_dt, z1_resync)
+        out = output_path or _default_output_path(prefix, a, b, seed,
+                                                   n_steps_used, z1_resync,
+                                                   fixed_windows)
+        return out, window_strings
+    return result
 
 
 def main() -> None:
@@ -1412,15 +1468,43 @@ def main() -> None:
                               "default is propagation, the inference regime")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--panels-only", action="store_true",
+                         help="run ONLY the image tool (compare_panels): the "
+                              "7-column figure and optional trajectories, no "
+                              "statistics. Ignores --n-stats and the sweeps.")
+    parser.add_argument("--stats-only", action="store_true",
+                         help="run ONLY the statistics tool "
+                              "(compare_statistics): the 2x4 figure and the "
+                              "sweeps, no per-window panels. --n-stats "
+                              "defaults to 200 here if left at 0.")
     args = parser.parse_args()
-    compare_f_theta(args.checkpoint_a, args.checkpoint_b,
-                     n_samples=args.n_samples, n_steps=args.steps,
-                     seed=args.seed, fixed_windows=args.fixed_windows,
-                     max_dt=args.max_dt, z1_resync=args.z1_resync,
-                     f_scale_sweep=args.f_scale_sweep,
-                     alpha_sweep=args.alpha_sweep,
-                     n_stats=args.n_stats, trajectory=args.trajectory,
-                     output_path=args.output, device=args.device)
+    if args.panels_only and args.stats_only:
+        parser.error("--panels-only and --stats-only are mutually exclusive")
+
+    if args.stats_only:
+        compare_statistics(
+            args.checkpoint_a, args.checkpoint_b,
+            n_stats=args.n_stats or 200, n_steps=args.steps, seed=args.seed,
+            max_dt=args.max_dt, z1_resync=args.z1_resync,
+            f_scale_sweep=args.f_scale_sweep, alpha_sweep=args.alpha_sweep,
+            trajectory=args.trajectory, output_path=args.output,
+            device=args.device)
+    elif args.panels_only:
+        compare_panels(
+            args.checkpoint_a, args.checkpoint_b,
+            n_samples=args.n_samples, n_steps=args.steps, seed=args.seed,
+            fixed_windows=args.fixed_windows, max_dt=args.max_dt,
+            z1_resync=args.z1_resync, trajectory=args.trajectory,
+            output_path=args.output, device=args.device)
+    else:
+        compare_f_theta(args.checkpoint_a, args.checkpoint_b,
+                         n_samples=args.n_samples, n_steps=args.steps,
+                         seed=args.seed, fixed_windows=args.fixed_windows,
+                         max_dt=args.max_dt, z1_resync=args.z1_resync,
+                         f_scale_sweep=args.f_scale_sweep,
+                         alpha_sweep=args.alpha_sweep,
+                         n_stats=args.n_stats, trajectory=args.trajectory,
+                         output_path=args.output, device=args.device)
 
 
 if __name__ == "__main__":

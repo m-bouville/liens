@@ -314,12 +314,13 @@ def check_z2_measurability(checkpoint_path: Path, base_path: Path | None = None,
             "per_window": pw, "per_window_first_deriv": pw1,
             "n_windows": int(take), "narrow": narrow, "wide": wide,
             "dt_narrow": dt_narrow, "temperature": temps}
-    _print_by_group(narrow, wide, dt_narrow, temps)
+    _print_by_group(narrow, wide, dt_narrow, temps, first_deriv=d1_a)
     return out
 
 
 def _print_by_group(narrow: np.ndarray, wide: np.ndarray,
-                     dt_narrow: np.ndarray, temps: np.ndarray) -> None:
+                     dt_narrow: np.ndarray, temps: np.ndarray,
+                     first_deriv: np.ndarray | None = None) -> None:
     """Per dt decade and per T split.
 
     Aggregates mislead here by construction: the Taylor fit put the
@@ -338,8 +339,19 @@ def _print_by_group(narrow: np.ndarray, wide: np.ndarray,
     # independent of the correlation.
     # (The invariant is |z2|*dt^2, equivalently |z2|^2*dt^4 -- |z2|^2*dt^2
     #  still falls as 1/dt^2 and would look like a decaying signal.)
+    # E|d1| and E|d1|*dt alongside, because the SAME scaling test applies to
+    # the first derivative with a different exponent. Noise in a first
+    # difference is sqrt(2)*sigma/dt, so under the noise hypothesis
+    # E|d1|*dt is CONSTANT across decades while E|d1| itself falls as 1/dt;
+    # a real velocity is dt-independent in |d1|, so its scaled column GROWS
+    # as dt. Together with the z2 columns this separates two very different
+    # diagnoses: if only the CURVATURE is noise-dominated the trajectory is
+    # smooth and merely wiggly at second order (L_interp's target), but if
+    # the VELOCITY is noise-dominated too then z0's frame-to-frame encoding
+    # noise swamps the dynamics themselves and the problem is upstream, in
+    # stage 1's representation, not in stage 2's objective.
     print(f"  {'decade':<16}{'n':>7}{'bias frac':>11}{'med corr':>10}"
-          f"{'E|z2|':>12}{'E|z2|*dt^2':>12}")
+          f"{'E|z2|':>12}{'E|z2|*dt^2':>12}{'E|d1|':>12}{'E|d1|*dt':>11}")
     if dt_narrow.size and dt_narrow.max() > 0:
         positive = dt_narrow[dt_narrow > 0]
         if positive.size:
@@ -353,9 +365,24 @@ def _print_by_group(narrow: np.ndarray, wide: np.ndarray,
                 pw = _per_window_agreement(narrow[sel], wide[sel])
                 mag = float(np.abs(narrow[sel]).mean())
                 dt_mean = float(dt_narrow[sel].mean())
-                print(f"  1e{d:<3d}- 1e{d + 1:<7d}{int(sel.sum()):>7}"
-                      f"{frac:>11.3f}{pw.get('median', float('nan')):>+10.3f}"
-                      f"{mag:>12.3e}{mag * dt_mean ** 2:>12.3e}")
+                row = (f"  1e{d:<3d}- 1e{d + 1:<7d}{int(sel.sum()):>7}"
+                       f"{frac:>11.3f}{pw.get('median', float('nan')):>+10.3f}"
+                       f"{mag:>12.3e}{mag * dt_mean ** 2:>12.3e}")
+                if first_deriv is not None:
+                    d1_mag = float(np.abs(first_deriv[sel]).mean())
+                    row += f"{d1_mag:>12.3e}{d1_mag * dt_mean:>11.3e}"
+                print(row)
+
+    if first_deriv is not None:
+        print("  (READING RULE -- both scaled columns are flat under pure "
+              "noise and GROW under real signal:")
+        print("     E|z2|*dt^2 flat -> curvature is stencil noise;  "
+              "E|d1|*dt flat -> the VELOCITY is noise too.")
+        print("     curvature-only noise = a smooth trajectory encoded "
+              "wiggly, which L_interp targets. BOTH noisy = z0's own "
+              "frame-to-frame")
+        print("     encoding noise swamps the dynamics, and the fix is "
+              "upstream in stage 1, not in stage 2's objective.)")
 
     print("\n" + "-" * 70)
     print("per temperature split (the Taylor fit put dt* 40x apart across it)")
