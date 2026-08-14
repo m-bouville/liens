@@ -158,6 +158,28 @@ class Encoder(nn.Module):
             for name, cfg in stream_configs.items()
         })
 
+        # Optional nonlinear residual head H per stream: z = B(y) + H(y).
+        # 3x3 -> GELU -> 3x3, the SECOND conv zero-initialised so H(y)=0 at
+        # init and the stream is byte-identical to the pure-linear (1x1 B)
+        # head until training grows the residual. GELU (not ReLU) keeps the
+        # map differentiable everywhere, so perturbation linearity degrades
+        # smoothly with ||H|| instead of fracturing at kinks. Built only for
+        # streams whose config asks for it; absent entirely otherwise, so a
+        # "linear" stream's state_dict has no H.* keys (old checkpoints load
+        # unchanged, new "linear" streams stay identical to them).
+        self.residual_heads = nn.ModuleDict()
+        for name, cfg in stream_configs.items():
+            if getattr(cfg, "head_kind", "linear") == "residual":
+                h = cfg.head_hidden
+                conv2 = nn.Conv2d(h, cfg.channels, kernel_size=3, padding=1)
+                nn.init.zeros_(conv2.weight)
+                nn.init.zeros_(conv2.bias)
+                self.residual_heads[name] = nn.Sequential(
+                    nn.Conv2d(channels[-1], h, kernel_size=3, padding=1),
+                    nn.GELU(),
+                    conv2,
+                )
+
         # ONE conditioner per theta-conditioned stream, not shared --
         # each stream's own bottleneck is already independent (see this
         # class's own docstring on why), so its own conditioner is too;
@@ -195,6 +217,33 @@ class Encoder(nn.Module):
                 f"unknown stream {stream_name!r}; have "
                 f"{sorted(self._trunk_grad_scale)}")
         self._trunk_grad_scale[stream_name] = float(scale)
+
+    def head_nonlinearity(self) -> dict:
+        """Per stream, a scale-free measure of how far the nonlinear residual
+        head has moved from the pure-linear map. 0.0 means still linear (a
+        linear head, or a residual head at init). This is the scalar the
+        three smoothness properties are traded against -- report it, don't
+        assume it stays small.
+
+        Measured on the OUTPUT conv of H (the zero-initialised one): it is
+        what actually injects nonlinearity into z, so its norm is 0 exactly
+        when H(y)=0, whereas H's input conv is random-initialised and would
+        make a fresh residual head look nonlinear when it is not.
+        Normalised by ||B||, both Frobenius norms over weights and biases."""
+        import torch as _torch
+        out = {}
+        with _torch.no_grad():
+            for name, bottleneck in self.bottlenecks.items():
+                if name not in self.residual_heads:
+                    out[name] = 0.0
+                    continue
+                b_norm = _torch.sqrt(sum(p.pow(2).sum()
+                                          for p in bottleneck.parameters()))
+                out_conv = self.residual_heads[name][-1]  # the zero-init conv
+                h_norm = _torch.sqrt(sum(p.pow(2).sum()
+                                          for p in out_conv.parameters()))
+                out[name] = float(h_norm / b_norm.clamp_min(1e-12))
+        return out
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor | None = None):
         if x.shape[-2] != self.input_size or x.shape[-1] != self.input_size:
@@ -236,7 +285,13 @@ class Encoder(nn.Module):
             x_stream = x if scale == 1.0 else x.detach() + scale * (x - x.detach())
             feat = self.theta_conditioners[name](x_stream, theta) \
                 if name in self.theta_conditioners else x_stream
-            z[name] = bottleneck(feat)
+            out = bottleneck(feat)
+            if name in self.residual_heads:
+                # z = B(y) + H(y). H reads the SAME theta-conditioned,
+                # trunk-grad-scaled features B does, so the leak knob governs
+                # both branches identically.
+                out = out + self.residual_heads[name](feat)
+            z[name] = out
 
         if self.use_skips:
             return z, skips

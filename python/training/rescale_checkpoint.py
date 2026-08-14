@@ -287,19 +287,24 @@ def rescale_checkpoint_to_size(
             f"('encoders.shared.' or 'encoder.'). Keys begin: "
             f"{sorted(prev['model_state'])[:4]}"
         )
-    # The bottleneck and theta-conditioner are built on channels[-1], which
-    # doubles with every added stage, so their old weights are the WRONG SHAPE
-    # and must be dropped rather than offered to load_state_dict -- an
-    # unexpected-key error here would be correct but far less clear than
-    # naming them up front.
+    # The bottleneck, theta-conditioner AND any residual head (H in
+    # z = B y + H(y)) are built on channels[-1], which doubles with every
+    # added stage, so their old weights are the WRONG SHAPE and must be
+    # dropped rather than offered to load_state_dict -- an unexpected-key
+    # error here would be correct but far less clear than naming them up
+    # front. A dropped H is reinitialised zero-effective (its output conv is
+    # zero-init), so the rescaled encoder maps like the pure-linear head
+    # until retrained -- consistent with the bottleneck's own reinit story.
     encoder_transfer = {k: v for k, v in old_encoder_state.items()
-                         if not k.startswith(("bottlenecks.", "theta_conditioners."))}
+                         if not k.startswith(("bottlenecks.", "theta_conditioners.",
+                                               "residual_heads."))}
     encoder_result = encoder.load_state_dict(encoder_transfer, strict=False)
 
     expected_missing_encoder = tuple(f"down_blocks.{i}." for i in range(n_stages_old, n_stages_new))
     unexpected_missing = [
         k for k in encoder_result.missing_keys
-        if not k.startswith(expected_missing_encoder + ("bottlenecks.", "theta_conditioners."))
+        if not k.startswith(expected_missing_encoder + ("bottlenecks.", "theta_conditioners.",
+                                                          "residual_heads."))
     ]
     if unexpected_missing or encoder_result.unexpected_keys:
         raise ValueError(
@@ -406,7 +411,8 @@ def rescale_checkpoint_to_size(
     # a missing bottleneck -- an obscure shape error a long way from its cause.
     new_config["stream_configs"] = {
         name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
+                "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,
+               "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
         for name, cfg in stream_configs.items()
     }
     new_config["recon_stream_name"] = recon_stream_name
@@ -532,6 +538,7 @@ def extract_stage1_checkpoint(
         recon_stream_name: {
             "channels": state_cfg.channels, "spatial_size": state_cfg.spatial_size,
             "mode": state_cfg.mode.value, "condition_on_theta": state_cfg.condition_on_theta,
+            "head_kind": state_cfg.head_kind, "head_hidden": state_cfg.head_hidden,
         }
     }
     new_config["recon_stream_name"] = recon_stream_name

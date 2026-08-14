@@ -189,7 +189,8 @@ def load_ae_components(checkpoint_path: str | Path,
     # mismatch but was actually caused right here.
     ae_component_config["stream_configs"] = {
         name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
+               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,
+               "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
         for name, cfg in _resolved_streams.items()
     }
     ae_component_config["recon_stream_name"] = _resolved_recon_name
@@ -375,7 +376,8 @@ def load_joint_refinement_checkpoint(checkpoint_path: str | Path,
     # mismatch but was actually caused right here.
     ae_component_config["stream_configs"] = {
         name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
+               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,
+               "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
         for name, cfg in _resolved_streams.items()
     }
     ae_component_config["recon_stream_name"] = _resolved_recon_name

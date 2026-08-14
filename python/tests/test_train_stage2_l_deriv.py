@@ -1002,9 +1002,116 @@ def test_trunk_isolation_does_not_shadow_the_deriv_stream_config():
                      for t in n.targets
                      if isinstance(t, ast.Name) and t.id == "deriv_stream"]
     assert deriv_assigns, "no deriv_stream assignment found -- test is stale"
+
+    def _is_config_valued(value):
+        # The two legitimate forms, both of which bind a CONFIG OBJECT:
+        #   deriv_stream = stream_configs[...]           (lookup)
+        #   deriv_stream = dataclasses.replace(deriv_stream, ...)  (upgrade)
+        # Anything else -- in particular a bare Name like deriv_stream_name,
+        # a str -- rebinds it to something without .channels and crashes the
+        # stats_head1 path.
+        if isinstance(value, ast.Subscript):
+            return True
+        if (isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "replace"
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id == "dataclasses"
+                and value.args
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id == "deriv_stream"):
+            return True
+        return False
+
     for node in deriv_assigns:
-        assert isinstance(node.value, ast.Subscript), (
-            "deriv_stream is assigned something other than stream_configs[...]; "
-            "if it is the stream NAME (a str), the stats_head1 path reads a "
-            "str .channels and crashes"
+        assert _is_config_valued(node.value), (
+            "deriv_stream is assigned something other than stream_configs[...] "
+            "or dataclasses.replace(deriv_stream, ...); if it is the stream "
+            "NAME (a str), the stats_head1 path reads a str .channels and "
+            "crashes"
         )
+
+
+def test_deriv_head_hidden_upgrades_a_resumed_stream_to_residual():
+    """
+    Resuming a stage-2 checkpoint whose deriv stream is linear, with
+    deriv_head_hidden > 0, must upgrade it to a residual head: the config
+    flips to head_kind='residual' while every other field is preserved.
+    Tested at the config level (dataclasses.replace), the transform the
+    resume branch applies before building the AE.
+    """
+    import dataclasses
+    from models.latent_streams import LatentStreamConfig, LatentStreamMode
+
+    linear = LatentStreamConfig(name="deriv", channels=8, spatial_size=8,
+                                 mode=LatentStreamMode.PURE_LATENT,
+                                 condition_on_theta=True)
+    upgraded = dataclasses.replace(linear, head_kind="residual", head_hidden=64)
+    assert upgraded.head_kind == "residual" and upgraded.head_hidden == 64
+    # everything else preserved
+    assert upgraded.channels == 8 and upgraded.condition_on_theta is True
+    assert upgraded.mode == LatentStreamMode.PURE_LATENT
+    # linear is untouched (replace returns a copy)
+    assert linear.head_kind == "linear"
+
+
+@pytest.mark.slow
+def test_stage2a_end_to_end_freezes_z0_and_saves_a_loadable_residual_config(
+        tmp_path, isolated_project_root):
+    """
+    The full stage-2a contract, verified on a real (tiny) run. This e2e
+    caught THREE bugs the unit tests missed on first execution:
+      1. the load-tolerance filter only whitelisted encoders.* while the AE
+         also aliases the encoder under pathways.<stream>.encoder.*, so the
+         upgrade crashed on resume;
+      2. the epoch loop's recursive ae.train() flipped the stage2a-frozen
+         trunk back to train mode, letting BatchNorm running stats drift
+         (21.2 buffer drift on a "frozen" trunk) -- which CHANGES z0;
+      3. train_stage2's own inline config serialization (a 4th site) lacked
+         head_kind/head_hidden, so the saved checkpoint claimed a linear
+         head while carrying H weights -- unloadable downstream.
+    Asserts all four properties: trunk+decoder byte-identical INCLUDING
+    buffers, z0 head byte-identical, deriv head actually trained, and the
+    saved config round-tripping to a residual head.
+    """
+    import torch
+    from models.latent_streams import resolve_stream_configs_from_checkpoint_config
+
+    base_path = _build_sweep(tmp_path, n_runs=6, size=32)
+    s1 = train_autoencoder(
+        size=32, base_path=base_path, epochs=1, batch_size=4, base_channels=4,
+        latent_channels=4, val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        checkpoint_path=tmp_path / "s1.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=tmp_path / "c1.png")
+    train_stage2(
+        base_path=base_path, resume_from=s1, deriv_weight=1.0, stats0_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "s2.pt", device="cpu", log_every_epoch=False,
+        loss_curve_path=tmp_path / "c2.png", deriv_target_centered=True)
+    before = torch.load(tmp_path / "s2.pt", map_location="cpu", weights_only=True)
+
+    train_stage2(
+        base_path=base_path, resume_from=tmp_path / "s2.pt", deriv_weight=0.1,
+        stats0_weight=0.01, epochs=2, batch_size=4, num_workers=0, min_step=0,
+        min_stdev_phi=None, checkpoint_path=tmp_path / "s2a.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "c2a.png",
+        deriv_target_centered=True, stage2a=True, deriv_head_hidden=8)
+    after = torch.load(tmp_path / "s2a.pt", map_location="cpu", weights_only=True)
+
+    sb, sa = before["model_state"], after["model_state"]
+    assert all(torch.equal(sb[k], sa[k]) for k in sb
+               if k.startswith(("encoders.shared.down_blocks", "decoders"))), (
+        "stage2a changed the trunk or decoder (parameters or BatchNorm "
+        "buffers) -- z0 is no longer preserved by construction")
+    assert all(torch.equal(sb[k], sa[k]) for k in sb
+               if k.startswith("encoders.shared.bottlenecks.state")), (
+        "stage2a moved the recon (z0) head")
+    assert any(not torch.equal(sb[k], sa[k]) for k in sb
+               if k.startswith("encoders.shared.bottlenecks.deriv")), (
+        "stage2a trained NOTHING in the deriv head")
+    deriv_cfg = after["config"]["stream_configs"]["deriv"]
+    assert deriv_cfg.get("head_kind") == "residual" and deriv_cfg.get("head_hidden") == 8, (
+        f"saved config lost the head upgrade: {deriv_cfg}")
+    cfgs, _ = resolve_stream_configs_from_checkpoint_config(after["config"])
+    assert cfgs["deriv"].head_kind == "residual"

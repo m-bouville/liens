@@ -298,7 +298,7 @@ def test_check_parameter_dependence_non_default_spatial_size(tmp_path, tmp_run_d
                           run_dirs=[run_dir])
 
     output_path = check_parameter_dependence(
-        lds_checkpoint_path=lds_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
+        lds_checkpoint_path=lds_path, device="cpu", min_step=0, output_path=tmp_path / "out.png", latent_cache_dir=tmp_path / "latent_cache"
     )
     assert_figure_was_really_written(output_path)
     # A script that found NO data still writes its figure, so the blank check

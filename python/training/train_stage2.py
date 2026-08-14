@@ -72,7 +72,7 @@ def _compact_loss(value: float, width: int = 7, precision: int = 4) -> str:
 _STAGE2_PREAMBLE_PARAMS = (
     # See train_lds's _LDS_PREAMBLE_PARAMS for why these are excluded here.
     "deriv_weight", "deriv_weight_warmup_epochs", "stats0_weight", "stats1_weight",
-    "z0_from_deriv_weight", "trunk_from_deriv_weight",
+    "z0_from_deriv_weight",
     "deriv_dt_weight_exponent", "deriv_target_centered",
     "val_aug_averaging", "recon0_scale", "epochs", "batch_size", "augment",
     "early_stopping_patience", "n_frozen_stages",
@@ -83,7 +83,8 @@ def train_stage2(
     base_path: Path, resume_from: Path, size: int | None = None,
     deriv_weight: float = 1.0, deriv_weight_warmup_epochs: int = 3, stats0_weight: float = 0.0,
     stats1_weight: float = 0.0, z0_from_deriv_weight: float = 0.0,
-    trunk_from_deriv_weight: float = 1.0,
+    trunk_from_deriv_weight: float = 1.0, stage2a: bool = False,
+    deriv_head_hidden: int = 0,
     deriv_dt_weight_exponent: float = 0.0, deriv_target_centered: bool = False,
     interp_weight: float = 0.0, interp_scale: float = 1.0,
     val_aug_averaging: bool = False,
@@ -456,7 +457,7 @@ def train_stage2(
               f"the deriv stream fresh (replaces what used to require a separate stage 1b pass).")
         ext = extend_state_checkpoint_with_deriv_stream(
             resume_from, condition_on_theta=(True if condition_on_theta is None else condition_on_theta),
-            device=device,
+            device=device, deriv_head_hidden=deriv_head_hidden,
         )
         ae = ext.ae
         stats_head = ext.stats_head0
@@ -510,6 +511,21 @@ def train_stage2(
             )
         deriv_stream_name = other_streams[0]
         deriv_stream = stream_configs[deriv_stream_name]
+
+        # Upgrade the deriv stream to a residual head (z1 = B y + H(y)) when
+        # deriv_head_hidden > 0. The resumed checkpoint's B weights load as
+        # before; the new H tensors are zero-initialised and absent from the
+        # checkpoint, which the strict=False load below tolerates -- so the
+        # encoder starts byte-identical to the ancestor and training grows H.
+        # dataclasses.replace keeps every other field of the resumed config.
+        if deriv_head_hidden > 0:
+            import dataclasses
+            deriv_stream = dataclasses.replace(
+                deriv_stream, head_kind="residual", head_hidden=deriv_head_hidden)
+            stream_configs = {**stream_configs, deriv_stream_name: deriv_stream}
+            print(f"upgrading the '{deriv_stream_name}' stream to a residual "
+                  f"head (head_hidden={deriv_head_hidden}); H is zero-init, so "
+                  f"the encoder starts identical to the ancestor.")
 
         # condition_on_theta is NOT decided here -- deriv's theta-FiLM
         # conditioning is a structural property fixed once, when the
@@ -567,7 +583,26 @@ def train_stage2(
             ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
                                          stream_configs=stream_configs,
                                          decoder_for_stream=decoder_for_stream).to(device)
-        ae.load_state_dict(prev["model_state"])
+        # Tolerate a checkpoint that predates residual heads: a "residual"
+        # stream adds residual_heads.* keys the old (B-only) state_dict lacks,
+        # and those are zero-initialised (H(y)=0), so the encoder is
+        # byte-identical to the checkpoint until training. Accept ONLY missing
+        # residual_heads.* keys; any OTHER missing key, or any unexpected key,
+        # is still a real mismatch and must raise.
+        _missing, _unexpected = ae.load_state_dict(prev["model_state"], strict=False)
+        # The AE exposes the encoder under MORE THAN ONE state_dict path
+        # (encoders.<name>.* and the per-stream pathways.<stream>.encoder.*
+        # aliases of the same shared module), so match the H tensors by the
+        # ".residual_heads." segment wherever it appears, not by one prefix.
+        _bad_missing = [k for k in _missing if ".residual_heads." not in k]
+        if _bad_missing or _unexpected:
+            raise RuntimeError(
+                f"checkpoint does not match the model: "
+                f"missing {_bad_missing}, unexpected {list(_unexpected)}")
+        if _missing:
+            print(f"resuming a pre-residual-head checkpoint: {len(_missing)} "
+                  f"zero-initialised residual-head tensor(s) added "
+                  f"(H(y)=0, so the encoder starts identical to the ancestor).")
         # Isolate z0's shared trunk from L_deriv's gradient when asked. The
         # deriv stream still reads the trunk forward (z1 is still computed
         # from it); only the gradient L_deriv sends BACK into the trunk is
@@ -815,6 +850,34 @@ def train_stage2(
     # printed stats1 loss term visibly decreasing epoch over epoch (that
     # decrease came entirely from the shared trunk moving via L_deriv/
     # L_recon, not from stats_head1 itself learning anything at all).
+    if stage2a:
+        # STAGE 2a: train ONLY the deriv stream's own head (residual_heads +
+        # bottleneck + FiLM), everything else -- shared trunk, decoder, the
+        # recon stream's head -- frozen. z0 is then bit-unchanged, so its
+        # velocity coherence is preserved by construction (no gate needed on
+        # it), and L_recon0/L_stats0 drop out of the objective since nothing
+        # they touch is trainable. This is the fast, cache-friendly pass that
+        # fits z1 against a fixed z0 before any joint (2b) re-training.
+        for prm in ae.parameters():
+            prm.requires_grad_(False)
+        head_prefixes = tuple(
+            f"encoders.shared.{mod}.{deriv_stream_name}"
+            for mod in ("residual_heads", "bottlenecks", "theta_conditioners"))
+        n_head = 0
+        for pname, prm in ae.named_parameters():
+            if pname.startswith(head_prefixes):
+                prm.requires_grad_(True)
+                n_head += prm.numel()
+        # BatchNorm etc. in the frozen trunk must not update running stats.
+        ae.eval()
+        for mod in ae.encoders["shared"].bottlenecks[deriv_stream_name].modules():
+            mod.train()
+        if deriv_stream_name in ae.encoders["shared"].residual_heads:
+            ae.encoders["shared"].residual_heads[deriv_stream_name].train()
+        print(f"STAGE 2a: head-only training of the '{deriv_stream_name}' "
+              f"stream ({n_head} trainable params); trunk, decoder and the "
+              f"recon head are frozen and in eval mode. z0 is unchanged.")
+
     params = [p for p in ae.parameters() if p.requires_grad]
     if stats_head1 is not None:
         params += [p for p in stats_head1.parameters() if p.requires_grad]
@@ -1333,6 +1396,20 @@ def train_stage2(
             tracker.reset_with_grace(grace_epochs)
 
         ae.train()
+        if stage2a:
+            # ae.train() above is recursive and just flipped the WHOLE model
+            # -- including the stage2a-frozen trunk and decoder -- back to
+            # train mode, which lets BatchNorm running stats drift via the
+            # forward-pass EMA even though requires_grad_(False) stops the
+            # gradient updates (measured: buffer drift 21.2 on a "frozen"
+            # trunk before this guard). Re-apply eval to everything, then
+            # train mode ONLY on the deriv head's own modules.
+            ae.eval()
+            ae.encoders["shared"].bottlenecks[deriv_stream_name].train()
+            if deriv_stream_name in ae.encoders["shared"].theta_conditioners:
+                ae.encoders["shared"].theta_conditioners[deriv_stream_name].train()
+            if deriv_stream_name in ae.encoders["shared"].residual_heads:
+                ae.encoders["shared"].residual_heads[deriv_stream_name].train()
         # stats_head stays in eval mode always -- frozen, never trained
         # here, so no reason to toggle its train/eval-mode-specific
         # behavior (dropout/batchnorm, if any) at all.
@@ -1503,7 +1580,8 @@ def train_stage2(
                     "stats_weight": ancestor_stats_weight,
                     "stream_configs": {
                         name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
+                               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,
+                               "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
                         for name, cfg in stream_configs.items()
                     },
                     "recon_stream_name": recon_stream_name,
@@ -1548,6 +1626,7 @@ def train_stage2(
                                    "interp_weight": interp_weight,
                                    "interp_scale": interp_scale,
                                    "trunk_from_deriv_weight": trunk_from_deriv_weight,
+                                   "stage2a": stage2a,
                                    "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
                                    "deriv_dt_weight_exponent": deriv_dt_weight_exponent,
                                    "deriv_target_centered": deriv_target_centered,

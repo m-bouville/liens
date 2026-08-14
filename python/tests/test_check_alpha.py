@@ -280,7 +280,7 @@ def _synthetic_context(n_runs=12, n_steps=10):
     return ds, _F()
 
 
-def test_the_report_renders_without_nan(monkeypatch, capsys):
+def test_the_report_renders_without_nan(tmp_path, monkeypatch, capsys):
     """
     THE REPORT IS THE PRODUCT, and no unit test above touches it -- they all
     call the numeric functions directly. That gap hid a real bug: _quantiles
@@ -297,7 +297,7 @@ def test_the_report_renders_without_nan(monkeypatch, capsys):
     monkeypatch.setattr(mod, "_load_ae_f_theta_and_dataset",
                          lambda *a, **k: (torch.device("cpu"), False, None, None,
                                           ds, None, f_theta))
-    mod.check_alpha(pathlib.Path("unused.pt"))
+    mod.check_alpha(pathlib.Path("unused.pt"), latent_cache_dir=tmp_path / "latent_cache")
     out = capsys.readouterr().out
     assert "nan" not in out.lower(), (
         f"the report printed nan:\n{out}"
@@ -306,7 +306,7 @@ def test_the_report_renders_without_nan(monkeypatch, capsys):
     assert "cost of each candidate alpha" in out
 
 
-def test_the_report_anchors_calibration_on_the_STABLE_median(monkeypatch, capsys):
+def test_the_report_anchors_calibration_on_the_STABLE_median(tmp_path, monkeypatch, capsys):
     """
     THE GUIDANCE IS PART OF THE TOOL, and a wrong sentence in it cost a real
     run: the first version told the reader to choose alpha below the UNSTABLE
@@ -325,7 +325,7 @@ def test_the_report_anchors_calibration_on_the_STABLE_median(monkeypatch, capsys
     monkeypatch.setattr(mod, "_load_ae_f_theta_and_dataset",
                          lambda *a, **k: (torch.device("cpu"), False, None, None,
                                           ds, None, f_theta))
-    result = mod.check_alpha(pathlib.Path("unused.pt"))
+    result = mod.check_alpha(pathlib.Path("unused.pt"), latent_cache_dir=tmp_path / "latent_cache")
     out = capsys.readouterr().out
     assert "ANCHOR ON THE STABLE RUN'S MEDIAN" in out
     assert "below the unstable" not in out.lower(), (
@@ -339,7 +339,7 @@ def test_the_report_anchors_calibration_on_the_STABLE_median(monkeypatch, capsys
     )
 
 
-def test_the_report_prices_every_candidate_alpha(monkeypatch, capsys):
+def test_the_report_prices_every_candidate_alpha(tmp_path, monkeypatch, capsys):
     """
     Each candidate alpha must reach the table with a real cost, since the
     entire point of the inversion is to state alpha in the familiar units
@@ -353,7 +353,7 @@ def test_the_report_prices_every_candidate_alpha(monkeypatch, capsys):
                          lambda *a, **k: (torch.device("cpu"), False, None, None,
                                           ds, None, f_theta))
     result = mod.check_alpha(pathlib.Path("unused.pt"),
-                              candidate_alphas=(0.3, 0.1, 0.03))
+                              candidate_alphas=(0.3, 0.1, 0.03), latent_cache_dir=tmp_path / "latent_cache")
     assert set(result["by_alpha"]) == {0.3, 0.1, 0.03}
     for alpha, stats in result["by_alpha"].items():
         for key in ("mean", "p95", "p100"):
@@ -498,7 +498,7 @@ def test_delta_over_t_falls_when_the_step_outpaces_the_slowdown():
     )
 
 
-def test_the_table_defaults_to_the_checkpoints_own_alpha(monkeypatch, capsys):
+def test_the_table_defaults_to_the_checkpoints_own_alpha(tmp_path, monkeypatch, capsys):
     """
     The table must describe the run that PRODUCED the weights, not a
     hypothetical: reading alpha and max_substeps off the model is what makes
@@ -513,7 +513,7 @@ def test_the_table_defaults_to_the_checkpoints_own_alpha(monkeypatch, capsys):
     monkeypatch.setattr(mod, "_load_ae_f_theta_and_dataset",
                          lambda *a, **k: (torch.device("cpu"), False, None, None,
                                           _decade_dataset(), None, field))
-    result = mod.check_alpha(pathlib.Path("unused.pt"))
+    result = mod.check_alpha(pathlib.Path("unused.pt"), latent_cache_dir=tmp_path / "latent_cache")
     assert result["report_alpha"] == 0.037
     assert result["max_substeps"] == 99
     out = capsys.readouterr().out
@@ -521,7 +521,7 @@ def test_the_table_defaults_to_the_checkpoints_own_alpha(monkeypatch, capsys):
     assert "max_substeps=99" in out
 
 
-def test_the_table_renders_every_column_without_nan(monkeypatch, capsys):
+def test_the_table_renders_every_column_without_nan(tmp_path, monkeypatch, capsys):
     """Same class of bug as the p95 column that was silently nan: the report
     is the product, and no unit test above renders it."""
     import pathlib
@@ -530,7 +530,7 @@ def test_the_table_renders_every_column_without_nan(monkeypatch, capsys):
     monkeypatch.setattr(mod, "_load_ae_f_theta_and_dataset",
                          lambda *a, **k: (torch.device("cpu"), False, None, None,
                                           _decade_dataset(), None, _ProportionalField()))
-    result = mod.check_alpha(pathlib.Path("unused.pt"))
+    result = mod.check_alpha(pathlib.Path("unused.pt"), latent_cache_dir=tmp_path / "latent_cache")
     out = capsys.readouterr().out
     assert "step size at alpha=" in out
     assert "delta_t/t" in out and "depth" in out
@@ -559,7 +559,7 @@ def test_the_figure_is_written_with_every_panel(monkeypatch, tmp_path):
                          lambda *a, **k: (torch.device("cpu"), False, None, None,
                                           ds, None, f_theta))
     out = tmp_path / "alpha.png"
-    mod.check_alpha(pathlib.Path("unused.pt"), output_path=out)
+    mod.check_alpha(pathlib.Path("unused.pt"), output_path=out, latent_cache_dir=tmp_path / "latent_cache")
     assert out.exists() and out.stat().st_size > 10_000
 
 
@@ -575,7 +575,7 @@ def test_no_figure_is_written_when_no_path_is_given(monkeypatch, tmp_path):
                                           ds, None, f_theta))
     called = []
     monkeypatch.setattr(mod, "_plot", lambda *a, **k: called.append(1))
-    mod.check_alpha(pathlib.Path("unused.pt"), output_path=None)
+    mod.check_alpha(pathlib.Path("unused.pt"), output_path=None, latent_cache_dir=tmp_path / "latent_cache")
     assert not called
 
 
@@ -607,7 +607,7 @@ def test_the_figure_survives_a_degenerate_field(monkeypatch, tmp_path):
                          lambda *a, **k: (torch.device("cpu"), False, None, None,
                                           ds, None, _Zero()))
     out = tmp_path / "degenerate.png"
-    mod.check_alpha(pathlib.Path("unused.pt"), output_path=out)
+    mod.check_alpha(pathlib.Path("unused.pt"), output_path=out, latent_cache_dir=tmp_path / "latent_cache")
     assert out.exists()
 
 
@@ -760,7 +760,7 @@ def test_the_output_directory_is_created(monkeypatch, tmp_path):
                          lambda *a, **k: (torch.device("cpu"), False, None, None,
                                           ds, None, f_theta))
     out = tmp_path / "does" / "not" / "exist" / "alpha.png"
-    mod.check_alpha(pathlib.Path("unused.pt"), output_path=out)
+    mod.check_alpha(pathlib.Path("unused.pt"), output_path=out, latent_cache_dir=tmp_path / "latent_cache")
     assert out.exists()
 
 

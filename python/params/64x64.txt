@@ -11,11 +11,11 @@ min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
 min_std_deriv = 0.15e-3		# skip time derivatives whose stdev is below this
 min_passing_steps= 12		# any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
-recon0_scale  = 0.1e-3
-stats0_scale  = 0.01
+recon0_scale  = 0.2e-3
+stats0_scale  = 0.02
 
-deriv_scale   = 0.02e-3
-rollout_scale = 1e-6
+deriv_scale   = 2.e-6		# was 0.02e-3
+interp_scale  = 0.01		# was 5.e-3
 
 # force 	      = True
 
@@ -31,13 +31,18 @@ condition_on_theta= True
 latent_spatial_size= 8
 latent_channels = 8  		# 8 * 8x8 = 512 DoF  [64x64 = 4096]
 
-stats0_weight  = 1  # was 0.01     	# weight of L_stats relative to L_recon
+# resume_from	  = checkpoints/stage1/128x128-stage2-as-stage1.pt
 
-epochs 		  =  60	 # change to 40?		# note: stage 1 is augmented
+stats0_weight  = 0.25     	# weight of L_stats relative to L_recon
+
+epochs 		  =  80
 patience 	  =  10       	# renamed to early_stopping_patience internally
+ema_warmup_epochs=10
+
 batches		  = 256
 
-cache_in_memory= True
+cache_in_memory= False
+augment       = False		# takes hours per epoch otherwise
 
 # force 	      = True
 
@@ -48,48 +53,72 @@ cache_in_memory= True
 
 # latent_channels = 8
 
-stats0_weight   = 0.25     	# was 0.5; weight of L_stats0 relative to L_recon0
-deriv_weight    = 4.
+stats0_weight   = 0.25     	# weight of L_stats0 relative to L_recon0
+deriv_weight    = 0.5		# 
+interp_weight   = 0.		# was 0.1
 
 val_ema_decay   = 0.8		# was 0.7 (default)
 
-n_frozen_stages= 1
+n_frozen_stages =   0
 z0_from_deriv_weight=0.  # was 0.05	# in [0, 1]: 0 means z0 is trained on reconstruction alone, not `L_deriv`
-deriv_dt_weight_exponent = -0.5
+deriv_dt_weight_exponent = -1.  # was -0.5: "not just suboptimal, it plausibly has the wrong sign"
 
 deriv_target_centered=True
-resume_from	  = checkpoints/stage2/64x64-stage2.pt
+resume_from	  = checkpoints/stage2/64x64-stage2-20260803_07h01.pt
+
+deriv_head_hidden = 64			# size of H in: z1 = B·y + H(y)
 
 epochs 		  = 100
-patience 	  =  25
-deriv_weight_warmup_epochs= 15  # also switches to symmetric definition of derivative
+patience 	  =  10
+deriv_weight_warmup_epochs= 0  # also switches to symmetric definition of derivative
+
+# trunk_from_deriv_weight=0.  # TEST
 
 batches 	  = same
 
+lr 			  = 1.e-4  # was 1.e-3, the default
+
 val_aug_averaging= True
 
-# force 	      = True
+force 	      = True
 
 
 
 # Stage 3a
 #   latent dynamics surrogate (1step)
-n_rollout_steps= 1
-ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
+n_rollout_steps= 1			# always 1 for 3a
+z1_resync       = True		# always True for 3a
 
-use_dt_decade_weights = True  # was (de facto) False
+alpha			=  0.5		# adaptative sub-step (higher: more lenient)
+max_substeps    = 512		# default: 256
+target_vram_gib = 6.		# leave 1 GB as headroom for driver/context
+truncate_bptt 	=  32
+bucket_refresh_epochs=10
 
-epochs 		  =1500
-patience 	  = 100
+memory_cost_a_bytes= None
+memory_cost_b_bytes= None
+memory_cost_p 	   = None
 
-num_workers	  =   8   # was 8
+# resume_from 	= checkpoints/stage3a/128x128-stage3a.pt
+
+rollout_scale = 1e-6
+ae_stats_weight= 1.
+
+use_dt_decade_weights = False  # was True before alpha
+
+epochs 		  = 1000		# increase?
+patience 	  =  100
+
+
+num_workers	  =   4   # was 8
 batches		  = 4096
+spike_skip_factor= 10
 
-lr 			  = 0.4e-3  # was 20e-6,  default: 0.001
-z0_noise_scale=   0.175
+lr 			  = 1.e-6  # was 0.2e-3; default: 1.e-3
+z0_noise_scale=   0.15	# was 0.175
 
-dt_cap		  = 125   # 125/0.05 = 2500 time steps
-max_dt        = 150
+dt_cap		  = inf		# for second order
+max_dt        = 2500   # 2500/0.05 = 50'000 time steps (last: 550'000 -> 600'000)
 
 force 	      = True
 
@@ -97,22 +126,43 @@ force 	      = True
 
 # Stage 3b
 #   latent dynamics surrogate (rollout)
-n_rollout_steps= 2
+n_rollout_steps=  2			# always > 1 for 3b
+z1_resync      = False		# always False for 3b
 
-ae_stats_weight= 1.  # was 0.01 (and was `stats0_weight`)
-one_step_weight= 0.5
+alpha			= same		# adaptative sub-step
+max_substeps    = same		# default: 256
+bucket_batches 	= True		# default: True
+batch_cost_budget = 2000000000     # ~2.8 GiB, i.e. 5.5 GiB / 1.9
+target_vram_gib =  6.
+truncate_bptt 	= same
+bucket_refresh_epochs=0
 
-use_dt_decade_weights = True  # was (de facto) False
+memory_cost_a_bytes= 120787
+memory_cost_b_bytes= 18469
+memory_cost_p      = 0.79
 
-epochs 		  =1000
-patience 	  =  50
+# resume_from = checkpoints/stage3b/128x128-stage3b-20260806_18h10.pt
 
-num_workers	  = same
-batches		  = same
+rollout_scale  = 1.e-6			# was 1e-6
+ae_stats_weight= 1.
+one_step_weight= 0. 		# was 0.5
 
-lr 			  =   0.2e-3  # default: 0.001
-z0_noise_scale=   0.1
-dt_cap		  = same
+use_dt_decade_weights = same
+
+epochs 		  = 2000
+patience 	  =  100
+
+num_workers	  =    4
+batches		  = 4096
+# min_batch_size=  512 		# not implemented, TODO?
+spike_skip_factor= same
+# grad_spike_factor = 0        # disable the gradient guard; grad_clip does the bounding
+
+lr 			  =   3.e-6  	# was 3.e-6; default: 1.e-3
+z0_noise_scale= same
+
+dt_cap		  = same		# must be
+max_dt        = 2000 
 
 force 	      = True
 
@@ -122,13 +172,26 @@ force 	      = True
 #   encoder refinement
 rollout_weight = 1.0        # primary term for stage 4 (matches the default, but explicit is safer)
 recon0_weight   = 0.2  # was 0.5       # small but > 0 anchor
-stats0_weight   = 1  # was 0.01
+stats0_weight   = 0.2
 
-n_rollout_steps= same
+n_rollout_steps = same
+# adaptative sub-step: alpha always inherited 
+
+recon0_scale    =   0.15e-3
+stats0_scale    =   0.03
+
+rollout_scale   =   0.2
+rollout_weight_warmup_epochs= 20
+rollout_weight_warmup_start = 1e-3  # geometric warmup
+
+lr 			  =   5e-6  	# default: 1.e-3
+
+epochs 		  = 100
+patience 	  =  25 	# tends to shoot up: patience won't pay
 
 batches		  = 128
-epochs 		  =   0		# 50
-patience 	  =   5 	# tends to shoot up: patience won't pay
+
+max_dt        = same
 
 force 	      = True
 
@@ -138,12 +201,24 @@ force 	      = True
 #   end-to-end refinement
 rollout_weight = 0.2        # now secondary -- see reasoning below
 recon0_weight   = 1  # was 1.0        # now primary, per the original design intent
-stats0_weight   = 1  # was 0.01
+stats0_weight   = 0.25
 
-n_rollout_steps= same      # match stage 4's -- same reasoning as before
+# resume_from = checkpoints/stage5/128x128-stage5-20260805_09h45.pt
+
+recon0_scale    =   0.4e-3
+stats0_scale    =   0.015
+rollout_scale   = 0.03
+
+n_rollout_steps = same      # match stage 4's -- same reasoning as before
+# adaptative sub-step: alpha always inherited 
+
+lr 			  =   0.5e-4  	# default: 1.e-3
+
+epochs         =  50
+patience       =  10
 
 batches        = 128
-epochs         =  0		# 30
-patience       =   5
+
+max_dt         = same
 
 force 	       = True

@@ -215,7 +215,8 @@ def test_load_ae_components_config_and_provenance(tmp_path):
         "size": 64, "base_channels": 4, "latent_channels": 8,
         "latent_spatial_size": LATENT_SPATIAL_SIZE,
         "stream_configs": {"state": {"channels": 8, "spatial_size": LATENT_SPATIAL_SIZE,
-                                      "mode": "autoencoder", "condition_on_theta": False}},
+                                      "mode": "autoencoder", "condition_on_theta": False,
+                                      "head_kind": "linear", "head_hidden": 0}},
         "recon_stream_name": "state",
     }
     assert components["encoder"].provenance["epoch"] == 12

@@ -92,6 +92,18 @@ class LatentStreamConfig:
     mode: LatentStreamMode
     description: str = ""
     condition_on_theta: bool = False
+    # Head mapping trunk features y to this stream's latent z. "linear" is
+    # the historical head: z = B y, a 1x1 conv (pointwise-linear). "residual"
+    # adds a zero-initialised nonlinear branch H: z = B y + H(y), with H a
+    # 3x3 -> activation -> 3x3 conv of width head_hidden. Zero-init means a
+    # "residual" head is byte-identical to "linear" until trained, so every
+    # property the linear head has (perturbation linearity, interpolation
+    # affinity, latent smoothness) holds at initialisation and degrades only
+    # as ||H|| grows -- a measured quantity, not an assumed one. Same head is
+    # available to EVERY stream; whether z0 and z1 end up asymmetric is an
+    # outcome of training under uniform demands, not a per-stream default.
+    head_kind: str = "linear"
+    head_hidden: int = 0
 
 
 def decode_stream(decoder, z, stream: LatentStreamConfig):
@@ -263,7 +275,12 @@ def resolve_stream_configs_from_checkpoint_config(model_cfg: dict) -> tuple[dict
                                   # existed have no such key -- False (no conditioning) is the
                                   # correct fallback, matching this project's usual backward-compat
                                   # convention rather than requiring every old checkpoint migrated.
-                                  condition_on_theta=cfg.get("condition_on_theta", False))
+                                  condition_on_theta=cfg.get("condition_on_theta", False),
+                                  # NEW head fields: pre-head checkpoints have
+                                  # neither key, and "linear"/0 reproduces the
+                                  # 1x1 bottleneck they were saved with.
+                                  head_kind=cfg.get("head_kind", "linear"),
+                                  head_hidden=cfg.get("head_hidden", 0))
         for name, cfg in stream_configs_raw.items()
     }
     return stream_configs, recon_stream_name

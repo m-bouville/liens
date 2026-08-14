@@ -66,6 +66,7 @@ class ExtendedStateCheckpoint:
 def extend_state_checkpoint_with_deriv_stream(
     resume_from: Path, latent_channels: int | None = None,
     condition_on_theta: bool = True, device: str | torch.device | None = None,
+    deriv_head_hidden: int = 0,
 ) -> ExtendedStateCheckpoint:
     """
     resume_from: a stage 1a (single-stream, state-only) checkpoint --
@@ -125,7 +126,9 @@ def extend_state_checkpoint_with_deriv_stream(
         state_name: state_cfg,
         "deriv": LatentStreamConfig(name="deriv", channels=deriv_channels,
                                      spatial_size=deriv_spatial, mode=LatentStreamMode.PURE_LATENT,
-                                     condition_on_theta=condition_on_theta),
+                                     condition_on_theta=condition_on_theta,
+                                     head_kind=("residual" if deriv_head_hidden > 0 else "linear"),
+                                     head_hidden=deriv_head_hidden),
     }
 
     # Encoder EXTENDED with the new deriv bottleneck -- built fresh

@@ -163,3 +163,47 @@ def test_the_requirement_FOLLOWS_the_filter(tmp_path):
     with pytest.raises(FileNotFoundError):
         load.validate_run_dirs([d], min_stdev_phi=0.01)              # filter -> required
     assert load.validate_run_dirs([d], required=("metadata.txt",)) == [d]   # explicit override
+
+
+def test_no_test_calls_a_caching_diagnostic_without_an_explicit_cache_dir():
+    """
+    REGRESSION for a real sandbox leak: check_parameter_dependence /
+    check_dt_vs_time / check_alpha default latent_cache_dir to the REAL
+    checkpoints/latent_cache under the working tree. A test invoking one
+    without overriding it writes cache entries into the developer's repo --
+    observed as a mystery `64x64-<fingerprint>` directory minted by the
+    suite (each run's fake encoder fingerprints differently, so these
+    ACCUMULATE, one per suite run). Harmless to real caches (the fingerprint
+    can't collide) but a test must not write outside its tmp_path.
+
+    Sweep every test file: any direct call to one of these diagnostics must
+    pass latent_cache_dir explicitly.
+    """
+    import ast
+    from pathlib import Path
+
+    diagnostics = {"check_parameter_dependence", "check_dt_vs_time",
+                    "check_alpha"}
+    leaks = []
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            # ONLY real call expressions -- not docstring or comment mentions.
+            # (The first version matched the function NAME textually and so
+            #  flagged prose like "extracted from check_parameter_dependence()"
+            #  inside a helper's docstring; AST sees only executable calls.)
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = (fn.id if isinstance(fn, ast.Name)
+                     else fn.attr if isinstance(fn, ast.Attribute) else None)
+            if name not in diagnostics:
+                continue
+            has_cache = any(kw.arg == "latent_cache_dir" for kw in node.keywords)
+            if not has_cache:
+                leaks.append(f"{path.name}:{node.lineno} ({name})")
+    assert not leaks, (
+        "these test calls default latent_cache_dir to the REAL cache root "
+        "and will write into the developer's working tree:\n  "
+        + "\n  ".join(leaks)
+    )
