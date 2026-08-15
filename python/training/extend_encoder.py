@@ -143,7 +143,9 @@ def extend_state_checkpoint_with_deriv_stream(
     old_encoder_state = _strip_prefix(prev["model_state"], "encoder")
     load_result = encoder.load_state_dict(old_encoder_state, strict=False)
     unexpected_missing = [k for k in load_result.missing_keys
-                           if not (k.startswith("bottlenecks.deriv.") or k.startswith("theta_conditioners.deriv."))]
+                           if not (k.startswith("bottlenecks.deriv.")
+                                   or k.startswith("theta_conditioners.deriv.")
+                                   or k.startswith("residual_heads.deriv."))]
     if unexpected_missing or load_result.unexpected_keys:
         raise ValueError(
             f"Loading stage 1a's encoder weights into the extended (state+deriv) encoder didn't "

@@ -851,6 +851,18 @@ def train_stage2(
     # decrease came entirely from the shared trunk moving via L_deriv/
     # L_recon, not from stats_head1 itself learning anything at all).
     if stage2a:
+        # A frozen trunk with only a LINEAR (1x1) deriv head is the exact
+        # configuration already shown to fail: the head cannot express the
+        # derivative from fixed features, so L_deriv climbs instead of
+        # falling. stage2a is only meaningful with a residual head to train,
+        # so require one rather than silently running the futile case.
+        if deriv_stream_name not in ae.encoders["shared"].residual_heads:
+            raise ValueError(
+                "stage2a=True trains ONLY the deriv head with the trunk "
+                "frozen, but the deriv stream has a linear (1x1) head, which "
+                "cannot fit the derivative from fixed features. Set "
+                "deriv_head_hidden>0 so there is a residual head to train, or "
+                "run joint (stage2a=False) if you intend to move the trunk.")
         # STAGE 2a: train ONLY the deriv stream's own head (residual_heads +
         # bottleneck + FiLM), everything else -- shared trunk, decoder, the
         # recon stream's head -- frozen. z0 is then bit-unchanged, so its

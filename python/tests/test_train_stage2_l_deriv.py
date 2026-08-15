@@ -1115,3 +1115,47 @@ def test_stage2a_end_to_end_freezes_z0_and_saves_a_loadable_residual_config(
         f"saved config lost the head upgrade: {deriv_cfg}")
     cfgs, _ = resolve_stream_configs_from_checkpoint_config(after["config"])
     assert cfgs["deriv"].head_kind == "residual"
+
+
+@pytest.mark.slow
+def test_stage2a_raises_on_a_linear_deriv_head(tmp_path, isolated_project_root):
+    """
+    BEHAVIORAL guard test (the earlier version only grepped the source and so
+    passed even with the guard's condition inverted): stage2a=True with a
+    LINEAR deriv head (deriv_head_hidden=0) is the already-failed case --
+    frozen trunk + pointwise-linear head cannot fit the derivative -- and must
+    raise, not run futilely. The same call with a RESIDUAL head must NOT raise.
+    """
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+
+    # linear head + stage2a -> must raise
+    with pytest.raises(ValueError, match="residual head"):
+        train_stage2(
+            base_path=base_path, resume_from=stage1_path,
+            stage2a=True, deriv_head_hidden=0,
+            deriv_weight=0.5, stats0_weight=0.01,
+            epochs=1, batch_size=4, num_workers=0,
+            min_step=0, min_stdev_phi=None,
+            checkpoint_path=tmp_path / "s2a_linear.pt", device="cpu",
+            log_every_epoch=False, loss_curve_path=tmp_path / "c_lin.png",
+        )
+
+    # residual head + stage2a -> must NOT raise (runs a real head-only epoch)
+    out = train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        stage2a=True, deriv_head_hidden=16,
+        deriv_weight=0.5, stats0_weight=0.01,
+        epochs=1, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "s2a_residual.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "c_res.png",
+    )
+    assert out.exists()
+    cfg = torch.load(out, map_location="cpu", weights_only=True)["stage2_config"]
+    assert cfg["stage2a"] is True

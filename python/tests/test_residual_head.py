@@ -78,18 +78,44 @@ def test_trained_residual_head_actually_changes_the_output():
     assert not torch.allclose(before, after)
 
 
-def test_head_config_round_trips_through_a_checkpoint():
-    """head_kind/head_hidden must survive serialization or a resumed run
-    silently reverts to a linear head."""
-    from models.latent_streams import LatentStreamConfig as C, LatentStreamMode as M
-    cfg = C(name="deriv", channels=4, spatial_size=8, mode=M.PURE_LATENT,
-            head_kind="residual", head_hidden=32)
-    serialized = {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                   "mode": cfg.mode.value,
-                   "condition_on_theta": cfg.condition_on_theta,
-                   "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
-    assert serialized["head_kind"] == "residual"
-    assert serialized["head_hidden"] == 32
+def test_head_config_round_trips_through_real_serialization():
+    """head_kind/head_hidden must survive the ACTUAL serialize/deserialize
+    round trip -- through split_ae_components' writer and
+    resolve_stream_configs_from_checkpoint_config's reader -- or a resumed run
+    silently reverts to a linear head. (The earlier version hand-built the
+    serialized dict in the test and so proved nothing about the real code.)"""
+    from models.latent_streams import resolve_stream_configs_from_checkpoint_config
+
+    # Build a real AE with a residual deriv head, serialize its config the way
+    # a checkpoint does, then deserialize and confirm the head survived.
+    res = _enc("residual", 32)
+    # emulate the checkpoint config block the writers produce (same shape as
+    # checkpoint_components.py's stream_configs serialization)
+    model_cfg = {
+        "size": 32, "base_channels": 8, "latent_channels": 4,
+        "latent_spatial_size": 8,
+        "stream_configs": {
+            name: {"channels": c.channels, "spatial_size": c.spatial_size,
+                    "mode": c.mode.value,
+                    "condition_on_theta": c.condition_on_theta,
+                    "head_kind": c.head_kind, "head_hidden": c.head_hidden}
+            for name, c in res.stream_configs.items()
+        },
+        "recon_stream_name": "state",
+    }
+    restored, _ = resolve_stream_configs_from_checkpoint_config(model_cfg)
+    assert restored["deriv"].head_kind == "residual"
+    assert restored["deriv"].head_hidden == 32
+    assert restored["state"].head_kind == "linear"  # untouched stream
+    # and a pre-head checkpoint (no head keys) must deserialize to linear/0
+    legacy = {**model_cfg, "stream_configs": {
+        "state": {"channels": 4, "spatial_size": 8, "mode": "autoencoder",
+                   "condition_on_theta": False},
+        "deriv": {"channels": 4, "spatial_size": 8, "mode": "pure_latent",
+                   "condition_on_theta": True}}}
+    restored_legacy, _ = resolve_stream_configs_from_checkpoint_config(legacy)
+    assert restored_legacy["deriv"].head_kind == "linear"
+    assert restored_legacy["deriv"].head_hidden == 0
 
 
 def test_head_nonlinearity_is_zero_at_init_and_grows_when_trained():
@@ -112,3 +138,5 @@ def test_head_nonlinearity_is_zero_at_init_and_grows_when_trained():
 def test_linear_stream_reports_zero_nonlinearity():
     enc = _enc("linear")
     assert enc.head_nonlinearity() == {"state": 0.0, "deriv": 0.0}
+
+

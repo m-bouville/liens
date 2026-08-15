@@ -565,6 +565,9 @@ caveats worth knowing:
 `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` prints just: 0.15
 
 
+### reconstruction (returns µstructures for AE verification)
+`python -m evaluation.check_reconstruction --checkpoint checkpoints/stage2/64x64-stage2-20260815_06h43.pt --size 64 --min-step 1500 --min-stdev-phi 0.01 --device cuda`
+
 ### stdev_phi_time (dataset)
 `python -m evaluation.check_stdev_phi_time --base-path ../datasets --size 128 --min-step 1500 --min-run-fraction 0.5`
 

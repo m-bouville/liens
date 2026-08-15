@@ -254,3 +254,30 @@ def test_going_backwards_from_substepped_to_single_step_is_flagged(tmp_path):
             dt_cap=float("inf"), n_substeps=1, n_rollout_steps=4,
             device=torch.device("cpu"))
     assert "NOT equivalent" in buf.getvalue()
+
+
+def test_max_substeps_none_is_legal_in_fixed_mode():
+    """
+    REGRESSION: max_substeps is the clamp on the ALPHA-derived count and is
+    read only in the adaptive path. In fixed mode (alpha=None, n_substeps
+    drives the count) it is never consulted, so None must be accepted --
+    passing max_substeps=None crashed the constructor with
+    'TypeError: < not supported between NoneType and int' before any
+    substepping ran.
+    """
+    from models.latent_dynamics import LatentDynamics
+    m = LatentDynamics(latent_channels=8, alpha=None, n_substeps=512,
+                        max_substeps=None)
+    # constructed without error; the fixed-count path does not consult it
+    assert m.max_substeps >= 1  # kept as a harmless int, not None
+
+
+def test_max_substeps_none_is_refused_in_adaptive_mode():
+    """When alpha IS set, max_substeps is the clamp that bounds the derived
+    count -- None there is a real misconfiguration and must raise, not be
+    silently coerced."""
+    from models.latent_dynamics import LatentDynamics
+    import pytest
+    with pytest.raises(ValueError, match="max_substeps"):
+        LatentDynamics(latent_channels=8, alpha=0.5, n_substeps=1,
+                        max_substeps=None)

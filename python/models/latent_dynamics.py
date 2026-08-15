@@ -258,9 +258,24 @@ class LatentDynamics(nn.Module):
                 f"the full chain."
             )
         self.truncate_bptt = truncate_bptt
-        if max_substeps < 1:
-            raise ValueError(f"max_substeps must be >= 1, got {max_substeps}")
-        self.max_substeps = int(max_substeps)
+        # max_substeps is the CLAMP on the alpha-derived count and is read ONLY
+        # in the adaptive path (alpha set). In fixed mode (alpha is None,
+        # n_substeps drives everything) it is never used, so None is legal
+        # there and means "no adaptive clamp -- there is nothing to clamp".
+        # Requiring a positive int unconditionally crashed a fixed-mode run
+        # that passed max_substeps=None, before the substepping logic ran.
+        if alpha is not None:
+            if max_substeps is None or max_substeps < 1:
+                raise ValueError(
+                    f"max_substeps must be >= 1 when alpha is set (adaptive "
+                    f"substepping clamps the derived count at it), got "
+                    f"{max_substeps}")
+            self.max_substeps = int(max_substeps)
+        else:
+            # Fixed mode: keep an int for any incidental use, defaulting when
+            # None so nothing downstream sees NoneType, but it is not consulted
+            # by the fixed-count path.
+            self.max_substeps = int(max_substeps) if max_substeps is not None else 1
         self.n_substeps_clamped = 0
         # Running totals for the epoch report. The whole argument for alpha
         # over a fixed count is that the step ADAPTS as f_theta sharpens --
