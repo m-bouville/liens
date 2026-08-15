@@ -30,6 +30,15 @@ struct SimulationParameters
     int    seed;
 };
 
+bool Simulation::__stop_requested() const
+{
+    std::filesystem::path stop_file =
+        std::filesystem::path("../datasets") /
+        (std::to_string(__config.Nx) + "x" + std::to_string(__config.Ny)) /
+        "STOP_ALL";
+    
+    return std::filesystem::exists(stop_file);
+}
 
 void Simulation::run()
 {
@@ -44,7 +53,7 @@ void Simulation::run()
     std::size_t nb_done     = 0;
     std::size_t nb_remaining= 0;
     std::vector<SimulationParameters> simulations_to_run;
-
+    bool stop_reported = false;
 
     for (int seed : __config.seeds)
         for (double noise : __config.noises)
@@ -67,6 +76,17 @@ void Simulation::run()
     // run what needs to be run
     for (const auto& sim : simulations_to_run)
     {
+        if (Simulation::__stop_requested())
+        {
+            if (!stop_reported)
+            {
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cout << "STOP_ALL detected. No further simulations will be started.\n";
+                stop_reported = true;  // do not display again next time
+            }
+            break;
+        }
+
         futures.push_back(
             std::async(std::launch::async,
                 &Simulation::__runOneSimulation,

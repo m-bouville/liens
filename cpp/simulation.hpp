@@ -21,6 +21,8 @@ private:
 
     std::mutex cout_mutex;
 
+    bool __stop_requested() const;
+
     void __runOneSimulation(double T,
                             double noise,
                             int seed);
