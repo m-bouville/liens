@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from models.latent_dynamics import LatentDynamics
+from models.constants import N_THETA
 
 LC, LS, B = 4, 8, 2
 
@@ -32,7 +33,7 @@ def _model(n_substeps=1, **kw):
 def _state(seed=0):
     torch.manual_seed(seed)
     return (torch.randn(B, LC, LS, LS), torch.randn(B, LC, LS, LS) * 0.01,
-            torch.zeros(B, 1))
+            torch.zeros(B, N_THETA))
 
 
 # --------------------------------------------------------------------
@@ -193,7 +194,7 @@ def test_rollout_default_path_is_untouched():
     z0 = torch.randn(B, LC, LS, LS)
     z1_seq = torch.randn(B, n + 1, LC, LS, LS) * 0.01
     dts = torch.rand(B, n) * 100 + 1
-    theta = torch.zeros(B, 1)
+    theta = torch.zeros(B, N_THETA)
     with torch.no_grad():
         got = model.rollout(z0, z1_seq, dts, theta)
         cur, expected = z0, [z0]
@@ -215,7 +216,7 @@ def test_z1_resync_false_ignores_the_supplied_z1_after_the_first_frame():
     z0 = torch.randn(B, LC, LS, LS)
     z1_seq = torch.randn(B, n + 1, LC, LS, LS) * 0.01
     dts = torch.rand(B, n) * 100 + 1
-    theta = torch.zeros(B, 1)
+    theta = torch.zeros(B, N_THETA)
     corrupted = z1_seq.clone()
     corrupted[:, 1:] = 999.0
     with torch.no_grad():
@@ -263,7 +264,7 @@ def test_the_capped_substep_divergence_is_real_not_a_test_artifact():
     """
     z0 = torch.zeros(1, LC, LS, LS)
     z1 = torch.zeros(1, LC, LS, LS)
-    theta = torch.zeros(1, 1)
+    theta = torch.zeros(1, N_THETA)
     dt = torch.full((1,), 2500.0)
     totals = []
     for n in (1, 32):

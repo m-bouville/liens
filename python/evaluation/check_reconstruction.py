@@ -46,6 +46,7 @@ from models.latent_streams import (
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
 from utils.naming import ae_checkpoint_name
+from models.constants import N_THETA
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every default checkpoint/output path is built from
@@ -161,7 +162,7 @@ def check_reconstruction(
         # Stage 2's own format: every stream shares ONE decoder.
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
                            base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
-                           n_theta=1).to(device)
+                           n_theta=N_THETA).to(device)
         decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
                            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size).to(device)
@@ -179,7 +180,7 @@ def check_reconstruction(
         # as any dict-building loop).
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
                            base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
-                           n_theta=1).to(device)
+                           n_theta=N_THETA).to(device)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             if stream_configs[stream_name].mode == LatentStreamMode.PURE_LATENT:
@@ -194,7 +195,8 @@ def check_reconstruction(
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
                                      stream_configs=stream_configs,
                                      decoder_for_stream=decoder_for_stream).to(device)
-    ae.load_state_dict(ae_state)
+    from models.encoder import zero_pad_theta_columns
+    ae.load_state_dict(zero_pad_theta_columns(ae_state, ae))
     ae.eval()
 
     def _pathway_scale(stream_name):

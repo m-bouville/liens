@@ -12,7 +12,8 @@ import torch
 from torch.utils.data import Dataset
 
 import training.latent_cache as latent_cache
-from models.constants import LATENT_SPATIAL_SIZE as _LATENT_SPATIAL_SIZE
+from models.constants import (LATENT_SPATIAL_SIZE as _LATENT_SPATIAL_SIZE,
+                               N_THETA, theta_coordinates)
 from models.latent_streams import DEFAULT_STREAM_NAME
 from utils import load_datasets as load
 
@@ -1402,7 +1403,7 @@ class MicrostructureEvolutionDataset(Dataset):
                         # buffer mixes frames from several runs at once,
                         # so each frame needs its own copy to stay
                         # aligned with buffer_frames/buffer_sizes).
-                        run_theta = torch.tensor([metadata.temperature - metadata.T0], dtype=torch.float32)
+                        run_theta = torch.tensor(theta_coordinates(metadata.temperature, metadata.T0), dtype=torch.float32)
                         buffer_thetas.append(run_theta.unsqueeze(0).expand(frames.size(0), -1))
                     if buffer_total >= encode_batch_size:
                         flushed, flushed_deriv = _flush_buffer()
@@ -1521,7 +1522,8 @@ class MicrostructureEvolutionDataset(Dataset):
             # theta=0 instead of asking the network to discover T0's
             # significance implicitly from data.
             self._run_theta.append(
-                torch.tensor([metadata.temperature - metadata.T0], dtype=torch.float32)
+                torch.tensor(theta_coordinates(metadata.temperature, metadata.T0),
+                              dtype=torch.float32)
             )
 
             for start in range(len(kept_steps) - self.window_length + 1):

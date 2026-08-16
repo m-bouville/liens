@@ -1032,27 +1032,53 @@ def test_trunk_isolation_does_not_shadow_the_deriv_stream_config():
         )
 
 
-def test_deriv_head_hidden_upgrades_a_resumed_stream_to_residual():
+@pytest.mark.slow
+def test_deriv_head_hidden_upgrades_a_resumed_stream_to_residual(tmp_path, isolated_project_root):
     """
-    Resuming a stage-2 checkpoint whose deriv stream is linear, with
-    deriv_head_hidden > 0, must upgrade it to a residual head: the config
-    flips to head_kind='residual' while every other field is preserved.
-    Tested at the config level (dataclasses.replace), the transform the
-    resume branch applies before building the AE.
+    BEHAVIORAL: resuming a stage-2 checkpoint whose deriv stream is LINEAR,
+    with deriv_head_hidden>0, must drive train_stage2's own resume branch to
+    upgrade it to a residual head -- the resumed encoder gains
+    residual_heads.deriv.* keys it did not have. The earlier version called
+    dataclasses.replace inside the test and asserted its own result, so it
+    passed even when the resume branch's upgrade was deleted (it exercised
+    Python's dataclasses, not train_stage2). This resumes a real linear
+    stage-2 checkpoint and inspects the written checkpoint's config + keys.
     """
-    import dataclasses
-    from models.latent_streams import LatentStreamConfig, LatentStreamMode
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    # a LINEAR-head stage-2 ancestor (deriv_head_hidden defaults to 0)
+    linear_stage2 = train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, stats0_weight=0.01, epochs=1, batch_size=4,
+        num_workers=0, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "linear_s2.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "c_lin_anc.png",
+    )
+    anc = torch.load(linear_stage2, map_location="cpu", weights_only=True)
+    anc_cfg = anc["config"]["stream_configs"]["deriv"]
+    assert anc_cfg.get("head_kind", "linear") == "linear", "ancestor must be linear"
+    anc_keys = [k for k in anc["model_state"] if "residual_heads" in k]
+    assert not anc_keys, "linear ancestor must have NO residual-head keys"
 
-    linear = LatentStreamConfig(name="deriv", channels=8, spatial_size=8,
-                                 mode=LatentStreamMode.PURE_LATENT,
-                                 condition_on_theta=True)
-    upgraded = dataclasses.replace(linear, head_kind="residual", head_hidden=64)
-    assert upgraded.head_kind == "residual" and upgraded.head_hidden == 64
-    # everything else preserved
-    assert upgraded.channels == 8 and upgraded.condition_on_theta is True
-    assert upgraded.mode == LatentStreamMode.PURE_LATENT
-    # linear is untouched (replace returns a copy)
-    assert linear.head_kind == "linear"
+    # resume it WITH deriv_head_hidden>0 -> the resume branch must upgrade
+    upgraded = train_stage2(
+        base_path=base_path, resume_from=linear_stage2,
+        deriv_weight=0.5, stats0_weight=0.01, deriv_head_hidden=16,
+        epochs=1, batch_size=4, num_workers=0, min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "upgraded_s2.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "c_up.png",
+    )
+    up = torch.load(upgraded, map_location="cpu", weights_only=True)
+    up_cfg = up["config"]["stream_configs"]["deriv"]
+    assert up_cfg["head_kind"] == "residual", "resume did not upgrade to residual"
+    assert up_cfg["head_hidden"] == 16
+    up_keys = [k for k in up["model_state"] if "residual_heads.deriv" in k]
+    assert up_keys, "upgraded checkpoint must contain residual_heads.deriv.* weights"
 
 
 @pytest.mark.slow

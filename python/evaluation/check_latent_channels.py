@@ -45,6 +45,7 @@ from models.latent_streams import (
 from training.datasets import MicrostructureSnapshotDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
+from models.constants import theta_coordinates, N_THETA
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every default checkpoint/output path is built from
@@ -152,7 +153,7 @@ def rank_channel_importance(
             if run_dir not in metadata_cache:
                 metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
             metadata = metadata_cache[run_dir]
-            theta = torch.tensor([[metadata.temperature - metadata.T0]],
+            theta = torch.tensor([theta_coordinates(metadata.temperature, metadata.T0)],
                                   dtype=torch.float32, device=device)
             z = ae_encoder(x, theta=theta)[recon_stream_name]
             if latent_channels is None:
@@ -216,7 +217,7 @@ def check_latent_channels(
     elif decoder_for_stream is None:
         encoder = Encoder(input_size=ae_config["size"], in_channels=1,
                            base_channels=ae_config["base_channels"], stream_configs=stream_configs,
-                           n_theta=1)
+                           n_theta=N_THETA)
         decoder = Decoder(output_size=ae_config["size"], out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
@@ -225,7 +226,7 @@ def check_latent_channels(
     else:
         encoder = Encoder(input_size=ae_config["size"], in_channels=1,
                            base_channels=ae_config["base_channels"], stream_configs=stream_configs,
-                           n_theta=1)
+                           n_theta=N_THETA)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             stream_cfg = stream_configs[stream_name]
@@ -237,7 +238,8 @@ def check_latent_channels(
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
                                      stream_configs=stream_configs,
                                      decoder_for_stream=decoder_for_stream).to(device)
-    ae.load_state_dict(checkpoint["model_state"])
+    from models.encoder import zero_pad_theta_columns
+    ae.load_state_dict(zero_pad_theta_columns(checkpoint["model_state"], ae))
     ae.eval()
     ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
 
@@ -311,7 +313,7 @@ def check_latent_channels(
             if run_dir not in metadata_cache:
                 metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
             metadata = metadata_cache[run_dir]
-            theta = torch.tensor([[metadata.temperature - metadata.T0]],
+            theta = torch.tensor([theta_coordinates(metadata.temperature, metadata.T0)],
                                   dtype=torch.float32, device=device)
             z_dict = ae_encoder(x, theta=theta)
             all_x.append(x_raw)

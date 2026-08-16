@@ -21,6 +21,7 @@ from utils import load_datasets as load
 from evaluation.check_rollout import _padded_bounds, _error_bounds, parse_fixed_window, _correlation_pct, _format_small
 from models.latent_dynamics import LatentDynamics
 from models.latent_streams import DEFAULT_STREAM_NAME
+from models.constants import N_THETA, theta_coordinates
 
 
 def test_padded_bounds_asymmetric_case():
@@ -260,7 +261,7 @@ def test_compute_sample_chains_through_full_window(tmp_run_dir):
     ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
                                  stream_configs=stream_configs)
     ae.eval()
-    f_theta = LatentDynamics(latent_channels=4, n_theta=1, hidden_dim=16, n_hidden_layers=1)
+    f_theta = LatentDynamics(latent_channels=4, n_theta=N_THETA, hidden_dim=16, n_hidden_layers=1)
     f_theta.eval()
     ae_config = {"size": 64, "latent_channels": 4, "latent_spatial_size": 8,
                  "stream_configs": {"state": {"channels": 4, "spatial_size": 8, "mode": "autoencoder"},
@@ -294,7 +295,7 @@ def test_compute_sample_chains_through_full_window(tmp_run_dir):
         z0_t = x_all_encoded[DEFAULT_STREAM_NAME][0:1]
         z1_sequence = x_all_encoded["deriv"].unsqueeze(0)  # (1, len(window), C, 8, 8)
         dts = torch.tensor([[1000 * 0.05, 1000 * 0.05, 1000 * 0.05]], dtype=torch.float32)
-        theta = torch.tensor([[0.8 - 1.0]], dtype=torch.float32)  # temperature - T0, from the fixture
+        theta = torch.tensor([theta_coordinates(0.8, 1.0)], dtype=torch.float32)  # [T-T0, log(T0-T)]
         z0_hat_full = f_theta.rollout(z0_t, z1_sequence, dts, theta)
         expected_pred = ae.pathways["state"].decoder(z0_hat_full[:, -1])[0, 0].numpy()
 
@@ -388,7 +389,7 @@ def test_check_rollout_threads_dt_cap_from_the_saved_checkpoint(monkeypatch, tmp
     torch.save({
         "epoch": 1, "val_loss": 0.05,
         "ae_checkpoint": "does-not-need-to-exist.pt",
-        "config": {"latent_channels": 4, "n_theta": 1, "hidden_dim": 8,
+        "config": {"latent_channels": 4, "n_theta": N_THETA, "hidden_dim": 8,
                    "n_hidden_layers": 1, "dt_cap": 125.0},
     }, checkpoint_path)
 

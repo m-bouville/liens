@@ -26,6 +26,7 @@ from training.train_lds import _SpikeGuard
 from training.spike_guard import end_epoch_pair
 
 import pathlib
+from models.constants import N_THETA
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
@@ -1518,7 +1519,7 @@ def test_the_reported_median_is_the_bands_own():
         g.should_skip(40.0, band=difficulty_band(1000))
 
     dt_window = torch.full((4, 2), 1000.0)
-    theta = torch.zeros(4, 1)
+    theta = torch.zeros(4, N_THETA)
     _record_spike(g, torch.tensor(500.0), dt_window, theta)
     assert g.worst is not None
     assert g.worst[1] == 40.0, (

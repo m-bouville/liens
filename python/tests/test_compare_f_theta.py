@@ -16,6 +16,7 @@ import pytest
 import torch
 
 import evaluation.compare_f_theta as cf
+from models.constants import N_THETA
 
 
 @pytest.fixture(autouse=True)
@@ -292,7 +293,7 @@ def _stub_metadata(monkeypatch):
     def _meta(path):
         m = _re.search(r"T(\d+)", str(path))
         T = int(m.group(1)) / 1000.0 if m else 0.7
-        return _types.SimpleNamespace(temperature=T, T0=0.0, dt=1.0)
+        return _types.SimpleNamespace(temperature=T, T0=1.0, dt=1.0)
 
     monkeypatch.setattr(cf.load, "read_metadata", _meta)
 
@@ -659,7 +660,7 @@ def test_the_trajectory_length_matches_the_window(monkeypatch):
     n_steps = 5
 
     class FakeMeta:
-        dt, temperature, T0 = 1.0, 900.0, 800.0
+        dt, temperature, T0 = 1.0, 0.8, 1.0
 
     monkeypatch.setattr(cf.load, "read_metadata", lambda p: FakeMeta())
     monkeypatch.setattr(cf.load, "snapshot_filename", lambda s: f"s{s}")
@@ -714,7 +715,7 @@ def test_compute_trajectory_decodes_EVERY_frame(monkeypatch):
     decoded = []
 
     class FakeMeta:
-        dt, temperature, T0 = 1.0, 900.0, 800.0
+        dt, temperature, T0 = 1.0, 0.8, 1.0
 
     monkeypatch.setattr(cf.load, "read_metadata", lambda p: FakeMeta())
     monkeypatch.setattr(cf.load, "snapshot_filename", lambda s: f"s{s}")
@@ -1190,7 +1191,7 @@ def _stats_for_figure(monkeypatch, blow_up_every=10, max_dt_a=2000.0,
     def _meta(path):
         m = _re.search(r"T(\d+)", str(path))
         T = int(m.group(1)) / 1000.0 if m else 0.7
-        return _types.SimpleNamespace(temperature=T, T0=0.0, dt=1.0)
+        return _types.SimpleNamespace(temperature=T, T0=1.0, dt=1.0)
 
     monkeypatch.setattr(cf.load, "read_metadata", _meta)
     a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
@@ -1486,7 +1487,7 @@ def _causal_io_stub(monkeypatch, save_steps, seen_reads):
     import types
 
     class FakeMeta:
-        dt, temperature, T0 = 1.0, 900.0, 800.0
+        dt, temperature, T0 = 1.0, 0.8, 1.0
 
     FakeMeta.save_steps = save_steps
     monkeypatch.setattr(cf.load, "read_metadata", lambda p: FakeMeta())
@@ -2092,7 +2093,7 @@ def test_stage2_is_causal_and_reads_only_the_starting_frame(monkeypatch):
     reads = []
 
     class FakeMeta:
-        dt, temperature, T0 = 1.0, 0.9, 0.0
+        dt, temperature, T0 = 1.0, 0.9, 1.0
 
     monkeypatch.setattr(cf.load, "read_metadata", lambda p: FakeMeta())
     monkeypatch.setattr(cf.load, "snapshot_filename", lambda s: f"s{s}")
@@ -2288,7 +2289,7 @@ def _lds_with_nonzero_f(seed=0):
     """
     from models.latent_dynamics import LatentDynamics
     gen = torch.Generator().manual_seed(seed)
-    lds = LatentDynamics(latent_channels=2, n_theta=1, latent_spatial=4,
+    lds = LatentDynamics(latent_channels=2, n_theta=N_THETA, latent_spatial=4,
                           hidden_dim=16, n_hidden_layers=1)
     lds.eval()
     with torch.no_grad():
@@ -2310,7 +2311,7 @@ def test_scale_zero_reproduces_stage_two_exactly():
     z1 = torch.randn(B, 2, 4, 4) * 0.01
     z1_seq = z1.unsqueeze(1).repeat(1, n + 1, 1, 1, 1)
     dts = torch.full((B, n), 100.0)
-    theta = torch.zeros(B, 1)
+    theta = torch.zeros(B, N_THETA)
     with torch.no_grad():
         assert lds.f(z0, z1, theta).abs().mean() > 1e-3, "fixture f is ~0"
         with cf.scaled_f_theta(lds, 0.0):
@@ -2336,7 +2337,7 @@ def test_the_scale_sweep_moves_between_the_two_models():
     z1 = torch.randn(B, 2, 4, 4) * 0.01
     z1_seq = z1.unsqueeze(1).repeat(1, n + 1, 1, 1, 1)
     dts = torch.full((B, n), 100.0)
-    theta = torch.zeros(B, 1)
+    theta = torch.zeros(B, N_THETA)
     outs = {}
     with torch.no_grad():
         for scale in (0.0, 0.5, 1.0):
@@ -2356,7 +2357,7 @@ def test_scaling_f_theta_is_undone_afterwards():
     lds = _lds_with_nonzero_f()
     z0 = torch.randn(1, 2, 4, 4)
     z1 = torch.randn(1, 2, 4, 4) * 0.01
-    theta = torch.zeros(1, 1)
+    theta = torch.zeros(1, N_THETA)
     with torch.no_grad():
         before = lds.f(z0, z1, theta).clone()
         with cf.scaled_f_theta(lds, 0.0):
@@ -2371,7 +2372,7 @@ def test_the_scaling_survives_an_exception():
     lds = _lds_with_nonzero_f()
     z0 = torch.randn(1, 2, 4, 4)
     z1 = torch.randn(1, 2, 4, 4) * 0.01
-    theta = torch.zeros(1, 1)
+    theta = torch.zeros(1, N_THETA)
     with torch.no_grad():
         before = lds.f(z0, z1, theta).clone()
     try:
@@ -2394,7 +2395,7 @@ def test_scaling_f_theta_to_zero_reproduces_stage_2_exactly():
     import torch
     from models.latent_dynamics import LatentDynamics
 
-    m = LatentDynamics(latent_channels=2, n_theta=1, hidden_dim=8,
+    m = LatentDynamics(latent_channels=2, n_theta=N_THETA, hidden_dim=8,
                         n_hidden_layers=1)
     m.eval()
     # a non-trivial, state-dependent curvature (an untrained net outputs 0,
@@ -2402,7 +2403,7 @@ def test_scaling_f_theta_to_zero_reproduces_stage_2_exactly():
     m.f = lambda z0, z1, theta: 1e-4 * torch.tanh(z0)
     z0 = torch.randn(1, 2, 8, 8)
     z1 = torch.randn(1, 2, 8, 8)
-    th = torch.zeros(1, 1)
+    th = torch.zeros(1, N_THETA)
     dts = torch.full((1, 3), 100.0)
     z1s = z1.unsqueeze(1).expand(-1, 4, -1, -1, -1).contiguous()
 
@@ -2431,7 +2432,7 @@ def test_scaling_f_theta_to_zero_reproduces_stage_2_exactly():
 def _lds_alpha(alpha=1.5, max_substeps=512, seed=1):
     from models.latent_dynamics import LatentDynamics
     torch.manual_seed(0)
-    lds = LatentDynamics(latent_channels=2, n_theta=1, latent_spatial=4,
+    lds = LatentDynamics(latent_channels=2, n_theta=N_THETA, latent_spatial=4,
                           hidden_dim=16, n_hidden_layers=1, alpha=alpha,
                           max_substeps=max_substeps)
     lds.eval()
@@ -2454,7 +2455,7 @@ def test_smaller_alpha_takes_more_substeps_and_is_restored():
     z1 = torch.randn(1, 2, 4, 4) * 0.01
     z1_seq = z1.unsqueeze(1).repeat(1, 5, 1, 1, 1)
     dts = torch.full((1, 4), 500.0)
-    theta = torch.zeros(1, 1)
+    theta = torch.zeros(1, N_THETA)
 
     def substeps_used():
         lds._substep_total = 0
@@ -2492,7 +2493,7 @@ def test_alpha_sweep_refuses_a_fixed_substep_model():
     """
     from models.latent_dynamics import LatentDynamics
     torch.manual_seed(0)
-    lds = LatentDynamics(latent_channels=2, n_theta=1, latent_spatial=4,
+    lds = LatentDynamics(latent_channels=2, n_theta=N_THETA, latent_spatial=4,
                           hidden_dim=16, n_hidden_layers=1, n_substeps=1)
     out = cf.sweep_alpha({"f_theta": lds, "label": "m", "ae": None,
                            "ae_config": {}}, [], "cpu", False)

@@ -52,7 +52,7 @@ from matplotlib.colors import TwoSlopeNorm
 import numpy as np
 import torch
 
-from models.constants import LATENT_SPATIAL_SIZE
+from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 from evaluation._window_parsing import parse_fixed_window
@@ -104,7 +104,7 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
     x_next_raw = load.read_phi_half(run_dir / load.snapshot_filename(steps[-1]), nx, ny)
 
     dt_total = (steps[-1] - steps[0]) * metadata.dt  # total elapsed span, for display only
-    theta_val = metadata.temperature - metadata.T0  # see LatentDynamics/dataset docstrings
+    theta_vec = theta_coordinates(metadata.temperature, metadata.T0)  # [T-T0, log(T0-T)]
 
     with torch.no_grad():
         # ae.encoder(x) returns dict[str, Tensor] (one entry per latent
@@ -142,7 +142,7 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         # stream in one pass internally, so a theta-conditioned "deriv"
         # stream requires it even though z0_t/z0_next_true below only
         # ever read the recon stream's own output.
-        theta_encode = torch.full((len(steps), 1), theta_val, dtype=torch.float32, device=device)
+        theta_encode = torch.tensor(theta_vec, dtype=torch.float32, device=device).expand(len(steps), -1)
         x_all_encoded = ae_encoder(x_all, theta=theta_encode)
         z0_t = x_all_encoded[recon_stream_name][0:1]  # only the STARTING z0 is a rollout() input
         z1_sequence = x_all_encoded["deriv"].unsqueeze(0)  # (1, len(steps), C, 8, 8) -- every step
@@ -154,7 +154,7 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         # from n_rollout_steps chained calls at the actual per-step dts.
         dt_per_step = [(steps[i + 1] - steps[i]) * metadata.dt for i in range(len(steps) - 1)]
         dts = torch.tensor([dt_per_step], dtype=torch.float32, device=device)
-        theta = torch.tensor([[theta_val]], dtype=torch.float32, device=device)
+        theta = torch.tensor([theta_vec], dtype=torch.float32, device=device)
 
         z0_hat_full = f_theta.rollout(z0_t, z1_sequence, dts, theta,
                                        z1_resync=z1_resync)

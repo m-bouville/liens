@@ -47,6 +47,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from models.constants import theta_coordinates
 
 from evaluation._ae_stats_eval import load_ae_and_stats_head
 from evaluation._window_parsing import _is_int
@@ -157,7 +158,7 @@ def check_interpolation(
             # (the only one this loop actually keeps, via
             # [recon_stream_name]) still requires theta to be given, or
             # this call raises.
-            theta = torch.tensor([[metadata.temperature - metadata.T0]],
+            theta = torch.tensor([theta_coordinates(metadata.temperature, metadata.T0)],
                                   dtype=torch.float32, device=device)
             z1 = ae_encoder(x1, theta=theta)[recon_stream_name]
             z2 = ae_encoder(x2, theta=theta)[recon_stream_name]

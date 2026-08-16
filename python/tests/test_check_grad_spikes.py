@@ -13,6 +13,7 @@ from evaluation.check_grad_spikes import (
     _grad_norm, measure_window, separation,
 )
 from models.latent_dynamics import LatentDynamics
+from models.constants import N_THETA
 
 
 def _model(**kw):
@@ -26,7 +27,7 @@ def _model(**kw):
 def _row(dt=(50.0, 80.0), scale=0.3, seed=0):
     torch.manual_seed(seed)
     return (torch.randn(3, 2, 4, 4) * scale, torch.randn(3, 2, 4, 4) * scale,
-            torch.tensor(list(dt)), torch.zeros(1))
+            torch.tensor(list(dt)), torch.zeros(N_THETA))
 
 
 def test_the_gradient_is_decomposed_across_the_rollout():

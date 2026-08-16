@@ -25,7 +25,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.autoencoder import Autoencoder, MultiStreamAutoencoder
-from models.constants import LATENT_SPATIAL_SIZE
+from models.constants import LATENT_SPATIAL_SIZE, N_THETA
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_dynamics import LatentDynamics
@@ -227,7 +227,7 @@ def _load_frozen_encoder(
         # Stage 2's own (pre-stage-1b) format: every stream shares ONE decoder.
         _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
                                    base_channels=ae_config["base_channels"], stream_configs=stream_configs,
-                                   n_theta=1)
+                                   n_theta=N_THETA)
         _decoder_module = Decoder(output_size=ae_config["size"], out_channels=1,
                                    base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                                    latent_spatial_size=recon_stream.spatial_size)
@@ -242,7 +242,7 @@ def _load_frozen_encoder(
         # here, never read again after this load.
         _encoder_module = Encoder(input_size=ae_config["size"], in_channels=1,
                                    base_channels=ae_config["base_channels"], stream_configs=stream_configs,
-                                   n_theta=1)
+                                   n_theta=N_THETA)
         _decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             stream_cfg = stream_configs[stream_name]
@@ -254,7 +254,8 @@ def _load_frozen_encoder(
         ae = MultiStreamAutoencoder(encoders={"shared": _encoder_module}, decoders=_decoders,
                                      stream_configs=stream_configs,
                                      decoder_for_stream=decoder_for_stream).to(device)
-    ae.load_state_dict(ae_checkpoint["model_state"])
+    from models.encoder import zero_pad_theta_columns
+    ae.load_state_dict(zero_pad_theta_columns(ae_checkpoint["model_state"], ae))
     encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
     encoder.eval()
     for p in encoder.parameters():
@@ -347,7 +348,9 @@ def _resume_f_theta_from_checkpoint(
             raise ValueError(f"{resume_from}'s architecture doesn't match the requested one: "
                               + ", ".join(f"{k}={old} (checkpoint) vs {new} (requested)"
                                           for k, old, new in mismatch))
-        f_theta.load_state_dict(prev_lds["model_state"])
+        from models.encoder import zero_pad_theta_columns
+        f_theta.load_state_dict(
+            zero_pad_theta_columns(prev_lds["model_state"], f_theta))
         prev_n_rollout = prev_lds.get("data_config", {}).get("n_rollout_steps")
         print(f"Resumed f_theta from {resume_from} (epoch {prev_lds['epoch']}, "
               f"val_loss={prev_lds['val_loss']:.6f}, trained at n_rollout_steps="
@@ -813,7 +816,7 @@ def train_lds(
     # with a shape error that says nothing about the ancestor.
     cross_check_ancestor_config(ae_config, {"size": size}, ae_checkpoint_path,
                                  what="autoencoder ancestor")
-    f_theta = LatentDynamics(latent_channels=ae_config["latent_channels"], n_theta=1,
+    f_theta = LatentDynamics(latent_channels=ae_config["latent_channels"], n_theta=N_THETA,
                               latent_spatial=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
                               dt_cap=dt_cap, n_substeps=n_substeps, alpha=alpha,
@@ -1505,7 +1508,7 @@ def train_lds(
                 "ae_checkpoint": str(Path(ae_checkpoint_path).resolve()),
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
-                    "latent_channels": ae_config["latent_channels"], "n_theta": 1,
+                    "latent_channels": ae_config["latent_channels"], "n_theta": N_THETA,
                     "latent_spatial_size": ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                     "hidden_dim": hidden_dim, "n_hidden_layers": n_hidden_layers,
                     "dt_cap": dt_cap,

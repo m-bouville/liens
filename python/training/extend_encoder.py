@@ -26,6 +26,7 @@ for anything real (see models/latent_streams.py's own
 LatentStreamMode.PURE_LATENT docstring).
 """
 from dataclasses import dataclass
+from models.constants import N_THETA
 from pathlib import Path
 
 import torch
@@ -139,8 +140,10 @@ def extend_state_checkpoint_with_deriv_stream(
     # since stage 1a never had either. Identical mechanism to stage
     # 1b's own equivalent step.
     encoder = Encoder(input_size=size, in_channels=1, base_channels=base_channels,
-                       stream_configs=stream_configs, n_theta=1)
+                       stream_configs=stream_configs, n_theta=N_THETA)
     old_encoder_state = _strip_prefix(prev["model_state"], "encoder")
+    from models.encoder import zero_pad_theta_columns
+    old_encoder_state = zero_pad_theta_columns(old_encoder_state, encoder)
     load_result = encoder.load_state_dict(old_encoder_state, strict=False)
     unexpected_missing = [k for k in load_result.missing_keys
                            if not (k.startswith("bottlenecks.deriv.")

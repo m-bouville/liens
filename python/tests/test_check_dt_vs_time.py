@@ -476,4 +476,13 @@ def test_END_TO_END_check_dt_vs_time_runs_and_reports(tmp_path, capsys,
     # the fit must be REAL numbers, not nan formatted into the message
     assert math.isfinite(result["a"]) and math.isfinite(result["b"])
     assert result["mean"].shape == (3, 3)
-    assert int(result["count"].sum()) == len(result["rows"])
+    # The count grid holds only rows with a FINITE field value: grid_table
+    # excludes non-finite rel_err (line "sel = ... & np.isfinite(v)"), which
+    # arises legitimately when a window's reference magnitude is 0 (denom<=0
+    # -> rel_err=nan, a degenerate flat-latent window). So the grid sums to
+    # the number of finite-field rows, NOT len(rows); asserting equality with
+    # len(rows) wrongly presumes every collected pair has a defined rel_err.
+    import math as _math
+    n_finite = sum(1 for r in result["rows"] if _math.isfinite(r["rel_err"]))
+    assert int(result["count"].sum()) == n_finite
+    assert int(result["count"].sum()) <= len(result["rows"])

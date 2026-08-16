@@ -44,6 +44,7 @@ import torch
 from evaluation._ae_stats_eval import load_ae_and_stats_head
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
+from models.constants import theta_coordinates
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every default checkpoint/output path is built from
@@ -123,7 +124,7 @@ def check_perturbation(
             # this loop actually keeps, via [recon_stream_name]) still
             # requires theta to be given, or this call raises.
             metadata = load.read_metadata(run_dir / "metadata.txt")
-            theta = torch.tensor([[metadata.temperature - metadata.T0]],
+            theta = torch.tensor([theta_coordinates(metadata.temperature, metadata.T0)],
                                   dtype=torch.float32, device=device)
             z = ae_encoder(x, theta=theta)[recon_stream_name]
             stats_z = stats_head(z)  # baseline stats(z), NOT ground truth

@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from models.latent_dynamics import LatentDynamics
+from models.constants import N_THETA
 
 
 def _model(nonzero_field=True, **kwargs):
@@ -57,7 +58,7 @@ def _twin(reference, **kwargs):
 def _inputs(b=2, seed=1):
     torch.manual_seed(seed)
     return (torch.randn(b, 4, 8, 8), torch.randn(b, 4, 8, 8),
-            torch.full((b,), 100.0), torch.zeros(b, 1))
+            torch.full((b,), 100.0), torch.zeros(b, N_THETA))
 
 
 def test_a_forced_count_reproduces_the_fixed_substep_integrator_exactly():
@@ -131,7 +132,7 @@ def test_every_sample_lands_exactly_on_the_transition_endpoint():
     z0 = torch.zeros(b, 4, 8, 8)
     z1 = torch.ones(b, 4, 8, 8)
     dt = torch.tensor([120.0, 250.0])
-    theta = torch.zeros(b, 1)
+    theta = torch.zeros(b, N_THETA)
 
     # With f == 0 the scheme is exact linear extrapolation, so the arrival
     # state is z0 + z1*dt for ANY count -- which is precisely the statement
@@ -223,7 +224,7 @@ def test_a_zero_velocity_state_is_bounded_by_max_substeps_not_infinite():
     z0 = torch.randn(2, 4, 8, 8)
     z1 = torch.zeros(2, 4, 8, 8)
     dt = torch.full((2,), 100.0)
-    theta = torch.zeros(2, 1)
+    theta = torch.zeros(2, N_THETA)
     f_big = torch.ones_like(z0)
     n = m._substeps_for(z0, z1, dt, theta, f_big)
     assert torch.all(n == 32), n
@@ -236,7 +237,7 @@ def test_a_dead_state_takes_one_substep():
     z0 = torch.randn(2, 4, 8, 8)
     z1 = torch.zeros(2, 4, 8, 8)
     dt = torch.full((2,), 100.0)
-    theta = torch.zeros(2, 1)
+    theta = torch.zeros(2, N_THETA)
     n = m._substeps_for(z0, z1, dt, theta, torch.zeros_like(z0))
     assert torch.all(n == 1), n
     assert m.n_substeps_clamped == 0, "a dead state is not a clamp"
@@ -253,7 +254,7 @@ def test_the_count_satisfies_the_criterion_it_was_derived_from():
     z0 = torch.randn(8, 4, 8, 8)
     z1 = torch.randn(8, 4, 8, 8)
     dt = torch.full((8,), 400.0)
-    theta = torch.zeros(8, 1)
+    theta = torch.zeros(8, N_THETA)
     # No multiplier: at this field scale the criterion already demands ~120-160
     # sub-steps, which binds hard while staying under max_substeps=256. Scaling
     # f up pushed it into the clamp, where the guarantee legitimately does not
@@ -286,7 +287,7 @@ def test_the_criterion_is_violated_exactly_where_max_substeps_binds():
     z0 = torch.randn(4, 4, 8, 8)
     z1 = torch.randn(4, 4, 8, 8) * 0.01
     dt = torch.full((4,), 500.0)
-    theta = torch.zeros(4, 1)
+    theta = torch.zeros(4, N_THETA)
     f_n = m.f(z0, z1, theta) * 100.0
     n = m._substeps_for(z0, z1, dt, theta, f_n)
     assert torch.all(n == 4), n
@@ -340,7 +341,7 @@ def test_an_adaptive_model_does_not_take_the_one_shot_fast_path():
     z0 = torch.randn(2, 4, 8, 8)
     z1_seq = torch.randn(2, 3, 4, 8, 8)
     dts = torch.full((2, 2), 500.0)
-    theta = torch.zeros(2, 1)
+    theta = torch.zeros(2, N_THETA)
 
     adaptive_out = m.rollout(z0, z1_seq, dts, theta, z1_resync=True)
 
@@ -515,7 +516,7 @@ def test_a_clamp_is_carried_across_resets():
     z0 = torch.randn(3, 4, 8, 8)
     z1 = torch.randn(3, 4, 8, 8) * 0.01
     dt = torch.full((3,), 500.0)
-    theta = torch.zeros(3, 1)
+    theta = torch.zeros(3, N_THETA)
     m._integrate(z0, z1, dt, theta)
     first = m.substep_stats()
     assert first["clamped"] > 0
@@ -714,7 +715,7 @@ def _tbptt_model(scale=0.005, **kw):
 def _tbptt_inputs(b=2):
     torch.manual_seed(3)
     return (torch.randn(b, 4, 8, 8) * 0.3, torch.randn(b, 4, 8, 8) * 0.3,
-            torch.full((b,), 120.0), torch.zeros(b, 1))
+            torch.full((b,), 120.0), torch.zeros(b, N_THETA))
 
 
 def test_truncation_leaves_the_forward_pass_bit_identical():
@@ -769,7 +770,7 @@ def test_truncation_shortens_the_backward_graph():
                             n_hidden_layers=1, n_substeps=64, truncate_bptt=k)
         torch.manual_seed(1)
         out, _, _ = m._integrate(torch.randn(1, 2, 4, 4), torch.randn(1, 2, 4, 4),
-                                  torch.full((1,), 10.0), torch.zeros(1, 1))
+                                  torch.full((1,), 10.0), torch.zeros(1, N_THETA))
         return _max_graph_depth(out)
 
     full = depth(None)
@@ -802,7 +803,7 @@ def test_every_sample_of_a_heterogeneous_batch_gets_gradient():
     z0, z1 = torch.randn(B, 2, 4, 4), torch.randn(B, 2, 4, 4)
     counts = torch.tensor([70, 100, 129, 140, 200])
     m._substeps_for = lambda *a, **k: counts
-    out, _, _ = m._integrate(z0, z1, torch.full((B,), 100.0), torch.zeros(B, 1))
+    out, _, _ = m._integrate(z0, z1, torch.full((B,), 100.0), torch.zeros(B, N_THETA))
     per_sample = out.reshape(B, -1).square().sum(dim=1)
     for i in range(B):
         m.zero_grad()
@@ -832,7 +833,7 @@ def test_deep_samples_are_still_truncated_in_a_mixed_batch():
         z0, z1 = torch.randn(2, 2, 4, 4) * 0.3, torch.randn(2, 2, 4, 4) * 0.3
         m._substeps_for = lambda *a, **kw: torch.tensor([3, 2048])
         out, _, _ = m._integrate(z0, z1, torch.full((2,), 120.0),
-                                  torch.zeros(2, 1))
+                                  torch.zeros(2, N_THETA))
         out[1].square().sum().backward()
         return max(float(p.grad.abs().max()) for p in m.parameters()
                    if p.grad is not None)
@@ -895,7 +896,7 @@ def test_every_substep_count_produces_a_usable_gradient(k):
         m.n_substeps = n
         torch.manual_seed(0)
         out, _, _ = m._integrate(torch.randn(1, 2, 4, 4), torch.randn(1, 2, 4, 4),
-                                  torch.full((1,), 5.0), torch.zeros(1, 1))
+                                  torch.full((1,), 5.0), torch.zeros(1, N_THETA))
         assert out.grad_fn is not None, (
             f"k={k}, n_max={n} (n%k={n % k}): output has no gradient path"
         )
@@ -1020,7 +1021,7 @@ def _integrate_counts(counts, k):
     b = len(counts)
     m._substeps_for = lambda *a, **kw: torch.tensor(counts)
     return m._integrate(torch.randn(b, 2, 4, 4) * 0.3, torch.randn(b, 2, 4, 4) * 0.3,
-                         torch.full((b,), 60.0), torch.zeros(b, 1))
+                         torch.full((b,), 60.0), torch.zeros(b, N_THETA))
 
 
 @pytest.mark.parametrize("counts", [
@@ -1078,7 +1079,7 @@ def test_the_realised_retained_cost_is_recorded_per_transition():
     counts = torch.tensor([50, 60, 70, 80, 300, 320, 340, 360])
     m._substeps_for = lambda *a, **k: counts
     m._integrate(torch.randn(B, 2, 4, 4), torch.randn(B, 2, 4, 4),
-                  torch.full((B,), 100.0), torch.zeros(B, 1))
+                  torch.full((B,), 100.0), torch.zeros(B, N_THETA))
     hi, lo = float(counts.max()), float(counts.min())
     expected = B * min(hi, B * 64.0, (hi - lo) + 64.0)
     assert m._retained_peak == pytest.approx(expected), (
@@ -1096,7 +1097,7 @@ def test_the_realised_retained_cost_is_recorded_per_transition():
     m2._substeps_for = lambda *a, **k: torch.tensor([100, 18000])
     torch.manual_seed(0)
     m2._integrate(torch.randn(2, 2, 4, 4), torch.randn(2, 2, 4, 4),
-                   torch.full((2,), 100.0), torch.zeros(2, 1))
+                   torch.full((2,), 100.0), torch.zeros(2, N_THETA))
     assert m2._retained_peak == pytest.approx(2 * 128.0), (
         f"{m2._retained_peak} -- the n bound is missing, so a 2-sample batch "
         f"is charged for arrival segments it cannot have"
@@ -1111,7 +1112,7 @@ def test_the_realised_peak_resets_per_epoch():
     torch.manual_seed(0)
     m._substeps_for = lambda *a, **k: torch.tensor([100, 200])
     m._integrate(torch.randn(2, 2, 4, 4), torch.randn(2, 2, 4, 4),
-                  torch.full((2,), 100.0), torch.zeros(2, 1))
+                  torch.full((2,), 100.0), torch.zeros(2, N_THETA))
     assert m._retained_peak > 0
     m.substep_stats(reset=True)
     assert m._retained_peak == 0.0, "cumulative would hide the drift"
@@ -1125,7 +1126,7 @@ def test_the_realised_peak_resets_per_epoch():
                          truncate_bptt=64)
     torch.manual_seed(0)
     m3._integrate(torch.randn(4, 2, 4, 4) * 0.3, torch.randn(4, 2, 4, 4) * 0.3,
-                   torch.full((4,), 300.0), torch.zeros(4, 1))
+                   torch.full((4,), 300.0), torch.zeros(4, N_THETA))
     assert m3.substep_stats(reset=False) is not None, "fixture took no adaptive path"
     assert m3._retained_peak > 0
     m3.substep_stats(reset=True)
@@ -1141,5 +1142,5 @@ def test_it_is_not_recorded_without_truncation():
     torch.manual_seed(0)
     m._substeps_for = lambda *a, **k: torch.tensor([100, 200])
     m._integrate(torch.randn(2, 2, 4, 4), torch.randn(2, 2, 4, 4),
-                  torch.full((2,), 100.0), torch.zeros(2, 1))
+                  torch.full((2,), 100.0), torch.zeros(2, N_THETA))
     assert m._retained_peak == 0.0

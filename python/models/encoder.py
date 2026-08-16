@@ -4,6 +4,8 @@ compact latent representations (streams) -- see the project's own
 C0/C1 design doc for why more than one.
 """
 
+from models.constants import N_THETA
+
 import math
 
 import torch
@@ -111,7 +113,7 @@ class Encoder(nn.Module):
         base_channels: int = 32,
         norm: str = "batch",
         use_skips: bool = False,
-        n_theta: int = 1,
+        n_theta: int = N_THETA,
     ):
         super().__init__()
 
@@ -296,3 +298,47 @@ class Encoder(nn.Module):
         if self.use_skips:
             return z, skips
         return z
+
+
+def zero_pad_theta_columns(state_dict: dict, model: "nn.Module") -> dict:
+    """Upgrade a checkpoint trained with FEWER theta features to a model that
+    expects more (n_theta grew, e.g. 1 -> 2 when log(T0-T) was added).
+
+    Every theta-conditioned module (encoder FiLM conditioners, f_theta's MLP)
+    takes theta as the LAST n_theta columns of its FIRST Linear's weight. A
+    model with more theta features has wider first-Linear weights; the extra
+    columns are the new features. Zero-padding them makes the loaded model
+    BIT-IDENTICAL in function to the checkpoint (the new feature contributes
+    nothing until trained), the same backward-compatible contract the
+    residual head uses on its own zero-init output conv.
+
+    Returns a NEW state_dict with the relevant weights right-zero-padded to
+    the model's widths. Keys whose width already matches are passed through
+    untouched, so this is a no-op for same-n_theta loads. Only ever GROWS a
+    weight (raises if the checkpoint is WIDER than the model -- that is a
+    real mismatch, not an upgrade).
+    """
+    import torch
+    model_sd = model.state_dict()
+    out = dict(state_dict)
+    for key, ckpt_w in state_dict.items():
+        if key not in model_sd:
+            continue
+        model_w = model_sd[key]
+        if ckpt_w.shape == model_w.shape:
+            continue
+        # only first-Linear weights differ, and only in their last (input) dim
+        if (ckpt_w.dim() == 2 and model_w.dim() == 2
+                and ckpt_w.shape[0] == model_w.shape[0]
+                and ckpt_w.shape[1] < model_w.shape[1]):
+            pad = model_w.shape[1] - ckpt_w.shape[1]
+            zeros = torch.zeros(ckpt_w.shape[0], pad,
+                                 dtype=ckpt_w.dtype, device=ckpt_w.device)
+            out[key] = torch.cat([ckpt_w, zeros], dim=1)
+        elif ckpt_w.shape[1] > model_w.shape[1]:
+            raise ValueError(
+                f"checkpoint weight {key} is WIDER ({tuple(ckpt_w.shape)}) than "
+                f"the model ({tuple(model_w.shape)}) -- that is a real "
+                f"mismatch, not a theta-feature upgrade (which only ever adds "
+                f"columns). Refusing to silently truncate.")
+    return out

@@ -26,6 +26,7 @@ from models.encoder import Encoder
 from models.latent_streams import LatentStreamConfig, LatentStreamMode
 from training.datasets import MicrostructureEvolutionDataset
 from utils import load_datasets as load
+from models.constants import N_THETA, theta_coordinates
 
 
 def _make_encoder(seed=0, base_channels=8, size=64):
@@ -40,7 +41,7 @@ def _make_encoder(seed=0, base_channels=8, size=64):
                                      mode=LatentStreamMode.DECODER, condition_on_theta=True),
     }
     return Encoder(input_size=size, stream_configs=stream_configs, in_channels=1,
-                    base_channels=base_channels, n_theta=1)
+                    base_channels=base_channels, n_theta=N_THETA)
 
 
 def _perturb_film(encoder, scale=0.5, seed=1):
@@ -93,8 +94,8 @@ def test_film_is_exact_noop_at_zero_init():
     encoder = _make_encoder()
     encoder.eval()
     x = torch.randn(3, 1, 64, 64)
-    theta_a = torch.full((3, 1), 0.1)
-    theta_b = torch.full((3, 1), 5.0)
+    theta_a = torch.full((3, N_THETA), 0.1)
+    theta_b = torch.full((3, N_THETA), 5.0)
     with torch.no_grad():
         z_a = encoder(x, theta=theta_a)
         z_b = encoder(x, theta=theta_b)
@@ -112,8 +113,8 @@ def test_state_stream_isolated_from_theta_after_training():
     _perturb_film(encoder)
     encoder.eval()
     x = torch.randn(3, 1, 64, 64)
-    theta_a = torch.full((3, 1), 0.1)
-    theta_b = torch.full((3, 1), 5.0)
+    theta_a = torch.full((3, N_THETA), 0.1)
+    theta_b = torch.full((3, N_THETA), 5.0)
     with torch.no_grad():
         z_a = encoder(x, theta=theta_a)
         z_b = encoder(x, theta=theta_b)
@@ -177,7 +178,9 @@ def test_theta_correctly_aligned_across_cross_run_buffer_flushes(tmp_path):
                                                   metadata.nx, metadata.ny)).unsqueeze(0)
             for s in metadata.save_steps
         ])
-        theta = torch.full((frames.size(0), 1), metadata.temperature - metadata.T0)
+        theta = torch.tensor(
+            theta_coordinates(metadata.temperature, metadata.T0),
+            dtype=torch.float32).unsqueeze(0).expand(frames.size(0), -1)
         with torch.no_grad():
             expected = encoder(frames, theta=theta)
         assert torch.allclose(ds._run_data[run_idx], expected["state"], atol=1e-6), \

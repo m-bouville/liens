@@ -13,6 +13,7 @@ to know anything about.
 """
 
 from collections.abc import Callable
+from models.constants import N_THETA
 from pathlib import Path
 
 import torch
@@ -564,7 +565,7 @@ def train_stage2(
         # decoder, matching what such a checkpoint's own state_dict
         # actually has.
         encoder = Encoder(input_size=size, in_channels=1, base_channels=model_cfg["base_channels"],
-                           stream_configs=stream_configs, n_theta=1)
+                           stream_configs=stream_configs, n_theta=N_THETA)
         decoder_for_stream = model_cfg.get("decoder_for_stream")
         if decoder_for_stream is None:
             decoder = Decoder(output_size=size, out_channels=1, base_channels=model_cfg["base_channels"],
@@ -589,7 +590,14 @@ def train_stage2(
         # byte-identical to the checkpoint until training. Accept ONLY missing
         # residual_heads.* keys; any OTHER missing key, or any unexpected key,
         # is still a real mismatch and must raise.
-        _missing, _unexpected = ae.load_state_dict(prev["model_state"], strict=False)
+        # Upgrade any pre-2-feature-theta checkpoint: zero-pad the new theta
+        # input column of each conditioner's first Linear so the loaded model
+        # is bit-identical in function (the log(T0-T) coordinate starts silent
+        # and training grows it). A same-n_theta checkpoint passes through
+        # untouched.
+        from models.encoder import zero_pad_theta_columns
+        _prev_state = zero_pad_theta_columns(prev["model_state"], ae)
+        _missing, _unexpected = ae.load_state_dict(_prev_state, strict=False)
         # The AE exposes the encoder under MORE THAN ONE state_dict path
         # (encoders.<name>.* and the per-stream pathways.<stream>.encoder.*
         # aliases of the same shared module), so match the H tensors by the

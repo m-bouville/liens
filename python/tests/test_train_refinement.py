@@ -31,6 +31,7 @@ from models.latent_dynamics import LatentDynamics
 from training.stats_head import StatsHead
 from training.train_refinement import train_refinement
 from utils import load_datasets as load
+from models.constants import N_THETA
 
 
 SIZE = 64
@@ -127,11 +128,11 @@ def _build_ae_checkpoint(path: Path, include_stats_head: bool = True):
 
 
 def _build_lds_checkpoint(path: Path):
-    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=1, hidden_dim=8, n_hidden_layers=1)
+    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=N_THETA, hidden_dim=8, n_hidden_layers=1)
     checkpoint = {
         "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05,
         "val_loss_ema": 0.05, "ae_checkpoint": "fake", "test_dirs": [],
-        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": 1, "hidden_dim": 8,
+        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": N_THETA, "hidden_dim": 8,
                    "n_hidden_layers": 1},
         "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2,
                          "n_rollout_steps": 1},
@@ -231,12 +232,12 @@ def test_train_refinement_mismatched_ancestors_raises_before_training(tmp_path, 
     _build_ae_checkpoint(ae_checkpoint_path, include_stats_head=True)
 
     # Deliberately mismatched latent_channels
-    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS + 4, n_theta=1,
+    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS + 4, n_theta=N_THETA,
                               hidden_dim=8, n_hidden_layers=1)
     torch.save({
         "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05,
         "val_loss_ema": 0.05, "ae_checkpoint": "fake", "test_dirs": [],
-        "config": {"latent_channels": LATENT_CHANNELS + 4, "n_theta": 1, "hidden_dim": 8,
+        "config": {"latent_channels": LATENT_CHANNELS + 4, "n_theta": N_THETA, "hidden_dim": 8,
                    "n_hidden_layers": 1},
         "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2,
                          "n_rollout_steps": 1},

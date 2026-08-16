@@ -30,6 +30,7 @@ from utils import load_datasets as load
 
 from evaluation.compare_rollout_training import compare_rollout_training
 from evaluation._window_parsing import parse_fixed_window
+from models.constants import N_THETA
 
 
 SIZE = 32
@@ -96,12 +97,12 @@ def _build_ae_checkpoint(path: Path):
 
 
 def _build_lds_checkpoint(path: Path, ae_checkpoint_path: Path, dt_cap: float = float("inf")):
-    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=1, hidden_dim=8, n_hidden_layers=1,
+    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=N_THETA, hidden_dim=8, n_hidden_layers=1,
                               dt_cap=dt_cap)
     checkpoint = {
         "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05,
         "val_loss_ema": 0.05, "ae_checkpoint": str(ae_checkpoint_path), "test_dirs": [],
-        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": 1, "hidden_dim": 8,
+        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": N_THETA, "hidden_dim": 8,
                    "n_hidden_layers": 1, "dt_cap": dt_cap},
         "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2},
     }
@@ -218,11 +219,11 @@ def test_load_lds_falls_back_to_inf_for_an_old_checkpoint_with_no_dt_cap_key(
     _build_ae_checkpoint(ae_checkpoint_path)
     lds_path = tmp_path / "fake-stage3-old.pt"
     torch.save({
-        "model_state": LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=1,
+        "model_state": LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=N_THETA,
                                        hidden_dim=8, n_hidden_layers=1).state_dict(),
         "epoch": 1, "val_loss": 0.05, "val_loss_ema": 0.05,
         "ae_checkpoint": str(ae_checkpoint_path), "test_dirs": [],
-        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": 1, "hidden_dim": 8,
+        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": N_THETA, "hidden_dim": 8,
                    "n_hidden_layers": 1},  # deliberately: no "dt_cap" key at all
         "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2},
     }, lds_path)

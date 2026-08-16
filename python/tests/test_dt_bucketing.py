@@ -15,6 +15,7 @@ import torch
 from training.dt_bucketing import (
     CostBucketBatchSampler, estimate_window_costs, substep_cost,
 )
+from models.constants import N_THETA
 
 
 def _population(n=6000, seed=0, sigma=0.45):
@@ -914,7 +915,7 @@ def test_retained_peak_can_be_read_without_clearing_the_substep_stats():
                         truncate_bptt=64)
     _torch.manual_seed(0)
     m._integrate(_torch.randn(4, 2, 4, 4) * 0.3, _torch.randn(4, 2, 4, 4) * 0.3,
-                  _torch.full((4,), 300.0), _torch.zeros(4, 1))
+                  _torch.full((4,), 300.0), _torch.zeros(4, N_THETA))
     peak = m.retained_peak()
     assert peak > 0
     assert m.retained_peak() == peak, "reading cleared it"
@@ -1235,9 +1236,9 @@ def test_the_model_exposes_the_realised_counts_per_batch():
     counts = _torch.tensor([70, 100])
     m._substeps_for = lambda *a, **k: counts
     m._integrate(_torch.randn(2, 2, 4, 4), _torch.randn(2, 2, 4, 4),
-                  _torch.full((2,), 100.0), _torch.zeros(2, 1))
+                  _torch.full((2,), 100.0), _torch.zeros(2, N_THETA))
     m._integrate(_torch.randn(2, 2, 4, 4), _torch.randn(2, 2, 4, 4),
-                  _torch.full((2,), 100.0), _torch.zeros(2, 1))
+                  _torch.full((2,), 100.0), _torch.zeros(2, N_THETA))
     got = m.last_counts()
     assert len(got) == 2, "one entry per transition"
     assert _torch.equal(got[0], counts)

@@ -17,6 +17,7 @@ from evaluation.check_substep_convergence import (
     _integrate_at, decade_of, sweep, verdict,
 )
 from models.latent_dynamics import LatentDynamics
+from models.constants import N_THETA
 
 
 def _rows(truth, self_):
@@ -89,7 +90,7 @@ def test_the_step_count_is_forced_and_the_model_is_left_as_found():
     prev_n = m.n_substeps
     torch.manual_seed(0)
     z0, z1 = torch.randn(4, 2, 4, 4), torch.randn(4, 2, 4, 4)
-    dt, th = torch.full((4,), 60.0), torch.zeros(4, 1)
+    dt, th = torch.full((4,), 60.0), torch.zeros(4, N_THETA)
 
     # Counting f_theta EVALUATIONS, not _substeps_for calls: on the fixed-count
     # path the criterion is never consulted, so spying on it sees nothing and
@@ -138,7 +139,7 @@ def test_the_sweep_reports_self_difference_between_consecutive_counts():
                         n_hidden_layers=1, n_substeps=1)
     torch.manual_seed(0)
     z0, z1 = torch.randn(6, 2, 4, 4) * 0.3, torch.randn(6, 2, 4, 4) * 0.3
-    dt, th = torch.full((6,), 40.0), torch.zeros(6, 1)
+    dt, th = torch.full((6,), 40.0), torch.zeros(6, N_THETA)
     rows = sweep(m, z0, z1, dt, th, z0.clone(), [1, 2, 4])
     assert [r["n"] for r in rows] == [1, 2, 4]
     assert all("self_rms" in r for r in rows[:-1])

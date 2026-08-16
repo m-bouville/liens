@@ -20,6 +20,7 @@ import torch
 
 from models.latent_dynamics import LatentDynamics
 from training.train_lds import train_lds
+from models.constants import N_THETA
 
 LC, LS = 4, 8
 
@@ -51,7 +52,7 @@ def test_rollout_is_unchanged_at_the_defaults():
     z0 = torch.randn(B, LC, LS, LS)
     z1_seq = torch.randn(B, n + 1, LC, LS, LS)
     dts = torch.rand(B, n) * 100 + 1
-    theta = torch.zeros(B, 1)
+    theta = torch.zeros(B, N_THETA)
 
     with torch.no_grad():
         got = model.rollout(z0, z1_seq, dts, theta)

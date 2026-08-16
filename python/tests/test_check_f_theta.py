@@ -18,6 +18,7 @@ from models.encoder import Encoder
 from models.latent_dynamics import LatentDynamics
 from models.latent_streams import LatentStreamConfig, LatentStreamMode
 from utils import load_datasets as load
+from models.constants import N_THETA
 
 
 SIZE = 32
@@ -81,13 +82,13 @@ def _build_ae_checkpoint(path: Path):
 
 
 def _build_lds_checkpoint(path: Path, ae_checkpoint_path: Path, run_dirs, dt_cap: float = float("inf")):
-    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=1, hidden_dim=8, n_hidden_layers=1,
+    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=N_THETA, hidden_dim=8, n_hidden_layers=1,
                               dt_cap=dt_cap)
     checkpoint = {
         "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05,
         "val_loss_ema": 0.05, "ae_checkpoint": str(ae_checkpoint_path),
         "test_dirs": [str(d) for d in run_dirs],
-        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": 1, "hidden_dim": 8,
+        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": N_THETA, "hidden_dim": 8,
                    "n_hidden_layers": 1, "dt_cap": dt_cap},
         "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2},
     }
@@ -141,7 +142,7 @@ def test_compute_f_diagnostics_rejects_window_length_below_3():
     class _FakeDataset:
         window_length = 2
 
-    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+    f_theta = LatentDynamics(latent_channels=4, n_theta=N_THETA, latent_spatial=4,
                               hidden_dim=8, n_hidden_layers=1)
     with pytest.raises(ValueError, match="window_length"):
         compute_f_diagnostics(_FakeDataset(), f_theta, torch.device("cpu"))
@@ -156,7 +157,7 @@ def test_compute_f_diagnostics_chaining_matches_manual_computation():
     at the identical dt2/theta, and z0_step1_error is the actual gap
     between them."""
     torch.manual_seed(0)
-    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+    f_theta = LatentDynamics(latent_channels=4, n_theta=N_THETA, latent_spatial=4,
                               hidden_dim=8, n_hidden_layers=1)
     with torch.no_grad():
         torch.manual_seed(2)
@@ -168,7 +169,7 @@ def test_compute_f_diagnostics_chaining_matches_manual_computation():
     window0 = torch.randn(B, 3, 4, 4, 4)  # (B, window_length=3, C, 8->4 spatial for a small test, 4, 4)
     window1 = torch.randn(B, 3, 4, 4, 4)
     dt_window = torch.tensor([[5.0, 8.0], [3.0, 12.0], [7.0, 2.0]])
-    theta = torch.randn(B, 1)
+    theta = torch.randn(B, N_THETA)
 
     class _FakeDataset(torch.utils.data.Dataset):
         window_length = 3
@@ -213,7 +214,7 @@ def test_ideal_target_matches_manual_computation():
     against an independent, manual walk -- not just trusted from
     reading the function's own source."""
     torch.manual_seed(3)
-    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+    f_theta = LatentDynamics(latent_channels=4, n_theta=N_THETA, latent_spatial=4,
                               hidden_dim=8, n_hidden_layers=1)
     with torch.no_grad():
         torch.manual_seed(4)
@@ -225,7 +226,7 @@ def test_ideal_target_matches_manual_computation():
     window0 = torch.randn(B, 3, 4, 4, 4)
     window1 = torch.randn(B, 3, 4, 4, 4)
     dt_window = torch.tensor([[4.0, 6.0], [9.0, 3.0]])
-    theta = torch.randn(B, 1)
+    theta = torch.randn(B, N_THETA)
 
     class _FakeDataset(torch.utils.data.Dataset):
         window_length = 3
@@ -270,7 +271,7 @@ def test_ideal_target_formula_genuinely_inverts_forward():
     known f value by construction, verified against ratio=1.0 and
     cos_sim=1.0 exactly (not approximately close to f_theta's own,
     generally-different output)."""
-    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+    f_theta = LatentDynamics(latent_channels=4, n_theta=N_THETA, latent_spatial=4,
                               hidden_dim=8, n_hidden_layers=1)
     known_f_value = 0.7
     with torch.no_grad():
@@ -291,7 +292,7 @@ def test_ideal_target_formula_genuinely_inverts_forward():
     z1_1 = torch.randn(B, 4, 4, 4)
     dt1 = torch.tensor([5.0, 5.0])
     dt2 = torch.tensor([3.0, 3.0])
-    theta = torch.randn(B, 1)
+    theta = torch.randn(B, N_THETA)
 
     with torch.no_grad():
         z0_hat_1 = f_theta(z0_0, z1_0, dt1, theta)
@@ -329,7 +330,7 @@ def _make_dataset_for_dead_relu_check(n_samples=32):
     window0 = torch.randn(n_samples, 3, 4, 4, 4)
     window1 = torch.randn(n_samples, 3, 4, 4, 4)
     dt_window = torch.rand(n_samples, 2) * 10 + 1
-    theta = torch.randn(n_samples, 1)
+    theta = torch.randn(n_samples, N_THETA)
 
     class _FakeDataset(torch.utils.data.Dataset):
         window_length = 3
@@ -351,7 +352,7 @@ def test_check_dead_relus_reports_near_zero_on_a_healthy_freshly_initialized_net
     from evaluation.check_f_theta import check_dead_relus
 
     torch.manual_seed(8)
-    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+    f_theta = LatentDynamics(latent_channels=4, n_theta=N_THETA, latent_spatial=4,
                               hidden_dim=32, n_hidden_layers=2)
     dataset = _make_dataset_for_dead_relu_check()
 
@@ -380,7 +381,7 @@ def test_check_dead_relus_detects_a_genuinely_collapsed_trunk():
     stuck, which wouldn't genuinely test what this test claims to."""
     from evaluation.check_f_theta import check_dead_relus, compute_f_diagnostics
 
-    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+    f_theta = LatentDynamics(latent_channels=4, n_theta=N_THETA, latent_spatial=4,
                               hidden_dim=16, n_hidden_layers=2)
     with torch.no_grad():
         hidden_linears = [layer for layer in f_theta.net if isinstance(layer, torch.nn.Linear)][:-1]
@@ -503,7 +504,7 @@ def test_check_f_theta_threads_dt_cap_from_the_saved_checkpoint(monkeypatch, tmp
         # validation not existing.
         "epoch": 1, "val_loss": 0.05, "test_dirs": [str(_fake_run_dir(tmp_path))],
         "ae_checkpoint": "does-not-need-to-exist.pt",
-        "config": {"latent_channels": 4, "n_theta": 1, "hidden_dim": 8,
+        "config": {"latent_channels": 4, "n_theta": N_THETA, "hidden_dim": 8,
                    "n_hidden_layers": 1, "dt_cap": 125.0},
         "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 3},
     }, checkpoint_path)
@@ -596,11 +597,11 @@ def test_untrained_f_theta_does_not_produce_broken_log_scaled_panels(recwarn, tm
 
     # Confirm the premise: this checkpoint's own f_theta really is
     # all-zero, so the all-zero code path is genuinely being exercised.
-    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=1,
+    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=N_THETA,
                               hidden_dim=8, n_hidden_layers=1)
     assert f_theta.f(torch.randn(2, LATENT_CHANNELS, 8, 8),
                      torch.randn(2, LATENT_CHANNELS, 8, 8),
-                     torch.randn(2, 1)).abs().max().item() == 0.0
+                     torch.randn(2, N_THETA)).abs().max().item() == 0.0
 
     check_f_theta(
         lds_checkpoint_path=lds_checkpoint_path, min_step=0, device="cpu",

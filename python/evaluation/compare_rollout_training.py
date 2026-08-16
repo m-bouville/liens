@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.constants import LATENT_SPATIAL_SIZE
+from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from evaluation._window_parsing import parse_fixed_window
 from training.checkpoint_components import build_ae_from_checkpoint
@@ -95,7 +95,7 @@ def rollout_errors(run_dir: Path, steps: list[int], encoder, f_theta,
     # the (n_steps+1, ...) batch of frames via standard FiLM
     # broadcasting, confirmed directly -- no need to expand/repeat it
     # to match frames' own batch size.
-    theta = torch.tensor([[metadata.temperature - metadata.T0]],
+    theta = torch.tensor([theta_coordinates(metadata.temperature, metadata.T0)],
                           dtype=torch.float32, device=device)
 
     with torch.no_grad():

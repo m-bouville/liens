@@ -52,6 +52,7 @@ from evaluation.check_interpolation import check_interpolation
 from evaluation.check_perturbation import check_perturbation
 from evaluation.check_rollout import check_rollout
 from evaluation.check_parameter_dependence import check_parameter_dependence
+from models.constants import N_THETA
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:Polyfit may be poorly conditioned"),
@@ -136,7 +137,7 @@ def _save_ae_checkpoint(path, run_dirs, size=64, base_channels=4, latent_channel
 def _save_lds_checkpoint(path, ae_checkpoint_path, latent_channels=4,
                           latent_spatial_size=_NON_DEFAULT_SPATIAL, run_dirs=None):
     """Real LatentDynamics checkpoint, pointing at a real AE ancestor."""
-    f_theta = LatentDynamics(latent_channels=latent_channels, n_theta=1,
+    f_theta = LatentDynamics(latent_channels=latent_channels, n_theta=N_THETA,
                               latent_spatial=latent_spatial_size, hidden_dim=16, n_hidden_layers=1)
     checkpoint = {
         "model_state": f_theta.state_dict(),
@@ -144,7 +145,7 @@ def _save_lds_checkpoint(path, ae_checkpoint_path, latent_channels=4,
         "val_loss": 0.05,
         "test_dirs": [str(d) for d in (run_dirs or [])],
         "ae_checkpoint": str(Path(ae_checkpoint_path).resolve()),
-        "config": {"latent_channels": latent_channels, "n_theta": 1,
+        "config": {"latent_channels": latent_channels, "n_theta": N_THETA,
                    "latent_spatial_size": latent_spatial_size, "hidden_dim": 16, "n_hidden_layers": 1},
     }
     torch.save(checkpoint, path)

@@ -7,6 +7,7 @@ from models.encoder import Encoder
 from models.decoder import Decoder
 from models.latent_streams import LatentStreamConfig, LatentStreamMode
 from evaluation.check_reconstruction import check_reconstruction
+from models.constants import N_THETA
 
 
 def _build_run_dir(base_dir, name, size=32):
@@ -147,12 +148,12 @@ def test_check_reconstruction_loads_a_real_train_refinement_checkpoint(
                    "recon_stream_name": "state"},
     }, ae_path)
 
-    f_theta = LatentDynamics(latent_channels=latent_channels, n_theta=1, hidden_dim=8, n_hidden_layers=1)
+    f_theta = LatentDynamics(latent_channels=latent_channels, n_theta=N_THETA, hidden_dim=8, n_hidden_layers=1)
     lds_path = tmp_path / "fake-stage3.pt"
     torch.save({
         "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05, "ae_checkpoint": "fake",
         "test_dirs": [],
-        "config": {"latent_channels": latent_channels, "n_theta": 1, "hidden_dim": 8, "n_hidden_layers": 1},
+        "config": {"latent_channels": latent_channels, "n_theta": N_THETA, "hidden_dim": 8, "n_hidden_layers": 1},
         "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2, "n_rollout_steps": 1},
     }, lds_path)
 

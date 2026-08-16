@@ -28,6 +28,7 @@ import torch
 from models.latent_dynamics import (
     LatentDynamics, _MEANING_FIELDS, integration_kwargs_from_config,
 )
+from models.constants import N_THETA
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -195,7 +196,7 @@ def test_a_saved_config_round_trips_into_an_equivalent_model():
     with torch.no_grad():
         original.net[-1].weight.normal_(0.0, 0.02)
         original.net[-1].bias.normal_(0.0, 0.02)
-    config = {"latent_channels": 4, "n_theta": 1, "latent_spatial_size": 8,
+    config = {"latent_channels": 4, "n_theta": N_THETA, "latent_spatial_size": 8,
               "hidden_dim": 8, "n_hidden_layers": 1,
               "dt_cap": float("inf"), "n_substeps": 1,
               "alpha": 0.05, "max_substeps": 64}
@@ -209,7 +210,7 @@ def test_a_saved_config_round_trips_into_an_equivalent_model():
     z0 = torch.randn(4, 4, 8, 8)
     z1 = torch.randn(4, 4, 8, 8)
     dt = torch.full((4,), 500.0)
-    theta = torch.zeros(4, 1)
+    theta = torch.zeros(4, N_THETA)
     a, _, _ = original._integrate(z0.clone(), z1.clone(), dt, theta)
     b, _, _ = rebuilt._integrate(z0.clone(), z1.clone(), dt, theta)
     assert torch.equal(a, b), "the rebuilt model integrates differently from the original"
@@ -236,7 +237,7 @@ def test_dropping_alpha_from_a_config_is_visibly_different():
     z0 = torch.randn(4, 4, 8, 8)
     z1 = torch.randn(4, 4, 8, 8)
     dt = torch.full((4,), 500.0)
-    theta = torch.zeros(4, 1)
+    theta = torch.zeros(4, N_THETA)
     a, _, _ = model._integrate(z0.clone(), z1.clone(), dt, theta)
     b, _, _ = lost._integrate(z0.clone(), z1.clone(), dt, theta)
     assert not torch.allclose(a, b, rtol=1e-3), (

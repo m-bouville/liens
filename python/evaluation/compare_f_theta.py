@@ -62,7 +62,7 @@ from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 # not the CWD -- the project's path policy, so the tool lands its figure in
 # output/ wherever it is invoked from.
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent
-from models.constants import LATENT_SPATIAL_SIZE
+from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
@@ -857,7 +857,7 @@ def compute_stage2_trajectory(run_dir: Path, steps: list[int], ae,
     """
     metadata = load.read_metadata(run_dir / "metadata.txt")
     nx, ny = ae_config["size"], ae_config["size"]
-    theta_val = metadata.temperature - metadata.T0
+    theta_vec = theta_coordinates(metadata.temperature, metadata.T0)
     with torch.no_grad():
         _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
         ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
@@ -867,7 +867,7 @@ def compute_stage2_trajectory(run_dir: Path, steps: list[int], ae,
         x0 = torch.from_numpy(
             load.read_phi_half(run_dir / load.snapshot_filename(steps[0]), nx, ny)
         ).unsqueeze(0).unsqueeze(0).to(device)
-        theta_encode = torch.full((1, 1), theta_val, dtype=torch.float32,
+        theta_encode = torch.tensor([theta_vec], dtype=torch.float32,
                                    device=device)
         encoded = ae_encoder(x0, theta=theta_encode)
         z0 = encoded[recon_stream_name]
@@ -916,7 +916,7 @@ def compute_causal_trajectory(run_dir: Path, steps: list[int], ae,
         return None
 
     nx, ny = ae_config["size"], ae_config["size"]
-    theta_val = metadata.temperature - metadata.T0
+    theta_vec = theta_coordinates(metadata.temperature, metadata.T0)
     with torch.no_grad():
         _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
         ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
@@ -925,8 +925,8 @@ def compute_causal_trajectory(run_dir: Path, steps: list[int], ae,
         frames = [load.read_phi_half(run_dir / load.snapshot_filename(s), nx, ny)
                    for s in (prev_step, steps[0])]
         x = torch.stack([torch.from_numpy(f) for f in frames]).unsqueeze(1).to(device)
-        theta_encode = torch.full((2, 1), theta_val, dtype=torch.float32,
-                                   device=device)
+        theta_encode = torch.tensor(theta_vec, dtype=torch.float32,
+                                   device=device).expand(2, -1)
         encoded = ae_encoder(x, theta=theta_encode)[recon_stream_name]
         z0_prev, z0_t = encoded[0:1], encoded[1:2]
 
@@ -954,7 +954,7 @@ def compute_trajectory(run_dir: Path, steps: list[int], ae, f_theta,
     """
     metadata = load.read_metadata(run_dir / "metadata.txt")
     nx, ny = ae_config["size"], ae_config["size"]
-    theta_val = metadata.temperature - metadata.T0
+    theta_vec = theta_coordinates(metadata.temperature, metadata.T0)
     real_frames = [load.read_phi_half(run_dir / load.snapshot_filename(s), nx, ny)
                     for s in steps]
     dt_per_step = [(steps[i + 1] - steps[i]) * metadata.dt
@@ -967,13 +967,13 @@ def compute_trajectory(run_dir: Path, steps: list[int], ae, f_theta,
                       else ae.decoder)
         x_all = torch.stack([torch.from_numpy(f) for f in real_frames]
                              ).unsqueeze(1).to(device)
-        theta_encode = torch.full((len(steps), 1), theta_val,
-                                   dtype=torch.float32, device=device)
+        theta_encode = torch.tensor(theta_vec,
+                                   dtype=torch.float32, device=device).expand(len(steps), -1)
         encoded = ae_encoder(x_all, theta=theta_encode)
         z0_t = encoded[recon_stream_name][0:1]
         z1_sequence = encoded["deriv"].unsqueeze(0)
         dts = torch.tensor([dt_per_step], dtype=torch.float32, device=device)
-        theta = torch.tensor([[theta_val]], dtype=torch.float32, device=device)
+        theta = torch.tensor([theta_vec], dtype=torch.float32, device=device)
 
         z0_hat_full = f_theta.rollout(z0_t, z1_sequence, dts, theta,
                                        z1_resync=z1_resync)

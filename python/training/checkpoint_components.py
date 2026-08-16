@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 
 from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
-from models.constants import LATENT_SPATIAL_SIZE
+from models.constants import LATENT_SPATIAL_SIZE, N_THETA
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import (
@@ -555,7 +555,7 @@ def build_ae_from_checkpoint(
     if is_flat_checkpoint:
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
                            base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
-                           n_theta=1)
+                           n_theta=N_THETA)
         decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
                            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
@@ -570,7 +570,7 @@ def build_ae_from_checkpoint(
     elif decoder_for_stream is None:
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
                            base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
-                           n_theta=1)
+                           n_theta=N_THETA)
         decoder = Decoder(output_size=model_cfg["size"], out_channels=1,
                            base_channels=model_cfg["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
@@ -579,7 +579,7 @@ def build_ae_from_checkpoint(
     else:
         encoder = Encoder(input_size=model_cfg["size"], in_channels=1,
                            base_channels=model_cfg["base_channels"], stream_configs=stream_configs,
-                           n_theta=1)
+                           n_theta=N_THETA)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             stream_cfg = stream_configs[stream_name]

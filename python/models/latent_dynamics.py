@@ -4,6 +4,8 @@ evolves over time, given z1 (the derivative stream) as a known input at
 every step -- without solving the discretized phase-field PDE.
 """
 
+from models.constants import N_THETA
+
 import math
 
 import torch
@@ -115,7 +117,7 @@ class LatentDynamics(nn.Module):
     only one output to produce.
     """
 
-    def __init__(self, latent_channels: int, n_theta: int = 1,
+    def __init__(self, latent_channels: int, n_theta: int = N_THETA,
                  latent_spatial: int = LATENT_SPATIAL_SIZE, hidden_dim: int = 256,
                  n_hidden_layers: int = 2, dt_cap: float = float("inf"),
                  n_substeps: int = 1, alpha: float | None = None,

@@ -14,6 +14,7 @@ from training.datasets import (
     MicrostructureEvolutionDataset, MicrostructureSnapshotDataset,
 )
 from models.latent_streams import DEFAULT_STREAM_NAME
+from models.constants import N_THETA
 
 
 def test_cached_mode_window_shape(tmp_run_dir, fake_encoder):
@@ -26,7 +27,7 @@ def test_cached_mode_window_shape(tmp_run_dir, fake_encoder):
     window, dt_window, theta = ds[0]
     assert window.shape == (3, 4, 8, 8)  # (window_length, latent_channels, 8, 8)
     assert dt_window.shape == (2,)
-    assert theta.shape == (1,)
+    assert theta.shape == (N_THETA,)
 
 
 def test_raw_mode_window_shape(tmp_run_dir):
@@ -39,7 +40,7 @@ def test_raw_mode_window_shape(tmp_run_dir):
     window, dt_window, theta = ds[0]
     assert window.shape == (3, 1, 64, 64)  # (window_length, 1, ny, nx) -- raw, unencoded
     assert dt_window.shape == (2,)
-    assert theta.shape == (1,)
+    assert theta.shape == (N_THETA,)
 
 
 def test_raw_mode_values_match_real_files(tmp_run_dir):
