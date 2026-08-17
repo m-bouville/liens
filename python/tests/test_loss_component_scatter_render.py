@@ -430,8 +430,13 @@ def test_components_are_laid_out_as_a_lower_triangle(monkeypatch, tmp_path):
                     f"transpose -- and should be hidden"
                 )
             else:
-                assert panel.get_xlabel() == names[c]
-                assert panel.get_ylabel() == names[r + 1]
+                assert panel.get_visible()
+                # labels live on the margins only (see the dedicated test);
+                # here just assert the margins carry the RIGHT names
+                if r == 2:
+                    assert panel.get_xlabel() == names[c]
+                if c == 0:
+                    assert panel.get_ylabel() == names[r + 1]
 
 
 def test_every_pair_appears_exactly_once(monkeypatch, tmp_path):
@@ -440,7 +445,11 @@ def test_every_pair_appears_exactly_once(monkeypatch, tmp_path):
     for names in (["a", "b"], ["a", "b", "c"], ["a", "b", "c", "d"],
                    ["a", "b", "c", "d", "e"]):
         ax = _grid(monkeypatch, names, tmp_path)
-        seen = [(ax[r][c].get_xlabel(), ax[r][c].get_ylabel())
+        # Read the pairing from the GRID POSITION, not the axis labels:
+        # interior panels deliberately carry no label text (corner-plot
+        # convention), so labels identify only the margins. Position is the
+        # structural fact -- row r is y=names[r+1], column c is x=names[c].
+        seen = [(names[c], names[r + 1])
                 for r in range(ax.shape[0]) for c in range(ax.shape[1])
                 if ax[r][c].get_visible()]
         expected = {(names[i], names[j])
@@ -454,3 +463,175 @@ def test_a_single_component_draws_nothing(tmp_path):
     written empty."""
     from utils.plots import loss_component_scatter
     assert loss_component_scatter([1, 2], _hist(["only"]), tmp_path / "s.png") is None
+
+
+def test_all_axes_share_one_square_range_for_45deg_iso_lines(monkeypatch, tmp_path):
+    """
+    Every axis of every panel uses ONE shared [lo, hi], computed as the
+    proportional limits over ALL scaled components at once (min over all
+    vars, max over all vars). This is what makes the iso-total line x+y=c
+    render at 45 deg and panels directly comparable: an iso-line is only a
+    45-deg VISUAL line when both axes cover the same interval per unit
+    length. (Superseded the former per-axis proportional fit, which tilted
+    the iso-lines flat whenever two components differed in magnitude -- the
+    reported near-horizontal-iso-line bug. The trade-off, deliberately
+    accepted: a narrow-spread component sharing the plot with a wide-spread
+    one no longer fills its own axis; its small motion is a small motion,
+    read against the common scale rather than magnified.)
+    """
+    import matplotlib.pyplot as plt
+    from utils.plots import loss_component_scatter
+
+    captured = {"axes": []}
+    original = plt.subplots
+
+    def spy(*args, **kwargs):
+        fig, ax = original(*args, **kwargs)
+        captured["axes"].append(ax)
+        return fig, ax
+
+    monkeypatch.setattr(plt, "subplots", spy)
+    # three components with very different magnitudes -- recon0 ~1, stats0
+    # ~0.44 (both narrow), deriv spanning 1..70 (wide), like a real 2a run.
+    hist = {
+        "recon0": {"train": [1.06, 1.03], "val": [1.06, 1.03], "best_so_far": [1.06, 1.03]},
+        "stats0": {"train": [0.44, 0.44], "val": [0.44, 0.44], "best_so_far": [0.44, 0.44]},
+        "deriv":  {"train": [70.0, 1.06], "val": [70.0, 1.06], "best_so_far": [70.0, 1.06]},
+    }
+    loss_component_scatter([1, 2], hist, tmp_path / "s.png")
+    grid = captured["axes"][0]
+    n = grid.shape[0]
+
+    # collect every visible panel's x and y limits
+    seen = []
+    for r in range(n):
+        for c in range(n):
+            ax = grid[r][c]
+            if not ax.get_visible():
+                continue
+            seen.append((ax.get_xlim(), ax.get_ylim()))
+    assert seen, "no visible panels"
+
+    ref_x, ref_y = seen[0]
+    for xlim, ylim in seen:
+        # x range == y range on every panel (square)
+        assert xlim == pytest.approx(ylim, rel=1e-9), (
+            f"axis not square: xlim={xlim} ylim={ylim}")
+        # and identical across every panel (shared)
+        assert xlim == pytest.approx(ref_x, rel=1e-9), (
+            f"x range differs across panels: {xlim} vs {ref_x}")
+        assert ylim == pytest.approx(ref_y, rel=1e-9), (
+            f"y range differs across panels: {ylim} vs {ref_y}")
+
+    # the shared range must actually span the global data (min ~0.44 .. max ~70),
+    # not be fitted to any single component
+    lo, hi = ref_x
+    assert lo < 0.44 and hi > 70.0, (
+        f"shared range [{lo:.3f}, {hi:.3f}] does not enclose all components "
+        f"(expected to span the global min 0.44 and max 70.0)")
+
+
+def test_only_the_margins_carry_axis_labels(monkeypatch, tmp_path):
+    """Corner-plot convention: a column shares its x quantity and a row its
+    y, so interior labels are pure clutter. In a lower triangle the margins
+    are exactly the last row and the first column."""
+    names = ["recon0", "stats0", "deriv", "interp"]
+    ax = _grid(monkeypatch, names, tmp_path)
+    n = ax.shape[0]
+    for r in range(n):
+        for c in range(r + 1):
+            panel = ax[r][c]
+            assert bool(panel.get_xlabel()) == (r == n - 1), (r, c, "xlabel")
+            assert bool(panel.get_ylabel()) == (c == 0), (r, c, "ylabel")
+
+
+def test_proportional_limits_handles_a_single_value():
+    """One point has zero spread; the floor must keep the limits from
+    collapsing to a singular range."""
+    from utils.plots import _proportional_limits
+    lo, hi = _proportional_limits([2.0])
+    assert lo < 2.0 < hi
+    lo, hi = _proportional_limits([2.0, 2.0])
+    assert lo < 2.0 < hi
+
+
+def test_ref_components_drawn_as_purple_circle(monkeypatch, tmp_path):
+    """
+    ref_components (the pre-run baseline -- the log's 'ref|' line) is drawn as
+    a purple open circle on every panel, so the run's trajectory reads
+    RELATIVE to where it resumed from, not just relative to its own epoch 1.
+    Also: the ref point joins the shared-range computation, so it is always
+    in-frame (a baseline drawn off the axes would be worse than none).
+    """
+    import matplotlib.pyplot as plt
+    from utils.plots import loss_component_scatter
+
+    captured = {}
+    original = plt.subplots
+
+    def spy(*a, **k):
+        fig, ax = original(*a, **k)
+        captured["ax"] = ax
+        return fig, ax
+
+    monkeypatch.setattr(plt, "subplots", spy)
+    hist = {
+        "recon0": {"train": [0.9, 0.8], "val": [0.73, 0.68], "best_so_far": [0.73, 0.68]},
+        "deriv":  {"train": [0.43, 0.87], "val": [0.44, 0.73], "best_so_far": [0.44, 0.44]},
+    }
+    # ref recon0 is LARGER than any plotted recon0 -> it also exercises the
+    # "ref must widen the shared range to stay in-frame" path.
+    ref = {"recon0": 1.03, "deriv": 0.47}
+    loss_component_scatter([1, 2], hist, tmp_path / "c.png", ref_components=ref)
+
+    grid = captured["ax"]
+    purple_pts = []
+    for row in grid:
+        for ax in row:
+            if not ax.get_visible():
+                continue
+            for coll in ax.collections:
+                ec = coll.get_edgecolors()
+                if len(ec) and abs(ec[0][0] - 0.5804) < 0.03 and abs(ec[0][2] - 0.7412) < 0.03:
+                    off = coll.get_offsets()
+                    if len(off):
+                        purple_pts.append(tuple(off[0]))
+    assert purple_pts, "no purple ref circle drawn on any panel"
+    # the ref point sits at (ref[name_x], ref[name_y]); for the recon0-vs-deriv
+    # panel that is (1.03, 0.47) in some axis order
+    got = purple_pts[0]
+    assert (abs(got[0] - 1.03) < 1e-6 and abs(got[1] - 0.47) < 1e-6) or \
+           (abs(got[0] - 0.47) < 1e-6 and abs(got[1] - 1.03) < 1e-6), \
+        f"purple circle not at the ref coordinates: {got}"
+
+    # and it is IN-FRAME on that panel (range widened to include it)
+    for row in grid:
+        for ax in row:
+            if ax.get_visible() and ax.collections:
+                lo, hi = ax.get_xlim()
+                assert lo <= 1.03 <= hi, f"ref x=1.03 out of frame [{lo},{hi}]"
+                break
+
+
+def test_ref_components_none_is_a_no_op(monkeypatch, tmp_path):
+    """No ref_components (the default) draws no purple circle and does not
+    error -- the feature is purely additive."""
+    import matplotlib.pyplot as plt
+    from utils.plots import loss_component_scatter
+
+    captured = {}
+    original = plt.subplots
+    monkeypatch.setattr(plt, "subplots",
+                        lambda *a, **k: (lambda fg, ax: (captured.__setitem__("ax", ax), (fg, ax))[1])(*original(*a, **k)))
+    hist = {
+        "recon0": {"train": [0.9, 0.8], "val": [0.73, 0.68], "best_so_far": [0.73, 0.68]},
+        "deriv":  {"train": [0.43, 0.87], "val": [0.44, 0.73], "best_so_far": [0.44, 0.44]},
+    }
+    loss_component_scatter([1, 2], hist, tmp_path / "c.png")  # no ref
+    for row in captured["ax"]:
+        for ax in row:
+            for coll in ax.collections:
+                ec = coll.get_edgecolors()
+                if len(ec):
+                    assert not (abs(ec[0][0] - 0.5804) < 0.03 and abs(ec[0][2] - 0.7412) < 0.03), \
+                        "purple circle drawn when ref_components was None"

@@ -1232,6 +1232,28 @@ def _build_and_save_figures(
         _coverage_report["dropped"] += int((~keep).sum())
         return unique_x[keep], mean_signed[keep], mean_abs[keep], n[keep]
 
+    def _ylim_from_below_cutoff(xy_curves, dt_cutoff, fallback):
+        """y-range from only the points with dt < dt_cutoff, across the given
+        (x_array, y_array) curves. Points at/above the cutoff are the
+        converged regime, where error/dt is meaningless (dz0 -> 0) and would
+        blow the range up; they stay plotted but do not set the limits.
+        Falls back to the passed-in (lo, hi) if nothing is below the cutoff
+        (e.g. cutoff is inf because no convergence was detected)."""
+        vals = []
+        for xs, ys in xy_curves:
+            xs = np.asarray(xs, dtype=float)
+            ys = np.asarray(ys, dtype=float)
+            m = np.isfinite(xs) & np.isfinite(ys) & (xs < dt_cutoff)
+            vals.extend(ys[m].tolist())
+        if not vals:
+            return fallback
+        lo, hi = min(vals), max(vals)
+        if lo == hi:            # single value / degenerate -> keep fallback span around it
+            return fallback
+        pad = 0.05 * (hi - lo)
+        return lo - pad, hi + pad
+
+
     # left=10 was correct for raw dt (whose smallest value on this sweep
     # is ~25) and badly wrong for dt/tau, which reaches ~1e-2 -- it
     # clipped away all but the top decade. Data-driven when
@@ -1407,6 +1429,57 @@ def _build_and_save_figures(
           results.euler_losses / results.dts)
     dt_signed_13, dt_abs_13 = dt_signed_13 * _DT_PANEL_SCALE, dt_abs_13 * _DT_PANEL_SCALE
 
+    # Saturation cutoff for the LEFT-column (signed / |error|) y-range.
+    # Past the point where the field has converged, dz0 -> 0, so error/dt
+    # (which divides by a vanishing displacement) explodes to meaningless
+    # values that, if left to set the y-range, crush the real signal into a
+    # thin band. mean|dz0| vs dt has a SHARP cliff at convergence (see the
+    # 'mean|dz0| vs dt' panel: flat, then a ~1.5-decade drop), so 'below a
+    # third of its max' cleanly locates it -- the threshold is robust because
+    # almost nothing lands between the plateau and the floor. dt AT or ABOVE
+    # this cutoff is excluded from the y-range computation only; the values
+    # are still plotted (they go off-chart) and x_lim is untouched, so all
+    # panels keep the same dt range.
+    # Cutoff computed from the RAW dz0 displacement binned by dt -- NOT via
+    # _grp, whose per-run coverage filter drops exactly the sparse high-dt
+    # bins where convergence lives, which would hide the cliff and leave the
+    # cutoff at inf (no effect). Bin raw |dz0| by the same dt bins the panels
+    # use, take each bin's mean, and find the first dt where that mean has
+    # dropped below a third of its plateau max.
+    _sat_dt_cutoff = float("inf")
+    _dz0_binx = _px(_dt_x)
+    _raw_dz0abs = np.asarray(results.dz0_abs, dtype=float)
+    _uniq_dt = np.unique(_dz0_binx[np.isfinite(_dz0_binx)])
+    if len(_uniq_dt):
+        _dz0_bin_means = np.array([
+            np.nanmean(_raw_dz0abs[_dz0_binx == u]) if np.any(_dz0_binx == u) else np.nan
+            for u in _uniq_dt])
+        _finite = np.isfinite(_dz0_bin_means)
+        if _finite.any():
+            _dz0max = float(np.nanmax(_dz0_bin_means[_finite]))
+            # The peak's own index: mean|dz0| RISES from a small value at the
+            # shortest dt (little displacement in little time), plateaus, then
+            # CLIFFS at convergence. 'Below a third of max' is true at BOTH
+            # ends -- the rising left edge and the converged right edge -- so
+            # scanning from dt=0 catches the left edge (wrong: that is early,
+            # well-resolved data). Anchor at the peak and take the first
+            # sub-threshold bin to the RIGHT of it: that is the convergence
+            # cliff.
+            _peak_idx = int(np.nanargmax(np.where(_finite, _dz0_bin_means, -np.inf)))
+            _after_peak = np.arange(len(_dz0_bin_means)) > _peak_idx
+            _below = np.where(_finite & _after_peak
+                              & (_dz0_bin_means < _dz0max / 3.0))[0]
+            if len(_below):
+                _sat_dt_cutoff = float(_uniq_dt[_below[0]])
+    if np.isfinite(_sat_dt_cutoff):
+        print(f"left-column y-range: excluding dt >= {_sat_dt_cutoff:.4g} "
+              f"(mean|dz0| fell below 1/3 of its max -> converged, error/dt "
+              f"there is meaningless); values still plotted, x-range unchanged")
+    else:
+        print("left-column y-range: no dz0 convergence cliff detected "
+              "(mean|dz0| never drops below 1/3 of its max within the dt range) "
+              "-- y-range uses all data, unchanged")
+
     # Regression curve overlay: eps/eps'/A are SHARED (the joint fit's
     # own point, or the only fit there is under euler_only=True); C is
     # ALWAYS the euler-only-specific coefficient (present in both fit
@@ -1519,7 +1592,20 @@ def _build_and_save_figures(
     # so it's included in this lock deliberately -- if it's large enough
     # to widen the range, that's the actual finding, not something to
     # hide by locking the range before plotting it.
-    ax_signed.set_ylim(ax_signed.get_ylim())
+    # EXCLUDE the converged regime (dt >= _sat_dt_cutoff): there dz0 -> 0
+    # so error/dt is meaningless and would blow up the range. Those points
+    # stay plotted (off-chart), x_lim is untouched. Range from EVERY curve on
+    # the panel (trivial, euler, and full/causal/oracle), not euler alone --
+    # exclude large dt, exclude no curve.
+    _sig_range_curves = [(dt_x, dt_trivial_signed), (dt_x_13, dt_signed_13)]
+    if oracle_curves is None:
+        _sig_range_curves.append((dt_x, dt_signed))
+    else:
+        _sig_range_curves += [(oracle_curves["x"], oracle_curves["causal_signed"]),
+                              (oracle_curves["x"], oracle_curves["oracle_signed"])]
+    _sig_lo, _sig_hi = _ylim_from_below_cutoff(
+        _sig_range_curves, _sat_dt_cutoff, ax_signed.get_ylim())
+    ax_signed.set_ylim(_sig_lo, _sig_hi)
 
     # |error| is strictly a magnitude, so it belongs on a LOG y-axis --
     # the curves span 3+ decades here (a trivial-baseline floor near 1e-2
@@ -1584,6 +1670,40 @@ def _build_and_save_figures(
     # log scale, NOT set_ylim(bottom=0) -- 0 is not representable on a log
     # axis, and matplotlib would silently clip to its own positive floor.
     _log_scale_if_positive(ax_abs, "y")
+    # The converged tail affects this LOG magnitude panel at the BOTTOM, not
+    # the top: as dz0/dt -> 0 the accurate curves (causal/oracle) underflow
+    # toward ~1e-4, which would drag y_MIN down and crush the real structure
+    # into the top of the axis. So the cutoff governs y_MIN only -- exclude
+    # dt >= cutoff from the lower bound -- while y_MAX comes from ALL data
+    # (every curve, every dt): the euler curve actually CLIMBS at long dt and
+    # that rise is real, in-frame signal. Range over every curve (exclude no
+    # curve), split by which bound the cutoff applies to.
+    _abs_range_curves = [(dt_x, dt_trivial_abs), (dt_x_13, dt_abs_13)]
+    if oracle_curves is None:
+        _abs_range_curves.append((dt_x, dt_abs))
+    else:
+        _abs_range_curves += [(oracle_curves["x"], oracle_curves["causal_abs"]),
+                              (oracle_curves["x"], oracle_curves["oracle_abs"])]
+    # y_min: the smallest POSITIVE sub-cutoff value across all curves, with
+    # multiplicative padding (this is a log axis -- additive padding can go
+    # non-positive and is invalid). The underflowing converged tail (dt >=
+    # cutoff) is excluded, so it cannot drag the floor down.
+    _abs_sub_vals = []
+    for _cx, _cy in _abs_range_curves:
+        _cx = np.asarray(_cx, float); _cy = np.asarray(_cy, float)
+        _m = np.isfinite(_cx) & np.isfinite(_cy) & (_cx < _sat_dt_cutoff) & (_cy > 0)
+        _abs_sub_vals.extend(_cy[_m].tolist())
+    _abs_lo = min(_abs_sub_vals) / 1.3 if _abs_sub_vals else ax_abs.get_ylim()[0]
+    # y_max: from ALL data, all dt (the long-dt euler climb is real signal)
+    _all_abs_vals = []
+    for _cx, _cy in _abs_range_curves:
+        _cy = np.asarray(_cy, float)
+        _all_abs_vals.extend(_cy[np.isfinite(_cy) & (_cy > 0)].tolist())
+    _abs_hi = max(_all_abs_vals) * 1.1 if _all_abs_vals else ax_abs.get_ylim()[1]
+    if _abs_hi > 0:
+        _cur_lo, _cur_hi = ax_abs.get_ylim()
+        _new_lo = _abs_lo if _abs_lo > 0 else _cur_lo
+        ax_abs.set_ylim(_new_lo, _abs_hi)
 
     # Regression curves, SIGNED panel only -- still no equivalent shown
     # on the absolute panel; abs() of this same curve tracks E[signed

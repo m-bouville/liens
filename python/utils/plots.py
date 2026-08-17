@@ -308,9 +308,24 @@ def loss_curve(
     return output_path
 
 
+def _proportional_limits(values: list[float], exponent: float = 0.15,
+                          floor: float = 1.05) -> tuple[float, float]:
+    """(lo, hi) log-axis limits padded by a fraction of the data's OWN span.
+
+    Returns limits such that the data occupies a roughly constant fraction
+    of a LOG axis regardless of how tight or wide it is -- measured at
+    51-77% across spans from 1.1x to 100x, against 10-83% for a fixed
+    ratio. All values must be positive (the caller checks).
+    """
+    lo, hi = min(values), max(values)
+    pad = max((hi / lo) ** exponent, floor) if lo > 0 and hi > lo else floor
+    return lo / pad, hi * pad
+
+
 def loss_component_scatter(
     epoch_history: list[int], component_histories: dict[str, dict[str, list[float]]],
     output_path: Path, title: str = "",
+    ref_components: dict[str, float] | None = None,
 ) -> Path | None:
     """
     Companion to loss_curve(): for a COMPOSITE loss (total = sum of
@@ -386,9 +401,36 @@ def loss_component_scatter(
             if c > r:
                 axes[r][c].set_visible(False)
 
-    pairs = [(names[c], names[r + 1], axes[r][c])
+    pairs = [(names[c], names[r + 1], axes[r][c], r, c)
              for r in range(n) for c in range(r + 1)]
-    for name_x, name_y, ax in pairs:
+
+    # ONE shared range for every axis of every panel, computed over ALL
+    # components at once -- max(over all scaled vars) and min(over all scaled
+    # vars). The components are already the WEIGHTED, SCALE-NORMALIZED
+    # contributions (they sum to the total), so they are directly comparable
+    # in magnitude and belong on a common scale. Per-axis auto-scaling
+    # (each axis fitted to its own variable's spread) was the bug behind the
+    # near-horizontal iso-total lines: an iso-total x + y = c is only a 45-deg
+    # visual line when both axes cover the same interval per unit length. With
+    # recon0 spanning ~1-1.06 and deriv ~1-675 on their OWN axes, the shared
+    # x+y=c line tilted flat. A single square range fixes that: the iso-lines
+    # render at 45 deg and panels become directly comparable to each other.
+    _all_positive = [v
+                     for comp in component_histories.values()
+                     for series in ("train", "val", "best_so_far")
+                     for v in comp[series]
+                     if math.isfinite(v) and v > 0]
+    # the ref (pre-run baseline) point must be in-frame too, so its component
+    # values join the shared-range computation.
+    if ref_components:
+        _all_positive += [v for v in ref_components.values()
+                          if isinstance(v, (int, float)) and math.isfinite(v) and v > 0]
+    if _all_positive:
+        global_lo, global_hi = _proportional_limits(_all_positive)
+    else:
+        global_lo, global_hi = 0.0, 1.0
+
+    for name_x, name_y, ax, row, col in pairs:
         cx, cy = component_histories[name_x], component_histories[name_y]
 
         # best_so_far is DASHED, and that is not decoration. It coincides
@@ -422,6 +464,22 @@ def loss_component_scatter(
                 ax.scatter([x[-1]], [y[-1]], s=90, marker="*", color=color,
                            edgecolors="black", linewidths=0.5, zorder=5)
 
+        # The REF point: the pre-run baseline (the log's "ref|" line -- the
+        # ancestor's component values before this run's epoch 1). Drawn as a
+        # purple circle so the run's trajectory is legible RELATIVE to where it
+        # started from the resumed checkpoint, not just relative to its own
+        # first epoch. Only drawn when both this panel's components are present
+        # and positive (log axes).
+        if ref_components is not None:
+            rx = ref_components.get(name_x)
+            ry = ref_components.get(name_y)
+            if (rx is not None and ry is not None
+                    and math.isfinite(rx) and math.isfinite(ry)
+                    and rx > 0 and ry > 0):
+                ax.scatter([rx], [ry], s=110, marker="o", facecolors="none",
+                           edgecolors="tab:purple", linewidths=2.0, zorder=6,
+                           label="ref (pre-run)")
+
         # FINITE values only, everywhere below. An epochs=0 ablation never
         # iterates the train set, so every train component is NaN -- and while
         # `v > 0` already excludes NaN from `positive_x`, the fallback branch
@@ -448,8 +506,14 @@ def loss_component_scatter(
         if positive_x and positive_y:
             ax.set_xscale("log")
             ax.set_yscale("log")
-            xlo, xmax = min(positive_x) / 1.6, max(positive_x) * 1.6
-            ylo, ymax = min(positive_y) / 1.6, max(positive_y) * 1.6
+            # SHARED square range on both axes (see the global computation
+            # above): same [lo, hi] for x and y so the iso-total line renders
+            # at 45 deg and every panel is on the same scale. This replaces
+            # the former per-axis _proportional_limits(positive_x/positive_y),
+            # which fitted each axis to its own variable and tilted the
+            # iso-lines flat whenever the two components differed in magnitude.
+            xlo, xmax = global_lo, global_hi
+            ylo, ymax = global_lo, global_hi
         else:
             ax.set_xlim(left=0)
             ax.set_ylim(bottom=0)
@@ -458,9 +522,11 @@ def loss_component_scatter(
             # scale to: an axes holding only NaN points reports non-finite
             # limits, and feeding those straight back into set_xlim raises.
             # `or 1.0` covers all-zero components too (every term inactive):
-            # max()*1.1 is then 0, and set_xlim(0, 0) is singular.
-            xmax = (max(all_x) * 1.1 if all_x else 0.0) or 1.0
-            ymax = (max(all_y) * 1.1 if all_y else 0.0) or 1.0
+            # max()*1.1 is then 0, and set_xlim(0, 0) is singular. Shared
+            # across x and y (a single max over BOTH) to keep the axes square
+            # even on this degenerate branch, consistent with the log branch.
+            _fallback_max = (max(all_x + all_y) * 1.1 if (all_x or all_y) else 0.0) or 1.0
+            xmax = ymax = _fallback_max
 
         for c in _iso_total_levels(all_x, all_y):
             if ax.get_xscale() == "log":
@@ -482,9 +548,31 @@ def loss_component_scatter(
                             linewidth=0.8, zorder=1)
         ax.set_xlim(xlo if xlo else 0, xmax)
         ax.set_ylim(ylo if ylo else 0, ymax)
-        ax.set_xlabel(name_x)
-        ax.set_ylabel(name_y)
-        if ax is pairs[0][2]:
+        # Corner-plot convention: label only the MARGINS. Every panel in a
+        # column has the same x quantity and every panel in a row the same
+        # y, so repeating labels and tick text in the interior is pure
+        # clutter -- and on a log axis with a narrow range matplotlib
+        # labels every MINOR tick, which overprinted into an unreadable
+        # smear ("1.2x10 1.4x10 1.6x10..."). Interior panels keep their
+        # ticks (the grid still reads) but lose the text.
+        # In a lower triangle column `col` is visible for every row >= col,
+        # so its bottom-most visible panel is ALWAYS the last row; and row
+        # `row` starts at column 0. Hence the margins are exactly
+        # row == n-1 and col == 0.
+        if row == n - 1:
+            ax.set_xlabel(name_x)
+        else:
+            ax.tick_params(labelbottom=False)
+        if col == 0:
+            ax.set_ylabel(name_y)
+        else:
+            ax.tick_params(labelleft=False)
+        # Minor-tick text off on log axes: majors (decades) stay labelled.
+        if ax.get_xscale() == "log":
+            ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+        if ax.get_yscale() == "log":
+            ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+        if (row, col) == (0, 0):
             # "best", not a fixed corner. These trajectories head toward the
             # origin, so they occupy the LOWER-LEFT... except early in a run,
             # when every point is still up and to the right and a hardcoded

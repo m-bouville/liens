@@ -1185,3 +1185,149 @@ def test_stage2a_raises_on_a_linear_deriv_head(tmp_path, isolated_project_root):
     assert out.exists()
     cfg = torch.load(out, map_location="cpu", weights_only=True)["stage2_config"]
     assert cfg["stage2a"] is True
+
+
+@pytest.mark.slow
+def test_spike_guard_is_constructed_and_consulted_when_factor_set(
+        tmp_path, isolated_project_root, monkeypatch):
+    """
+    spike_skip_factor must reach a real _SpikeGuard AND that guard must be
+    consulted every train batch -- proving the guard is WIRED into stage 2's
+    training loop (stage 2 previously had none). Testing the SKIP outcome
+    end-to-end is not possible in a toy run: _SpikeGuard.should_skip returns
+    False until it has seen min_history (50) batches in a band, and a small
+    test never reaches that (the 'toy regime cannot exhibit the behavior'
+    trap). So we assert the wiring directly: the factor is passed to the
+    constructor, and should_skip is called at least once per training batch.
+    With factor 0.0 (default) NO guard is constructed -- the negative half of
+    the contract, covered by every other stage-2 test's unchanged path.
+    """
+    import training.train_stage2 as ts
+
+    seen = {"factor": None, "should_skip_calls": 0}
+    real_init = ts._SpikeGuard.__init__
+
+    def spy_init(self, factor, *a, **k):
+        seen["factor"] = factor
+        real_init(self, factor, *a, **k)
+    real_should = ts._SpikeGuard.should_skip
+
+    def spy_should(self, *a, **k):
+        seen["should_skip_calls"] += 1
+        return real_should(self, *a, **k)
+
+    monkeypatch.setattr(ts._SpikeGuard, "__init__", spy_init)
+    monkeypatch.setattr(ts._SpikeGuard, "should_skip", spy_should)
+
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, stats0_weight=0.01, epochs=1, batch_size=2,
+        num_workers=0, min_step=0, min_stdev_phi=None,
+        spike_skip_factor=7.5,
+        checkpoint_path=tmp_path / "guarded.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "c.png",
+    )
+    assert seen["factor"] == 7.5, (
+        f"spike_skip_factor did not reach _SpikeGuard (saw {seen['factor']}) "
+        f"-- guard not constructed from the parameter")
+    assert seen["should_skip_calls"] > 0, (
+        "should_skip was never called -- the guard is constructed but not "
+        "consulted in the training loop")
+
+
+@pytest.mark.slow
+def test_spike_skip_factor_wires_the_guard_and_skips(tmp_path, isolated_project_root, monkeypatch):
+    """
+    BEHAVIORAL: spike_skip_factor>0 must construct a _SpikeGuard in
+    train_stage2 and route each training batch's loss through
+    should_skip() BEFORE backward()/step(); a skipped batch must not take
+    an optimizer step. Stage 2 had no spike protection at all (unlike
+    train_lds), so a trunk-unfreezing run (trunk_from_deriv_weight>0) that
+    spiked could corrupt the checkpoint. This forces one skip and checks
+    the step was withheld.
+    """
+    import training.spike_guard as sg
+    import torch as _torch
+
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+
+    # force the guard to skip its first training-batch query, then never again
+    calls = {"skip_done": False, "n_should_skip": 0, "n_step": 0}
+
+    def fake_should_skip(self, loss_value, band=None, loss_was_ordinary=False):
+        calls["n_should_skip"] += 1
+        if not calls["skip_done"]:
+            calls["skip_done"] = True
+            return True          # skip exactly one batch
+        return False
+    monkeypatch.setattr(sg._SpikeGuard, "should_skip", fake_should_skip)
+
+    real_step = _torch.optim.Adam.step
+    def counting_step(self, *a, **k):
+        calls["n_step"] += 1
+        return real_step(self, *a, **k)
+    monkeypatch.setattr(_torch.optim.Adam, "step", counting_step)
+
+    train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, stats0_weight=0.01,
+        spike_skip_factor=10.0,          # <-- the wiring under test
+        epochs=1, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "s2_spike.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve_spike.png",
+    )
+
+    # the guard WAS consulted (wired in), and it skipped once
+    assert calls["n_should_skip"] > 0, "should_skip never called -> guard not wired into stage 2"
+    assert calls["skip_done"], "the forced skip never triggered"
+    # and there was at least one real (non-skipped) batch that DID step
+    assert calls["n_step"] > 0, "no optimizer step at all -- loop structure wrong"
+    # the skipped batch withheld its step: total should_skip queries exceed steps
+    # by at least the one we forced (each train batch is queried once; skipped
+    # ones don't step)
+    assert calls["n_should_skip"] > calls["n_step"], (
+        f"queries ({calls['n_should_skip']}) not > steps ({calls['n_step']}); "
+        "the skipped batch appears to have stepped anyway")
+
+
+def test_spike_skip_factor_zero_leaves_guard_off(tmp_path, isolated_project_root, monkeypatch):
+    """spike_skip_factor=0 (default) must NOT construct a guard: should_skip
+    is never called, so the default path is exactly the old behaviour."""
+    import training.spike_guard as sg
+
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    n = {"calls": 0}
+    real = sg._SpikeGuard.should_skip
+    monkeypatch.setattr(sg._SpikeGuard, "should_skip",
+                        lambda self, *a, **k: (n.__setitem__("calls", n["calls"] + 1), real(self, *a, **k))[1])
+
+    train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, stats0_weight=0.01,
+        # spike_skip_factor defaults to 0
+        epochs=1, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "s2_noguard.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve_noguard.png",
+    )
+    assert n["calls"] == 0, "guard consulted when spike_skip_factor=0 (should be off)"

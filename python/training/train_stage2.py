@@ -35,6 +35,7 @@ from training.datasets import VAL_DECORRELATED_AUG_INDICES, MicrostructureEvolut
 from training.losses import (ReconLoss, StatsLoss, InterpLoss, centered_deriv_target,
                               dt_weighted_deriv_loss)
 from training.stats_head import StatsHead
+from training.spike_guard import _SpikeGuard, _record_spike, difficulty_band
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
 from utils.plots import loss_component_scatter, loss_curve, write_loss_history, should_write_loss_figure
@@ -98,6 +99,7 @@ def train_stage2(
     min_std_deriv: float | None = None, augment: bool = False,
     condition_on_theta: bool | None = None,
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
+    spike_skip_factor: float = 0.0, grad_clip: float = 0.0,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
     on_checkpoint_saved: Callable[[Path, int], None] | None = None,
     n_frozen_stages: int = 0,
@@ -903,6 +905,29 @@ def train_stage2(
         params += [p for p in stats_head1.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(params, lr=lr)
 
+    # Spike guard: stage 2 had NO spike protection, unlike stage 3 (train_lds)
+    # and stages 4/5. When the trunk is trainable (trunk_from_deriv_weight>0,
+    # stage2a=False) L_deriv's gradient reaches the shared trunk and stage 2
+    # spikes like the others -- observed: train deriv 0.545 -> 11.75 in one
+    # epoch, jolting z0 (val recon0 bounced +-40%). The guard skips a batch
+    # whose loss exceeds spike_skip_factor x a running median WITHIN its
+    # difficulty band (dt_max), the same banded logic train_lds uses so
+    # legitimately-hard long-dt batches are not skipped as a block. Off by
+    # default (factor 0.0 -> no guard), matching prior stage-2 behavior; a
+    # trunk-moving run should set it (10.0 is train_lds's default).
+    #
+    # CAVEAT specific to stage 2 (not present in the stage-3 caller): when the
+    # trunk trains (2b), its BatchNorm running buffers ADVANCE on a skipped
+    # batch, because the forward pass has already run by the time the loss --
+    # the skip signal -- is known (see spike_guard.snapshot_running_stats' own
+    # docstring). No optimizer STEP is taken, but the buffers drift by one
+    # batch's momentum. For occasional spikes (1-2 batches/epoch, the design
+    # case) this is second-order versus the spike it prevents. If skipping
+    # becomes frequent it compounds -- and frequent skipping itself signals lr
+    # too high; lower lr rather than relying on the guard as a crutch. (Stage 3
+    # is immune: its encoder is frozen and LatentDynamics has no BatchNorm.)
+    spike_guard = _SpikeGuard(spike_skip_factor) if spike_skip_factor > 0 else None
+
     def step(batch, train: bool, deriv_weight_used: float, use_centered: bool = False):
         window, dt_window, theta, true_stats = batch
         window = window.to(device, non_blocking=True)
@@ -1104,8 +1129,24 @@ def train_stage2(
                  + interp_weight * interp / interp_scale)
 
         if train:
+            # Guard reads the loss BEFORE backward(): a spiked (or non-finite)
+            # loss must never reach backward()/optimizer.step(). Banded by the
+            # batch's own dt_max so hard long-dt batches are judged against
+            # their own population, not skipped as a block (see train_lds and
+            # difficulty_band). Off entirely when spike_guard is None.
+            if spike_guard is not None:
+                _band = difficulty_band(float(dt_window.detach().max()))
+                if spike_guard.should_skip(float(total.detach()), band=_band):
+                    _record_spike(spike_guard, total, dt_window, theta)
+                    optimizer.zero_grad()
+                    return (total.detach(), recon.detach(),
+                            stats_loss_val.detach(), stats1_loss_val.detach(),
+                            deriv_loss.detach(), interp.detach())
             optimizer.zero_grad()
             total.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    (p for p in ae.parameters() if p.requires_grad), grad_clip)
             optimizer.step()
 
         # Returned as GPU tensors, NOT .item()'d here -- .item() blocks
@@ -1176,6 +1217,7 @@ def train_stage2(
 
     _prev_use_centered = False  # see just_switched's own comment inside the loop below
 
+    ref_components_for_scatter = None  # populated by the pre-run baseline eval below
     if epochs > 0:
         # RNG state saved/restored around this ENTIRE block -- confirmed
         # directly (via a real A/B run) that without this, the reference
@@ -1289,6 +1331,14 @@ def train_stage2(
         }
         ref_terms = " ".join(f"+{_compact_loss(w * v / s)}" for lbl, (w, s, v) in ref_term_values.items()
                               if any(lbl == l for _, l, _ in active_terms))
+        # Retain the ref (pre-run baseline) as WEIGHTED, SCALE-NORMALIZED
+        # contributions -- the same quantity loss_component_scatter plots for
+        # every epoch -- so the scatter can mark where the run started from the
+        # resumed checkpoint (a purple circle) alongside its own trajectory.
+        ref_components_for_scatter = {"recon0": ref_recon / recon0_scale}
+        for lbl, (w, s, v) in ref_term_values.items():
+            if any(lbl == l for _, l, _ in active_terms):
+                ref_components_for_scatter[lbl] = w * v / s
         nan_terms = " ".join(f"+{_compact_loss(float('nan'))}" for lbl, (_, _, _) in ref_term_values.items()
                               if any(lbl == l for _, l, _ in active_terms))
         print(f"{'ref':>4}|"
@@ -1454,8 +1504,10 @@ def train_stage2(
         train_interp_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
+            _n_train_batches = 0
             for batch in train_loader:
                 bs = batch[0].size(0)
+                _n_train_batches += 1
                 total, recon, stats, stats1, deriv, interp_val = step(
                     batch, train=True, deriv_weight_used=effective_deriv_weight,
                     use_centered=use_centered_this_epoch)
@@ -1465,6 +1517,23 @@ def train_stage2(
                 train_stats1_sum += stats1 * bs
                 train_deriv_sum += deriv * bs
                 train_interp_sum += interp_val * bs
+            if spike_guard is not None:
+                _n_skipped = spike_guard.n_skipped_this_epoch
+                _worst = spike_guard.worst
+                _deadlocked = spike_guard.end_epoch(_n_train_batches)
+                if _n_skipped:
+                    _w = (f" worst loss {_SpikeGuard.median_display(_worst[0])} "
+                          f"(band median {_SpikeGuard.median_display(_worst[1])}, "
+                          f"dt_max={_worst[2]:.0f}, theta0={_worst[3]:.4f})"
+                          if _worst else "")
+                    print(f"  spike guard: skipped {_n_skipped}/{_n_train_batches} "
+                          f"train batch(es) this epoch (loss > {spike_skip_factor}x "
+                          f"band median).{_w}")
+                if _deadlocked:
+                    print(f"  spike guard: WARNING every train batch skipped this "
+                          f"epoch -- weights took no step. If this persists the run "
+                          f"is deadlocked (broken weights make every batch an "
+                          f"outlier); lower lr or raise spike_skip_factor.")
             train_total = (train_total_sum / n_train).item()
             train_recon = (train_recon_sum / n_train).item()
             train_stats = (train_stats_sum / n_train).item()
@@ -1572,6 +1641,7 @@ def train_stage2(
             loss_component_scatter(
                 epoch_history, component_histories, loss_components_path,
                 title="Stage 2 loss components",
+                ref_components=ref_components_for_scatter,
             )
 
         train_terms = " ".join(f"+{tw*tv/s:7.4f}" for lbl, (tw, _, s, tv, _) in term_values.items()
@@ -1776,6 +1846,7 @@ def train_stage2(
     loss_component_scatter(
         epoch_history, component_histories, loss_components_path,
         title="Stage 2 loss components",
+        ref_components=ref_components_for_scatter,
     )
 
     print("\nPer-block PARAMETER drift (L2 norm of change from stage-1 starting point):")

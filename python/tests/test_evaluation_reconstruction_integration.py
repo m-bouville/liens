@@ -596,3 +596,119 @@ def test_the_two_reductions_really_differ():
     per_window = float(np.mean(dz0 / dt))
     grouped = float(np.mean(dz0) / np.mean(dt))
     assert abs(per_window / grouped - 1.0) > 0.5
+
+
+def test_dt_dependence_left_column_yrange_excludes_converged_regime():
+    """
+    The left-column (signed / |error|) y-range of the dt_dependence figure
+    must be set from only the dt below the saturation cutoff -- the first dt
+    where mean|dz0| drops below 1/3 of its max. Past that, the field has
+    converged (dz0 -> 0), so error/dt explodes to meaningless values that,
+    if allowed to set the range, crush the real signal into a thin band.
+    The post-cutoff points are still plotted (off-chart) and x-range is
+    unchanged; only the y-range computation excludes them.
+
+    This tests the two pieces of that logic directly (they live as nested
+    helpers inside check_parameter_dependence's plotting function, so they
+    are reproduced here at the exact form used there).
+    """
+    import numpy as np
+
+    def find_cutoff(dz0x, dz0abs):
+        dz0abs = np.asarray(dz0abs, float)
+        finite = np.isfinite(dz0abs)
+        dz0max = float(np.nanmax(dz0abs[finite]))
+        # anchor at the peak, take first sub-(max/3) bin to its RIGHT (the
+        # convergence cliff), NOT the rising left edge which is also sub-1/3.
+        peak = int(np.nanargmax(np.where(finite, dz0abs, -np.inf)))
+        after = np.arange(len(dz0abs)) > peak
+        below = np.where(finite & after & (dz0abs < dz0max / 3.0))[0]
+        return float(np.asarray(dz0x)[below[0]]) if len(below) else float("inf")
+
+    def ylim_below(xy, dt_cutoff, fallback):
+        vals = []
+        for xs, ys in xy:
+            xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+            m = np.isfinite(xs) & np.isfinite(ys) & (xs < dt_cutoff)
+            vals.extend(ys[m].tolist())
+        if not vals:
+            return fallback
+        lo, hi = min(vals), max(vals)
+        if lo == hi:
+            return fallback
+        pad = 0.05 * (hi - lo)
+        return lo - pad, hi + pad
+
+    # mean|dz0|: RISES from a small value at short dt (12), climbs to a
+    # plateau (~75), then CLIFFS at convergence. The rising left edge (12) is
+    # below max/3=25 too -- the detector must NOT stop there.
+    dt = np.array([7, 25, 100, 500, 2000, 5000, 1e4, 5e4])
+    dz0 = np.array([12, 35, 75, 76, 70, 60, 1.2, 0.8])
+    cutoff = find_cutoff(dt, dz0)
+    assert cutoff == 1e4, (
+        f"cutoff should be the convergence cliff (1e4), not the rising left "
+        f"edge (7); got {cutoff}")
+
+    # signed error: modest pre-cliff, explodes post-cliff (the meaningless part)
+    # signed error, aligned with the 8-element dt above: small at the rising
+    # edge and through the plateau, then explodes post-cliff (meaningless).
+    err = np.array([0.02, 0.0, 0.1, 0.3, 0.5, 0.68, 500.0, 900.0])
+    lo, hi = ylim_below([(dt, err)], cutoff, (-1.0, 1000.0))
+    assert hi < 1.0, f"post-cliff explosion leaked into y-range (hi={hi})"
+    assert lo < 0.1, f"pre-cliff minimum not captured (lo={lo})"
+
+    # no convergence detected -> cutoff inf -> all data used (fallback semantics)
+    lo2, hi2 = ylim_below([(dt, err)], float("inf"), (-5.0, 5.0))
+    assert hi2 > 900, "an inf cutoff must include every point"
+
+    # RANGE MUST SPAN ALL CURVES, not just euler-only: a second curve (causal)
+    # dips below euler's floor, and the range has to reach it. Excluding large
+    # dt, but excluding no curve.
+    euler = np.array([0.10, 0.12, 0.15, 0.30, 0.50, 0.68, 500.0, 900.0])
+    causal = np.array([0.01, 0.02, -0.05, 0.05, 0.03, 0.02, 400.0, 800.0])  # dips to -0.05, below euler
+    lo_all, _ = ylim_below([(dt, euler), (dt, causal)], cutoff, (-1.0, 1000.0))
+    lo_euler, _ = ylim_below([(dt, euler)], cutoff, (-1.0, 1000.0))
+    assert lo_all < lo_euler, (
+        f"range from all curves ({lo_all}) must reach below euler-only's floor "
+        f"({lo_euler}) -- the causal curve dips lower and must not be clipped")
+    # the -0.05 causal point (pre-cliff) must be inside the range
+    assert lo_all <= -0.05 + 1e-9, "range does not reach the lowest pre-cliff causal point"
+    # |error| PANEL (log magnitude) -- the cutoff governs a DIFFERENT bound
+    # than on the signed panel. The converged tail here UNDERFLOWS (accurate
+    # curves -> ~0 as the field stops moving), dragging y_MIN down; meanwhile
+    # the euler curve CLIMBS at long dt and that rise is real. So:
+    #   y_min: from sub-cutoff data only (underflow excluded)
+    #   y_max: from ALL data (the long-dt climb kept)
+    def abs_bounds(curves, dt_cutoff):
+        # y_min from below-cutoff, with the real code's positivity guard: on a
+        # log axis a non-positive padded lower edge is invalid, so fall back.
+        lo, _ = ylim_below(curves, dt_cutoff, (1e-9, 1.0))
+        if lo <= 0:
+            # fall back to the smallest positive pre-cutoff value itself
+            subvals = []
+            for xs, ys in curves:
+                xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+                m = np.isfinite(xs) & np.isfinite(ys) & (xs < dt_cutoff) & (ys > 0)
+                subvals.extend(ys[m].tolist())
+            lo = min(subvals) if subvals else 1e-9
+        # y_max from all positive data
+        allv = []
+        for xs, ys in curves:
+            ys = np.asarray(ys, float)
+            allv.extend(ys[np.isfinite(ys) & (ys > 0)].tolist())
+        hi = max(allv) * 1.1 if allv else 1.0
+        return lo, hi
+
+    dt_abs = np.array([7, 25, 100, 500, 2000, 5000, 1e4, 5e4])
+    abs_cutoff = 1e4
+    # euler: mid-range, CLIMBS at the largest dt (2.06) -- must set y_max
+    euler_abs = np.array([2.2, 1.9, 1.3, 1.0, 1.1, 1.5, 1.8, 2.06])
+    # causal: underflows in the converged tail (1e-4) -- must NOT set y_min
+    causal_abs = np.array([0.9, 0.6, 0.3, 0.05, 0.01, 0.001, 1e-4, 5e-5])
+    lo_ab, hi_ab = abs_bounds([(dt_abs, euler_abs), (dt_abs, causal_abs)], abs_cutoff)
+    # y_max includes the long-dt euler climb (>= 2.06)
+    assert hi_ab >= 2.06, f"y_max ({hi_ab}) must include the long-dt euler climb 2.06"
+    # y_min excludes the converged-tail underflow (1e-4, 5e-5 at dt >= cutoff)
+    assert lo_ab > 1e-4, f"y_min ({lo_ab}) must exclude the post-cutoff underflow (1e-4)"
+    # but y_min still reaches the lowest PRE-cutoff causal point (0.001 at dt=5000)
+    assert lo_ab <= 0.001 + 1e-6, f"y_min ({lo_ab}) must reach the pre-cutoff causal floor 0.001"
