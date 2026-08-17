@@ -635,3 +635,61 @@ def test_ref_components_none_is_a_no_op(monkeypatch, tmp_path):
                 if len(ec):
                     assert not (abs(ec[0][0] - 0.5804) < 0.03 and abs(ec[0][2] - 0.7412) < 0.03), \
                         "purple circle drawn when ref_components was None"
+
+
+def test_sub_decade_range_still_shows_axis_numbers(monkeypatch, tmp_path):
+    """
+    REGRESSION: on a converged run every component sits in a narrow sub-decade
+    window (e.g. 0.4..1.0), so the log axes cross NO power of ten and
+    LogLocator places no major (decade) ticks. The minor-tick labels must NOT
+    be blanked in that case, or the axes show no numbers at all (the reported
+    'not a single number on axes' bug). Blank minors only when a major tick is
+    actually in view.
+    """
+    import matplotlib.pyplot as plt
+    from utils.plots import loss_component_scatter
+
+    captured = {}
+    original = plt.subplots
+
+    def spy(*a, **k):
+        fig, ax = original(*a, **k)
+        captured["ax"] = ax
+        return fig, ax
+    monkeypatch.setattr(plt, "subplots", spy)
+
+    # all components strictly between 0.4 and 0.7 -- the shared range then
+    # excludes 1.0, so NO axis crosses a power of ten (the real failure
+    # condition; a range that happens to include 1.0 has a major tick and
+    # would mask the bug).
+    hist = {
+        "recon0": {"train": [0.62, 0.60], "val": [0.61, 0.59], "best_so_far": [0.61, 0.59]},
+        "deriv":  {"train": [0.43, 0.42], "val": [0.44, 0.45], "best_so_far": [0.44, 0.44]},
+    }
+    loss_component_scatter([1, 2], hist, tmp_path / "c.png",
+                           ref_components={"recon0": 0.65, "deriv": 0.47})
+
+    grid = captured["ax"]
+    n = grid.shape[0]
+    bl = grid[n - 1][0]           # bottom-left panel: has both axis labels
+    grid[0][0].figure.canvas.draw()
+
+    def any_numbers(ax):
+        # count only labels whose TICK falls inside the axis limits -- an
+        # out-of-view decade label object exists but does not render, so it
+        # must not count as 'the axis has numbers'.
+        def in_view(axis, get_labels, lo, hi, minor):
+            locs = axis.get_minorticklocs() if minor else axis.get_majorticklocs()
+            labels = get_labels(minor=minor)
+            return [lb.get_text() for loc, lb in zip(locs, labels)
+                    if lo <= loc <= hi and lb.get_text().strip()]
+        xlo, xhi = ax.get_xlim(); ylo, yhi = ax.get_ylim()
+        x = (in_view(ax.xaxis, ax.get_xticklabels, xlo, xhi, False)
+             + in_view(ax.xaxis, ax.get_xticklabels, xlo, xhi, True))
+        y = (in_view(ax.yaxis, ax.get_yticklabels, ylo, yhi, False)
+             + in_view(ax.yaxis, ax.get_yticklabels, ylo, yhi, True))
+        return bool(x), bool(y)
+
+    has_x, has_y = any_numbers(bl)
+    assert has_x, "x-axis has no numbers on a sub-decade range (minor labels wrongly blanked)"
+    assert has_y, "y-axis has no numbers on a sub-decade range (minor labels wrongly blanked)"

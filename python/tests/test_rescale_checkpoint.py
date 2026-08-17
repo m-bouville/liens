@@ -474,12 +474,12 @@ def test_default_output_is_named_for_what_it_is_not_for_its_source(tmp_path):
     extend_state_checkpoint_with_deriv_stream would accept it and stage 2 would
     build a deriv head on a 75%-random trunk with nothing flagging it.
     """
-    from training.port_checkpoint import _default_output_path
+    from training.port_checkpoint import _default_ported_checkpoint_path
     for src in ("ck/stage1/64x64-stage1.pt", "ck/stage2/64x64-stage2.pt", "ck/anything.pt"):
-        out = _default_output_path(Path(src), 128)
+        out = _default_ported_checkpoint_path(Path(src), 128)
         assert out.name == "128x128-ported.pt", src
         assert out.parent.name == "stage1", src
-    assert _default_output_path(Path("ck/stage2/64x64-stage2.pt"), 256).name \
+    assert _default_ported_checkpoint_path(Path("ck/stage2/64x64-stage2.pt"), 256).name \
         == "256x256-ported.pt"
 
 

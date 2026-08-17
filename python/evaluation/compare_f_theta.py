@@ -62,7 +62,7 @@ from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 # not the CWD -- the project's path policy, so the tool lands its figure in
 # output/ wherever it is invoked from.
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent
-from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates
+from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates, N_THETA
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
@@ -70,8 +70,11 @@ from training.losses import ReconLoss
 from utils import load_datasets as load
 
 
-def _fmt_corr(corr: float | None) -> str:
-    """None happens on real data: a quiet window's real dx has ~zero std --
+def _fmt_corr_pct(corr: float | None) -> str:
+    """Format a correlation that is ALREADY IN PERCENT (this module's
+    _correlation_pct convention) -- hence the _pct name, distinguishing it
+    from evaluation._plot_helpers.fmt_corr which takes raw [-1, 1].
+    None happens on real data: a quiet window's real dx has ~zero std --
     the low-|z1| population -- and correlation is undefined there. 'n/a'
     rather than a crash in the title formatting."""
     return "n/a" if corr is None else f"{corr:.0f}%"
@@ -102,12 +105,13 @@ def _load_model(lds_checkpoint_path: Path, device) -> dict:
     ae_path = Path(ck["ae_checkpoint"])
     ae, ae_encoder, ae_ck, _, _ = build_ae_from_checkpoint(ae_path, device)
     f_theta = LatentDynamics(
-        latent_channels=cfg["latent_channels"], n_theta=cfg["n_theta"],
+        latent_channels=cfg["latent_channels"], n_theta=N_THETA,
         latent_spatial=cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=cfg["hidden_dim"], n_hidden_layers=cfg["n_hidden_layers"],
         **integration_kwargs_from_config(cfg),
     ).to(device)
-    f_theta.load_state_dict(ck["model_state"])
+    from models.encoder import zero_pad_theta_columns
+    f_theta.load_state_dict(zero_pad_theta_columns(ck["model_state"], f_theta))
     f_theta.eval()
     return {"path": lds_checkpoint_path, "ck": ck, "config": cfg, "ae": ae,
             "ae_encoder": ae_encoder, "ae_config": ae_ck["config"],
@@ -1170,7 +1174,7 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
     return device, a, b, windows, window_strings, prefix, title, n_steps_used
 
 
-def _default_output_path(prefix, a, b, seed, n_steps_used, z1_resync,
+def _default_figure_path(prefix, a, b, seed, n_steps_used, z1_resync,
                           fixed_windows):
     sa = a["label"].replace(" ", "")
     sb = b["label"].replace(" ", "")
@@ -1239,10 +1243,10 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
             (real_delta, d_lo, d_hi, f"real dx\nscale=[{d_lo:.3f}, {d_hi:.3f}]"),
             (per["a"]["pred_delta"], d_lo, d_hi,
              f"pred dx ({a['label']})\nloss={_format_small(per['a']['loss'])}, "
-             f"corr={_fmt_corr(per['a']['corr'])}"),
+             f"corr={_fmt_corr_pct(per['a']['corr'])}"),
             (per["b"]["pred_delta"], d_lo, d_hi,
              f"pred dx ({b['label']})\nloss={_format_small(per['b']['loss'])}, "
-             f"corr={_fmt_corr(per['b']['corr'])}"),
+             f"corr={_fmt_corr_pct(per['b']['corr'])}"),
             (per["a"]["error"], e_lo, e_hi, f"error {a['label']}"),
             (per["b"]["error"], e_lo, e_hi, f"error {b['label']}"),
             (diff, f_lo, f_hi,
@@ -1268,7 +1272,7 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
           f"with --n-samples 24 (or the RMS tools) before concluding.")
 
     if output_path is None:
-        output_path = _default_output_path(prefix, a, b, seed, n_steps_used,
+        output_path = _default_figure_path(prefix, a, b, seed, n_steps_used,
                                             z1_resync, fixed_windows)
     else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1341,7 +1345,7 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
                   f"(pred[k] == pred[0]) or the real frames are identical. "
                   f"Those steps are absent from the correlation panel.")
     if output_path is None:
-        output_path = _default_output_path(prefix, a, b, seed, n_steps_used,
+        output_path = _default_figure_path(prefix, a, b, seed, n_steps_used,
                                             z1_resync, None)
     else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1415,7 +1419,7 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
          n_steps_used) = _setup_comparison(path_a, path_b, device_r, n_samples,
                                             n_steps, seed, fixed_windows,
                                             max_dt, z1_resync)
-        out = output_path or _default_output_path(prefix, a, b, seed,
+        out = output_path or _default_figure_path(prefix, a, b, seed,
                                                    n_steps_used, z1_resync,
                                                    fixed_windows)
         return out, window_strings

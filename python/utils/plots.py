@@ -6,8 +6,8 @@ files directly, without going through the solver's PNG export.
 import math
 from pathlib import Path
 
-import matplotlib.animation as animation
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import matplotlib.ticker as mticker
 import numpy as np
 
@@ -476,7 +476,7 @@ def loss_component_scatter(
             if (rx is not None and ry is not None
                     and math.isfinite(rx) and math.isfinite(ry)
                     and rx > 0 and ry > 0):
-                ax.scatter([rx], [ry], s=110, marker="o", facecolors="none",
+                ax.scatter([rx], [ry], s=70, marker="o", facecolors="none",
                            edgecolors="tab:purple", linewidths=2.0, zorder=6,
                            label="ref (pre-run)")
 
@@ -568,10 +568,27 @@ def loss_component_scatter(
         else:
             ax.tick_params(labelleft=False)
         # Minor-tick text off on log axes: majors (decades) stay labelled.
+        # BUT only when there is at least one major (decade) tick IN VIEW to
+        # carry the labelling -- a sub-decade range (e.g. 0.4..0.5, common on a
+        # converged run) crosses no power of ten, so LogLocator places no major
+        # ticks at all, and blanking the minors too would leave the axis with
+        # NO numbers whatsoever. In that case keep the minor labels (and give
+        # them a readable scalar format) so the axis is still legible.
+        def _has_major_in_view(axis, lo, hi):
+            ticks = axis.get_majorticklocs()
+            return any(lo <= t <= hi for t in ticks)
         if ax.get_xscale() == "log":
-            ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+            _lo, _hi = ax.get_xlim()
+            if _has_major_in_view(ax.xaxis, _lo, _hi):
+                ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+            else:
+                ax.xaxis.set_minor_formatter(mticker.ScalarFormatter())
         if ax.get_yscale() == "log":
-            ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+            _lo, _hi = ax.get_ylim()
+            if _has_major_in_view(ax.yaxis, _lo, _hi):
+                ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+            else:
+                ax.yaxis.set_minor_formatter(mticker.ScalarFormatter())
         if (row, col) == (0, 0):
             # "best", not a fixed corner. These trajectories head toward the
             # origin, so they occupy the LOWER-LEFT... except early in a run,

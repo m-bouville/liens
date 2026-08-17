@@ -43,6 +43,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+from evaluation._plot_helpers import fmt_corr as _fmt_corr, \
+    log_scale_if_positive as _log_scale_if_positive
 import torch
 from torch.utils.data import DataLoader
 
@@ -199,10 +202,6 @@ def _log_corr(x: np.ndarray, y: np.ndarray) -> float | None:
     return np.corrcoef(log_x, log_y)[0, 1]
 
 
-def _fmt_corr(c: float | None) -> str:
-    return "N/A (zero variance)" if c is None else f"{c * 100:.1f}%"
-
-
 def check_dead_relus(f_theta: LatentDynamics, dataset: MicrostructureEvolutionDataset,
                       device: torch.device, n_samples: int = 512) -> dict[str, np.ndarray]:
     """
@@ -285,38 +284,6 @@ def check_dead_relus(f_theta: LatentDynamics, dataset: MicrostructureEvolutionDa
 def _print_summary(name: str, values: np.ndarray) -> None:
     print(f"  {name:20s}: mean={values.mean():14.4e}  median={np.median(values):14.4e}  "
           f"max={values.max():14.4e}  p90={np.percentile(values, 90):14.4e}")
-
-
-def _log_scale_if_positive(ax, *value_arrays, axis: str = "y") -> bool:
-    """
-    Sets a log scale ONLY if the data actually has positive values;
-    returns whether it did.
-
-    A log axis needs at least one positive value -- otherwise matplotlib
-    emits "Data has no positive values, and therefore cannot be
-    log-scaled" and silently leaves the panel unusable. That is not a
-    hypothetical here: LatentDynamics zero-initializes its own final
-    layer (see its own docstring), so f_theta is EXACTLY zero
-    everywhere until trained -- which is precisely the state
-    ensure_lds_checkpoint produces when this script is pointed at an
-    AE-family (stage-1/1b/2) checkpoint, a mode check_f_theta()'s own
-    docstring explicitly documents as supported. Every ||f||-derived
-    quantity is then identically 0, so three panels of this figure used
-    to render broken, with only a warning to indicate it.
-
-    Falls back to a LINEAR scale and annotates the panel in that case,
-    rather than leaving a reader to assume an axis is log-scaled when
-    it isn't.
-    """
-    combined = np.concatenate([np.asarray(v, dtype=float).ravel() for v in value_arrays]) \
-        if value_arrays else np.array([])
-    if combined.size and np.any(combined > 0):
-        (ax.set_xscale if axis == "x" else ax.set_yscale)("log")
-        return True
-    ax.text(0.5, 0.5, f"all-zero data\n({axis}-axis left LINEAR, not log)",
-            transform=ax.transAxes, ha="center", va="center",
-            fontsize=8, color="tab:red", alpha=0.7)
-    return False
 
 
 def _print_binned_by_dt2(name: str, dt2: np.ndarray, values: np.ndarray) -> None:
@@ -492,15 +459,15 @@ def check_f_theta(
     axes[0, 1].scatter(d["dt2"], d["f2_real_norm"], s=8, alpha=0.4, label="f2_real")
     axes[0, 1].scatter(d["dt2"], d["f2_chained_norm"], s=8, alpha=0.4, label="f2_chained")
     axes[0, 1].set_xscale("log")
-    _log_scale_if_positive(axes[0, 1], d["f2_real_norm"], d["f2_chained_norm"])
+    _log_scale_if_positive(axes[0, 1], d["f2_real_norm"], d["f2_chained_norm"], annotate=True)
     axes[0, 1].set_xlabel("dt2")
     axes[0, 1].set_ylabel("||f||")
     axes[0, 1].set_title("||f|| vs dt2, real vs chained z0")
     axes[0, 1].legend()
 
     axes[0, 2].scatter(d["z0_step1_error"], d["f2_chained_norm"], s=8, alpha=0.4)
-    _log_scale_if_positive(axes[0, 2], d["z0_step1_error"], axis="x")
-    _log_scale_if_positive(axes[0, 2], d["f2_chained_norm"])
+    _log_scale_if_positive(axes[0, 2], d["z0_step1_error"], axis="x", annotate=True)
+    _log_scale_if_positive(axes[0, 2], d["f2_chained_norm"], annotate=True)
     axes[0, 2].set_xlabel("||z0_hat(t1) - z0(t1)|| (step-1 error)")
     axes[0, 2].set_ylabel("||f2_chained||")
     axes[0, 2].set_title("||f2_chained|| vs how off-distribution z0 is")
@@ -545,7 +512,7 @@ def check_f_theta(
     ax_ratio.scatter(d["dt2"], d["ratio_real"], s=8, alpha=0.4, color="tab:blue")
     ax_cos.scatter(d["dt2"], d["cos_sim_real"], s=8, alpha=0.4, color="tab:orange")
     ax_ratio.set_xscale("log")
-    _log_scale_if_positive(ax_ratio, d["ratio_real"])
+    _log_scale_if_positive(ax_ratio, d["ratio_real"], annotate=True)
     ax_ratio.set_xlabel("dt2")
     ax_ratio.set_ylabel("ratio_real", color="tab:blue")
     ax_cos.set_ylabel("cos_sim_real", color="tab:orange")

@@ -42,7 +42,7 @@ from training.rescale_checkpoint import (
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/X.py -> python/
 
 
-def _default_output_path(checkpoint_path: Path, to_size: int) -> Path:
+def _default_ported_checkpoint_path(checkpoint_path: Path, to_size: int) -> Path:
     """`checkpoints/stage1/{to_size}x{to_size}-ported.pt`.
 
     Named and placed for what the file IS, not for where its source came from.
@@ -102,7 +102,7 @@ def port_checkpoint(
     """Returns the path written (or the path that WOULD be written, if dry_run)."""
     device = torch.device(device or "cpu")
     if output_path is None:
-        output_path = _default_output_path(checkpoint_path, to_size)
+        output_path = _default_ported_checkpoint_path(checkpoint_path, to_size)
 
     rescaled = rescale_checkpoint_to_size(
         checkpoint_path, to_size=to_size, device=device,

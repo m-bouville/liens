@@ -171,7 +171,13 @@ def test_every_saved_figure_is_closed(path):
     closing would defeat it. It never calls savefig, hence the savefig-based
     count below does not see it.
     """
-    src = path.read_text(encoding="utf-8")
+    # source_without_comments, NOT raw read_text: a comment that MENTIONS
+    # .savefig( (utils/plots.py line ~72 documents savefig cost) counted as a
+    # save and made the balance depend on unrelated code happening to contain
+    # a spare plt.close() -- deleting dead make_video() (1 close, 0 saves)
+    # exposed it. The same trap, and the same fix, as the source-matching
+    # tests in source_without_comments' own docstring.
+    src = source_without_comments(path)
     saves = src.count(".savefig(")
     closes = src.count("plt.close(")
     assert closes >= saves, (

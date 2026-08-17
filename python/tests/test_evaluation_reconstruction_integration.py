@@ -490,10 +490,20 @@ def test_the_ratio_row_uses_one_log_axis_not_a_twin_pair():
     # and a log axis cannot take a symmetric-about-zero range, so the
     # alignment helper must be reached only on the twin-axis rows
     assert "left_ylim, right_ylim = _symmetric_left_zero_right_ylim(" in src
-    context = src[:src.rindex("_symmetric_left_zero_right_ylim(")][-1200:]
+    # The dz0dt figure's per-row ratio panels use ONE log axis (one_axis=True)
+    # rather than a twin pair; the symmetric-about-zero alignment (whose lower
+    # bound is -inf on a log axis) must be reached only on the twin-axis
+    # branch. Scope the check to _figure_dz0dt's own body -- the main figure
+    # has its own, legitimately-twinned call that does not use one_axis.
+    dz0dt_start = src.index("def _figure_dz0dt")
+    dz0dt_end = src.index("\ndef ", dz0dt_start + 1)
+    dz0dt_body = src[dz0dt_start:dz0dt_end]
+    assert "one_axis = True" in dz0dt_body, "the dz0dt ratio row is not on a single axis"
+    call_in_dz0dt = dz0dt_body.rindex("_symmetric_left_zero_right_ylim(")
+    context = dz0dt_body[:call_in_dz0dt][-1200:]
     assert "if one_axis:" in context and "else:" in context, (
-        "the symmetric-about-zero alignment is applied unconditionally; on a "
-        "log axis its lower bound is -inf"
+        "the symmetric-about-zero alignment is applied unconditionally in the "
+        "dz0dt ratio row; on a log axis its lower bound is -inf"
     )
 
 

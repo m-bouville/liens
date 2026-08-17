@@ -26,6 +26,8 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+from evaluation._plot_helpers import log_scale_if_positive as _shared_log_scale
 import torch
 
 from training.losses import centered_deriv_target
@@ -49,39 +51,6 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py 
 # Sentinel: None is a MEANINGFUL value (caching off), so it cannot double as
 # "not specified". Without this, a caller could not turn the cache off.
 _UNSET_CACHE = object()
-
-
-def _log_scale_if_positive(ax, which: str = "y") -> bool:
-    """set_{x,y}scale("log") only when the axis HAS positive data.
-
-    matplotlib raises "Data has no positive values, and therefore cannot be
-    log-scaled" from inside tight_layout() -- not from set_yscale() -- so an
-    all-zero or all-negative panel kills the whole figure at save time, with a
-    traceback pointing at the layout engine rather than at the panel.
-
-    Degenerate populations reach here legitimately: a tiny run set, a
-    diagnostic on an untrained f_theta whose residuals are identically zero, a
-    single-dt slice. Losing one panel's log scaling beats losing the figure.
-
-    Returns whether log scale was applied, so a caller can say so.
-    """
-    lines = list(ax.get_lines())
-    data = []
-    for ln in lines:
-        arr = ln.get_ydata() if which == "y" else ln.get_xdata()
-        data.append(np.asarray(arr, dtype=float))
-    for coll in ax.collections:            # scatter() lands here, not in lines
-        off = coll.get_offsets()
-        if off is not None and len(off):
-            off = np.asarray(off, dtype=float)
-            data.append(off[:, 1] if which == "y" else off[:, 0])
-    if not data:
-        return False
-    allv = np.concatenate(data) if len(data) > 1 else data[0]
-    if not np.any(np.isfinite(allv) & (allv > 0)):
-        return False
-    ax.set_yscale("log") if which == "y" else ax.set_xscale("log")
-    return True
 
 
 def max_autocorr_dist(nx: int, ny: int) -> int:
@@ -114,6 +83,7 @@ from evaluation._latent_eval import (
 # this sweep, so 12 log bins is ~3 per decade -- enough to see the shape,
 # few enough that each bin holds a usable number of windows.
 _DEDIM_N_BINS = 12
+_DT_PANEL_SCALE = 1000  # dz0/dt panels display in units of 1e-3
 
 
 # A plotted point must be built from at least this fraction of the runs
@@ -822,7 +792,7 @@ def _boxplot_by_x(ax, x_values: np.ndarray, y_values: np.ndarray, log_x: bool = 
         ax.set_xlim(unique_x.min() - pad, unique_x.max() + pad)
 
     if log_x:
-        _log_scale_if_positive(ax, "x")
+        _shared_log_scale(ax, axis="x")
         return
 
     # Value-evenly-spaced tick TARGETS, nearest-snapped to real data --
@@ -1172,6 +1142,201 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     )
 
 
+def _figure_dz0dt(results, _t_x, _dt_x, _grp, _t_label, _dt_label,
+                  _title_text, dz0dt_output_path) -> None:
+    """Ground-truth dz0, dz0/dt and d2z0/dt2 vs t and dt (dz0dt.png).
+
+    Extracted from _build_and_save_figures: this figure is fully
+    independent of the other two -- it plots the encoder's own
+    z0 displacement/rate/curvature, with no error, model, or euler_only
+    distinction, so it shares nothing with the parameter_dependence /
+    dt_dependence figures except the grouping helper and axis labels,
+    which are passed in. Pure side effect (writes one file).
+    """
+    # ---- separate figure: ground-truth dz0, dz0/dt and d2z0/dt2 vs t, dt --
+    # NOT part of the main figure above, since neither is an error or a
+    # model-dependent quantity at all: both are computed purely from
+    # the encoder's own z0_t/z0_next_true, with no z1/f_theta/euler_only
+    # distinction applying to either (unlike literally everything else
+    # this function computes). Answers a different question than the
+    # rest of this script -- not "how wrong is the model", but "how
+    # much/fast is the underlying microstructure actually evolving, and
+    # does that itself depend on when (t) you look or over what span
+    # (dt)". Row 0: dz0 (the raw, un-normalized displacement). Row 1:
+    # dz0/dt (the rate) -- the SAME quantity this figure showed before
+    # this row was added, just now alongside its own un-normalized
+    # counterpart for direct comparison.
+    #
+    # Two lines per panel (mean(x) and mean|x|), NOT a boxplot -- tried
+    # boxplots first, but with real data they end up dominated by
+    # outlier whiskers/fliers (this quantity has the same "mean >> median,
+    # outlier-driven skew" character established repeatedly elsewhere in
+    # this script), burying the actual central trend the mean curves
+    # show cleanly. Also no scatter/dot-sizing-by-window-count the way
+    # the main figure's own twin-axis panels have -- just the two lines,
+    # kept deliberately simple.
+    #
+    # Grouped by unique value (_mean_curves_by_unique_value) for BOTH t
+    # and dt, not binned -- both are naturally discrete here, drawn from
+    # the same fixed, regularly-spaced save-cadence grid (see the main
+    # figure's own dt panels for the same reasoning; t is no different
+    # from dt in this respect, despite spanning a much wider range).
+    fig2, axes2 = plt.subplots(3, 2, figsize=(12, 15))
+
+    panel_rows = [
+        (results.dz0_signed, results.dz0_abs, "dz0", 0),
+        (results.dz0_signed, results.dz0_abs, "dz0/dt", 1),
+        # THE ROW THAT CAN JUSTIFY A max_dt. |dz0| saturating makes dz0/dt
+        # fall as 1/dt by construction, and the FIRST-order term of the
+        # expansion is then bounded -- it argues for no limit at all. The
+        # dt^2/2 term is multiplied by THIS, so if |d2z0/dt2| does not fall
+        # at least as fast as 1/dt^2, the second-order term grows with dt and
+        # the expansion has a range.
+        (results.dz1_signed, results.dz1_abs, "d2z0/dt2", 2),
+    ]
+    # Group mean dt, so the dz0/dt row can be formed by dividing the GROUPED
+    # dz0 curves rather than by averaging per-window ratios. (_grp's
+    # "signed" slot is just a mean, so passing dts twice yields mean dt.)
+    _, _t_dt_mean, _, _ = _grp(_t_x, results.dts, results.dts)
+    _, _dt_dt_mean, _, _ = _grp(_dt_x, results.dts, results.dts)
+
+    for y_signed, y_abs, name, row in panel_rows:
+        # EVERY panel: |mean X| and mean|X| on ONE log axis.
+        #
+        # Both are positive, so a single log scale shows them together and
+        # their RATIO becomes readable: mean|X| is the typical magnitude,
+        # |mean X| the part that survives averaging across windows, and the
+        # gap between them is how much cancels. A signed axis beside a twin
+        # |.| axis, on two different linear scales, could not show that.
+        t_x, _t_sig, t_abs_y, _ = _grp(_t_x, y_signed, y_abs)
+        dt_x, _dt_sig, dt_abs_y, _ = _grp(_dt_x, y_signed, y_abs)
+        t_signed_y, dt_signed_y = np.abs(_t_sig), np.abs(_dt_sig)
+        if name in ("dz0/dt", "d2z0/dt2"):
+            # BOTH derivative rows are formed the same way: group the raw
+            # increment, THEN divide by the group's dt. Not mean(dz0/dt),
+            # which is a different quantity whenever dt varies within a
+            # group, as it does across every t group -- and not one reduction
+            # for one row and the other for the other, which is what these
+            # two rows had while they were being compared to each other.
+            t_signed_y = np.abs(_t_sig) / _t_dt_mean
+            t_abs_y = t_abs_y / _t_dt_mean
+            dt_signed_y = np.abs(_dt_sig) / _dt_dt_mean
+            dt_abs_y = dt_abs_y / _dt_dt_mean
+        # x1000 for readability -- these values are naturally tiny,
+        # matching the same reasoning/named-constant convention as
+        # _DT_PANEL_SCALE in the main figure's own dt panels above.
+        t_signed_y, t_abs_y = t_signed_y * _DT_PANEL_SCALE, t_abs_y * _DT_PANEL_SCALE
+        dt_signed_y, dt_abs_y = dt_signed_y * _DT_PANEL_SCALE, dt_abs_y * _DT_PANEL_SCALE
+
+        one_axis = True
+        ax_t, ax_dt = axes2[row, 0], axes2[row, 1]
+        # ONE axis for the ratio row: both curves are positive and share a
+        # unit, so a twin pair on two linear scales would hide exactly the
+        # comparison the row exists to make.
+        twin_t = ax_t if one_axis else ax_t.twinx()
+        twin_dt = ax_dt if one_axis else ax_dt.twinx()
+
+        signed_label = f"|mean {name}|"
+        abs_label = f"mean|{name}|"
+        if not one_axis:
+            ax_t.axhline(0, color="gray", linewidth=0.7, linestyle=":")
+        ax_t.plot(t_x, t_signed_y, "o-", color="tab:blue", label=signed_label)
+        twin_t.plot(t_x, t_abs_y, "o-", color="tab:orange", label=abs_label)
+        ax_t.set_xlabel(_t_label)
+        if one_axis:
+            ax_t.set_ylabel(f"{name} [1e-3]")
+            _shared_log_scale(ax_t, axis="y")
+        else:
+            ax_t.set_ylabel(f"mean({name})", color="tab:blue")
+            twin_t.set_ylabel(f"mean|{name}|", color="tab:orange")
+            ax_t.tick_params(axis="y", labelcolor="tab:blue")
+            twin_t.tick_params(axis="y", labelcolor="tab:orange")
+        ax_t.set_title(f"real {name} vs t")
+        _shared_log_scale(ax_t, axis="x")
+        # Starts at 1000, not the data's own minimum -- requested
+        # explicitly, presumably to crop out the smallest-t region
+        # (sparse, few windows this early relative to min_step) rather
+        # than let it dominate the axis the way [0,3]'s own divergent
+        # small-dt region did earlier in this session.
+        # From the PLOTTED curve, not a global minimum: a single stray window
+        # at small t was setting the left edge and leaving two empty decades
+        # on a panel whose data starts at ~1e5.
+        _finite_t = t_x[np.isfinite(t_x) & (t_x > 0)]
+        if len(_finite_t):
+            ax_t.set_xlim(float(_finite_t.min()) / 1.5,
+                           float(_finite_t.max()) * 1.5)
+        # twin_t IS ax_t on a single-axis row, so gathering handles from both
+        # listed every curve twice.
+        lines1, labels1 = ax_t.get_legend_handles_labels()
+        lines2, labels2 = (([], []) if twin_t is ax_t
+                            else twin_t.get_legend_handles_labels())
+        ax_t.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="best")
+
+        if not one_axis:
+            ax_dt.axhline(0, color="gray", linewidth=0.7, linestyle=":")
+        ax_dt.plot(dt_x, dt_signed_y, "o-", color="tab:blue", label=signed_label)
+        twin_dt.plot(dt_x, dt_abs_y, "o-", color="tab:orange", label=abs_label)
+        ax_dt.set_xlabel(_dt_label)
+        if one_axis:
+            ax_dt.set_ylabel(f"{name} [1e-3]")
+            _shared_log_scale(ax_dt, axis="y")
+        else:
+            ax_dt.set_ylabel(f"mean({name})", color="tab:blue")
+            twin_dt.set_ylabel(f"mean|{name}|", color="tab:orange")
+            ax_dt.tick_params(axis="y", labelcolor="tab:blue")
+            twin_dt.tick_params(axis="y", labelcolor="tab:orange")
+        ax_dt.set_title(f"real {name} vs dt")
+        _shared_log_scale(ax_dt, axis="x")
+        _finite_dt = dt_x[np.isfinite(dt_x) & (dt_x > 0)]
+        if len(_finite_dt):
+            ax_dt.set_xlim(float(_finite_dt.min()) / 1.5,
+                            float(_finite_dt.max()) * 1.5)
+        lines1, labels1 = ax_dt.get_legend_handles_labels()
+        lines2, labels2 = (([], []) if twin_dt is ax_dt
+                            else twin_dt.get_legend_handles_labels())
+        ax_dt.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="best")
+
+        # y-ranges aligned WITHIN this row only (dz0 and dz0/dt are
+        # different quantities with different natural scales -- dz0
+        # grows with dt, dz0/dt does not, per this session's own
+        # earlier finding -- so aligning across rows would be
+        # comparing two different units on one shared scale, not a
+        # fair comparison the way aligning the two columns within one
+        # row is). Left (signed) symmetric about 0, right (abs) floored
+        # at 0, same reasoning/helper as the main figure's own
+        # twin-axis panels.
+        if one_axis:
+            # A single LOG axis: symmetric-about-zero has no meaning, and
+            # forcing a floor at 0 would be a lower bound of -inf. Share the
+            # two columns' range so they stay comparable.
+            lo = min(min(t_signed_y.min(), t_abs_y.min()),
+                      min(dt_signed_y.min(), dt_abs_y.min()))
+            hi = max(max(t_signed_y.max(), t_abs_y.max()),
+                      max(dt_signed_y.max(), dt_abs_y.max()))
+            if np.isfinite(lo) and lo > 0:
+                for ax in (ax_t, ax_dt):
+                    ax.set_ylim(lo / 1.5, hi * 1.5)
+        else:
+            left_ylim, right_ylim = _symmetric_left_zero_right_ylim(
+                [ax_t, ax_dt], [twin_t, twin_dt])
+            ax_t.set_ylim(left_ylim)
+            ax_dt.set_ylim(left_ylim)
+            twin_t.set_ylim(right_ylim)
+            twin_dt.set_ylim(right_ylim)
+
+    # No EULER-ONLY MODE banner here, unlike the main figure -- neither
+    # dz0 nor dz0/dt depends on that mode at all (see this section's
+    # own opening comment), so showing that banner would incorrectly
+    # imply this figure is also about the euler-only-vs-full
+    # distinction.
+    fig2.suptitle(f"{_title_text}\nground-truth dz0, dz0/dt and d2z0/dt2 [1e-3]",
+                   fontsize=13)
+    fig2.tight_layout(rect=(0, 0, 1, 0.95))
+    fig2.savefig(dz0dt_output_path, dpi=120)
+    plt.close(fig2)
+    print(f"Saved figure to {dz0dt_output_path}")
+
+
 def _build_and_save_figures(
     results: _EvaluationResults, stats: _DerivedStats, lds_checkpoint_path: Path, output_path: Path,
     dz0dt_output_path: Path, dt_dependence_output_path: Path, decode: bool, euler_only: bool,
@@ -1349,7 +1514,7 @@ def _build_and_save_figures(
         # computed pixel-space quantity.
         ax = axes_dt[1, 1]
         _boxplot_by_x(ax, _px(_dt_x), results.pixel_losses, log_x=True)
-        _log_scale_if_positive(ax, "y")
+        _shared_log_scale(ax, axis="y")
         ax.set_xlabel(_dt_label)
         ax.set_xlim(left=_x_left)
         ax.set_ylabel(f"pixel-space{_euler_tag}: decode(z0(t+dt)): mean|pred - true|")
@@ -1387,7 +1552,6 @@ def _build_and_save_figures(
     # propagates automatically through the ylim computation and the
     # regression curve below without needing separate handling) and
     # labeling the axis "[1e-3]" keeps the actual numbers readable.
-    _DT_PANEL_SCALE = 1000
     dt_x, dt_signed, dt_abs, dt_n = _grp(_dt_x, results.latent_losses_signed / results.dts,
           results.latent_losses / results.dts)
     dt_signed, dt_abs = dt_signed * _DT_PANEL_SCALE, dt_abs * _DT_PANEL_SCALE
@@ -1669,7 +1833,7 @@ def _build_and_save_figures(
                         label="oracle dz0/dt (sees future)")
     # log scale, NOT set_ylim(bottom=0) -- 0 is not representable on a log
     # axis, and matplotlib would silently clip to its own positive floor.
-    _log_scale_if_positive(ax_abs, "y")
+    _shared_log_scale(ax_abs, axis="y")
     # The converged tail affects this LOG magnitude panel at the BOTTOM, not
     # the top: as dz0/dt -> 0 the accurate curves (causal/oracle) underflow
     # toward ~1e-4, which would drag y_MIN down and crush the real structure
@@ -1745,7 +1909,7 @@ def _build_and_save_figures(
     # z1(t) + [z0(t)-z0(t+dt)]/dt = z1(t) - dz0/dt, exactly.
     for ax, name, title in [(ax_signed, "error", "error (mean, signed)\nerror = (z0_pred(t+dt)-z0_true(t+dt))/dt"),
                              (ax_abs, "|error|", "|error| (mean, absolute)\nerror = (z0_pred(t+dt)-z0_true(t+dt))/dt")]:
-        _log_scale_if_positive(ax, "x")
+        _shared_log_scale(ax, axis="x")
         ax.set_xlabel(_dt_label)
         ax.set_xlim(left=_x_left)
         ax.set_ylabel(f"mean({name}) [1e-3]" if name == "error" else f"mean{name} [1e-3]")
@@ -1928,7 +2092,7 @@ def _build_and_save_figures(
     twin7 = ax7.twinx()
     ax7.plot(dt_x7, dz0_abs_by_dt, "o-", color="tab:orange", label="mean|dz0|")
     twin7.plot(dt_x7, dz0dt_abs_by_dt, "o-", color="tab:red", label="mean|dz0/dt|")
-    _log_scale_if_positive(ax7, "x")
+    _shared_log_scale(ax7, axis="x")
     ax7.set_xlabel(_dt_label)
     ax7.set_xlim(left=_x_left)
     ax7.set_ylabel("mean|dz0| [1e-3]", color="tab:orange")
@@ -1950,188 +2114,8 @@ def _build_and_save_figures(
     plt.close(fig_dt)
     print(f"Saved figure to {dt_dependence_output_path}")
 
-    # ---- separate figure: ground-truth dz0, dz0/dt and d2z0/dt2 vs t, dt --
-    # NOT part of the main figure above, since neither is an error or a
-    # model-dependent quantity at all: both are computed purely from
-    # the encoder's own z0_t/z0_next_true, with no z1/f_theta/euler_only
-    # distinction applying to either (unlike literally everything else
-    # this function computes). Answers a different question than the
-    # rest of this script -- not "how wrong is the model", but "how
-    # much/fast is the underlying microstructure actually evolving, and
-    # does that itself depend on when (t) you look or over what span
-    # (dt)". Row 0: dz0 (the raw, un-normalized displacement). Row 1:
-    # dz0/dt (the rate) -- the SAME quantity this figure showed before
-    # this row was added, just now alongside its own un-normalized
-    # counterpart for direct comparison.
-    #
-    # Two lines per panel (mean(x) and mean|x|), NOT a boxplot -- tried
-    # boxplots first, but with real data they end up dominated by
-    # outlier whiskers/fliers (this quantity has the same "mean >> median,
-    # outlier-driven skew" character established repeatedly elsewhere in
-    # this script), burying the actual central trend the mean curves
-    # show cleanly. Also no scatter/dot-sizing-by-window-count the way
-    # the main figure's own twin-axis panels have -- just the two lines,
-    # kept deliberately simple.
-    #
-    # Grouped by unique value (_mean_curves_by_unique_value) for BOTH t
-    # and dt, not binned -- both are naturally discrete here, drawn from
-    # the same fixed, regularly-spaced save-cadence grid (see the main
-    # figure's own dt panels for the same reasoning; t is no different
-    # from dt in this respect, despite spanning a much wider range).
-    fig2, axes2 = plt.subplots(3, 2, figsize=(12, 15))
-
-    panel_rows = [
-        (results.dz0_signed, results.dz0_abs, "dz0", 0),
-        (results.dz0_signed, results.dz0_abs, "dz0/dt", 1),
-        # THE ROW THAT CAN JUSTIFY A max_dt. |dz0| saturating makes dz0/dt
-        # fall as 1/dt by construction, and the FIRST-order term of the
-        # expansion is then bounded -- it argues for no limit at all. The
-        # dt^2/2 term is multiplied by THIS, so if |d2z0/dt2| does not fall
-        # at least as fast as 1/dt^2, the second-order term grows with dt and
-        # the expansion has a range.
-        (results.dz1_signed, results.dz1_abs, "d2z0/dt2", 2),
-    ]
-    # Group mean dt, so the dz0/dt row can be formed by dividing the GROUPED
-    # dz0 curves rather than by averaging per-window ratios. (_grp's
-    # "signed" slot is just a mean, so passing dts twice yields mean dt.)
-    _, _t_dt_mean, _, _ = _grp(_t_x, results.dts, results.dts)
-    _, _dt_dt_mean, _, _ = _grp(_dt_x, results.dts, results.dts)
-
-    for y_signed, y_abs, name, row in panel_rows:
-        # EVERY panel: |mean X| and mean|X| on ONE log axis.
-        #
-        # Both are positive, so a single log scale shows them together and
-        # their RATIO becomes readable: mean|X| is the typical magnitude,
-        # |mean X| the part that survives averaging across windows, and the
-        # gap between them is how much cancels. A signed axis beside a twin
-        # |.| axis, on two different linear scales, could not show that.
-        t_x, _t_sig, t_abs_y, _ = _grp(_t_x, y_signed, y_abs)
-        dt_x, _dt_sig, dt_abs_y, _ = _grp(_dt_x, y_signed, y_abs)
-        t_signed_y, dt_signed_y = np.abs(_t_sig), np.abs(_dt_sig)
-        if name in ("dz0/dt", "d2z0/dt2"):
-            # BOTH derivative rows are formed the same way: group the raw
-            # increment, THEN divide by the group's dt. Not mean(dz0/dt),
-            # which is a different quantity whenever dt varies within a
-            # group, as it does across every t group -- and not one reduction
-            # for one row and the other for the other, which is what these
-            # two rows had while they were being compared to each other.
-            t_signed_y = np.abs(_t_sig) / _t_dt_mean
-            t_abs_y = t_abs_y / _t_dt_mean
-            dt_signed_y = np.abs(_dt_sig) / _dt_dt_mean
-            dt_abs_y = dt_abs_y / _dt_dt_mean
-        # x1000 for readability -- these values are naturally tiny,
-        # matching the same reasoning/named-constant convention as
-        # _DT_PANEL_SCALE in the main figure's own dt panels above.
-        t_signed_y, t_abs_y = t_signed_y * _DT_PANEL_SCALE, t_abs_y * _DT_PANEL_SCALE
-        dt_signed_y, dt_abs_y = dt_signed_y * _DT_PANEL_SCALE, dt_abs_y * _DT_PANEL_SCALE
-
-        one_axis = True
-        ax_t, ax_dt = axes2[row, 0], axes2[row, 1]
-        # ONE axis for the ratio row: both curves are positive and share a
-        # unit, so a twin pair on two linear scales would hide exactly the
-        # comparison the row exists to make.
-        twin_t = ax_t if one_axis else ax_t.twinx()
-        twin_dt = ax_dt if one_axis else ax_dt.twinx()
-
-        signed_label = f"|mean {name}|"
-        abs_label = f"mean|{name}|"
-        if not one_axis:
-            ax_t.axhline(0, color="gray", linewidth=0.7, linestyle=":")
-        ax_t.plot(t_x, t_signed_y, "o-", color="tab:blue", label=signed_label)
-        twin_t.plot(t_x, t_abs_y, "o-", color="tab:orange", label=abs_label)
-        ax_t.set_xlabel(_t_label)
-        if one_axis:
-            ax_t.set_ylabel(f"{name} [1e-3]")
-            _log_scale_if_positive(ax_t, "y")
-        else:
-            ax_t.set_ylabel(f"mean({name})", color="tab:blue")
-            twin_t.set_ylabel(f"mean|{name}|", color="tab:orange")
-            ax_t.tick_params(axis="y", labelcolor="tab:blue")
-            twin_t.tick_params(axis="y", labelcolor="tab:orange")
-        ax_t.set_title(f"real {name} vs t")
-        _log_scale_if_positive(ax_t, "x")
-        # Starts at 1000, not the data's own minimum -- requested
-        # explicitly, presumably to crop out the smallest-t region
-        # (sparse, few windows this early relative to min_step) rather
-        # than let it dominate the axis the way [0,3]'s own divergent
-        # small-dt region did earlier in this session.
-        # From the PLOTTED curve, not a global minimum: a single stray window
-        # at small t was setting the left edge and leaving two empty decades
-        # on a panel whose data starts at ~1e5.
-        _finite_t = t_x[np.isfinite(t_x) & (t_x > 0)]
-        if len(_finite_t):
-            ax_t.set_xlim(float(_finite_t.min()) / 1.5,
-                           float(_finite_t.max()) * 1.5)
-        # twin_t IS ax_t on a single-axis row, so gathering handles from both
-        # listed every curve twice.
-        lines1, labels1 = ax_t.get_legend_handles_labels()
-        lines2, labels2 = (([], []) if twin_t is ax_t
-                            else twin_t.get_legend_handles_labels())
-        ax_t.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="best")
-
-        if not one_axis:
-            ax_dt.axhline(0, color="gray", linewidth=0.7, linestyle=":")
-        ax_dt.plot(dt_x, dt_signed_y, "o-", color="tab:blue", label=signed_label)
-        twin_dt.plot(dt_x, dt_abs_y, "o-", color="tab:orange", label=abs_label)
-        ax_dt.set_xlabel(_dt_label)
-        if one_axis:
-            ax_dt.set_ylabel(f"{name} [1e-3]")
-            _log_scale_if_positive(ax_dt, "y")
-        else:
-            ax_dt.set_ylabel(f"mean({name})", color="tab:blue")
-            twin_dt.set_ylabel(f"mean|{name}|", color="tab:orange")
-            ax_dt.tick_params(axis="y", labelcolor="tab:blue")
-            twin_dt.tick_params(axis="y", labelcolor="tab:orange")
-        ax_dt.set_title(f"real {name} vs dt")
-        _log_scale_if_positive(ax_dt, "x")
-        _finite_dt = dt_x[np.isfinite(dt_x) & (dt_x > 0)]
-        if len(_finite_dt):
-            ax_dt.set_xlim(float(_finite_dt.min()) / 1.5,
-                            float(_finite_dt.max()) * 1.5)
-        lines1, labels1 = ax_dt.get_legend_handles_labels()
-        lines2, labels2 = (([], []) if twin_dt is ax_dt
-                            else twin_dt.get_legend_handles_labels())
-        ax_dt.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="best")
-
-        # y-ranges aligned WITHIN this row only (dz0 and dz0/dt are
-        # different quantities with different natural scales -- dz0
-        # grows with dt, dz0/dt does not, per this session's own
-        # earlier finding -- so aligning across rows would be
-        # comparing two different units on one shared scale, not a
-        # fair comparison the way aligning the two columns within one
-        # row is). Left (signed) symmetric about 0, right (abs) floored
-        # at 0, same reasoning/helper as the main figure's own
-        # twin-axis panels.
-        if one_axis:
-            # A single LOG axis: symmetric-about-zero has no meaning, and
-            # forcing a floor at 0 would be a lower bound of -inf. Share the
-            # two columns' range so they stay comparable.
-            lo = min(min(t_signed_y.min(), t_abs_y.min()),
-                      min(dt_signed_y.min(), dt_abs_y.min()))
-            hi = max(max(t_signed_y.max(), t_abs_y.max()),
-                      max(dt_signed_y.max(), dt_abs_y.max()))
-            if np.isfinite(lo) and lo > 0:
-                for ax in (ax_t, ax_dt):
-                    ax.set_ylim(lo / 1.5, hi * 1.5)
-        else:
-            left_ylim, right_ylim = _symmetric_left_zero_right_ylim(
-                [ax_t, ax_dt], [twin_t, twin_dt])
-            ax_t.set_ylim(left_ylim)
-            ax_dt.set_ylim(left_ylim)
-            twin_t.set_ylim(right_ylim)
-            twin_dt.set_ylim(right_ylim)
-
-    # No EULER-ONLY MODE banner here, unlike the main figure -- neither
-    # dz0 nor dz0/dt depends on that mode at all (see this section's
-    # own opening comment), so showing that banner would incorrectly
-    # imply this figure is also about the euler-only-vs-full
-    # distinction.
-    fig2.suptitle(f"{_title_text}\nground-truth dz0, dz0/dt and d2z0/dt2 [1e-3]",
-                   fontsize=13)
-    fig2.tight_layout(rect=(0, 0, 1, 0.95))
-    fig2.savefig(dz0dt_output_path, dpi=120)
-    plt.close(fig2)
-    print(f"Saved figure to {dz0dt_output_path}")
+    _figure_dz0dt(results, _t_x, _dt_x, _grp, _t_label, _dt_label,
+                  _title_text, dz0dt_output_path)
 
 
 

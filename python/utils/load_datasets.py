@@ -43,19 +43,6 @@ def read_phi_half(path: str | Path, nx: int, ny: int) -> np.ndarray:
     return data.reshape(ny, nx).astype(np.float32)
 
 
-def parse_step(filename: str | Path) -> int:
-    """Extract the integer step number from a snapshot filename like 't0100000'."""
-    name = Path(filename).name
-    m = _STEP_RE.match(name)
-    if not m:
-        raise ValueError(f"Filename '{name}' does not match expected pattern 't<digits>'")
-    return int(m.group(1))
-
-
-# ---------------------------------------------------------------------------
-# Key-value text files (config.txt, metadata.txt)
-# ---------------------------------------------------------------------------
-
 def _parse_kv_file(path: str | Path) -> dict[str, str]:
     """
     Parse a `key = value  # comment` text file (shared by config.txt and
@@ -94,35 +81,6 @@ class SweepConfig:
     phi0: float
     save_steps: list[int]
 
-
-def read_config(path: str | Path) -> SweepConfig:
-    """Parse the sweep config.txt written before a batch of simulations.
-    Simulation-sweep parameters ONLY -- min_step/min_stdev_phi/
-    stats_weight (ML training parameters) are no longer read from here;
-    they belong in a stage-parameters file instead (see main.py)."""
-    kv = _parse_kv_file(path)
-    return SweepConfig(
-        nx=int(kv["Nx"]),
-        ny=int(kv["Ny"]),
-        dt=float(kv["dt"]),
-        steps=int(kv["steps"]),
-        max_threads=int(kv["max_threads"]),
-        a0=float(kv["a0"]),
-        b=float(kv["b"]),
-        T0=float(kv["T0"]),
-        kappa=float(kv["kappa"]),
-        mobility=float(kv["M"]),
-        temperatures=_parse_list(kv["temperatures"], float),
-        noises=_parse_list(kv["noises"], float),
-        seeds=_parse_list(kv["seeds"], int),
-        phi0=float(kv["phi0"]),
-        save_steps=_parse_list(kv["save"], int),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Run directory naming (mirrors writer::make_dir_name)
-# ---------------------------------------------------------------------------
 
 def round_half_away_from_zero(x: float) -> int:
     """
@@ -428,3 +386,47 @@ def read_statistics_csv(path: str | Path) -> pd.DataFrame:
 
     df["step"] = df["step"].astype(int)
     return df.set_index("step")
+
+
+def parse_step(filename: str | Path) -> int:
+    """Extract the integer step number from a snapshot filename like 't0100000'."""
+    name = Path(filename).name
+    m = _STEP_RE.match(name)
+    if not m:
+        raise ValueError(f"Filename '{name}' does not match expected pattern 't<digits>'")
+    return int(m.group(1))
+
+
+# ---------------------------------------------------------------------------
+# Key-value text files (config.txt, metadata.txt)
+# ---------------------------------------------------------------------------
+
+
+def read_config(path: str | Path) -> SweepConfig:
+    """Parse the sweep config.txt written before a batch of simulations.
+    Simulation-sweep parameters ONLY -- min_step/min_stdev_phi/
+    stats_weight (ML training parameters) are no longer read from here;
+    they belong in a stage-parameters file instead (see main.py)."""
+    kv = _parse_kv_file(path)
+    return SweepConfig(
+        nx=int(kv["Nx"]),
+        ny=int(kv["Ny"]),
+        dt=float(kv["dt"]),
+        steps=int(kv["steps"]),
+        max_threads=int(kv["max_threads"]),
+        a0=float(kv["a0"]),
+        b=float(kv["b"]),
+        T0=float(kv["T0"]),
+        kappa=float(kv["kappa"]),
+        mobility=float(kv["M"]),
+        temperatures=_parse_list(kv["temperatures"], float),
+        noises=_parse_list(kv["noises"], float),
+        seeds=_parse_list(kv["seeds"], int),
+        phi0=float(kv["phi0"]),
+        save_steps=_parse_list(kv["save"], int),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Run directory naming (mirrors writer::make_dir_name)
+# ---------------------------------------------------------------------------
