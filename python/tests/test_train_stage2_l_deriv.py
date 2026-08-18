@@ -1142,6 +1142,14 @@ def test_stage2a_end_to_end_freezes_z0_and_saves_a_loadable_residual_config(
     cfgs, _ = resolve_stream_configs_from_checkpoint_config(after["config"])
     assert cfgs["deriv"].head_kind == "residual"
 
+    # stage 2a trains only the deriv stream, so the stacked loss-components
+    # figure (recon0/stats0/deriv) would be two dead-flat bands plus deriv --
+    # moot. It must NOT be written in 2a, while the plain loss curve still is.
+    assert (tmp_path / "c2a-components.png").exists() is False, (
+        "stage2a wrote the loss-components figure, which is moot when only "
+        "the deriv stream contributes")
+    assert (tmp_path / "c2a.png").exists(), "the plain loss curve should still be written"
+
 
 @pytest.mark.slow
 def test_stage2a_raises_on_a_linear_deriv_head(tmp_path, isolated_project_root):

@@ -19,7 +19,7 @@ from training.spike_guard import (
     _SpikeGuard, _record_spike, difficulty_band, early_stop_message, end_epoch_pair,
     restore_running_stats, snapshot_running_stats,
 )
-from utils.logging_utils import print_run_parameters
+from utils.logging_utils import print_run_parameters, EpochProgress
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
     clamp_grace_epochs, grace_epochs_for_ema,
@@ -552,7 +552,9 @@ def train_refinement(
         if epoch > 0:
             n_train = len(train_set)
             _n_train_batches = 0
+            _epoch_progress = EpochProgress(len(train_loader))
             for batch in train_loader:
+                _epoch_progress.tick()
                 _n_train_batches += 1
                 bs = batch[0].size(0)
                 loss, rollout, recon0, stats0 = step(
@@ -561,6 +563,7 @@ def train_refinement(
                 train_rollout_sum += rollout * bs
                 train_recon0_sum += recon0 * bs
                 train_stats0_sum += stats0 * bs
+            _epoch_progress.close()
             train_loss = (train_loss_sum / n_train).item()
             train_rollout = (train_rollout_sum / n_train).item()
             train_recon0 = (train_recon0_sum / n_train).item()

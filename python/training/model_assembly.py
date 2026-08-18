@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from models.autoencoder import Autoencoder, MultiStreamAutoencoder
-from models.constants import LATENT_SPATIAL_SIZE
+from models.constants import LATENT_SPATIAL_SIZE, N_THETA
 from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
@@ -85,6 +85,8 @@ def build_models_from_components(
         combined_state.update({f"encoder.{k}": v for k, v in components["encoder"].state_dict.items()})
         combined_state.update({f"decoder.{k}": v for k, v in components["decoder"].state_dict.items()})
         try:
+            from models.encoder import zero_pad_theta_columns
+            combined_state = zero_pad_theta_columns(combined_state, ae)
             result = ae.load_state_dict(combined_state, strict=False)
         except RuntimeError as e:
             # strict=False only relaxes missing/unexpected KEYS -- a SHAPE
@@ -161,7 +163,9 @@ def build_models_from_components(
         # instance") -- no prefix reconstruction needed here, unlike
         # the single-stream Autoencoder path above.
         try:
-            encoder.load_state_dict(components["encoder"].state_dict)
+            from models.encoder import zero_pad_theta_columns
+            encoder.load_state_dict(
+                zero_pad_theta_columns(components["encoder"].state_dict, encoder))
             decoder.load_state_dict(components["decoder"].state_dict)
         except RuntimeError as e:
             raise ValueError(
@@ -201,7 +205,10 @@ def build_models_from_components(
         frozen_modules.append(stats_head)
 
     lds_cfg = components["lds"].config
-    f_theta = LatentDynamics(latent_channels=lds_cfg["latent_channels"], n_theta=lds_cfg["n_theta"],
+    # n_theta=N_THETA, NOT lds_cfg["n_theta"]: an old (1-theta) f_theta
+    # ancestor upgrades to the current width, its new theta column zero-padded
+    # below -- bit-identical in function, same contract as the encoder loads.
+    f_theta = LatentDynamics(latent_channels=lds_cfg["latent_channels"], n_theta=N_THETA,
                               latent_spatial=lds_cfg.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=lds_cfg["hidden_dim"],
                               n_hidden_layers=lds_cfg["n_hidden_layers"],
@@ -213,6 +220,7 @@ def build_models_from_components(
                               # batch by epoch 4 -- the exact failure the old
                               # n_substeps comment here warned about.
                               **integration_kwargs_from_config(lds_cfg)).to(device)
-    f_theta.load_state_dict(components["lds"].state_dict)
+    from models.encoder import zero_pad_theta_columns
+    f_theta.load_state_dict(zero_pad_theta_columns(components["lds"].state_dict, f_theta))
 
     return ae, stats_head, f_theta, frozen_modules, final_stream_configs, recon_stream_name

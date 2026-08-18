@@ -1380,10 +1380,16 @@ def main():
     parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True,
                          help="--no-plot skips rendering the figure, which is ~99%% of the "
                               "runtime; the console tables are unaffected")
-    parser.add_argument("--statistic", choices=sorted(_AGGREGATORS), default="median",
+    stat_group = parser.add_mutually_exclusive_group()
+    stat_group.add_argument("--statistic", choices=sorted(_AGGREGATORS), default="median",
                          help="how runs are combined at both levels (default median). Only "
                               "'mean' carries the late-time trapping probability; see "
                               "_AGGREGATORS")
+    stat_group.add_argument("--median", dest="statistic", action="store_const", const="median",
+                         help="shorthand for --statistic median (band: p25-p75)")
+    stat_group.add_argument("--mean", dest="statistic", action="store_const", const="mean",
+                         help="shorthand for --statistic mean (band: +-1 sd)")
+
     parser.add_argument("--inspect-seed", type=int, default=None,
                          help="break this seed down into its individual runs, to decide whether "
                               "an anomaly is the seed (drop it) or a few runs (re-run them)")

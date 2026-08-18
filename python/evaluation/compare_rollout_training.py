@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates
+from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates, N_THETA
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from evaluation._window_parsing import parse_fixed_window
 from training.checkpoint_components import build_ae_from_checkpoint
@@ -53,7 +53,7 @@ def load_lds(checkpoint_path: Path, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     config = checkpoint["config"]
     f_theta = LatentDynamics(
-        latent_channels=config["latent_channels"], n_theta=config["n_theta"],
+        latent_channels=config["latent_channels"], n_theta=N_THETA,
         latent_spatial=config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=config["hidden_dim"], n_hidden_layers=config["n_hidden_layers"],
         # EVERY meaning-changing field, from ONE list -- see
@@ -65,7 +65,8 @@ def load_lds(checkpoint_path: Path, device: torch.device):
         # at dt=500. One list, one call, and a new field cannot miss a site.
         **integration_kwargs_from_config(config),
     ).to(device)
-    f_theta.load_state_dict(checkpoint["model_state"])
+    from models.encoder import zero_pad_theta_columns
+    f_theta.load_state_dict(zero_pad_theta_columns(checkpoint["model_state"], f_theta))
     f_theta.eval()
     return f_theta, checkpoint
 

@@ -1282,3 +1282,29 @@ def test_T0_reaches_the_plot_from_run_metadata_not_from_a_default(tmp_path, monk
     mod.check_stdev_phi_time(base_path=tmp_path / "datasets", size=SIZE,
                               output_path=tmp_path / "out.png")
     assert seen["T0"] == pytest.approx(2.0), "T0 must come from metadata, not the default"
+
+
+def test_median_mean_flag_shorthands_map_onto_statistic(monkeypatch):
+    """--median / --mean are boolean shorthands for --statistic median|mean;
+    all three forms share one dest and are mutually exclusive, so mixing
+    them is rejected instead of silently letting the last one win."""
+    import sys
+    from unittest import mock
+    import pytest
+    import evaluation.check_stdev_phi_time as m
+
+    def parsed_statistic(argv):
+        with mock.patch.object(sys, "argv", ["prog"] + argv), \
+             mock.patch.object(m, "check_stdev_phi_time") as fn:
+            m.main()
+            return fn.call_args.kwargs["statistic"]
+
+    assert parsed_statistic([]) == "median"                       # default unchanged
+    assert parsed_statistic(["--mean"]) == "mean"
+    assert parsed_statistic(["--median"]) == "median"
+    assert parsed_statistic(["--statistic", "mean"]) == "mean"    # long form still works
+
+    with pytest.raises(SystemExit):
+        parsed_statistic(["--mean", "--median"])
+    with pytest.raises(SystemExit):
+        parsed_statistic(["--statistic", "mean", "--median"])

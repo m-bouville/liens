@@ -4,6 +4,7 @@ PyTorch Dataset classes for loading phase-field runs off disk.
 
 import inspect
 import math
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 import training.latent_cache as latent_cache
+from utils.logging_utils import format_progress_count
 from models.constants import (LATENT_SPATIAL_SIZE as _LATENT_SPATIAL_SIZE,
                                N_THETA, theta_coordinates)
 from models.latent_streams import DEFAULT_STREAM_NAME
@@ -347,6 +349,7 @@ def _filtered_steps(metadata: "load.RunMetadata", bad_steps: set[int],
 def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
                       min_step: int = 0, min_stdev_phi: float | None = None,
                       min_passing_steps: int | None = None,
+                      split_label: str = "",
                       ) -> dict[Path, list[int]]:
     """
     Scan run_dirs ONCE and return a stable {run_dir: [kept_step, ...]}
@@ -428,7 +431,8 @@ def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
         good_steps[run_dir] = kept_steps
 
     if min_passing_steps is not None and n_runs_dropped_for_too_few_passing:
-        print(f"build_good_steps: {n_runs_dropped_for_too_few_passing}/{len(run_dirs)} runs "
+        _what = f"{split_label} runs" if split_label else "runs"
+        print(f"build_good_steps: {n_runs_dropped_for_too_few_passing}/{len(run_dirs)} {_what} "
               f"dropped ENTIRELY -- fewer than min_passing_steps={min_passing_steps} steps "
               f"cleared min_stdev_phi={min_stdev_phi}")
 
@@ -498,7 +502,8 @@ class MicrostructureSnapshotDataset(Dataset):
                  cache_in_memory: bool = False, augment: bool = False, min_step: int = 0,
                  min_stdev_phi: float | None = None, min_passing_steps: int | None = None,
                  include_stats: bool = False, stat_names: list[str] | None = None,
-                 good_steps: dict[Path, list[int]] | None = None):
+                 good_steps: dict[Path, list[int]] | None = None,
+                 split_label: str = ""):
         """
         good_steps: a precomputed {run_dir: [kept_step, ...]} mapping
         from build_good_steps(), to skip re-scanning run_dirs when
@@ -561,9 +566,23 @@ class MicrostructureSnapshotDataset(Dataset):
 
         run_dirs = [Path(d) for d in run_dirs]
         if good_steps is None:
-            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi, min_passing_steps)
+            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi,
+                                          min_passing_steps, split_label=split_label)
 
-        for run_dir in run_dirs:
+        # Per-run stats + index build. For a large sweep this parses a
+        # statistics.csv per run (1000+ files) silently, right after
+        # build_good_steps' own summary line -- a multi-second wall of no
+        # output that looks hung. Show an in-place counter for a non-trivial
+        # run set (raw counts below 10k, thousands above -- see
+        # format_progress_count).
+        _show_progress = len(run_dirs) >= 20
+        _n_runs = len(run_dirs)
+
+        for _run_pos, run_dir in enumerate(run_dirs):
+            if _show_progress and (_run_pos % 25 == 0 or _run_pos == _n_runs - 1):
+                sys.stdout.write(
+                    f"\r  indexing runs: {format_progress_count(_run_pos + 1, _n_runs)}   ")
+                sys.stdout.flush()
             metadata = load.read_metadata(run_dir / "metadata.txt")
             kept_steps = good_steps[run_dir]
 
@@ -594,6 +613,10 @@ class MicrostructureSnapshotDataset(Dataset):
                     if stats_df.loc[step, stat_names].isna().any():
                         continue
                 self._index.append((run_dir, step, metadata.nx, metadata.ny))
+
+        if _show_progress:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         self.augment = augment
         self.include_stats = include_stats
@@ -824,7 +847,10 @@ class MicrostructureEvolutionDataset(Dataset):
                  the training loop).
       dt_window: (n_r,) float32, physical time between consecutive steps
                  in the window, i.e. (step_b - step_a) * metadata.dt.
-      theta:     (1,) float32, currently [temperature - T0]. Per
+      theta:     (N_THETA,) float32, [T - T0, log(T0 - T)] -- see
+                 models.constants.theta_coordinates for why BOTH the linear
+                 and the log coordinate are supplied (the log linearises the
+                 power-law physical scales near T0). Per
                  docs/neural_nets.md, f_theta's theta subscript denotes
                  PHYSICAL parameters (e.g. temperature), not the neural
                  net's own learnable weights -- conditioning on theta is
@@ -881,7 +907,7 @@ class MicrostructureEvolutionDataset(Dataset):
                  max_dt: float | None = None, latent_cache_dir: Path | str | None = None,
                  stats_frame_index: int = 0,
                  fixed_aug_indices: tuple[int, ...] | list[int] | None = None,
-                 read_workers: int = 16):
+                 read_workers: int = 16, split_label: str = ""):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
@@ -1089,6 +1115,7 @@ class MicrostructureEvolutionDataset(Dataset):
         self.augment = augment
         self.min_std_deriv = min_std_deriv
         self.max_dt = max_dt
+        self._split_label = split_label
         # Latent cache. Only meaningful with a FROZEN encoder, which is what
         # stage 3 has by construction -- 3a and 3b load the same stage-2
         # checkpoint, and each diagnostic then encodes the test set again.
@@ -1189,7 +1216,8 @@ class MicrostructureEvolutionDataset(Dataset):
 
         run_dirs = [Path(d) for d in run_dirs]
         if good_steps is None:
-            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi, min_passing_steps)
+            good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi,
+                                          min_passing_steps, split_label=split_label)
 
         if self.encoder_given:
             encoder = encoder.to(device).eval()
@@ -1333,8 +1361,23 @@ class MicrostructureEvolutionDataset(Dataset):
         # merging them back together, after the streaming buffer above
         # made accumulating a separate whole-dataset frame list
         # unnecessary, avoids ever building that list at all.
+        # Progress for the read/encode pass -- the one long silent stretch of
+        # dataset construction. At 128x128 on CPU, encoding hundreds of runs'
+        # frames takes minutes with no output between "Loaded ... encoder" and
+        # "Evaluating N windows", which looks hung. Print an in-place counter
+        # (only when actually encoding, i.e. an encoder was given, and only for
+        # a non-trivial run count) so a cold-cache run shows steady progress and
+        # a warm-cache run visibly flies (cache hits skip the encode entirely).
+        _show_progress = self.encoder_given and len(run_dirs) >= 20
+        _n_total = len(run_dirs)
+
         with ThreadPoolExecutor(max_workers=read_workers) as read_pool:
-            for run_dir in run_dirs:
+            for _run_pos, run_dir in enumerate(run_dirs):
+                if _show_progress and (_run_pos % 25 == 0 or _run_pos == _n_total - 1):
+                    sys.stdout.write(
+                        f"\r  encoding runs: {format_progress_count(_run_pos + 1, _n_total)} "
+                        f"({n_cache_hits} cache hit{'' if n_cache_hits == 1 else 's'})   ")
+                    sys.stdout.flush()
                 metadata = load.read_metadata(run_dir / "metadata.txt")
                 kept_steps = good_steps[run_dir]
                 # BEFORE the read/encode below, not after: the window-level
@@ -1425,6 +1468,10 @@ class MicrostructureEvolutionDataset(Dataset):
                     run_data_by_index[run_index] = frames  # (n_kept, 1, ny, nx)
                     run_deriv_by_index[run_index] = None
 
+            if _show_progress:
+                sys.stdout.write("\n")   # close the in-place counter line
+                sys.stdout.flush()
+
             if self.encoder_given:
                 flushed, flushed_deriv = _flush_buffer()  # final, possibly-partial buffer
                 for pos, latents, deriv in zip(buffer_run_indices, flushed,
@@ -1470,7 +1517,8 @@ class MicrostructureEvolutionDataset(Dataset):
                       if self.max_dt is not None
                       else "consider a shorter window_length or looser filtering if this "
                            "is a large fraction")
-            print(f"MicrostructureEvolutionDataset: {n_windowless_runs}/{len(run_dirs)} runs "
+            _runs_word = f"{self._split_label} runs" if self._split_label else "runs"
+            print(f"MicrostructureEvolutionDataset: {n_windowless_runs}/{len(run_dirs)} {_runs_word} "
                   f"had fewer than window_length={window_length} {cause} and were skipped "
                   f"entirely ({advice})")
 
@@ -1553,15 +1601,16 @@ class MicrostructureEvolutionDataset(Dataset):
                         continue
                 self._index.append((run_idx, start))
 
+        _split_suffix = f" in {self._split_label} runs" if self._split_label else ""
         if n_max_dt_windows:
-            print(f"MicrostructureEvolutionDataset: {n_max_dt_windows} candidate window(s) skipped "
+            print(f"MicrostructureEvolutionDataset: {n_max_dt_windows} candidate window(s){_split_suffix} skipped "
                   f"for having a transition longer than max_dt={self.max_dt}. Beyond that dt the "
                   f"first-order (z0 + z1*dt) term's own error is large enough that f_theta can only "
                   f"add a correction on top of an already-wrong prediction -- excluding those "
                   f"windows trains f_theta only where it can actually help.")
 
         if n_degenerate_deriv_windows:
-            print(f"MicrostructureEvolutionDataset: {n_degenerate_deriv_windows} candidate window(s) "
+            print(f"MicrostructureEvolutionDataset: {n_degenerate_deriv_windows} candidate window(s){_split_suffix} "
                   f"skipped for having a near-degenerate first-transition derivative "
                   f"(std < min_std_deriv={self.min_std_deriv}) -- spatially complex but "
                   f"essentially stationary between those two specific steps (e.g. a straight, "

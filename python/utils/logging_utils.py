@@ -5,18 +5,30 @@ Extracted from main.py during its split into orchestration/.
 import inspect
 import sys
 import textwrap
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
 
 class _Tee:
-    """Writes to multiple streams at once (e.g. the real console AND a log file)."""
+    """Writes to multiple streams at once (e.g. the real console AND a log file).
+
+    CONVENTION: the FIRST stream is the live console; every other stream is a
+    capture file. Chunks that begin with '\\r' are in-place progress updates
+    (EpochProgress, the dataset encode/index bars, the interpolation counter):
+    transient by definition -- on a terminal each overwrites the last, but in a
+    log file every update would pile up as a permanent wall of repeated text.
+    They are therefore written to the console ONLY. Everything informative is
+    already emitted as a normal line as well (epoch summaries, the cache-hit
+    count line, the check's own results), so the log loses nothing readable.
+    """
 
     def __init__(self, *streams):
         self.streams = streams
 
     def write(self, data):
-        for s in self.streams:
+        streams = self.streams[:1] if data.startswith("\r") else self.streams
+        for s in streams:
             s.write(data)
             # Flush EVERY write, not just at close. Without this the log
             # file sits in Python's ~8 KiB buffer and a killed run (Ctrl-C,
@@ -129,3 +141,112 @@ def print_run_parameters(func, values: dict, already_printed=()) -> list[str]:
     for line in lines:
         print(line)
     return lines
+
+
+def format_progress_count(current: int, total: int) -> str:
+    """Format a 'current/total' progress fraction, switching to units of
+    thousands once the total is large enough that raw digits are hard to
+    scan. Below the threshold the raw integers read fine and are exact, so
+    they are kept.
+
+        format_progress_count(2801, 27088)  -> '2.8/27.1 thousand'
+        format_progress_count(151, 436)     -> '151/436'
+
+    The threshold is on the TOTAL (not current), so the unit does not flip
+    partway through a run.
+    """
+    if total >= 10_000:
+        return f"{current / 1000:.1f}/{total / 1000:.1f} thousand"
+    return f"{current}/{total}"
+
+
+def _format_duration(seconds: float) -> str:
+    """Compact human duration for an ETA: '45s', '2m30s', '1h05m'. Rounds to
+    whole seconds; drops the smaller unit once we're into hours."""
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{m}m{s:02d}s"
+    h, rem = divmod(seconds, 3600)
+    m = rem // 60
+    return f"{h}h{m:02d}m"
+
+
+class EpochProgress:
+    """In-place within-epoch batch counter that stays SILENT until the epoch
+    is actually slow.
+
+    Every-epoch summary lines already tell you the run is alive between epochs.
+    What they don't cover is a SINGLE epoch that itself takes minutes -- at
+    128x128 an epoch over a couple thousand batches can look frozen while it
+    runs. But most stages (stage 3, small resolutions) have fast epochs where a
+    per-batch counter would just be noise. So this prints nothing until the
+    current epoch has already run longer than `delay_s`; only then does a slow
+    epoch start showing "batch k/N", refreshed in place. A fast epoch finishes
+    before the delay and prints nothing at all -- no per-stage tuning, no flag.
+
+    Usage, once per epoch:
+        prog = EpochProgress(len(train_loader))
+        for batch in train_loader:
+            prog.tick()
+            ...
+        prog.close()
+
+    The per-batch cost is one time comparison (and, once past the delay, a
+    formatted write every `every` batches); the common fast-epoch path does no
+    I/O at all.
+    """
+
+    def __init__(self, n_batches, delay_s: float = 20.0, every: int = 50,
+                 stream=None):
+        self._n = n_batches
+        self._delay = delay_s
+        self._every = max(1, every)
+        self._stream = stream if stream is not None else sys.stdout
+        self._start = time.monotonic()
+        self._i = 0
+        self._active = False        # becomes True once the delay is crossed
+        self._max_width = 0         # widest line written, for erase-on-close
+        self._activated_at = None   # time (and batch) the counter went live --
+        self._activated_i = 0       # ETA rate is measured from here, not from
+        #                             __init__, so the delay window isn't counted
+
+    def tick(self):
+        """Call once per batch, before (or after) the batch's work."""
+        self._i += 1
+        now = time.monotonic()
+        if not self._active:
+            if now - self._start < self._delay:
+                return              # fast path: one comparison, no I/O
+            self._active = True     # this epoch is slow -- start showing progress
+            self._activated_at = now
+            self._activated_i = self._i
+        if self._i % self._every == 0 or self._i == self._n:
+            # ETA from the rate SINCE activation (the delay window is excluded,
+            # so it reflects steady batch speed). Needs at least one batch of
+            # elapsed time past activation to have a rate at all.
+            done_since = self._i - self._activated_i
+            elapsed_since = now - self._activated_at
+            if done_since > 0 and elapsed_since > 0:
+                rate = done_since / elapsed_since          # batches/sec
+                remaining = (self._n - self._i) / rate     # seconds
+                eta = f"~{_format_duration(remaining)} left"
+            else:
+                eta = "estimating..."
+            line = (f"\r  epoch progress: batch "
+                    f"{format_progress_count(self._i, self._n)}  ({eta})   ")
+            self._max_width = max(self._max_width, len(line))
+            self._stream.write(line)
+            self._stream.flush()
+
+    def close(self):
+        """Call once after the epoch's loop. ERASES the progress line (rather
+        than leaving it above the epoch summary): overwrite it with blanks and
+        return the cursor to column 0, so the epoch's own summary line prints
+        over clean ground and no per-batch clutter survives. No-op for a fast
+        epoch that never activated."""
+        if self._active:
+            self._stream.write("\r" + " " * self._max_width + "\r")
+            self._stream.flush()

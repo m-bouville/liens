@@ -42,12 +42,14 @@ being on sys.path):
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from models.constants import theta_coordinates
+from utils.logging_utils import format_progress_count
 
 from evaluation._ae_stats_eval import load_ae_and_stats_head
 from evaluation._window_parsing import _is_int
@@ -137,8 +139,19 @@ def check_interpolation(
     relative_error = np.zeros(n)
     elapsed_span = np.zeros(n)
 
+    # This loop encodes 3 frames per triple over tens of thousands of triples;
+    # at 128x128 on CPU it runs for minutes between "Using N triples" and the
+    # results, with no output (looks hung). Print an in-place counter for a
+    # non-trivial triple count. Gated so the small fixed-triple debugging runs
+    # stay silent.
+    _show_progress = n >= 500
+
     with torch.no_grad():
         for i, (run_dir, t1, t2, t3) in enumerate(triples):
+            if _show_progress and (i % 200 == 0 or i == n - 1):
+                sys.stdout.write(
+                    f"\r  interpolation check: {format_progress_count(i + 1, n)} triples   ")
+                sys.stdout.flush()
             alpha = (t2 - t1) / (t3 - t1)
             metadata = load.read_metadata(run_dir / "metadata.txt")
             elapsed_span[i] = (t3 - t1) * metadata.dt
@@ -172,6 +185,10 @@ def check_interpolation(
             target_norm = stats_z2.norm(dim=1).item()
 
             relative_error[i] = diff_norm / target_norm if target_norm > 1e-3 else np.nan
+
+    if _show_progress:
+        sys.stdout.write("\n")   # close the in-place counter line
+        sys.stdout.flush()
 
     valid = ~np.isnan(relative_error)
     n_dropped = n - valid.sum()

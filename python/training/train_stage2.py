@@ -19,7 +19,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from utils.logging_utils import print_run_parameters
+from utils.logging_utils import print_run_parameters, EpochProgress
 from models.autoencoder import MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -789,7 +789,8 @@ def train_stage2(
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
                                                   min_passing_steps=min_passing_steps,
                                                   fixed_aug_indices=(VAL_DECORRELATED_AUG_INDICES
-                                                                      if val_aug_averaging else None))
+                                                                      if val_aug_averaging else None),
+                                                  split_label="validation")
         print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
               f"{len(val_set)} val "
               f"{'centered (t-dt_minus, t, t+dt_plus)' if deriv_target_centered else 'consecutive-pair'} windows")
@@ -800,7 +801,7 @@ def train_stage2(
                                                     stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                     min_step=min_step, min_stdev_phi=min_stdev_phi,
                                                     min_passing_steps=min_passing_steps,
-                                                    augment=augment)
+                                                    augment=augment, split_label="training")
         val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None,
                                                   window_length=3 if deriv_target_centered else 2,
                                                   stats_frame_index=1 if deriv_target_centered else 0,
@@ -808,7 +809,8 @@ def train_stage2(
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
                                                   min_passing_steps=min_passing_steps,
                                                   fixed_aug_indices=(VAL_DECORRELATED_AUG_INDICES
-                                                                      if val_aug_averaging else None))
+                                                                      if val_aug_averaging else None),
+                                                  split_label="validation")
         print(f"{len(train_set)} train / {len(val_set)} val "
               f"{'centered (t-dt_minus, t, t+dt_plus)' if deriv_target_centered else 'consecutive-pair'} windows")
         train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
@@ -1505,7 +1507,9 @@ def train_stage2(
         if epoch > 0:
             n_train = len(train_set)
             _n_train_batches = 0
+            _epoch_progress = EpochProgress(len(train_loader))
             for batch in train_loader:
+                _epoch_progress.tick()
                 bs = batch[0].size(0)
                 _n_train_batches += 1
                 total, recon, stats, stats1, deriv, interp_val = step(
@@ -1517,6 +1521,7 @@ def train_stage2(
                 train_stats1_sum += stats1 * bs
                 train_deriv_sum += deriv * bs
                 train_interp_sum += interp_val * bs
+            _epoch_progress.close()
             if spike_guard is not None:
                 _n_skipped = spike_guard.n_skipped_this_epoch
                 _worst = spike_guard.worst
@@ -1637,7 +1642,11 @@ def train_stage2(
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
             component_histories[name]["best_so_far"].append(best_components[name])
-        if should_write_loss_figure(epoch, log_every_epoch):
+        if should_write_loss_figure(epoch, log_every_epoch) and not stage2a:
+            # In stage 2a only the deriv stream trains -- recon0 and stats0 are
+            # frozen and dead-flat, so a stacked-component scatter is two flat
+            # bands plus deriv: visual noise. The single moving term is already
+            # in the per-epoch console line and the plain loss_curve below.
             loss_component_scatter(
                 epoch_history, component_histories, loss_components_path,
                 title="Stage 2 loss components",
@@ -1843,11 +1852,12 @@ def train_stage2(
         reference_levels=loss_curve_levels,
     )
     write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
-    loss_component_scatter(
-        epoch_history, component_histories, loss_components_path,
-        title="Stage 2 loss components",
-        ref_components=ref_components_for_scatter,
-    )
+    if not stage2a:      # see the periodic call above: moot when only deriv moves
+        loss_component_scatter(
+            epoch_history, component_histories, loss_components_path,
+            title="Stage 2 loss components",
+            ref_components=ref_components_for_scatter,
+        )
 
     print("\nPer-block PARAMETER drift (L2 norm of change from stage-1 starting point):")
     frozen_groups = {group for group, value in param_drift.items() if value == 0.0}

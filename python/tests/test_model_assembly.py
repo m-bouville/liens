@@ -17,6 +17,7 @@ from models.latent_dynamics import LatentDynamics
 from training.stats_head import StatsHead
 from training.checkpoint_components import load_ae_components, load_lds_component
 from training.model_assembly import build_models_from_components
+from models.constants import N_THETA
 
 
 LATENT_CHANNELS = 4
@@ -51,7 +52,7 @@ def _save_ae_checkpoint(path, latent_channels=LATENT_CHANNELS, base_channels=4,
 
 
 def _save_lds_checkpoint(path, latent_channels=LATENT_CHANNELS, hidden_dim=32, n_hidden_layers=1):
-    f_theta = LatentDynamics(latent_channels=latent_channels, n_theta=1,
+    f_theta = LatentDynamics(latent_channels=latent_channels, n_theta=N_THETA,
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers)
     checkpoint = {
         "model_state": f_theta.state_dict(),
@@ -60,7 +61,7 @@ def _save_lds_checkpoint(path, latent_channels=LATENT_CHANNELS, hidden_dim=32, n
         "val_loss_ema": 0.06,
         "ae_checkpoint": "/fake/stage2.pt",
         "test_dirs": ["/fake/run"],
-        "config": {"latent_channels": latent_channels, "n_theta": 1,
+        "config": {"latent_channels": latent_channels, "n_theta": N_THETA,
                    "hidden_dim": hidden_dim, "n_hidden_layers": n_hidden_layers},
         "data_config": {"min_step": 4000, "min_stdev_phi": 0.01,
                          "window_length": 2, "n_rollout_steps": 1},

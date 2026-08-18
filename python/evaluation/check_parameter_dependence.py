@@ -85,6 +85,23 @@ from evaluation._latent_eval import (
 _DEDIM_N_BINS = 12
 _DT_PANEL_SCALE = 1000  # dz0/dt panels display in units of 1e-3
 
+# Verbose gate. The console output is dominated by multi-line EXPLANATORY
+# prose (what each metric means, how to read the oracle verdict, why the
+# centered oracle is not an achievable target, ...) that is invaluable the
+# first few times and pure scroll thereafter. Data lines (err_actual, the
+# per-decade tables, bias fraction, correlations, the length_scale bins)
+# always print; the explanations are routed through _vprint and appear only
+# under --verbose. Nothing is deleted -- the reasoning is one flag away, and
+# it lives in code (not a commented-out block that rots and can't be toggled).
+_VERBOSE = False
+
+
+def _vprint(*args, **kwargs):
+    """print() only when --verbose is set. For explanatory prose, never for
+    data the caller reads each run."""
+    if _VERBOSE:
+        print(*args, **kwargs)
+
 
 # A plotted point must be built from at least this fraction of the runs
 # contributing windows, or it is dropped. Composition bias is not a
@@ -407,21 +424,21 @@ def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None 
     ratio = c.mean() / max(a.mean(), 1e-30)  # CAUSAL ratio -- the fair one
     if ratio > 0.7:
         print("\n  -> oracle is close to actual: z1 is already near the best any first-order")
-        print("     update could do against THIS z0. The floor is in STAGE 1 (z0's own")
-        print("     trajectory), and further z1/stage-2 work is capped.")
+        _vprint("     update could do against THIS z0. The floor is in STAGE 1 (z0's own")
+        _vprint("     trajectory), and further z1/stage-2 work is capped.")
     elif ratio < 0.3:
         print("\n  -> oracle is far below actual: z0's own trajectory supports a much more")
-        print("     accurate first-order update than z1 currently delivers. The problem is")
-        print("     in STAGE 2 (z1), and improving it is worth doing.")
+        _vprint("     accurate first-order update than z1 currently delivers. The problem is")
+        _vprint("     in STAGE 2 (z1), and improving it is worth doing.")
     else:
         print("\n  -> intermediate: z1 leaves some accuracy on the table, but a real floor")
-        print("     from z0's own trajectory remains too. Both stages contribute.")
-    print("  (verdict is keyed on err_CAUSAL, not err_oracle: the centered oracle is built")
-    print("   from z0(t+dt) and then scored against that same z0(t+dt), so it absorbs part of")
-    print("   an error no causal predictor could avoid -- measured at ~50% on a deliberately")
-    print("   unpredictable trajectory. It is a smoothness probe of z0, NOT an achievable")
-    print("   target for z1, which sees only frame t. Both estimates also inherit z0's own")
-    print("   encoding noise, so neither is an absolute floor.)")
+        _vprint("     from z0's own trajectory remains too. Both stages contribute.")
+    _vprint("  (verdict is keyed on err_CAUSAL, not err_oracle: the centered oracle is built")
+    _vprint("   from z0(t+dt) and then scored against that same z0(t+dt), so it absorbs part of")
+    _vprint("   an error no causal predictor could avoid -- measured at ~50% on a deliberately")
+    _vprint("   unpredictable trajectory. It is a smoothness probe of z0, NOT an achievable")
+    _vprint("   target for z1, which sees only frame t. Both estimates also inherit z0's own")
+    _vprint("   encoding noise, so neither is an absolute floor.)")
     return per_window
 
 
@@ -544,8 +561,8 @@ def _print_saturation_cross_tab(temperatures: np.ndarray, length_scales: np.ndar
             ratio = (f"{latent_losses[in_dec & saturated].mean() / latent_losses[in_dec & ~saturated].mean():7.2f}"
                      if ns and nu and latent_losses[in_dec & ~saturated].mean() > 0 else f"{'--':>7s}")
             print(f"1e{e:<2d}- 1e{e+1:<3d}    {ns:5d}    {nu:5d}   {ms}  {mu} {ratio}")
-        print("  (ratios near 1.0 across decades -> the saturated/unsaturated gap was mostly a dt")
-        print("   effect; ratios staying well above 1.0 -> saturation carries real extra error)")
+        _vprint("  (ratios near 1.0 across decades -> the saturated/unsaturated gap was mostly a dt")
+        _vprint("   effect; ratios staying well above 1.0 -> saturation carries real extra error)")
 
 
 def _print_binned_summary(name: str, values: np.ndarray, latent_losses: np.ndarray,
@@ -861,10 +878,10 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     print(f"  |E[residual]|  (the part that does NOT cancel across windows -- the bias): "
           f"{bias_magnitude:.6e}")
     print(f"  bias fraction = |E[residual]| / E[|residual|] = {bias_fraction:.3f}")
-    print(f"  (near 1.0 -> error is mostly a consistent, SYSTEMATIC bias in the same "
-          f"direction every time -- in principle correctable by retraining z1 differently. "
-          f"near 0.0 -> error is mostly VARIANCE/NOISE, cancelling across windows -- an "
-          f"irreducible floor that retraining on the same KIND of data is unlikely to fix.)")
+    _vprint("  (near 1.0 -> error is mostly a consistent, SYSTEMATIC bias in the same "
+            "direction every time -- in principle correctable by retraining z1 differently. "
+            "near 0.0 -> error is mostly VARIANCE/NOISE, cancelling across windows -- an "
+            "irreducible floor that retraining on the same KIND of data is unlikely to fix.)")
 
     # ---- dt: unchanged from check_dt_dependence.py -- log-log, with
     # the power-law vs saturating-exponential model comparison. dt
@@ -894,7 +911,7 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     else:
         print(f"\ncorr w.r.t. log dt: log latent_loss {corr_dt_latent*100:.0f}% "
               f"(pixel-space skipped -- decode=False)")
-    print("(near 0 = no dt dependence; positive = error grows with dt)")
+    _vprint("(near 0 = no dt dependence; positive = error grows with dt)")
 
     print(f"\nModel comparison ({'euler-only' if euler_only else 'latent_loss'} vs dt): "
           f"power law vs saturating exponential")
@@ -1047,7 +1064,7 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     corr_length_latent = np.corrcoef(length_scales_valid, log_latent_for_length)[0, 1]
     print(f"corr w.r.t. length_scale: log latent_loss {corr_length_latent*100:.0f}% "
           f"(n={len(length_scales_valid)}, excluding saturated)")
-    print("(if this is the dominant driver, error should track length_scale more "
+    _vprint("(if this is the dominant driver, error should track length_scale more "
           "cleanly than it tracks dt/temperature/noise individually above)")
     _print_binned_summary("length_scale", length_scales_valid, latent_losses_for_length,
                            results.pixel_losses[~saturated] if decode else None)
@@ -2269,7 +2286,13 @@ def main():
                               "nothing")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                         help="also print the explanatory prose (how to read each metric, "
+                              "the oracle-verdict caveat, ...). Default output is data-only: "
+                              "the numbers and tables, without the multi-line explanations.")
     args = parser.parse_args()
+    global _VERBOSE
+    _VERBOSE = args.verbose
     if args.z1_resync is not None:
         parser.error(
             "--z1-resync/--no-z1-resync has no meaning in check_parameter_dependence: it "

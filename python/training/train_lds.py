@@ -287,7 +287,7 @@ from training.spike_guard import (  # noqa: E402,F401
     _SpikeGuard, _record_spike, difficulty_band, early_stop_message, end_epoch_pair,
     SkipReporter,
 )
-from utils.logging_utils import print_run_parameters
+from utils.logging_utils import print_run_parameters, EpochProgress
 
 
 def _resume_f_theta_from_checkpoint(
@@ -1250,7 +1250,9 @@ def train_lds(
         if epoch > 0:
             n_train = len(train_set)
             _n_train_batches = 0
+            _epoch_progress = EpochProgress(len(train_loader))
             for batch in train_loader:
+                _epoch_progress.tick()
                 _n_train_batches += 1
                 if _mem_diag is not None:
                     # Per-batch isolation: synchronise so the previous batch's
@@ -1276,6 +1278,7 @@ def train_lds(
                             float(torch.cuda.max_memory_reserved(device)))
             train_loss = (train_loss_sum / n_train).item()
             train_1step = (train_1step_sum / n_train).item()
+            _epoch_progress.close()
             if _bucket_sampler is not None and device.type == "cuda":
                 _alloc = float(torch.cuda.max_memory_allocated(device))
                 _resv = float(torch.cuda.max_memory_reserved(device))

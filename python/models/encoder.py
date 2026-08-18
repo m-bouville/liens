@@ -329,16 +329,21 @@ def zero_pad_theta_columns(state_dict: dict, model: "nn.Module") -> dict:
             continue
         # only first-Linear weights differ, and only in their last (input) dim
         if (ckpt_w.dim() == 2 and model_w.dim() == 2
-                and ckpt_w.shape[0] == model_w.shape[0]
-                and ckpt_w.shape[1] < model_w.shape[1]):
-            pad = model_w.shape[1] - ckpt_w.shape[1]
-            zeros = torch.zeros(ckpt_w.shape[0], pad,
-                                 dtype=ckpt_w.dtype, device=ckpt_w.device)
-            out[key] = torch.cat([ckpt_w, zeros], dim=1)
-        elif ckpt_w.shape[1] > model_w.shape[1]:
-            raise ValueError(
-                f"checkpoint weight {key} is WIDER ({tuple(ckpt_w.shape)}) than "
-                f"the model ({tuple(model_w.shape)}) -- that is a real "
-                f"mismatch, not a theta-feature upgrade (which only ever adds "
-                f"columns). Refusing to silently truncate.")
+                and ckpt_w.shape[0] == model_w.shape[0]):
+            if ckpt_w.shape[1] < model_w.shape[1]:
+                pad = model_w.shape[1] - ckpt_w.shape[1]
+                zeros = torch.zeros(ckpt_w.shape[0], pad,
+                                     dtype=ckpt_w.dtype, device=ckpt_w.device)
+                out[key] = torch.cat([ckpt_w, zeros], dim=1)
+            else:  # same rows, checkpoint WIDER: not an upgrade, refuse loudly
+                raise ValueError(
+                    f"checkpoint weight {key} is WIDER ({tuple(ckpt_w.shape)}) than "
+                    f"the model ({tuple(model_w.shape)}) -- that is a real "
+                    f"mismatch, not a theta-feature upgrade (which only ever adds "
+                    f"columns). Refusing to silently truncate.")
+        # ANY OTHER shape mismatch (different rank, different rows, biases,
+        # conv weights, ...) is not a theta upgrade and is deliberately passed
+        # through UNTOUCHED, so load_state_dict raises its own clear
+        # size-mismatch error naming the key -- this helper must not turn a
+        # legitimate shape error into an IndexError of its own.
     return out

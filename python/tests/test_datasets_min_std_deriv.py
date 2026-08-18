@@ -1,6 +1,5 @@
 import torch
 import pytest
-from pathlib import Path
 from utils import load_datasets as load
 from training.datasets import MicrostructureEvolutionDataset
 
@@ -111,3 +110,80 @@ def test_min_std_deriv_rejects_cached_latent_mode(tmp_path):
     with pytest.raises(ValueError, match="cached-latent"):
         MicrostructureEvolutionDataset([run_dir], encoder=fake_encoder, window_length=2,
                                          min_std_deriv=0.01)
+
+
+def _build_varying_deriv_run(base_dir, name, size=16):
+    """A run whose successive transitions have DIFFERENT derivative std --
+    some frames barely change, some change a lot -- so a mid-range
+    min_std_deriv keeps SOME windows and drops others. This is what
+    exercises the vectorized filter's per-transition alignment (window
+    `start` must use transition `start`, divided by ITS OWN dt), not just
+    the all-in / all-out cases the strip test covers."""
+    import numpy as np
+    import pandas as pd
+    run_dir = base_dir / name
+    run_dir.mkdir()
+    steps = [0, 1000, 3000, 6000, 10000, 15000]      # UNEVEN spacing on purpose
+    metadata_text = "\n".join([
+        f"directory = {name}", "code version = test", "status = complete",
+        f"Nx = {size}", f"Ny = {size}", "dt = 0.05", "steps = 15000",
+        f"save_steps = {' '.join(str(s) for s in steps)}",
+        "a0 = 1.0", "b = 1.0", "T0 = 1.0", "temperature = 0.8",
+        "kappa = 0.2", "mobility = 0.05", "phi0 = 0.0", "noise = 0.01",
+        "seed = 1", "equation = allen_cahn", "solver = explicit", "",
+    ])
+    (run_dir / "metadata.txt").write_text(metadata_text)
+
+    rng = np.random.default_rng(0)
+    base = rng.standard_normal((size, size)).astype("float32")
+    frames = [base]
+    # each successive frame adds a perturbation of GROWING magnitude, so the
+    # per-transition std increases along the run
+    for k in range(1, len(steps)):
+        frames.append(frames[-1] + (0.3 * k) * rng.standard_normal((size, size)).astype("float32"))
+    for step, fr in zip(steps, frames):
+        fr.astype("<f2").tofile(run_dir / load.snapshot_filename(step))
+
+    stdev_phi = float(np.stack(frames).std())
+    df = pd.DataFrame({"stdev_phi": [stdev_phi] * len(steps)}, index=steps)
+    df.index.name = "step"
+    df.to_csv(run_dir / "statistics.csv")
+    return run_dir, steps
+
+
+def test_vectorized_min_std_deriv_matches_the_scalar_formula(tmp_path):
+    """The vectorized per-transition std filter must keep EXACTLY the windows
+    the old per-window scalar computation would. Independently recompute the
+    old formula ((run_data[s+1]-run_data[s])/(dstep*dt)).std() per window and
+    compare the surviving window count against the dataset's own."""
+    import numpy as np
+    run_dir, steps = _build_varying_deriv_run(tmp_path, "T800_n010_s1")
+
+    # Reconstruct the raw frames exactly as the loader sees them (read_phi_half)
+    frames = np.stack([
+        load.read_phi_half(run_dir / load.snapshot_filename(s), 16, 16) for s in steps
+    ])  # (n, ny, nx) float32
+    dt = 0.05
+    window_length = 2
+
+    # pick a threshold strictly between the smallest and largest transition std
+    old_stds = []
+    for start in range(len(steps) - 1):
+        dstep = (steps[start + 1] - steps[start]) * dt
+        d = (frames[start + 1] - frames[start]) / dstep
+        old_stds.append(d.std(ddof=1))          # unbiased, matching torch default
+    old_stds = np.array(old_stds)
+    threshold = float(np.median(old_stds))       # keeps some, drops some
+    expected_kept = int(np.sum(old_stds[:len(steps) - window_length + 1] >= threshold))
+
+    ds = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=window_length,
+        min_stdev_phi=None, min_std_deriv=threshold,
+    )
+    assert len(ds) == expected_kept, (
+        f"vectorized filter kept {len(ds)} windows, scalar formula expects "
+        f"{expected_kept} (stds={old_stds}, thr={threshold})"
+    )
+    # and the mix is non-trivial -- guards against 'kept all' / 'kept none'
+    # accidentally matching
+    assert 0 < expected_kept < len(steps) - window_length + 1

@@ -591,7 +591,10 @@ def build_ae_from_checkpoint(
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
                                      stream_configs=stream_configs,
                                      decoder_for_stream=decoder_for_stream).to(device)
-    ae.load_state_dict(checkpoint["model_state"])
+    # Old (pre-2-feature-theta) checkpoints upgrade here: zero-pad the new
+    # theta input column so the loaded model is bit-identical in function.
+    from models.encoder import zero_pad_theta_columns
+    ae.load_state_dict(zero_pad_theta_columns(checkpoint["model_state"], ae))
     ae.eval()
     ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
 

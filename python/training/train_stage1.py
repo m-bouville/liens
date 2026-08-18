@@ -19,7 +19,7 @@ import gc
 import torch
 from torch.utils.data import DataLoader
 
-from utils.logging_utils import print_run_parameters
+from utils.logging_utils import print_run_parameters, EpochProgress
 from models.autoencoder import Autoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_streams import DEFAULT_STREAM_NAME, LatentStreamMode
@@ -339,6 +339,7 @@ def train_autoencoder(
             val_dirs, cache_in_memory=cache_in_memory, augment=False,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             include_stats=include_stats, stat_names=stat_names,
+            split_label="validation",
         )
         print(f"train_set: skipped (epochs=0 ablation -- never iterated over), "
               f"{val_set.n_base_samples} (val, unaugmented)")
@@ -347,6 +348,7 @@ def train_autoencoder(
             train_dirs, cache_in_memory=cache_in_memory, augment=augment,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             include_stats=include_stats, stat_names=stat_names,
+            split_label="training",
         )
         # Lock val's stat_names to whatever train resolved (auto-detection is
         # order-dependent; without this, val could silently end up checked
@@ -356,6 +358,7 @@ def train_autoencoder(
             val_dirs, cache_in_memory=cache_in_memory, augment=False,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             include_stats=include_stats, stat_names=val_stat_names,
+            split_label="validation",
         )
         if augment:
             print(f"{train_set.n_base_samples} base snapshots (train) -> {len(train_set)} after "
@@ -396,7 +399,10 @@ def train_autoencoder(
 
     if resume_from is not None:
         prev = torch.load(resume_from, map_location=device, weights_only=True)
-        ae.load_state_dict(prev["model_state"])
+        # no-op for theta-free stage-1 checkpoints; upgrades any conditioner
+        # a stage-2-lineage ancestor might carry (zero-pads the new theta col)
+        from models.encoder import zero_pad_theta_columns
+        ae.load_state_dict(zero_pad_theta_columns(prev["model_state"], ae))
         if stats_head is not None and prev.get("stats_head_state") is not None:
             stats_head.load_state_dict(prev["stats_head_state"])
         print(f"Resumed model weights from {resume_from}")
@@ -560,7 +566,9 @@ def train_autoencoder(
         train_stats0_sum = torch.zeros((), device=device)
         n_train = 0
         if epoch > 0:
+            _epoch_progress = EpochProgress(len(train_loader))
             for batch_idx, batch in enumerate(train_loader):
+                _epoch_progress.tick()
                 bs = batch[0].size(0) if include_stats else batch.size(0)
                 total, recon0, stats0 = step(batch, train=True)
                 train_total_sum += total * bs
@@ -572,6 +580,7 @@ def train_autoencoder(
                     # here can be ~48k batches, so a per-epoch report would
                     # first appear only after the point where the OOM happens.
                     print(_vram_report(f"epoch {epoch} batch {batch_idx}"), flush=True)
+            _epoch_progress.close()
             train_total = (train_total_sum / n_train).item()
             train_recon0 = (train_recon0_sum / n_train).item()
             train_stats0 = (train_stats0_sum / n_train).item()
