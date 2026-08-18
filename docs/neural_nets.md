@@ -1,7 +1,7 @@
 # Neural networks: autoencoder and surrogate evolution
 
 
-See `./docs/NN-code_structure.md` (written by Claude) for more details on the structure of the code.
+See `./NN-code_structure.md` (written by Claude) for more details on the structure of the code.
 
 
 
@@ -72,8 +72,6 @@ Currently, the first type works more reliably than the other.
 Note:
 ${}^*$: not yet implemented.
 
-  
-The asymmetry between C$_0$ and C$_1$ in on the number of channels, not size, in the latent space (still true?).
 
 
 ### Stages, losses and checkpoints
@@ -108,7 +106,7 @@ Notes:
 - ${}^\dagger$: mostly.
 
 
-![structure of stages and checkpoints](/assets/docs/liens_stage_checkpoint_flow.png "structure of stages and checkpoints")
+![structure of stages and checkpoints](./liens_stage_checkpoint_flow.png "structure of stages and checkpoints")
 
 
 
@@ -167,12 +165,13 @@ The reconstruction loss alone does not constrain the latent representation to pr
 #### No live calculations
 I just have a small dense net (`stats_head`) with $N_s$ output cells and say: "the values of these must match the statistics calculated in real space", without recalculating the statistics on x' (let alone on $\hat{z}$). Statistics are auxiliary prediction targets rather than differentiable image-derived losses. The statistics head is trained in latent space, only from ground-truth statistics computed offline.
 
+With `latent_channels` == 8 and `hidden_dim` == 16:
 ```text
-  latent (1024)
+  latent (512)
       ↓
-Linear(1024 → 128)
+Linear(512 → 16)
     ReLU
-Linear(128 → Ns)
+Linear(16 → Ns)
 ```
 
 
@@ -229,7 +228,7 @@ Since the autoencoder is frozen in stages 3a and 3b, the latent representation o
 ### fθ and dz1 / dt
 $f_\theta$ does not need to be trained to the first-order term, it only needs to learn $\ddot{z}_0$ (curvature, $\approx \dot{z}_1$), plus the gap between $z_1$ and $\dot{z}_0$. Thus $f_\theta(z_0(t), z_1(t))$ should be trained against
 $$[z_0(t + \Delta t) - z_0(t) - z_1(t)\,\Delta t] / (\Delta t^2/2),$$
-with $\theta$ (currently just the temperature) as further input.
+with $\theta$ (currently just the temperature: in the form of $T-T_0$, and $\ln(T_0-T)$ to handle $T$ close to $T_0$) as further input.
 Finally,
 $$z_0(t + \delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(z_0(t), z_1(t)) \, (\delta t^2/2) + o(\delta t^2).$$
 
@@ -292,7 +291,7 @@ D is frozen, even though `L_recon` is in the loss function: this is what disting
 
 ### Diagnostic tools
 
-See `./docs/NN-code_structure.md` for command-line instructions.
+See `./NN-code_structure.md` for command-line instructions.
 
 
 ### System size: 64×64 → 512×512
@@ -320,7 +319,7 @@ Blocks are labelled by index and channel transition. Under same-`dx` scaling, in
 | dec output_conv               |    289 |     289 |      289 |     289 |
 | **TOTAL decoder**   |**157'985**|**586'017**|**2'294'049**|**9'117'985**|
 |-------------------------------|-------:|--------:|---------:|--------:|
-| `f_θ` (dense MLP)             |460'288 | 460'288 |  460'288 | 460'288 |
+| `f_θ` (dense MLP)             |460'544 | 460'544 |  460'544 | 460'544 |
 | stats_head (dense)            |  8'344 |   8'344 |    8'344 |   8'344 |
 |-------------------------------|-------:|--------:|---------:|--------:|
 | **TOTAL AE + stats**|**656'993**|**2'570'849**|**10'199'649**|**40'661'601**|

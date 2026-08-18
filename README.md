@@ -104,10 +104,10 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\t
 ├── datasets/
 │   ├── 64x64/
 │   ├── 128x128/
-│   └── 256x256/
+│   └── 256x256/			# eventually
 ├── docs/
-│   ├── phase_field.md 		# written by hand
-│   ├── neural_nets.md 		# written by hand
+│   ├── phase_field.md 		# C++ simulations (doc written by hand)
+│   ├── neural_nets.md 		# Python NN (doc written by hand)
 │   └── NN-code_structure.md #written automatically by Claude
 ├── figures/				# figures selected for inclusion here
 ├── output/					# figures generated automatically
@@ -123,11 +123,20 @@ For more details on the structure of the `python` directory, see `./docs/NN-code
 
 ## Current status
 
+### For those who like checklists
 - [X] C++ phase-field solver
 - [X] Dataset generation
 - [X] 1. CNN autoencoder (C$_0$)
 - [X] 2. Derivative (C$_1$)
 - [X] 3. Latent dynamics surrogate
 - [X] 4-5. End-to-end training
-- [ ] Obtaining satisfactory results
-- [ ] Obtaining satisfying results
+- [X] Obtaining satisfactory results for short times
+- [ ] Obtaining satisfactory results at all temperatures
+- [ ] Obtaining satisfying results overall
+
+### For those who prefer text
+- All five training stages are implemented and run end-to-end. The work currently underway is improving the accuracy of the surrogate, not making it run at all.
+- The initial development was carried out using 64×64 images (32×32 for testing the code end-to-end). They were serviceable but hit their limit, with finite-size artifacts eventually dominating the results. The focus is now on 128×128 microstructures.
+- There is a (physically plausible) difference of behavior above and below $T = 0.9 \times T_0$. Work is being done to smoothen out this wrinkle.
+- Predicting $t + \delta t$ gives sensible results, $t + 10 \delta t$ does not.
+- A set of attribution diagnostics has localized the remaining error to the latent dynamics rather than the autoencoder (stages 1 and 2), and identified that the learned second-order corrector ($f_\theta$) does not yet belong in the propagation path as trained. This may hint at the need for a redesign of stage 3 (training $f_\theta$ as a vector field under a multi-step objective) as the next step. 
