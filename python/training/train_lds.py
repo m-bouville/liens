@@ -15,6 +15,7 @@ being on sys.path):
         --size 64 --base ../../datasets --n-rollout-steps 6
 """
 
+import time
 import argparse
 import math
 from collections.abc import Callable
@@ -760,6 +761,7 @@ def train_lds(
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
+            split_label="validation",
         )
         # Defined on BOTH branches: the epochs=0 ablation builds no train
         # loader at all, and the epoch loop's refresh check reads this name
@@ -777,6 +779,7 @@ def train_lds(
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
+            split_label="training",
         )
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
@@ -784,6 +787,7 @@ def train_lds(
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
+            split_label="validation",
         )
         print(f"{len(train_set)} train windows, {len(val_set)} val windows "
               f"(n_rollout_steps={n_rollout_steps}, window_length={window_length})\n")
@@ -1537,6 +1541,7 @@ def train_lds(
                 },
             }, checkpoint_path)
             msg += "  -> saved"
+            msg += f" at {time.strftime('%H:%M')}"  # match the checkpoint filename timestamp
             if on_checkpoint_saved is not None:
                 on_checkpoint_saved(checkpoint_path, epoch)
         else:

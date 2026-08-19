@@ -1,21 +1,42 @@
 """
-Scatter one-step LDS prediction error against dt, temperature, and
-noise, across every window in the test set (not just a handful) -- to
-check whether error systematically depends on any of these (as a few
-examples in check_rollout.py suggested for dt), and specifically to
-help decide WHERE in (temperature, noise) space more simulation data
-would help most. Motivation: a rare, hard case like hourglass-shaped
-grain snapping is exactly the kind of thing under-represented in some
-region of parameter space, not something more training epochs would
-fix -- if error is concentrated in an identifiable (temperature, noise)
-region, that's a direct, actionable signal for where to run more
-simulations, rather than a diffuse "the model needs to be better"
-conclusion.
+Scatter one-step LDS prediction error against dt, temperature, noise, and
+microstructural length scale, across every window in the test set (not just a
+handful) -- to check whether error systematically depends on any of these (as
+a few examples in check_rollout.py suggested for dt).
+
+Original motivation (kept because it is why the (temperature, noise) axes are
+here): a rare, hard case like hourglass-shaped grain snapping is exactly the
+kind of thing under-represented in some region of parameter space, not
+something more training epochs would fix -- IF error concentrated in an
+identifiable (temperature, noise) region, that would be a direct signal for
+where to run more simulations rather than a diffuse "the model needs to be
+better" conclusion.
+
+What this tool then FOUND, which revised that motivation (do not read the
+temperature/noise axes as the expected drivers):
+  - At 64x64 the apparent "error grows near the critical temperature" signal
+    was a FINITE-SIZE ARTIFACT: near-critical runs coarsen to the largest
+    features, which saturate autocorr_length's finite search window, and the
+    saturation -- not the temperature -- carried the error. The saturation
+    cross-tab below (_print_saturation_cross_tab) was built specifically to
+    catch this, and at 128x128 (larger search window, less saturation) the
+    temperature and noise correlations collapse to ~1% and ~0%.
+  - The clean single driver that survives at adequate resolution is the
+    microstructural LENGTH SCALE (autocorr_length): error rises roughly
+    monotonically with feature size, ~60% correlation on the unsaturated
+    population, far cleaner than dt/temperature/noise individually. That is
+    the actionable variable, not a (temperature, noise) region.
+So the length_scale scatter and the saturation confound-control below are not
+incidental extras -- they are the part of this tool that changed the
+conclusion. Treat the temperature/noise panels as confound checks to be ruled
+OUT, not as the hypothesis to confirm.
 
 Usage (run as a module from python/, since imports rely on that root
 being on sys.path):
     python -m evaluation.check_parameter_dependence \
         --lds-checkpoint ../checkpoints/stage3/64x64.pt
+Add --verbose/-v for the explanatory prose on how to read each metric; the
+default output is data-only (numbers, tables, run-specific conclusions).
 """
 
 import argparse
@@ -101,6 +122,65 @@ def _vprint(*args, **kwargs):
     data the caller reads each run."""
     if _VERBOSE:
         print(*args, **kwargs)
+
+
+# End-of-run summary collector. The full report is long; this gathers the
+# handful of headline numbers a reader actually compares across checkpoints
+# into one compact, copy-pasteable block at the very end. Each analysis
+# function records its own numbers here as it computes them (so the summary
+# can't drift from the report -- same values, printed twice), and
+# _print_run_summary() emits them. Keyed insertion order = display order.
+# Laid out one "metric: value" per line specifically so several runs' blocks
+# sit side by side as columns in a table (paste run A's block, then run B's,
+# and matching rows line up).
+_SUMMARY: dict = {}
+
+
+def _summary_reset():
+    _SUMMARY.clear()
+
+
+def _summary_put(key: str, value):
+    _SUMMARY[key] = value
+
+
+def _print_run_summary(checkpoint_path, euler_only: bool):
+    """Compact headline block: the numbers worth tabulating across runs."""
+    import pathlib
+    name = pathlib.Path(checkpoint_path).name
+    mode = "euler-only" if euler_only else "f_theta-corrected"
+    print("\n" + "=" * 70)
+    print("SUMMARY (copy-paste; one column per checkpoint when stacked)")
+    print("=" * 70)
+    print(f"  checkpoint            : {name}")
+    print(f"  mode                  : {mode}")
+    # ordered, with a fixed label width so stacked blocks align into columns
+    _order = [
+        ("err_actual", "err_actual (z1 1-step)", "{:.4f}"),
+        ("err_total_magnitude", "  E[|residual|] (total)", "{:.4e}"),
+        ("err_bias_magnitude", "  |E[residual]| (bias)", "{:.4e}"),
+        ("bias_fraction", "bias fraction", "{:.3f}"),
+        ("corr_length", "corr length_scale", "{:.0%}"),
+        ("corr_temp", "corr temperature", "{:.0%}"),
+        ("corr_noise", "corr noise", "{:.0%}"),
+        ("loss_T_cold", "mean loss T<=0.65", "{:.3f}"),
+        ("loss_T_hot", "mean loss T>=0.95", "{:.3f}"),
+        ("sat_fraction", "saturated fraction", "{:.0%}"),
+        ("sat_ratio", "loss ratio sat/unsat", "{:.1f}x"),
+        ("dt_exponent", "dt power-law exponent", "{:.3f}"),
+        ("oracle_ratio_1e1", "oracle/actual 1e1-1e2", "{:.3f}"),
+        ("oracle_ratio_1e2", "oracle/actual 1e2-1e3", "{:.3f}"),
+        ("oracle_ratio_1e3", "oracle/actual 1e3-1e4", "{:.3f}"),
+        ("worst_T", "worst temperature", "{}"),
+    ]
+    for key, label, fmt in _order:
+        if key in _SUMMARY and _SUMMARY[key] is not None:
+            try:
+                val = fmt.format(_SUMMARY[key])
+            except (ValueError, TypeError):
+                val = str(_SUMMARY[key])
+            print(f"  {label:22}: {val}")
+    print("=" * 70)
 
 
 # A plotted point must be built from at least this fraction of the runs
@@ -400,6 +480,7 @@ def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None 
         print(f"  DE-DIMENSIONALIZED: binning by dt/tau(run), tau at {ref_fraction:g}x the run's "
               f"own equilibrium amplitude")
     print(f"  err_actual (real z1)                       = {a.mean():.6e}")
+    _summary_put("err_actual", a.mean())
     print(f"  err_causal (backward dz0/dt, PAST ONLY)    = {c.mean():.6e}   "
           f"ratio {c.mean()/max(a.mean(), 1e-30):.3f}")
     print(f"  err_oracle (centered dz0/dt, SEES FUTURE)  = {o.mean():.6e}   "
@@ -420,6 +501,9 @@ def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None 
             print(f"  1e{e:<2d}- 1e{e+1:<3d} {m.sum():6d}   {a[m].mean():12.6e}   {c[m].mean():12.6e}   "
                   f"{o[m].mean():12.6e}  {c[m].mean()/max(a[m].mean(), 1e-30):10.3f}  "
                   f"{o[m].mean()/max(a[m].mean(), 1e-30):10.3f}")
+            if e in (1, 2, 3):   # tabulate the three loss-bearing dt decades
+                _summary_put(f"oracle_ratio_1e{e}",
+                             o[m].mean() / max(a[m].mean(), 1e-30))
 
     ratio = c.mean() / max(a.mean(), 1e-30)  # CAUSAL ratio -- the fair one
     if ratio > 0.7:
@@ -511,6 +595,9 @@ def _print_saturation_cross_tab(temperatures: np.ndarray, length_scales: np.ndar
     print(f"  overall saturated mean loss = {latent_losses[saturated].mean():.6f}  vs  "
           f"unsaturated = {latent_losses[~saturated].mean():.6f}  "
           f"(x{latent_losses[saturated].mean()/max(latent_losses[~saturated].mean(), 1e-12):.1f})")
+    _summary_put("sat_fraction", saturated.mean())
+    _summary_put("sat_ratio",
+                 latent_losses[saturated].mean() / max(latent_losses[~saturated].mean(), 1e-12))
 
     # THE decisive statistic -- not the corr(temperature, is_saturated)
     # above, which turned out to be the least informative number here.
@@ -878,6 +965,9 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     print(f"  |E[residual]|  (the part that does NOT cancel across windows -- the bias): "
           f"{bias_magnitude:.6e}")
     print(f"  bias fraction = |E[residual]| / E[|residual|] = {bias_fraction:.3f}")
+    _summary_put("err_total_magnitude", total_magnitude)   # E[|residual|]
+    _summary_put("err_bias_magnitude", bias_magnitude)     # |E[residual]|
+    _summary_put("bias_fraction", bias_fraction)
     _vprint("  (near 1.0 -> error is mostly a consistent, SYSTEMATIC bias in the same "
             "direction every time -- in principle correctable by retraining z1 differently. "
             "near 0.0 -> error is mostly VARIANCE/NOISE, cancelling across windows -- an "
@@ -918,6 +1008,7 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     a, b, r2_log, sse_power, pred_power = fit_power_law(results.dts, results.latent_losses)
     c, tau, r2_sat, sse_sat, pred_sat = fit_saturating_exponential(results.dts, results.latent_losses)
     print(f"  power law:     error ~ dt^{a:.3f}, SSE(real space)={sse_power:.6f}")
+    _summary_put("dt_exponent", a)
     print(f"  saturating exp: error -> {c:.4f} with timescale tau={tau:.1f}, "
           f"SSE(real space)={sse_sat:.6f}")
     better = "saturating exponential" if sse_sat < sse_power else "power law"
@@ -1010,10 +1101,23 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     # not just its magnitude.
     corr_temp_abs = np.corrcoef(results.temperatures, results.latent_losses)[0, 1]
     corr_temp_signed = np.corrcoef(results.temperatures, results.latent_losses_signed)[0, 1]
+    # Two extreme temperature regimes for the summary: T is not monotonic in
+    # loss, so a single corr hides the shape. Report the mean loss in the cold
+    # (T<=0.65) and near-critical (T>=0.95) tails separately -- the pair shows
+    # which end is worse and by how much, per checkpoint.
+    _t = results.temperatures
+    _cold = _t <= 0.65
+    _hot = _t >= 0.95
+    if _cold.any():
+        _summary_put("loss_T_cold", float(results.latent_losses[_cold].mean()))
+    if _hot.any():
+        _summary_put("loss_T_hot", float(results.latent_losses[_hot].mean()))
     corr_noise_abs = np.corrcoef(results.noises, results.latent_losses)[0, 1]
     corr_noise_signed = np.corrcoef(results.noises, results.latent_losses_signed)[0, 1]
     print(f"\ncorr w.r.t. temperature: error {corr_temp_signed * 100:.0f}%, |error| {corr_temp_abs * 100:.0f}%")
+    _summary_put("corr_temp", corr_temp_signed)
     print(f"corr w.r.t. noise: error {corr_noise_signed * 100:.0f}%, |error| {corr_noise_abs * 100:.0f}%")
+    _summary_put("corr_noise", corr_noise_signed)
     _print_binned_summary("temperature", results.temperatures, results.latent_losses, results.pixel_losses if decode else None)
     _print_binned_summary("noise", results.noises, results.latent_losses, results.pixel_losses if decode else None)
 
@@ -1064,6 +1168,7 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     corr_length_latent = np.corrcoef(length_scales_valid, log_latent_for_length)[0, 1]
     print(f"corr w.r.t. length_scale: log latent_loss {corr_length_latent*100:.0f}% "
           f"(n={len(length_scales_valid)}, excluding saturated)")
+    _summary_put("corr_length", corr_length_latent)
     _vprint("(if this is the dominant driver, error should track length_scale more "
           "cleanly than it tracks dt/temperature/noise individually above)")
     _print_binned_summary("length_scale", length_scales_valid, latent_losses_for_length,
@@ -1144,6 +1249,19 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
     for i in order[:10]:
         print(f"  {run_dir_list[i].name}: T={per_run_temps[i]:.3f}  noise={per_run_noises[i]:.4f}  "
               f"mean_loss={per_run_mean_loss[i]:.6f}  ({per_run_n_windows[i]} windows)")
+    # For the summary: the single worst RUN is a one-seed outlier and jumps
+    # around between checkpoints. The worst TEMPERATURE -- the distinct T value
+    # whose runs have the highest window-weighted mean loss -- aggregates over
+    # every run/seed at that T, so it's stable and says which physical regime
+    # actually fails.
+    _uT = np.unique(per_run_temps)
+    if len(_uT):
+        _tmean = np.array([
+            np.average(per_run_mean_loss[per_run_temps == t],
+                       weights=per_run_n_windows[per_run_temps == t])
+            for t in _uT])
+        _wi = int(np.argmax(_tmean))
+        _summary_put("worst_T", f"{_uT[_wi]:.3f} (mean loss {_tmean[_wi]:.2f})")
 
     return _DerivedStats(
         corr_dt_pixel=corr_dt_pixel,
@@ -2184,6 +2302,7 @@ def check_parameter_dependence(
     checkpoint too, for a same-scale comparison against an AE-family
     run).
     """
+    _summary_reset()
     ctx = _load_models_and_dataset(
         lds_checkpoint_path, min_step, min_stdev_phi, min_passing_steps, base_path, size,
         ae_stats_weight, hidden_dim, n_hidden_layers, condition_on_theta, euler_only,
@@ -2213,6 +2332,7 @@ def check_parameter_dependence(
     _build_and_save_figures(results, stats, ctx.lds_checkpoint_path, ctx.output_path,
                              ctx.dz0dt_output_path, ctx.dt_dependence_output_path,
                              decode, ctx.euler_only, dedimensionalize, dts_dim, steps_dim)
+    _print_run_summary(ctx.lds_checkpoint_path, ctx.euler_only)
     return ctx.output_path
 
 

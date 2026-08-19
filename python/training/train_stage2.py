@@ -12,6 +12,7 @@ rationale), a piece of real complexity train_autoencoder has no reason
 to know anything about.
 """
 
+import time
 from collections.abc import Callable
 from models.constants import N_THETA
 from pathlib import Path
@@ -1736,6 +1737,11 @@ def train_stage2(
                                    "n_frozen_stages": n_frozen_stages, "resumed_from": str(resume_from)},
             }, checkpoint_path)
             msg += "  -> saved"
+            # Stamp the save time (HH:MM) so a "-> saved" epoch line can be
+            # matched to the checkpoint file it produced -- the checkpoint
+            # filename carries the timestamp (e.g. ...-20260819_11h20.pt), and
+            # without this there was no way to tell WHICH epoch a given .pt is.
+            msg += f" at {time.strftime('%H:%M')}"
             if on_checkpoint_saved is not None:
                 on_checkpoint_saved(checkpoint_path, epoch)
         elif not was_in_grace_period:

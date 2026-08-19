@@ -8,6 +8,7 @@ first one where the encoder is trainable during rollout training.
 One function covers both stages (freeze_decoder selects which), same
 pattern as train_lds()'s 3a/3b curriculum sharing one function.
 """
+import time
 from pathlib import Path
 
 import torch
@@ -287,6 +288,7 @@ def train_refinement(
             val_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
+            split_label="validation",
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
               f"{len(test_dirs)} test dirs")
@@ -298,11 +300,13 @@ def train_refinement(
             train_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
+            split_label="training",
         )
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
+            split_label="validation",
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
               f"{len(test_dirs)} test dirs")
@@ -789,6 +793,7 @@ def train_refinement(
                 },
             }, checkpoint_path)
             msg += "  -> saved"
+            msg += f" at {time.strftime('%H:%M')}"  # match the checkpoint filename timestamp
             if on_checkpoint_saved is not None:
                 on_checkpoint_saved(checkpoint_path, epoch)
         else:

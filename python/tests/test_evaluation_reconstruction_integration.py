@@ -310,6 +310,14 @@ def test_check_parameter_dependence_non_default_spatial_size(tmp_path, tmp_run_d
         f"the script reported no windows -- it wrote a figure without processing "
         f"any data:\n{printed[-400:]}"
     )
+    # the end-of-run copy-pasteable SUMMARY block must appear and be POPULATED
+    # by the real run (not just render when hand-fed): its headline fields come
+    # from _summary_put calls scattered through the analysis, so an unreached
+    # call site would show here as a missing row.
+    assert "SUMMARY (copy-paste" in printed, "the summary block was not emitted"
+    assert "fake-stage3b.pt" in printed, "summary missing the checkpoint name"
+    assert "err_actual" in printed, "summary missing err_actual -- its _summary_put didn't run"
+    assert "bias fraction" in printed, "summary missing bias fraction"
 
 @pytest.mark.filterwarnings("ignore:checkpoint's saved config only described streams")
 def test_check_rollout_stale_multi_stream_metadata(tmp_path, tmp_run_dir):
@@ -722,3 +730,38 @@ def test_dt_dependence_left_column_yrange_excludes_converged_regime():
     assert lo_ab > 1e-4, f"y_min ({lo_ab}) must exclude the post-cutoff underflow (1e-4)"
     # but y_min still reaches the lowest PRE-cutoff causal point (0.001 at dt=5000)
     assert lo_ab <= 0.001 + 1e-6, f"y_min ({lo_ab}) must reach the pre-cutoff causal floor 0.001"
+
+
+def test_figure_dz0dt_renders_standalone_after_extraction():
+    """_figure_dz0dt was extracted verbatim from _build_and_save_figures (it
+    is the fully-independent ground-truth dz0/dz0dt/d2z0dt2 figure). Lock that
+    it is a real, independently-callable function producing a valid 3x2
+    figure from just the results fields + grouping helper it receives -- so a
+    future edit to the parent cannot silently re-inline or break it."""
+    import numpy as np
+    import tempfile
+    import matplotlib
+    matplotlib.use("Agg")
+    import evaluation.check_parameter_dependence as cpd
+
+    class _R:
+        pass
+    r = _R()
+    rng = np.random.default_rng(0)
+    n = 400
+    r.dts = np.geomspace(10, 5e4, n)
+    r.abs_steps = np.geomspace(1e3, 2e6, n)
+    r.dz0_signed = rng.normal(0, 0.05, n)
+    r.dz0_abs = np.abs(rng.normal(0.05, 0.02, n))
+    r.dz0dt_signed = r.dz0_signed / r.dts
+    r.dz0dt_abs = r.dz0_abs / r.dts
+    r.dz1_signed = rng.normal(0, 1e-4, n)        # the d2z0/dt2 row
+    r.dz1_abs = np.abs(rng.normal(1e-4, 5e-5, n))
+
+    def _grp(x_raw, y_signed, y_abs, run_dirs=None):
+        return cpd._mean_curves_by_unique_value(x_raw, y_signed, y_abs)
+
+    out = Path(tempfile.mkdtemp()) / "dz0dt.png"
+    cpd._figure_dz0dt(r, r.abs_steps, r.dts, _grp, "t", "dt", "title", out)
+    assert out.exists() and out.stat().st_size > 10000, \
+        "_figure_dz0dt did not produce a valid figure"

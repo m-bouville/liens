@@ -11,6 +11,7 @@ being on sys.path):
     python -m training.train_stage1 --size 64 --base ../datasets
 """
 
+import time
 import argparse
 from collections.abc import Callable
 from pathlib import Path
@@ -695,6 +696,7 @@ def train_autoencoder(
             }
             atomic_torch_save(checkpoint, checkpoint_path)
             msg += "  -> saved"
+            msg += f" at {time.strftime('%H:%M')}"  # match the checkpoint filename timestamp
             if on_checkpoint_saved is not None:
                 on_checkpoint_saved(checkpoint_path, epoch)
         else:

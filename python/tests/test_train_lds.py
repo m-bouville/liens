@@ -716,6 +716,12 @@ def test_the_grace_and_the_ceiling_are_the_same_verdict(tmp_path, isolated_proje
     capsys.readouterr()
 
     _train_3b(tmp_path, base_path, stage2_path, stage3a_path,
+              epochs=8,  # several post-grace epochs: with the default 4 and a
+              # grace of 3, exactly ONE epoch could save, and whether its EMA
+              # beat the grace-end best was a training-trajectory coin flip
+              # that landed differently across torch versions/platforms (fine
+              # on Linux, no-save RuntimeError on Windows). This test asserts
+              # the grace/ceiling MESSAGES, not the save -- decouple them.
               checkpoint_path=tmp_path / "stage3b-diff.pt")
     out = capsys.readouterr().out
     assert ("grace period" in out) != ("reference ceiling" in out), (

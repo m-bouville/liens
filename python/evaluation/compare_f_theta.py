@@ -68,6 +68,8 @@ from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
+from utils.logging_utils import format_progress_count
+import sys
 
 
 def _fmt_corr_pct(corr: float | None) -> str:
@@ -408,6 +410,37 @@ def _temperature_axis(ax) -> None:
     """
     lo, hi = ax.get_xlim()
     ax.set_xlim(lo, max(hi, 1.0))
+
+
+def _pretty_label(label: str, include_year: bool) -> str:
+    """'stage 2-20260812_20h08' -> 'stage 2 (12/08 at 20:08)', adding the year
+    ('12/08/2026') only when include_year is True (i.e. the compared
+    checkpoints do not all share the current year). Labels without a
+    -YYYYMMDD_HHhMM timestamp are returned unchanged."""
+    m = re.search(r"(?P<stage>.*?)-?(?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})"
+                  r"_(?P<h>\d{2})h(?P<min>\d{2})", label)
+    if not m:
+        return label
+    stage = m.group("stage").rstrip("-").strip()
+    date = f"{m.group('D')}/{m.group('M')}"
+    if include_year:
+        date += f"/{m.group('Y')}"
+    stamp = f"{date} at {m.group('h')}:{m.group('min')}"
+    return f"{stage} ({stamp})" if stage else f"({stamp})"
+
+
+def _labels_need_year(labels: list[str]) -> bool:
+    """True when the checkpoints' timestamps do not all fall in the current
+    year -- then the year must be shown to disambiguate."""
+    import datetime
+    years = set()
+    for label in labels:
+        m = re.search(r"-?(\d{4})\d{4}_\d{2}h\d{2}", label)
+        if m:
+            years.add(m.group(1))
+    if not years:
+        return False
+    return years != {str(datetime.date.today().year)}
 
 
 def _ylim_from_medians(ax, medians) -> None:
@@ -1293,6 +1326,302 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
     return output_path, window_strings
 
 
+def _load_stage2_ae(path: Path, device) -> dict:
+    """Load a stage-2 (AE-family) checkpoint as a plain model dict for the
+    stage-2 rollout comparison. Unlike _load_model (which expects an f_theta
+    checkpoint and reads its ae_checkpoint pointer), this treats the file
+    itself as the autoencoder -- which is what a stage-2 checkpoint is. Carries
+    just enough (ck for test_dirs/data_config, ae, ae_encoder, ae_config,
+    label) for _select_windows and compute_stage2_trajectory."""
+    ae, ae_encoder, ae_ck, _, _ = build_ae_from_checkpoint(path, device)
+    ck = torch.load(path, map_location=device, weights_only=True)
+    return {"path": path, "ck": ck, "ae": ae, "ae_encoder": ae_encoder,
+            "ae_config": ae_ck["config"], "label": _parse_stem(path.stem)[1]}
+
+
+def compare_stage2_rollouts(paths: list[Path], n_stats: int = 200,
+                            n_steps: int = 10, seed: int = 0,
+                            max_dt: float | None = None,
+                            output_path: Path | None = None,
+                            device: str | None = None) -> Path:
+    """Compare the STAGE-2 rollout (z0+z1 dt, causal, no f_theta) of an
+    arbitrary set of AE-family checkpoints -- one curve per checkpoint. This
+    is the tool for "which stage-2 checkpoint rolls out best" (e.g. comparing
+    training snapshots), independent of the f_theta a/b machinery.
+
+    Windows are chosen ONCE from the FIRST checkpoint's test split at the
+    common horizon, and every checkpoint's rollout is measured on that same
+    window set, so the curves are directly comparable. Loss and correlation
+    are collected per rollout step and plotted as median +/- quartile bands
+    against step count.
+    """
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if len(paths) < 1:
+        raise ValueError("need at least one checkpoint")
+    models = [_load_stage2_ae(Path(p), device) for p in paths]
+    # duplicate labels (two snapshots parsing to the same stem) would collide
+    # in the legend; disambiguate with the filename stem where needed.
+    all_labels = [x["label"] for x in models]
+    for m in models:
+        if all_labels.count(m["label"]) > 1:
+            m["label"] = f"{m['label']} [{Path(m['path']).stem}]"
+    # readable legend labels: 'stage 2-20260812_20h08' -> 'stage 2 (12/08 at
+    # 20:08)', with the year added only if the checkpoints span multiple years.
+    _need_year = _labels_need_year([m["label"] for m in models])
+    for m in models:
+        m["label"] = _pretty_label(m["label"], _need_year)
+
+    windows = _select_windows(models[0], n_stats, n_steps, seed, max_dt, device)
+    print(f"\nstage-2 rollout comparison over {len(windows)} windows "
+          f"(same windows for all {len(models)} checkpoints), "
+          f"horizon {n_steps} steps...")
+
+    # Per-window dt_total and temperature are shared across checkpoints (same
+    # windows), collected once for the vs-dt / vs-temperature panels.
+    dt_totals, temps = [], []
+    for run_dir, steps in windows:
+        run_dir = Path(run_dir)
+        meta = load.read_metadata(run_dir / "metadata.txt")
+        dt_totals.append(sum((steps[i + 1] - steps[i]) * meta.dt
+                             for i in range(len(steps) - 1)))
+        temps.append(meta.temperature)
+    dt_totals = np.array(dt_totals, dtype=float)
+    temps = np.array(temps, dtype=float)
+
+    # Total rollout evaluations for the progress bar: each model runs both the
+    # stage-2 and the causal trajectory over every window.
+    _total_evals = 2 * len(models) * len(windows)
+    _progress = {"done": 0}
+    _show_progress = _total_evals >= 500   # silent for small/test runs
+
+    def _tick():
+        _progress["done"] += 1
+        if _show_progress and (_progress["done"] % 50 == 0
+                               or _progress["done"] == _total_evals):
+            sys.stdout.write(
+                f"\r  rollout progress: "
+                f"{format_progress_count(_progress['done'], _total_evals)}   ")
+            sys.stdout.flush()
+
+    # A diverged rollout produces frames large enough that ReconLoss's squaring
+    # overflows float32 to inf; inf then poisons np.nanpercentile/median across
+    # windows (the "overflow encountered in reduce" warning). The divergence is
+    # real information -- the window blew up -- but it should read as "very bad
+    # and finite", not inf, so quartiles stay meaningful. Cap at a large
+    # sentinel well above any converged loss (which top out ~1e3 here).
+    _LOSS_CAP = 1e12
+
+    def _rollout_series(traj_fn, ae, ae_config):
+        """Per-window per-step loss/corr for a trajectory function that returns
+        a pred-frame LIST (stage-2 or causal) or None (causal, no past frame).
+        Returns (step_losses (W,S+1) with nan rows where undefined, step_corrs,
+        final_losses, final_corrs)."""
+        recon_loss = ReconLoss()
+        step_losses, step_corrs, fin_loss, fin_corr = [], [], [], []
+        for run_dir, steps in windows:
+            _tick()
+            run_dir = Path(run_dir)
+            nx = ny = ae_config["size"]
+            real = [load.read_phi_half(run_dir / load.snapshot_filename(s), nx, ny)
+                    for s in steps]
+            pred = traj_fn(run_dir, steps, ae, ae_config, device)
+            if pred is None:                       # causal: no frame before start
+                step_losses.append([np.nan] * len(steps))
+                step_corrs.append([np.nan] * len(steps))
+                fin_loss.append(np.nan)
+                fin_corr.append(np.nan)
+                continue
+            lk, ck = [], []
+            for k in range(len(real)):
+                with np.errstate(over="ignore", invalid="ignore"):
+                    loss_val = recon_loss(
+                        torch.from_numpy(pred[k])[None, None],
+                        torch.from_numpy(real[k])[None, None]).item()
+                lk.append(min(loss_val, _LOSS_CAP) if np.isfinite(loss_val)
+                          else _LOSS_CAP)
+                c = (_correlation_pct(pred[0], real[0]) if k == 0
+                     else _correlation_pct(pred[k] - pred[0], real[k] - real[0]))
+                ck.append(np.nan if c is None else c)
+            step_losses.append(lk)
+            step_corrs.append(ck)
+            fin_loss.append(lk[-1])
+            fin_corr.append(ck[-1])
+        return (np.array(step_losses, dtype=float),
+                np.array(step_corrs, dtype=float),
+                np.array(fin_loss, dtype=float),
+                np.array(fin_corr, dtype=float))
+
+    for m in models:
+        (m["step_losses"], m["step_corrs"],
+         m["final_loss"], m["final_corr"]) = _rollout_series(
+            compute_stage2_trajectory, m["ae"], m["ae_config"])
+        (m["causal_step_losses"], m["causal_step_corrs"],
+         m["causal_final_loss"], m["causal_final_corr"]) = _rollout_series(
+            compute_causal_trajectory, m["ae"], m["ae_config"])
+    if _show_progress:
+        sys.stdout.write("\r" + " " * 50 + "\r")   # erase the progress line
+        sys.stdout.flush()
+    import warnings
+    for m in models:
+        with np.errstate(over="ignore", invalid="ignore"), \
+                warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            med_loss = np.nanmedian(m["step_losses"], axis=0)
+            med_corr = np.nanmedian(m["step_corrs"], axis=0)
+        print(f"  {m['label']}: final median loss {med_loss[-1]:.5g}, "
+              f"final median corr {med_corr[-1]:.1f}%")
+    n_causal = int(np.isfinite(models[0]["causal_final_loss"]).sum())
+    print(f"  causal baseline defined on {n_causal}/{len(windows)} windows "
+          f"(needs a frame before the window start)")
+
+    if output_path is None:
+        prefix = _parse_stem(models[0]["path"].stem)[0] or "compare"
+        output_path = (_PYTHON_ROOT.parent / "output" / "rollout_check_png" /
+                       f"{prefix}-stage2_rollout-{len(models)}ckpts-seed{seed}"
+                       f"-{n_steps}steps.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _stage2_rollout_figure(models, dt_totals, temps, n_steps, output_path)
+    print(f"saved {output_path}")
+    return output_path
+
+
+def _stage2_rollout_figure(models, dt_totals, temps, n_steps, output_path):
+    """2x4: loss (top) and correlation (bottom), each as distribution /
+    vs-dt / vs-temperature / vs-steps. One colour per checkpoint. The causal
+    baseline (frozen backward dz0/dt -- the best a local derivative can do) is
+    drawn once in grey as the reference every stage-2 curve is judged against;
+    it is checkpoint-independent in spirit (each uses its own AE) so the first
+    model's causal is plotted, with the others' left implicit to avoid clutter.
+    """
+    import warnings
+    steps_axis = np.arange(n_steps + 1)
+    cmap = plt.get_cmap("tab10")
+    fig, axes = plt.subplots(2, 4, figsize=(25, 9))
+
+    def _dist(ax, arrays_labels_colours, is_loss):
+        for arr, label, colour in arrays_labels_colours:
+            v = np.sort(arr[np.isfinite(arr)])
+            if v.size == 0:
+                continue
+            ax.plot(np.linspace(0, 1, v.size), v, color=colour, label=label)
+        if is_loss:
+            ax.set_yscale("log")
+        ax.set_xlabel("cumulative fraction of windows")
+
+    def _vs(ax, x, arrays_labels_colours, binned, is_loss):
+        meds = []
+        for arr, label, colour in arrays_labels_colours:
+            fn = _binned if binned else _moving_window
+            res = fn(x, arr)
+            c, med, lo, hi = res[0], res[1], res[2], res[3]
+            if len(c) == 0:
+                continue
+            ax.plot(c, med, "-o", color=colour, label=label, markersize=3)
+            ax.fill_between(c, lo, hi, color=colour, alpha=0.12)
+            meds.append(med)
+        if is_loss:
+            ax.set_yscale("log")
+        if binned:
+            ax.set_xscale("log")
+        return meds
+
+    def _vs_steps(ax, per_model_step, causal_step, is_loss):
+        meds = []
+        for i, m in enumerate(models):
+            data = m[per_model_step]
+            with np.errstate(over="ignore", invalid="ignore"), \
+                    warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                med = np.nanmedian(data, axis=0)
+                lo = np.nanpercentile(data, 25, axis=0)
+                hi = np.nanpercentile(data, 75, axis=0)
+            ax.plot(steps_axis, med, "-o", color=cmap(i % 10),
+                    label=m["label"], markersize=3)
+            ax.fill_between(steps_axis, lo, hi, color=cmap(i % 10), alpha=0.12)
+            meds.append(med)
+        cdata = models[0][causal_step]
+        if np.isfinite(cdata).any():
+            with np.errstate(over="ignore", invalid="ignore"), \
+                    warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                _cmed = np.nanmedian(cdata, axis=0)
+            ax.plot(steps_axis, _cmed, "--",
+                    color="grey", label="causal (frozen dz0/dt)")
+            meds.append(_cmed)
+        if is_loss:
+            ax.set_yscale("log")
+        ax.set_xlabel("chained steps applied")
+        return meds
+
+    # colour/label bundles for the final-step panels (cols 0-2)
+    def _bundle(final_key, causal_key):
+        b = [(m[final_key], m["label"], cmap(i % 10))
+             for i, m in enumerate(models)]
+        b.append((models[0][causal_key], "causal (frozen dz0/dt)", "grey"))
+        return b
+
+    # TOP ROW: loss. Collect the MEDIAN curves so the y-range is set by them,
+    # not by the diverging quartile bands (a single 1e30 window otherwise
+    # flattens the decades that matter) -- same discipline as _stats_figure.
+    loss_dist_meds = [(m["final_loss"][np.isfinite(m["final_loss"])])
+                      for m in models]
+    _dist(axes[0, 0], _bundle("final_loss", "causal_final_loss"), True)
+    axes[0, 0].set_title("loss distribution (lower is better)")
+    axes[0, 0].set_ylabel("end-to-end loss (final step)")
+    axes[0, 0].legend(fontsize=7)
+    dt_loss_meds = _vs(axes[0, 1], dt_totals,
+                       _bundle("final_loss", "causal_final_loss"),
+                       binned=True, is_loss=True)
+    axes[0, 1].set_title("loss vs dt")
+    axes[0, 1].set_xlabel("dt_total (binned)")
+    _vs(axes[0, 2], temps, _bundle("final_loss", "causal_final_loss"),
+        binned=False, is_loss=True)
+    axes[0, 2].set_title("loss vs temperature")
+    axes[0, 2].set_xlabel("temperature")
+    step_loss_meds = _vs_steps(axes[0, 3], "step_losses",
+                               "causal_step_losses", True)
+    axes[0, 3].set_title("loss vs number of steps")
+    axes[0, 3].set_ylabel("median loss (band: quartiles)")
+    axes[0, 3].legend(fontsize=7)
+
+    # BOTTOM ROW: correlation
+    _dist(axes[1, 0], _bundle("final_corr", "causal_final_corr"), False)
+    axes[1, 0].set_title("correlation distribution (higher is better)")
+    axes[1, 0].set_ylabel("correlation (%) (final step)")
+    _vs(axes[1, 1], dt_totals, _bundle("final_corr", "causal_final_corr"),
+        binned=True, is_loss=False)
+    axes[1, 1].set_title("correlation vs dt")
+    axes[1, 1].set_xlabel("dt_total (binned)")
+    _vs(axes[1, 2], temps, _bundle("final_corr", "causal_final_corr"),
+        binned=False, is_loss=False)
+    axes[1, 2].set_title("correlation vs temperature")
+    axes[1, 2].set_xlabel("temperature")
+    _vs_steps(axes[1, 3], "step_corrs", "causal_step_corrs", False)
+    axes[1, 3].set_title("correlation vs number of steps")
+    axes[1, 3].set_ylabel("median correlation (%) (band: quartiles)")
+
+    # y-caps + alignment (mirrors _stats_figure's end block):
+    # loss panels get a median-driven range; the vs-dt and vs-steps panels
+    # share it so they read together. Correlation panels share a floored range.
+    _ylim_from_medians(axes[0, 1], dt_loss_meds)
+    _ylim_from_medians(axes[0, 3], step_loss_meds)
+    _ylim_from_medians(axes[0, 0], loss_dist_meds)
+    loss_ref = axes[0, 1].get_ylim()
+    for ax in (axes[0, 0], axes[0, 2], axes[0, 3]):
+        ax.set_ylim(loss_ref)
+    corr_panels = [axes[1, 0], axes[1, 1], axes[1, 2], axes[1, 3]]
+    corr_lo = max(min(ax.get_ylim()[0] for ax in corr_panels), _CORR_FLOOR)
+    corr_hi = max(ax.get_ylim()[1] for ax in corr_panels)
+    for ax in corr_panels:
+        ax.set_ylim(corr_lo, corr_hi)
+
+    fig.suptitle("stage-2 rollout comparison (z0 + z1 dt, causal, no f_theta) "
+                 "-- grey dashed: causal backward-dz0/dt baseline")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+
+
 def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
                         n_steps: int = 2, seed: int = 0,
                         max_dt: float | None = None, z1_resync: bool = False,
@@ -1428,8 +1757,18 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkpoint_a", type=Path)
-    parser.add_argument("checkpoint_b", type=Path)
+    parser.add_argument("checkpoints", type=Path, nargs="+",
+                        help="checkpoint(s). Default a/b modes use the first "
+                             "two (an f_theta 3a and 3b). With "
+                             "--stage2-compare, ALL of them are treated as "
+                             "stage-2 (AE-family) checkpoints and their "
+                             "stage-2 rollouts are compared, one curve each.")
+    parser.add_argument("--stage2-compare", action="store_true",
+                        help="compare the STAGE-2 rollout (z0+z1 dt, causal, "
+                             "no f_theta) of every positional checkpoint -- "
+                             "one curve per checkpoint, on shared windows. For "
+                             "'which stage-2 snapshot rolls out best'. Ignores "
+                             "the f_theta a/b machinery and its sweeps.")
     parser.add_argument("--n-samples", type=int, default=6)
     parser.add_argument("--steps", type=int, default=2,
                          help="transitions BOTH models chain, whatever either "
@@ -1485,9 +1824,23 @@ def main() -> None:
     if args.panels_only and args.stats_only:
         parser.error("--panels-only and --stats-only are mutually exclusive")
 
+    if args.stage2_compare:
+        compare_stage2_rollouts(
+            args.checkpoints, n_stats=args.n_stats or 200,
+            n_steps=args.steps, seed=args.seed, max_dt=args.max_dt,
+            output_path=args.output, device=args.device)
+        return
+
+    # a/b modes use the first two positionals (an f_theta 3a and 3b).
+    if len(args.checkpoints) < 2:
+        parser.error("the default (f_theta a/b) comparison needs two "
+                     "checkpoints; give two, or use --stage2-compare for "
+                     "one-or-more stage-2 checkpoints")
+    checkpoint_a, checkpoint_b = args.checkpoints[0], args.checkpoints[1]
+
     if args.stats_only:
         compare_statistics(
-            args.checkpoint_a, args.checkpoint_b,
+            checkpoint_a, checkpoint_b,
             n_stats=args.n_stats or 200, n_steps=args.steps, seed=args.seed,
             max_dt=args.max_dt, z1_resync=args.z1_resync,
             f_scale_sweep=args.f_scale_sweep, alpha_sweep=args.alpha_sweep,
@@ -1495,13 +1848,13 @@ def main() -> None:
             device=args.device)
     elif args.panels_only:
         compare_panels(
-            args.checkpoint_a, args.checkpoint_b,
+            checkpoint_a, checkpoint_b,
             n_samples=args.n_samples, n_steps=args.steps, seed=args.seed,
             fixed_windows=args.fixed_windows, max_dt=args.max_dt,
             z1_resync=args.z1_resync, trajectory=args.trajectory,
             output_path=args.output, device=args.device)
     else:
-        compare_f_theta(args.checkpoint_a, args.checkpoint_b,
+        compare_f_theta(checkpoint_a, checkpoint_b,
                          n_samples=args.n_samples, n_steps=args.steps,
                          seed=args.seed, fixed_windows=args.fixed_windows,
                          max_dt=args.max_dt, z1_resync=args.z1_resync,
