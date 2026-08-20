@@ -53,6 +53,7 @@ class _LoadedContext:
     dz0dt_output_path: Path
     dt_dependence_output_path: Path
     lds_checkpoint_path: Path  # post ensure_lds_checkpoint conversion, NOT the caller's original
+    original_checkpoint_path: Path  # the caller's original --lds-checkpoint (pre-conversion): carries stage2_config for the summary's param rows
     ae_config: dict
     dataset: "MicrostructureEvolutionDataset"
     ae_decoder: torch.nn.Module
@@ -367,6 +368,11 @@ def _load_models_and_dataset(
     check_parameter_dependence()'s own docstring for the parameters'
     meaning; unchanged here."""
     _stage_folder = _stage_folder_from_checkpoint_stem(lds_checkpoint_path)
+    # The caller's ORIGINAL path, before _load_ae_f_theta_and_dataset's
+    # ensure_lds_checkpoint reassigns lds_checkpoint_path to the ephemeral
+    # wrapper below -- needed for the summary's training-param rows, which the
+    # wrapper doesn't carry.
+    _original_checkpoint_path = lds_checkpoint_path
 
     output_path_defaulted = output_path is None
     if output_path is None:
@@ -426,7 +432,9 @@ def _load_models_and_dataset(
     return _LoadedContext(
         device=device, euler_only=euler_only, output_path=output_path,
         dz0dt_output_path=dz0dt_output_path, dt_dependence_output_path=dt_dependence_output_path,
-        lds_checkpoint_path=lds_checkpoint_path, ae_config=ae_config, dataset=dataset,
+        lds_checkpoint_path=lds_checkpoint_path,
+        original_checkpoint_path=_original_checkpoint_path,
+        ae_config=ae_config, dataset=dataset,
         ae_decoder=ae_decoder, f_theta=f_theta,
     )
 

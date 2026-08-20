@@ -314,7 +314,7 @@ def test_check_parameter_dependence_non_default_spatial_size(tmp_path, tmp_run_d
     # by the real run (not just render when hand-fed): its headline fields come
     # from _summary_put calls scattered through the analysis, so an unreached
     # call site would show here as a missing row.
-    assert "SUMMARY (copy-paste" in printed, "the summary block was not emitted"
+    assert "SUMMARY " in printed, "the summary block was not emitted"
     assert "fake-stage3b.pt" in printed, "summary missing the checkpoint name"
     assert "err_actual" in printed, "summary missing err_actual -- its _summary_put didn't run"
     assert "bias fraction" in printed, "summary missing bias fraction"

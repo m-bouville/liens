@@ -102,3 +102,130 @@ def test_summary_shows_raw_bias_variance_magnitudes():
     out = buf.getvalue()
     assert "E[|residual|] (total)" in out and "1.6830e+00" in out
     assert "|E[residual]| (bias)" in out and "3.9560e-01" in out
+
+
+def test_summary_shows_epsprime_asymptote():
+    """The |Euler error|/dt floor -- the flat asymptote of the euler |error|/dt
+    curve -- is the irreducible per-dt error that sets the usable-dt ceiling.
+    Reported with a fixed e-3 suffix so it reads off the [1,0] panel."""
+    m._summary_reset()
+    m._summary_put("err_over_dt_floor", 0.227)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        m._print_run_summary("x.pt", euler_only=True)
+    out = buf.getvalue()
+    assert "|Euler err|/dt floor" in out and "0.227e-3" in out
+    assert "eps'" not in out          # undefined symbol must not appear
+
+
+def test_summary_header_names_the_checkpoint():
+    """The header is 'SUMMARY <filename>' (was a generic 'copy-paste' line) so a
+    stacked set of blocks is self-labeling. When a source (original) checkpoint
+    is given, the header names IT, not the ephemeral-stage3 wrapper."""
+    m._summary_reset()
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        m._print_run_summary("path/to/128x128-stage2-20260818_13h54.pt",
+                             euler_only=True)
+    out = buf.getvalue()
+    assert "SUMMARY 128x128-stage2-20260818_13h54.pt" in out
+    # a rule separates the input params from the output metrics
+    assert "-" * 66 in out
+
+
+def test_summary_shows_training_params_from_stage2_config(tmp_path):
+    """The key training params that DIFFER between runs (stage2a,
+    z0_from_deriv_weight, deriv_dt_weight_exponent, ...) are read from the
+    original checkpoint's stage2_config and printed, so the table shows what
+    actually changed between checkpoints."""
+    import torch
+    ckpt = tmp_path / "src-stage2.pt"
+    torch.save({
+        "config": {"trunk_from_deriv_weight": 0.5},  # a param in a NON-stage2 dict
+        "stage2_config": {
+            "stage2a": True, "z0_from_deriv_weight": 0.05,
+            "deriv_dt_weight_exponent": -0.5,
+            "stats0_weight": 0.25, "deriv_target_centered": True}}, ckpt)
+    m._summary_reset()
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        m._print_run_summary("wrapper-ephemeral-stage3.pt", euler_only=True,
+                             source_checkpoint_path=str(ckpt))
+    out = buf.getvalue()
+    assert "z0_from_deriv_weight" in out and "0.05" in out
+    assert "deriv_dt_weight_exponent" in out and "-0.5" in out
+    assert "stage2a" in out and "True" in out
+    assert "trunk_from_deriv_weight" in out and "0.5" in out  # merged from config, not stage2_config
+    # header names the SOURCE checkpoint, not the evaluated wrapper
+    assert "SUMMARY src-stage2.pt" in out
+    assert "ephemeral-stage3" not in out
+
+
+def test_summary_params_silently_absent_without_stage2_config(tmp_path):
+    """A real stage-3 checkpoint (or any file lacking stage2_config) prints no
+    param rows -- the block degrades cleanly, no crash, no empty labels."""
+    import torch
+    ckpt = tmp_path / "real-stage3.pt"
+    torch.save({"config": {"size": 128}}, ckpt)
+    m._summary_reset()
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        m._print_run_summary(str(ckpt), euler_only=False)
+    out = buf.getvalue()
+    assert "z0_from_deriv_weight" not in out
+    assert "SUMMARY" in out          # block still renders
+
+
+def test_parameter_dependence_has_abs_error_vs_param_row():
+    """parameter_dependence.png gained a second row: raw |error| vs temperature
+    and vs noise (the [1,0]-style multi-curve panel re-binned against a
+    parameter). Guard the wiring so the row isn't silently lost in a refactor."""
+    import inspect
+    src = inspect.getsource(m._build_and_save_figures)
+    # 2x3 grid, not the old 1x3
+    assert "plt.subplots(2, 3" in src, "parameter_dependence is no longer a 2-row figure"
+    # the helper and both calls
+    assert "_plot_abs_error_vs_param" in src
+    assert "_ax_err_temp, results.temperatures" in src
+    assert "_ax_err_noise, results.noises" in src
+    # raw |error|, not divided by dt (option B) -- the helper bins the raw
+    # error arrays, never divides by results.dts
+    helper = src[src.index("def _plot_abs_error_vs_param"):
+                 src.index("_plot_abs_error_vs_param(_ax_err_temp")]
+    assert "/ results.dts" not in helper and "/results.dts" not in helper, (
+        "the |error| vs param panel must plot RAW |error|, not |error|/dt")
+    # unused corner is hidden
+    assert 'axes[1, 2].axis("off")' in src
+
+
+def test_dt_dependence_has_raw_delta_z0_column():
+    """dt_dependence.png gained a raw delta z0 column (col 0) alongside the
+    delta z0 / dt column (col 1): signed [0,0]/[0,1], absolute [1,0]/[1,1].
+    Labels use 'delta z0', defined explicitly, not 'error'."""
+    import inspect
+    src = inspect.getsource(m._build_and_save_figures)
+    assert "_ax_dz0_signed, _ax_dz0_abs = axes_dt[0, 0], axes_dt[1, 0]" in src
+    assert "delta z0 = z0_pred(t+dt) - z0_true(t+dt)" in src
+    assert "delta z0 (mean, signed)" in src
+    assert "|delta z0| / dt (mean, absolute)" in src
+    # the raw curves are NOT divided by dt (that is the /dt column's job)
+    helper = src[src.index("def _plot_raw_dz0"):src.index("_ax_dz0_signed.axhline")]
+    assert "/ results.dts" not in helper and "/results.dts" not in helper
+    # 'error' should be gone from the delta-z0 panel titles
+    assert "error (mean, signed)" not in src and "|error| (mean, absolute)" not in src
+
+
+def test_dt_dependence_has_dt_temperature_scatter():
+    """dt_dependence.png gained a per-window (dt, T) scatter colored by |error|
+    ([0,2]): dt on a LOG x-axis, temperature on y. Guard the wiring."""
+    import inspect
+    src = inspect.getsource(m._build_and_save_figures)
+    assert "_ax_dtT = axes_dt[1, 2]" in src, (
+        "the (dt,T) scatter should sit at [1,1] (square 2x2, sharing the slot "
+        "with the decode-only pixel panel)")
+    # per-window: colored by the raw error, x is dt (log), y is temperature
+    block = src[src.index("_ax_dtT = axes_dt[1, 2]"):
+                src.index("fig_dt.colorbar(_sc_dtT")]
+    assert "results.temperatures" in block and "results.latent_losses" in block
+    # x is dt on a log axis, routed through the shared guard (not a raw set_xscale)
+    assert '_shared_log_scale(_ax_dtT' in src

@@ -144,16 +144,59 @@ def _summary_put(key: str, value):
     _SUMMARY[key] = value
 
 
-def _print_run_summary(checkpoint_path, euler_only: bool):
-    """Compact headline block: the numbers worth tabulating across runs."""
+def _print_run_summary(checkpoint_path, euler_only: bool,
+                       source_checkpoint_path=None):
+    """Compact headline block: the numbers worth tabulating across runs.
+
+    source_checkpoint_path, when given, is the caller's ORIGINAL checkpoint
+    (before any ephemeral-stage3 conversion) -- the ephemeral wrapper doesn't
+    carry the source stage-2's stage2_config, so the training-param rows are
+    read from the original instead. Defaults to checkpoint_path (correct for a
+    real stage-3 checkpoint, which was never converted)."""
     import pathlib
-    name = pathlib.Path(checkpoint_path).name
+    import torch
+    # Name the ORIGINAL checkpoint, not the ephemeral-stage3 wrapper that was
+    # actually evaluated -- the wrapper's '-ephemeral-stage3' suffix is an
+    # implementation detail; the user thinks in terms of the stage-2 file they
+    # passed. Falls back to the evaluated path for a real stage-3 checkpoint.
+    name = pathlib.Path(source_checkpoint_path or checkpoint_path).name
     mode = "euler-only" if euler_only else "f_theta-corrected"
     print("\n" + "=" * 70)
-    print("SUMMARY (copy-paste; one column per checkpoint when stacked)")
+    print(f"SUMMARY {name}")
     print("=" * 70)
-    print(f"  checkpoint            : {name}")
     print(f"  mode                  : {mode}")
+    # Key training params, if the checkpoint carries them -- what actually
+    # DIFFERS between runs (stage2a, z0_from_deriv_weight,
+    # trunk_from_deriv_weight, deriv_dt_weight_exponent, ...). Read from the
+    # ORIGINAL checkpoint. The value can live in any of the checkpoint's config
+    # dicts depending on when/how it was saved (stage2_config is the usual
+    # home, but some params are only in the top-level config or data_config),
+    # so ALL of them are merged and searched -- stage2_config wins on conflict,
+    # since it is the stage's own record. Silently skipped when absent.
+    try:
+        _src = source_checkpoint_path or checkpoint_path
+        _ck = torch.load(_src, map_location="cpu", weights_only=True)
+        _s2 = {}
+        for _cfg_key in ("config", "data_config", "stats_config", "stage2_config"):
+            _cfg = _ck.get(_cfg_key)
+            if isinstance(_cfg, dict):
+                _s2.update(_cfg)   # later keys (stage2_config last) take precedence
+    except Exception:
+        _s2 = {}
+    _param_rows = [
+        ("stage2a", "stage2a"),
+        ("z0_from_deriv_weight", "z0_from_deriv_weight"),
+        ("trunk_from_deriv_weight", "trunk_from_deriv_weight"),
+        ("deriv_dt_weight_exponent", "deriv_dt_weight_exponent"),
+        ("stats0_weight", "stats0_weight"),
+        ("deriv_target_centered", "deriv_target_centered"),
+    ]
+    for _key, _label in _param_rows:
+        if _key in _s2:
+            print(f"  {_label:<22}: {_s2[_key]}")
+    # rule separating the run's INPUT parameters (above) from its measured
+    # OUTPUT metrics (below).
+    print("  " + "-" * 66)
     # ordered, with a fixed label width so stacked blocks align into columns
     _order = [
         ("err_actual", "err_actual (z1 1-step)", "{:.4f}"),
@@ -168,6 +211,7 @@ def _print_run_summary(checkpoint_path, euler_only: bool):
         ("sat_fraction", "saturated fraction", "{:.0%}"),
         ("sat_ratio", "loss ratio sat/unsat", "{:.1f}x"),
         ("dt_exponent", "dt power-law exponent", "{:.3f}"),
+        ("err_over_dt_floor", "|Euler err|/dt floor", "{:.3f}e-3"),
         ("oracle_ratio_1e1", "oracle/actual 1e1-1e2", "{:.3f}"),
         ("oracle_ratio_1e2", "oracle/actual 1e2-1e3", "{:.3f}"),
         ("oracle_ratio_1e3", "oracle/actual 1e3-1e4", "{:.3f}"),
@@ -1571,7 +1615,17 @@ def _build_and_save_figures(
     #  when one stray small-t window can otherwise set the edge for all.)
     _t_left = float(_positive_t.min()) / 1.5 if len(_positive_t) else 1000
     del _t_left
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11))
+    # parameter_dependence.png is now 2 ROWS. Row 0 (the original three
+    # panels): corr w.r.t. temperature, corr w.r.t. noise, per-run scatter.
+    # Row 1 (new): the [1,0]-style multi-curve |error| panel (trivial / euler /
+    # causal / oracle) re-plotted against temperature and noise -- raw |error|,
+    # NOT |error|/dt (that normalization is dt-specific; here the x-axis is a
+    # parameter, and raw |error| matches the quantity the row-0 correlations
+    # are computed on). [1,2] is unused (the scatter spans only row 0).
+    _ax_corr_temp, _ax_corr_noise, _ax_run = axes[0, 0], axes[0, 1], axes[0, 2]
+    _ax_err_temp, _ax_err_noise = axes[1, 0], axes[1, 1]
+    axes[1, 2].axis("off")
     # dt_dependence.png: the 4 panels whose x-axis is dt (error,
     # |error|, pixel-space, and the combined dz0/dz0dt panel), moved
     # out of parameter_dependence.png entirely -- a separate figure,
@@ -1580,7 +1634,16 @@ def _build_and_save_figures(
     # PREDICTION SPAN itself) from what's left in parameter_dependence.png
     # (how does error depend on WHERE in parameter space -- temperature,
     # noise, which run -- a window sits).
-    fig_dt, axes_dt = plt.subplots(2, 2, figsize=(12, 10))
+    fig_dt, axes_dt = plt.subplots(2, 3, figsize=(18, 10))
+    # dt_dependence.png is 2x3, organized as two error columns + a context
+    # column. delta z0 := z0_pred(t+dt) - z0_true(t+dt) (the raw one-step
+    # prediction residual). Column 0: delta z0 (signed [0,0], |delta z0| [1,0]).
+    # Column 1: delta z0 / dt (signed [0,1], |delta z0| / dt [1,1]) -- the same
+    # residual divided by the step, which factors out the trivial error~dt
+    # growth and carries the Taylor-fit / floor. Column 2: [0,2] the real
+    # |dz0|,|dz0/dt| context panel, [1,2] the (dt, T) scatter (or pixel-space
+    # when decode=True). The raw and /dt columns share the same four curves
+    # (trivial / euler / causal / oracle), differing only by the /dt division.
     # Computed HERE (early, right after figure creation) rather than
     # right before the T<0.9/T>=0.9 console-only diagnostic calls below
     # (where it originally lived) -- the dt panels (axes[0,2]/axes[1,2])
@@ -1647,7 +1710,7 @@ def _build_and_save_figures(
         # panel is pixel-space specifically: decode(z0_pred) - decode(z0_true),
         # the SAME residual, run through the decoder, not an independently
         # computed pixel-space quantity.
-        ax = axes_dt[1, 1]
+        ax = axes_dt[1, 2]
         _boxplot_by_x(ax, _px(_dt_x), results.pixel_losses, log_x=True)
         _shared_log_scale(ax, axis="y")
         ax.set_xlabel(_dt_label)
@@ -1656,7 +1719,76 @@ def _build_and_save_figures(
         ax.set_title(f"pixel-space (L1, decoded){_euler_tag}\n"
                      f"corr w.r.t. log dt: log |error| {stats.corr_dt_pixel * 100:.0f}%")
     else:
-        fig_dt.delaxes(axes_dt[1, 1])
+        # [1,1] (when NOT decoding): the (dt, T) plane BINNED into bubbles --
+        # size ~ window count, color ~ mean |error| in the cell -- matching
+        # parameter_dependence.png's per-run bubble scatter (viridis / vmin=0 /
+        # colorbar), but here each bubble is a (dt-bin, T-bin) cell rather than
+        # a run. dt binned in LOG space (its natural, geometric spacing), T in
+        # linear bins. Shows where in the dt-T plane the large errors sit --
+        # whether the big-dt windows that dominate the dt panels cluster at
+        # particular temperatures (the saturation confound) -- without drawing
+        # ~30k overlapping points. Shares the slot with the pixel panel above:
+        # the two are mutually exclusive by the decode flag.
+        _ax_dtT = axes_dt[1, 2]
+        _dtT_x = np.asarray(results.dts, dtype=float)
+        _dtT_T = np.asarray(results.temperatures, dtype=float)
+        _dtT_e = np.asarray(results.latent_losses, dtype=float)
+        _dtT_ok = (np.isfinite(_dtT_x) & (_dtT_x > 0)
+                   & np.isfinite(_dtT_T) & np.isfinite(_dtT_e))
+        if _dtT_ok.sum() >= 1:
+            _lx = np.log10(_dtT_x[_dtT_ok])
+            _ty = _dtT_T[_dtT_ok]
+            _ev = _dtT_e[_dtT_ok]
+            # dt: ~14 log-spaced bins (its natural geometric spacing).
+            _n_dt_bins = 14
+            _lx_edges = np.linspace(_lx.min(), _lx.max() + 1e-12, _n_dt_bins + 1)
+            # T: QUANTILE (equal-count) bins, not fixed-width. The sweep samples
+            # T far more densely near T0=1 (the near-critical mesh is tight
+            # there), so fixed-width bins pile most windows into the top few
+            # bins -> giant overlapping bubbles. Quantile edges follow the
+            # sampling density: fine near T=1, coarse where sparse, comparable
+            # counts per bin -> comparable bubble sizes, with the tight mesh
+            # showing as finer ROWS (matching how the per-run (T, noise)
+            # scatter renders the same density). Deduped in case discrete T
+            # values collapse adjacent quantiles.
+            _n_T_bins = 14
+            _ty_edges = np.unique(np.quantile(_ty, np.linspace(0.0, 1.0, _n_T_bins + 1)))
+            _ty_edges[-1] += 1e-12
+            _lx_idx = np.clip(np.digitize(_lx, _lx_edges) - 1, 0, _n_dt_bins - 1)
+            _ty_idx = np.clip(np.digitize(_ty, _ty_edges) - 1, 0, len(_ty_edges) - 2)
+            _cx, _cy, _cn, _cmean = [], [], [], []
+            for _i in range(_n_dt_bins):
+                for _j in range(len(_ty_edges) - 1):
+                    _m = (_lx_idx == _i) & (_ty_idx == _j)
+                    _cnt = int(_m.sum())
+                    if _cnt == 0:
+                        continue
+                    _cx.append(10.0 ** (0.5 * (_lx_edges[_i] + _lx_edges[_i + 1])))
+                    _cy.append(0.5 * (_ty_edges[_j] + _ty_edges[_j + 1]))
+                    _cn.append(_cnt)
+                    _cmean.append(float(_ev[_m].mean()))
+            _cn = np.asarray(_cn, dtype=float)
+            # bubble AREA ~ window count, but NORMALIZED so the densest cell is
+            # a fixed, non-overlapping size. The per-run scatter's own formula
+            # (0.5625*(30+10*n)) was tuned for per-RUN counts (~tens); per-CELL
+            # counts here run to hundreds, which that formula blows up into the
+            # overlapping blobs. Normalizing by the max keeps "size ~ count"
+            # honest while capping absolute size.
+            _cn_max = float(_cn.max()) if _cn.size else 1.0
+            _bubble_s = 60.0 + 240.0 * (_cn / _cn_max)
+            _sc_dtT = _ax_dtT.scatter(
+                _cx, _cy, c=_cmean, s=_bubble_s,
+                cmap="viridis", edgecolors="black", linewidths=0.3, alpha=0.7, vmin=0)
+            fig_dt.colorbar(_sc_dtT, ax=_ax_dtT,
+                            label=f"mean|delta z0|{_euler_tag}")
+        # dt is strictly positive, but route the log scale through the shared
+        # helper anyway (a raw set_xscale is guarded against) so a degenerate
+        # empty panel can't kill the figure at save time.
+        _shared_log_scale(_ax_dtT, _dtT_x[_dtT_ok], axis="x")
+        _ax_dtT.set_xlabel(_dt_label)
+        _ax_dtT.set_ylabel("temperature")
+        _ax_dtT.set_title(f"|delta z0| over the (dt, T) plane{_euler_tag}\n"
+                          f"(bubble size ~ windows in cell)")
 
     # SAME binned-mean-curve style as the temperature/noise panels below
     # (see that loop's own comments for the full rationale on twin axes
@@ -1728,6 +1860,21 @@ def _build_and_save_figures(
           results.euler_losses / results.dts)
     dt_signed_13, dt_abs_13 = dt_signed_13 * _DT_PANEL_SCALE, dt_abs_13 * _DT_PANEL_SCALE
 
+    # RAW delta z0 curves (column 0): the SAME residual as the /dt panels but
+    # WITHOUT dividing by results.dts and WITHOUT the _DT_PANEL_SCALE factor --
+    # so these are the plain one-step displacement/error magnitudes. Same four
+    # sources: trivial = the real dz0 (its signed error is -dz0, matching the
+    # panel's z0_pred - z0_true convention), euler/full = the euler/latent
+    # residual, causal/oracle = the oracle-per-window residuals (built below,
+    # in the oracle_curves block, in their own raw form).
+    _rz0_x, rz0_signed, rz0_abs, _ = _grp(
+        _dt_x, results.latent_losses_signed, results.latent_losses)
+    _, rz0_trivial_signed, rz0_trivial_abs, _ = _grp(
+        _dt_x, results.dz0_signed, results.dz0_abs)
+    rz0_trivial_signed = -rz0_trivial_signed
+    _rz0_x_13, rz0_signed_13, rz0_abs_13, _ = _grp(
+        _dt_x, results.euler_losses_signed, results.euler_losses)
+
     # Saturation cutoff for the LEFT-column (signed / |error|) y-range.
     # Past the point where the field has converged, dz0 -> 0, so error/dt
     # (which divides by a vanishing displacement) explodes to meaningless
@@ -1779,6 +1926,26 @@ def _build_and_save_figures(
               "(mean|dz0| never drops below 1/3 of its max within the dt range) "
               "-- y-range uses all data, unchanged")
 
+    # |Euler error|/dt floor of the euler-only curve ([1,0] in
+    # dt_dependence.png). With z0_pred = z0_true + a + b*dt, |error|/dt =
+    # a/dt + b, so at large (pre-convergence) dt the a/dt term dies and the
+    # curve flattens to the constant b -- the FLOOR of the |error|/dt curve.
+    # That floor is the irreducible per-dt error: predicting z0(t+dt) incurs
+    # absolute error ~ b*dt, so it sets the usable-dt ceiling. Proxy = min of
+    # the binned euler |error|/dt over dt < the convergence cutoff (the SAME
+    # cutoff already excluded from the left-column y-ranges, since past it
+    # dz0->0 makes error/dt meaningless and artificially small). Reported in
+    # the panel's 1e-3 units so it matches the [1,0] panel by eye.
+    _floor_mask = (np.isfinite(dt_x_13) & np.isfinite(dt_abs_13)
+                   & (dt_x_13 < _sat_dt_cutoff))
+    if _floor_mask.any():
+        # dt_abs_13 is scaled by _DT_PANEL_SCALE (1e-3 units). Report the
+        # physical value formatted with a fixed 'e-3' so it reads directly off
+        # the panel and stays consistent across checkpoints: min(dt_abs_13) is
+        # already the value in 1e-3 units, so "<value>e-3" IS the physical
+        # number (e.g. dt_abs_13 min 0.233 -> "0.233e-3").
+        _summary_put("err_over_dt_floor", float(np.min(dt_abs_13[_floor_mask])))
+
     # Regression curve overlay: eps/eps'/A are SHARED (the joint fit's
     # own point, or the only fit there is under euler_only=True); C is
     # ALWAYS the euler-only-specific coefficient (present in both fit
@@ -1818,7 +1985,7 @@ def _build_and_save_figures(
     # the SAME kind of quantity (both signed, or both absolute), unlike
     # before where one axis's own two curves were genuinely different
     # things (signed vs absolute) needing separate scales.
-    ax_signed, ax_abs = axes_dt[0, 0], axes_dt[1, 0]
+    ax_signed, ax_abs = axes_dt[0, 1], axes_dt[1, 1]
 
     # In EULER-ONLY mode (a stage-2/AE-family checkpoint, f_theta
     # untrained) the "full" curve is a numerically IDENTICAL duplicate of
@@ -1831,6 +1998,7 @@ def _build_and_save_figures(
     # informative curve and is kept as-is; the oracle curves are then
     # omitted rather than crowding four lines onto one panel.
     oracle_curves = None
+    raw_oracle_curves = None
     if euler_only and stats.oracle_per_window is not None:
         opw = stats.oracle_per_window
         ok = ~np.isnan(opw["causal_abs"])
@@ -1848,11 +2016,109 @@ def _build_and_save_figures(
                 oracle_signed=o_oracle_signed * _DT_PANEL_SCALE,
                 oracle_abs=o_oracle_abs * _DT_PANEL_SCALE,
             )
+            # RAW (non-/dt, non-scaled) causal/oracle curves for column 0.
+            _rzx, r_causal_signed, r_causal_abs, _ = _grp(_dt_x[ok],
+                opw["causal_signed"][ok], opw["causal_abs"][ok],
+                run_dirs=[d for d, k in zip(results.run_dirs, ok) if k])
+            _, r_oracle_signed, r_oracle_abs, _ = _grp(_dt_x[ok],
+                opw["oracle_signed"][ok], opw["oracle_abs"][ok],
+                run_dirs=[d for d, k in zip(results.run_dirs, ok) if k])
+            raw_oracle_curves = dict(
+                x=_rzx, causal_signed=r_causal_signed, causal_abs=r_causal_abs,
+                oracle_signed=r_oracle_signed, oracle_abs=r_oracle_abs)
     # dt_n and dt_n_13 group the SAME dt array the same way -- only the
     # loss VALUES differ between euler-only/full, not which windows
     # landed in which dt bucket -- so one dot-sizing scheme covers both
     # curves in both panels.
     sizes = _size_by_count(dt_n)
+
+    # ---- Column 0: raw delta z0 (signed [0,0], |delta z0| [1,0]) ----------
+    # Same four curves as the /dt column, plotted as the plain residual (no
+    # /dt, no scale). No Taylor-fit overlay or floor here: those are
+    # properties of the /dt view specifically. Signed panel is linear (crosses
+    # zero); |delta z0| panel is log (spans decades).
+    _ax_dz0_signed, _ax_dz0_abs = axes_dt[0, 0], axes_dt[1, 0]
+
+    def _plot_raw_dz0(ax, trivial_y, euler_y, full_y, oc_key_signed_or_abs, log_y):
+        """Plot the trivial/euler/(full|causal+oracle) curves of a raw delta z0
+        panel. oc_key is 'signed' or 'abs' -- selects which raw_oracle_curves
+        entries to use for the causal/oracle lines."""
+        ax.plot(_rz0_x, trivial_y, "--", color="gray", linewidth=1, zorder=0)
+        ax.scatter(_rz0_x, trivial_y, s=sizes, color="gray", zorder=0,
+                   marker="s", edgecolors="black", linewidths=0.3,
+                   label="trivial (no change)")
+        ax.plot(_rz0_x_13, euler_y, "-", color="tab:blue", linewidth=1, zorder=1)
+        ax.scatter(_rz0_x_13, euler_y, s=sizes, color="tab:blue", zorder=2,
+                   edgecolors="black", linewidths=0.3, label="euler-only")
+        if raw_oracle_curves is None:
+            ax.plot(_rz0_x, full_y, "-", color="tab:orange", linewidth=1, zorder=1)
+            ax.scatter(_rz0_x, full_y, s=sizes, color="tab:orange", zorder=2,
+                       edgecolors="black", linewidths=0.3, label="full")
+        else:
+            _rc = raw_oracle_curves
+            ax.plot(_rc["x"], _rc[f"causal_{oc_key_signed_or_abs}"], "-",
+                    color="tab:green", linewidth=1, zorder=1)
+            ax.scatter(_rc["x"], _rc[f"causal_{oc_key_signed_or_abs}"], s=20,
+                       color="tab:green", zorder=2, marker="^",
+                       edgecolors="black", linewidths=0.3,
+                       label="causal dz0 (past only)")
+            ax.plot(_rc["x"], _rc[f"oracle_{oc_key_signed_or_abs}"], ":",
+                    color="tab:purple", linewidth=1, zorder=1)
+            ax.scatter(_rc["x"], _rc[f"oracle_{oc_key_signed_or_abs}"], s=20,
+                       color="tab:purple", zorder=2, marker="v",
+                       edgecolors="black", linewidths=0.3,
+                       label="oracle dz0 (sees future)")
+        if log_y:
+            _shared_log_scale(ax, axis="y")
+        _shared_log_scale(ax, axis="x")
+        ax.set_xlabel(_dt_label)
+        ax.set_xlim(left=_x_left)
+        ax.legend(fontsize=7, loc="best")
+
+    _ax_dz0_signed.axhline(0, color="gray", linewidth=0.7, linestyle=":")
+    _plot_raw_dz0(_ax_dz0_signed, rz0_trivial_signed, rz0_signed_13, rz0_signed,
+                  "signed", log_y=False)
+    _ax_dz0_signed.set_ylabel("mean(delta z0)")
+    _ax_dz0_signed.set_title("delta z0 (mean, signed)\n"
+                             "delta z0 = z0_pred(t+dt) - z0_true(t+dt)")
+    _plot_raw_dz0(_ax_dz0_abs, rz0_trivial_abs, rz0_abs_13, rz0_abs,
+                  "abs", log_y=True)
+    _ax_dz0_abs.set_ylabel("mean|delta z0|")
+    _ax_dz0_abs.set_title("|delta z0| (mean, absolute)\n"
+                          "delta z0 = z0_pred(t+dt) - z0_true(t+dt)")
+
+    # y-range from the LOW-dt data, same idea as the /dt column: raw delta z0
+    # GROWS ~ dt, so the euler curve's large-dt values (dt >= _sat_dt_cutoff)
+    # would otherwise crush the low-dt structure into a sliver. Exclude that
+    # converged/large-dt regime from the range; the points stay plotted, just
+    # off-chart. Signed panel: symmetric linear range via the shared helper.
+    def _raw_range_curves(which):
+        _c = [(_rz0_x, rz0_trivial_signed if which == "signed" else rz0_trivial_abs),
+              (_rz0_x_13, rz0_signed_13 if which == "signed" else rz0_abs_13)]
+        if raw_oracle_curves is None:
+            _c.append((_rz0_x, rz0_signed if which == "signed" else rz0_abs))
+        else:
+            _c += [(raw_oracle_curves["x"], raw_oracle_curves[f"causal_{which}"]),
+                   (raw_oracle_curves["x"], raw_oracle_curves[f"oracle_{which}"])]
+        return _c
+    _rs_lo, _rs_hi = _ylim_from_below_cutoff(
+        _raw_range_curves("signed"), _sat_dt_cutoff, _ax_dz0_signed.get_ylim())
+    _ax_dz0_signed.set_ylim(_rs_lo, _rs_hi)
+    # Abs panel (log): y_max from the sub-cutoff data (the large-dt euler climb
+    # is what we're excluding here, unlike the /dt panel where it was the floor
+    # that needed protecting); y_min from all positive data, multiplicatively
+    # padded.
+    _ra_sub, _ra_all = [], []
+    for _cx, _cy in _raw_range_curves("abs"):
+        _cx = np.asarray(_cx, float); _cy = np.asarray(_cy, float)
+        _sub = np.isfinite(_cx) & np.isfinite(_cy) & (_cx < _sat_dt_cutoff) & (_cy > 0)
+        _ra_sub.extend(_cy[_sub].tolist())
+        _ra_all.extend(_cy[np.isfinite(_cy) & (_cy > 0)].tolist())
+    if _ra_sub:
+        _ra_hi = max(_ra_sub) * 1.3
+        _ra_lo = min(_ra_all) / 1.1 if _ra_all else _ax_dz0_abs.get_ylim()[0]
+        if _ra_hi > 0 and _ra_lo > 0:
+            _ax_dz0_abs.set_ylim(_ra_lo, _ra_hi)
 
     ax_signed.axhline(0, color="gray", linewidth=0.7, linestyle=":")
     # Trivial baseline plotted FIRST (lower zorder, sits visually behind
@@ -2042,12 +2308,12 @@ def _build_and_save_figures(
     # evaluation.check_deriv_temperature.py measures z1 against
     # directly) -- z0_euler_pred=z0(t)+z1(t)*dt divided by dt is
     # z1(t) + [z0(t)-z0(t+dt)]/dt = z1(t) - dz0/dt, exactly.
-    for ax, name, title in [(ax_signed, "error", "error (mean, signed)\nerror = (z0_pred(t+dt)-z0_true(t+dt))/dt"),
-                             (ax_abs, "|error|", "|error| (mean, absolute)\nerror = (z0_pred(t+dt)-z0_true(t+dt))/dt")]:
+    for ax, ylabel, title in [(ax_signed, "mean(delta z0) / dt [1e-3]", "delta z0 / dt (mean, signed)\ndelta z0 = z0_pred(t+dt) - z0_true(t+dt)"),
+                             (ax_abs, "mean|delta z0| / dt [1e-3]", "|delta z0| / dt (mean, absolute)\ndelta z0 = z0_pred(t+dt) - z0_true(t+dt)")]:
         _shared_log_scale(ax, axis="x")
         ax.set_xlabel(_dt_label)
         ax.set_xlim(left=_x_left)
-        ax.set_ylabel(f"mean({name}) [1e-3]" if name == "error" else f"mean{name} [1e-3]")
+        ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.legend(fontsize=7, loc="best")
 
@@ -2075,14 +2341,14 @@ def _build_and_save_figures(
     # s is marker AREA in matplotlib (points^2), and diameter ~ sqrt(s)
     # -- reducing diameter by a quarter (new = 0.75 * old) means scaling
     # area by 0.75^2 = 0.5625, not by 0.75 itself.
-    sc = axes[2].scatter(stats.run_temps, stats.run_noises, c=stats.run_mean_loss,
+    sc = _ax_run.scatter(stats.run_temps, stats.run_noises, c=stats.run_mean_loss,
                           s=0.5625 * (30 + 10 * stats.run_n_windows),
                           cmap="viridis", edgecolors="black", linewidths=0.3, alpha=0.7, vmin=0)
-    axes[2].set_xlabel("temperature")
-    axes[2].set_ylabel("noise")
-    axes[2].set_ylim(bottom=0)
-    axes[2].set_title("z0(t+dt): mean|pred - true| per run")
-    fig.colorbar(sc, ax=axes[2], label="z0(t+dt): mean|pred - true|")
+    _ax_run.set_xlabel("temperature")
+    _ax_run.set_ylabel("noise")
+    _ax_run.set_ylim(bottom=0)
+    _ax_run.set_title("z0(t+dt): mean|pred - true| per run")
+    fig.colorbar(sc, ax=_ax_run, label="z0(t+dt): mean|pred - true|")
 
     # Two curves per panel -- mean(error) (signed -- can be negative,
     # shows whether the bias itself has a consistent direction) and
@@ -2121,9 +2387,9 @@ def _build_and_save_figures(
     # length_scale's own correlation/model-comparison console output
     # above is UNCHANGED -- only this plotted panel is gone.
     panel_specs = [
-        (axes[0], temp_x, temp_signed, temp_abs, temp_n, "temperature",
+        (_ax_corr_temp, temp_x, temp_signed, temp_abs, temp_n, "temperature",
          stats.corr_temp_signed, stats.corr_temp_abs),
-        (axes[1], noise_x, noise_signed, noise_abs, noise_n, "noise",
+        (_ax_corr_noise, noise_x, noise_signed, noise_abs, noise_n, "noise",
          stats.corr_noise_signed, stats.corr_noise_abs),
     ]
     twin_axes = []
@@ -2165,7 +2431,7 @@ def _build_and_save_figures(
     # sweep's own temperature range starts well above 0, and 0 has no
     # special physical significance for it the way it does for a
     # magnitude like noise).
-    axes[1].set_xlim(left=0)
+    _ax_corr_noise.set_xlim(left=0)
 
     # y-ranges: LEFT (mean(z0_pred(t+dt)-z0_true(t+dt))) symmetric about 0, RIGHT
     # (mean|z0_pred(t+dt)-z0_true(t+dt)|) floored at 0 -- see
@@ -2173,10 +2439,76 @@ def _build_and_save_figures(
     # across these two panels only, computed from what's actually
     # autoscaled after every artist is in place.
     left_ylim, right_ylim = _symmetric_left_zero_right_ylim(
-        [axes[0], axes[1]], twin_axes)
-    for ax, twin in zip([axes[0], axes[1]], twin_axes):
+        [_ax_corr_temp, _ax_corr_noise], twin_axes)
+    for ax, twin in zip([_ax_corr_temp, _ax_corr_noise], twin_axes):
         ax.set_ylim(left_ylim)
         twin.set_ylim(right_ylim)
+
+    # ---- Row 1: raw |error| vs temperature and vs noise ----------------
+    # The [1,0]-style multi-curve panel (trivial / euler / full-or-causal /
+    # oracle) re-binned against a PARAMETER instead of dt, plotting RAW
+    # |error| (not |error|/dt: that normalization is dt-specific and would,
+    # per bin, average over the bin's dt composition -- see the option-B
+    # discussion). Same four curves and colors as dt_dependence.png's |error|
+    # panel, on a log y-axis (errors span decades). This is the binned-curve
+    # companion to the row-0 correlation panels, which correlate this exact
+    # quantity (results.latent_losses) against the same parameter.
+    def _plot_abs_error_vs_param(ax, param_values, param_label):
+        # Curves: trivial = |dz0| (predict no change), euler = euler |error|,
+        # and either full |error| (stage-3) or causal+oracle (euler-only, when
+        # the oracle per-window data is available -- same gate as the dt panel).
+        _pv = np.asarray(param_values, dtype=float)
+        _curves = [
+            ("trivial (no change)", results.dz0_abs, "gray", "--", "s"),
+            ("euler-only" if euler_only else "euler", results.euler_losses,
+             "tab:blue", "-", "o"),
+        ]
+        if oracle_curves is None:
+            _curves.append(("full (f_theta)", results.latent_losses,
+                            "tab:orange", "-", "o"))
+        elif stats.oracle_per_window is not None:
+            _opw = stats.oracle_per_window
+            _curves += [
+                ("causal dz0/dt (past only)", _opw["causal_abs"], "tab:green", "-", "^"),
+                ("oracle dz0/dt (sees future)", _opw["oracle_abs"], "tab:purple", "-", "v"),
+            ]
+        for _label, _yraw, _color, _ls, _marker in _curves:
+            _y = np.asarray(_yraw, dtype=float)
+            _ok = np.isfinite(_pv) & np.isfinite(_y)
+            if _ok.sum() < 2:
+                continue
+            # run_dirs MUST be masked with the same _ok, or _grp's coverage
+            # computation indexes the full-length results.run_dirs with a
+            # shorter boolean and raises (size mismatch). Same pattern as the
+            # oracle curves' own masked _grp calls.
+            _rd = [d for d, k in zip(results.run_dirs, _ok) if k]
+            _bx, _bsig, _babs, _bn = _grp(_pv[_ok], _y[_ok], _y[_ok], run_dirs=_rd)
+            _pos = _babs > 0            # log axis: drop non-positive bins
+            if _pos.sum() < 1:
+                continue
+            ax.plot(_bx[_pos], _babs[_pos], _ls, color=_color, linewidth=1, zorder=1)
+            ax.scatter(_bx[_pos], _babs[_pos], s=20, color=_color, zorder=2,
+                        marker=_marker, edgecolors="black", linewidths=0.3,
+                        label=_label)
+        # log y: |error| spans decades. Routed through the shared helper (a raw
+        # set_yscale is guarded against) so a non-positive or empty axis is
+        # handled the same way as every other log panel.
+        _shared_log_scale(ax, axis="y")
+        ax.set_xlabel(param_label)
+        ax.set_ylabel(f"|error|{_euler_tag}: mean|z0(t+dt) pred - true|")
+        ax.set_title(f"|error| vs {param_label}")
+        ax.legend(fontsize=7, loc="best")
+
+    _plot_abs_error_vs_param(_ax_err_temp, results.temperatures, "temperature")
+    _plot_abs_error_vs_param(_ax_err_noise, results.noises, "noise")
+    # Align the two bottom-row panels' y-range so the |error| magnitudes read
+    # on the same scale across temperature and noise (each autoscales to its
+    # own data otherwise, and the eye wrongly compares differently-zoomed
+    # axes). Union of both autoscaled ranges, applied to both.
+    _err_los, _err_his = zip(_ax_err_temp.get_ylim(), _ax_err_noise.get_ylim())
+    _err_ylim = (min(_err_los), max(_err_his))
+    _ax_err_temp.set_ylim(_err_ylim)
+    _ax_err_noise.set_ylim(_err_ylim)
 
     # Run TWICE -- all data, and a T<0.9 subset -- to check whether the
     # large stderr on eps/C (both consistent with zero in the all-data
@@ -2223,7 +2555,7 @@ def _build_and_save_figures(
     _, _, dz0dt_abs_by_dt, _ = _grp(_dt_x, results.dz0dt_signed, results.dz0dt_abs)
     dz0_abs_by_dt = dz0_abs_by_dt * _DT_PANEL_SCALE
     dz0dt_abs_by_dt = dz0dt_abs_by_dt * _DT_PANEL_SCALE
-    ax7 = axes_dt[0, 1]
+    ax7 = axes_dt[0, 2]
     twin7 = ax7.twinx()
     ax7.plot(dt_x7, dz0_abs_by_dt, "o-", color="tab:orange", label="mean|dz0|")
     twin7.plot(dt_x7, dz0dt_abs_by_dt, "o-", color="tab:red", label="mean|dz0/dt|")
@@ -2332,7 +2664,8 @@ def check_parameter_dependence(
     _build_and_save_figures(results, stats, ctx.lds_checkpoint_path, ctx.output_path,
                              ctx.dz0dt_output_path, ctx.dt_dependence_output_path,
                              decode, ctx.euler_only, dedimensionalize, dts_dim, steps_dim)
-    _print_run_summary(ctx.lds_checkpoint_path, ctx.euler_only)
+    _print_run_summary(ctx.lds_checkpoint_path, ctx.euler_only,
+                        source_checkpoint_path=ctx.original_checkpoint_path)
     return ctx.output_path
 
 
