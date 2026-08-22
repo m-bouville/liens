@@ -195,6 +195,18 @@ void Simulation::__runOneSimulation(double T,
     std::filesystem::path file;
     std::vector<writer::WriterStatistics> all_stats;
 
+    // NOTE ON SNAPSHOT TIMING (known, documented, deliberately NOT changed):
+    // the step is applied BEFORE the save check, so the file named "t<step>"
+    // holds phi at physical time (step+1)*dt, not step*dt, and the initial
+    // condition (step 0 == save 0) is never written (t0000000 is phi after ONE
+    // step). This is a one-dt shift on ABSOLUTE time labels only. The time
+    // INCREMENT between any two saved frames is unaffected (the +1 cancels in
+    // a difference), so every downstream model that trains on relative dt --
+    // the autoencoder (per-frame) and the latent dynamics surrogate (frame
+    // pairs + their dt) -- is completely unaffected. It is left as-is so the
+    // existing dataset stays internally consistent; if the whole dataset is
+    // ever regenerated, move the save check to BEFORE solver.step() (and save
+    // step 0 = the IC) to make t<step> == phi(step*dt).
     for (int step = 0; step < __config.steps; ++step)
     {
         solver.step(op, potential, neighbors, T, __config.dt);

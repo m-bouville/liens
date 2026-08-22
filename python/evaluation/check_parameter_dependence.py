@@ -185,15 +185,32 @@ def _print_run_summary(checkpoint_path, euler_only: bool,
         _s2 = {}
     _param_rows = [
         ("stage2a", "stage2a"),
+        ("lr", "lr"),
+        ("batch_size", "batch_size"),
         ("z0_from_deriv_weight", "z0_from_deriv_weight"),
         ("trunk_from_deriv_weight", "trunk_from_deriv_weight"),
         ("deriv_dt_weight_exponent", "deriv_dt_weight_exponent"),
+        # A weight is uninterpretable without its scale: the loss term is
+        # weight * raw_loss / scale, so the coefficient on the raw loss is
+        # weight/scale, and two runs at the same nominal weight can differ by
+        # an order of magnitude in effective pressure via the scale alone.
+        ("deriv_weight", "deriv_weight"),
+        ("deriv_scale", "deriv_scale"),
         ("stats0_weight", "stats0_weight"),
+        ("stats0_scale", "stats0_scale"),
+        ("recon0_scale", "recon0_scale"),
         ("deriv_target_centered", "deriv_target_centered"),
     ]
+    # Under stage2a the trunk and z0 are frozen, so L_deriv's trunk/z0 coupling
+    # weights have no effect no matter what they were set to -- flag them rather
+    # than let a reader compare an inert 0.5 against a live 0.5 across runs.
+    _stage2a_on = bool(_s2.get("stage2a", False))
+    _inert_under_2a = {"trunk_from_deriv_weight", "z0_from_deriv_weight"}
     for _key, _label in _param_rows:
         if _key in _s2:
-            print(f"  {_label:<22}: {_s2[_key]}")
+            _note = ("   (inert: stage2a freezes trunk & z0)"
+                     if _stage2a_on and _key in _inert_under_2a else "")
+            print(f"  {_label:<22}: {_s2[_key]}{_note}")
     # rule separating the run's INPUT parameters (above) from its measured
     # OUTPUT metrics (below).
     print("  " + "-" * 66)
@@ -822,6 +839,98 @@ def _size_by_count(n_windows: np.ndarray, min_size: float = 20.0, max_size: floa
     return min_size + (max_size - min_size) * (n_windows - lo) / (hi - lo)
 
 
+def _dtT_bubbles(ax, fig, dts, temps, values, ok, *, label, title, dt_label,
+                 diverging=False, color_dt_cutoff=None):
+    """Bin per-window `values` over the (log dt, quantile-T) plane and draw one
+    bubble per populated cell -- size ~ window count, color ~ cell-mean value.
+    Shared by the |delta z0| scatter and the causal-/euler-minus-trivial
+    difference panels. `ok` masks the windows to include (a difference panel
+    restricts to windows where the causal/oracle residual is defined).
+    diverging=True centers a signed (coolwarm) colormap at 0 -- for the
+    difference panels, where sign is the point (negative = beats trivial).
+
+    color_dt_cutoff, when finite, sets the COLORBAR range from cells with
+    dt < cutoff only (the high-dt cells still plot, but saturate at the
+    extremes rather than dominating the scale) -- high dt is where euler
+    overshoots hugely, and letting it set the range washes out all the
+    low/mid-dt structure."""
+    dts = np.asarray(dts, float); temps = np.asarray(temps, float)
+    values = np.asarray(values, float)
+    ok = ok & np.isfinite(dts) & (dts > 0) & np.isfinite(temps) & np.isfinite(values)
+    if ok.sum() >= 1:
+        _lx = np.log10(dts[ok]); _ty = temps[ok]; _ev = values[ok]
+        _n_dt = 14
+        _lxe = np.linspace(_lx.min(), _lx.max() + 1e-12, _n_dt + 1)
+        # quantile T bins -- see the original scatter's own comment: the
+        # near-critical mesh is tight, so equal-count bins keep bubbles
+        # comparable rather than piling the top rows into giant blobs.
+        _tye = np.unique(np.quantile(_ty, np.linspace(0.0, 1.0, 15)))
+        _tye[-1] += 1e-12
+        _lxi = np.clip(np.digitize(_lx, _lxe) - 1, 0, _n_dt - 1)
+        _tyi = np.clip(np.digitize(_ty, _tye) - 1, 0, len(_tye) - 2)
+        _cx, _cy, _cn, _cv = [], [], [], []
+        for _i in range(_n_dt):
+            for _j in range(len(_tye) - 1):
+                _m = (_lxi == _i) & (_tyi == _j)
+                if not _m.any():
+                    continue
+                _cx.append(10.0 ** (0.5 * (_lxe[_i] + _lxe[_i + 1])))
+                _cy.append(0.5 * (_tye[_j] + _tye[_j + 1]))
+                _cn.append(int(_m.sum()))
+                _cv.append(float(_ev[_m].mean()))
+        _cn = np.asarray(_cn, float)
+        _cx = np.asarray(_cx, float); _cv = np.asarray(_cv, float)
+        _cnmax = float(_cn.max()) if _cn.size else 1.0
+        _s = 60.0 + 240.0 * (_cn / _cnmax)
+        # color range from the sub-cutoff cells (all cells still plotted)
+        _range_v = _cv
+        if color_dt_cutoff is not None and np.isfinite(color_dt_cutoff):
+            _below = _cx < color_dt_cutoff
+            if _below.any():
+                _range_v = _cv[_below]
+        if diverging:
+            _amax = max(abs(float(np.min(_range_v))), abs(float(np.max(_range_v))),
+                        1e-30) if _range_v.size else 1.0
+            _sc = ax.scatter(_cx, _cy, c=_cv, s=_s, cmap="coolwarm",
+                             edgecolors="black", linewidths=0.3, alpha=0.7,
+                             vmin=-_amax, vmax=_amax)
+        else:
+            _vmax = float(np.max(_range_v)) if _range_v.size else None
+            _sc = ax.scatter(_cx, _cy, c=_cv, s=_s, cmap="viridis",
+                             edgecolors="black", linewidths=0.3, alpha=0.7,
+                             vmin=0, vmax=_vmax)
+        fig.colorbar(_sc, ax=ax, label=label)
+    _shared_log_scale(ax, dts[ok], axis="x")
+    ax.set_xlabel(dt_label)
+    ax.set_ylabel("temperature")
+    ax.set_title(title)
+
+
+def _saturation_dt_cutoff(dz0_abs, dt_binx):
+    """The dt at which mean|dz0| has cliffed below 1/3 of its plateau max --
+    the convergence cutoff. mean|dz0| RISES from small at the shortest dt,
+    plateaus, then cliffs; 'below 1/3 of max' is true at both ends, so we
+    anchor at the peak and take the first sub-threshold bin to its RIGHT.
+    Returns inf when no such cliff is found. Shared by the left-column y-range
+    logic and the (dt,T) bubble panels' colorbar range."""
+    dz0_abs = np.asarray(dz0_abs, dtype=float)
+    dt_binx = np.asarray(dt_binx)
+    uniq = np.unique(dt_binx[np.isfinite(dt_binx)])
+    if not len(uniq):
+        return float("inf")
+    means = np.array([np.nanmean(dz0_abs[dt_binx == u]) if np.any(dt_binx == u)
+                      else np.nan for u in uniq])
+    finite = np.isfinite(means)
+    if not finite.any():
+        return float("inf")
+    dz0max = float(np.nanmax(means[finite]))
+    peak_idx = int(np.nanargmax(np.where(finite, means, -np.inf)))
+    after_peak = np.arange(len(means)) > peak_idx
+    below = np.where(finite & after_peak & (means < dz0max / 3.0))[0]
+    return float(uniq[below[0]]) if len(below) else float("inf")
+
+
+
 def _symmetric_left_zero_right_ylim(left_axes, right_axes):
     """
     For a group of twin-axis panels sharing one signed quantity (left,
@@ -1158,9 +1267,9 @@ def _print_summary_statistics(results: _EvaluationResults, ae_config: dict, deco
         _summary_put("loss_T_hot", float(results.latent_losses[_hot].mean()))
     corr_noise_abs = np.corrcoef(results.noises, results.latent_losses)[0, 1]
     corr_noise_signed = np.corrcoef(results.noises, results.latent_losses_signed)[0, 1]
-    print(f"\ncorr w.r.t. temperature: error {corr_temp_signed * 100:.0f}%, |error| {corr_temp_abs * 100:.0f}%")
+    print(f"\ncorr w.r.t. temperature: delta z0 {corr_temp_signed * 100:.0f}%, |delta z0| {corr_temp_abs * 100:.0f}%")
     _summary_put("corr_temp", corr_temp_signed)
-    print(f"corr w.r.t. noise: error {corr_noise_signed * 100:.0f}%, |error| {corr_noise_abs * 100:.0f}%")
+    print(f"corr w.r.t. noise: delta z0 {corr_noise_signed * 100:.0f}%, |delta z0| {corr_noise_abs * 100:.0f}%")
     _summary_put("corr_noise", corr_noise_signed)
     _print_binned_summary("temperature", results.temperatures, results.latent_losses, results.pixel_losses if decode else None)
     _print_binned_summary("noise", results.noises, results.latent_losses, results.pixel_losses if decode else None)
@@ -1634,16 +1743,20 @@ def _build_and_save_figures(
     # PREDICTION SPAN itself) from what's left in parameter_dependence.png
     # (how does error depend on WHERE in parameter space -- temperature,
     # noise, which run -- a window sits).
-    fig_dt, axes_dt = plt.subplots(2, 3, figsize=(18, 10))
-    # dt_dependence.png is 2x3, organized as two error columns + a context
-    # column. delta z0 := z0_pred(t+dt) - z0_true(t+dt) (the raw one-step
-    # prediction residual). Column 0: delta z0 (signed [0,0], |delta z0| [1,0]).
-    # Column 1: delta z0 / dt (signed [0,1], |delta z0| / dt [1,1]) -- the same
-    # residual divided by the step, which factors out the trivial error~dt
-    # growth and carries the Taylor-fit / floor. Column 2: [0,2] the real
-    # |dz0|,|dz0/dt| context panel, [1,2] the (dt, T) scatter (or pixel-space
-    # when decode=True). The raw and /dt columns share the same four curves
-    # (trivial / euler / causal / oracle), differing only by the /dt division.
+    fig_dt, axes_dt = plt.subplots(2, 4, figsize=(24, 10))
+    # Convergence cutoff (mean|dz0| cliffs below 1/3 of its max): high-dt cells
+    # beyond it are where euler overshoots hugely, so they're excluded from the
+    # (dt,T) bubble panels' COLORBAR range (still plotted, just saturated) to
+    # keep the low/mid-dt structure legible. Same cutoff the left-column
+    # y-ranges use (reused, not recomputed, at that site below).
+    _sat_dt_cutoff = _saturation_dt_cutoff(results.dz0_abs, _px(_dt_x))
+    # dt_dependence.png is 2x4. Cols 0-1: the two error columns (delta z0 and
+    # delta z0 / dt, signed on row 0, absolute on row 1). Col 2: [0,2] the real
+    # |dz0|,|dz0/dt| context panel, [1,2] the |delta z0| (dt,T) bubble scatter
+    # (or pixel-space when decode=True). Col 3: (dt,T) bubble DIFFERENCE panels
+    # -- [0,3] causal - trivial, [1,3] euler - trivial -- showing, per cell,
+    # how much each predictor beats (blue, <0) or loses to (red, >0) the
+    # trivial "no change" baseline. Same binning/style as [1,2], diverging map.
     # Computed HERE (early, right after figure creation) rather than
     # right before the T<0.9/T>=0.9 console-only diagnostic calls below
     # (where it originally lived) -- the dt panels (axes[0,2]/axes[1,2])
@@ -1715,7 +1828,7 @@ def _build_and_save_figures(
         _shared_log_scale(ax, axis="y")
         ax.set_xlabel(_dt_label)
         ax.set_xlim(left=_x_left)
-        ax.set_ylabel(f"pixel-space{_euler_tag}: decode(z0(t+dt)): mean|pred - true|")
+        ax.set_ylabel(f"pixel-space{_euler_tag}: decode(z0(t+dt)): mean|delta z0|")
         ax.set_title(f"pixel-space (L1, decoded){_euler_tag}\n"
                      f"corr w.r.t. log dt: log |error| {stats.corr_dt_pixel * 100:.0f}%")
     else:
@@ -1729,66 +1842,45 @@ def _build_and_save_figures(
         # particular temperatures (the saturation confound) -- without drawing
         # ~30k overlapping points. Shares the slot with the pixel panel above:
         # the two are mutually exclusive by the decode flag.
-        _ax_dtT = axes_dt[1, 2]
-        _dtT_x = np.asarray(results.dts, dtype=float)
-        _dtT_T = np.asarray(results.temperatures, dtype=float)
-        _dtT_e = np.asarray(results.latent_losses, dtype=float)
-        _dtT_ok = (np.isfinite(_dtT_x) & (_dtT_x > 0)
-                   & np.isfinite(_dtT_T) & np.isfinite(_dtT_e))
-        if _dtT_ok.sum() >= 1:
-            _lx = np.log10(_dtT_x[_dtT_ok])
-            _ty = _dtT_T[_dtT_ok]
-            _ev = _dtT_e[_dtT_ok]
-            # dt: ~14 log-spaced bins (its natural geometric spacing).
-            _n_dt_bins = 14
-            _lx_edges = np.linspace(_lx.min(), _lx.max() + 1e-12, _n_dt_bins + 1)
-            # T: QUANTILE (equal-count) bins, not fixed-width. The sweep samples
-            # T far more densely near T0=1 (the near-critical mesh is tight
-            # there), so fixed-width bins pile most windows into the top few
-            # bins -> giant overlapping bubbles. Quantile edges follow the
-            # sampling density: fine near T=1, coarse where sparse, comparable
-            # counts per bin -> comparable bubble sizes, with the tight mesh
-            # showing as finer ROWS (matching how the per-run (T, noise)
-            # scatter renders the same density). Deduped in case discrete T
-            # values collapse adjacent quantiles.
-            _n_T_bins = 14
-            _ty_edges = np.unique(np.quantile(_ty, np.linspace(0.0, 1.0, _n_T_bins + 1)))
-            _ty_edges[-1] += 1e-12
-            _lx_idx = np.clip(np.digitize(_lx, _lx_edges) - 1, 0, _n_dt_bins - 1)
-            _ty_idx = np.clip(np.digitize(_ty, _ty_edges) - 1, 0, len(_ty_edges) - 2)
-            _cx, _cy, _cn, _cmean = [], [], [], []
-            for _i in range(_n_dt_bins):
-                for _j in range(len(_ty_edges) - 1):
-                    _m = (_lx_idx == _i) & (_ty_idx == _j)
-                    _cnt = int(_m.sum())
-                    if _cnt == 0:
-                        continue
-                    _cx.append(10.0 ** (0.5 * (_lx_edges[_i] + _lx_edges[_i + 1])))
-                    _cy.append(0.5 * (_ty_edges[_j] + _ty_edges[_j + 1]))
-                    _cn.append(_cnt)
-                    _cmean.append(float(_ev[_m].mean()))
-            _cn = np.asarray(_cn, dtype=float)
-            # bubble AREA ~ window count, but NORMALIZED so the densest cell is
-            # a fixed, non-overlapping size. The per-run scatter's own formula
-            # (0.5625*(30+10*n)) was tuned for per-RUN counts (~tens); per-CELL
-            # counts here run to hundreds, which that formula blows up into the
-            # overlapping blobs. Normalizing by the max keeps "size ~ count"
-            # honest while capping absolute size.
-            _cn_max = float(_cn.max()) if _cn.size else 1.0
-            _bubble_s = 60.0 + 240.0 * (_cn / _cn_max)
-            _sc_dtT = _ax_dtT.scatter(
-                _cx, _cy, c=_cmean, s=_bubble_s,
-                cmap="viridis", edgecolors="black", linewidths=0.3, alpha=0.7, vmin=0)
-            fig_dt.colorbar(_sc_dtT, ax=_ax_dtT,
-                            label=f"mean|delta z0|{_euler_tag}")
-        # dt is strictly positive, but route the log scale through the shared
-        # helper anyway (a raw set_xscale is guarded against) so a degenerate
-        # empty panel can't kill the figure at save time.
-        _shared_log_scale(_ax_dtT, _dtT_x[_dtT_ok], axis="x")
-        _ax_dtT.set_xlabel(_dt_label)
-        _ax_dtT.set_ylabel("temperature")
-        _ax_dtT.set_title(f"|delta z0| over the (dt, T) plane{_euler_tag}\n"
-                          f"(bubble size ~ windows in cell)")
+        _dtT_ok = np.ones(len(results.dts), dtype=bool)
+        _dtT_bubbles(axes_dt[1, 2], fig_dt, results.dts, results.temperatures,
+                     results.latent_losses, _dtT_ok,
+                     label=f"mean|delta z0|{_euler_tag}",
+                     title=f"|delta z0| over the (dt, T) plane{_euler_tag}\n"
+                           f"(bubble size ~ windows in cell)",
+                     dt_label=_dt_label, diverging=False,
+                     color_dt_cutoff=_sat_dt_cutoff)
+
+    # Col 3: (dt, T) DIFFERENCE bubbles -- each predictor's |delta z0| MINUS the
+    # trivial |dz0| baseline, per cell. Negative (blue) = beats trivial,
+    # positive (red) = loses to trivial. [0,3] causal - trivial, [1,3] euler -
+    # trivial. Only meaningful when the causal/oracle residuals exist (euler-
+    # only mode); otherwise the two cells are turned off. mean(|a|-|b|) over a
+    # cell = mean|a| - mean|b|, so a per-window difference and a difference of
+    # cell-means are identical here.
+    _trivial_abs = np.asarray(results.dz0_abs, dtype=float)
+    if stats.oracle_per_window is not None:
+        _opw = stats.oracle_per_window
+        _causal_abs = np.asarray(_opw["causal_abs"], dtype=float)
+        _diff_ok = ~np.isnan(_causal_abs)
+        _dtT_bubbles(axes_dt[0, 3], fig_dt, results.dts, results.temperatures,
+                     _causal_abs - _trivial_abs, _diff_ok,
+                     label="mean(|causal| - |trivial|)",
+                     title="causal - trivial over (dt, T)\n"
+                           "(blue = beats trivial, red = worse)",
+                     dt_label=_dt_label, diverging=True,
+                     color_dt_cutoff=_sat_dt_cutoff)
+        _dtT_bubbles(axes_dt[1, 3], fig_dt, results.dts, results.temperatures,
+                     np.asarray(results.euler_losses, dtype=float) - _trivial_abs,
+                     np.ones(len(results.dts), dtype=bool),
+                     label="mean(|euler| - |trivial|)",
+                     title="euler - trivial over (dt, T)\n"
+                           "(blue = beats trivial, red = worse)",
+                     dt_label=_dt_label, diverging=True,
+                     color_dt_cutoff=_sat_dt_cutoff)
+    else:
+        axes_dt[0, 3].axis("off")
+        axes_dt[1, 3].axis("off")
 
     # SAME binned-mean-curve style as the temperature/noise panels below
     # (see that loop's own comments for the full rationale on twin axes
@@ -1885,38 +1977,9 @@ def _build_and_save_figures(
     # almost nothing lands between the plateau and the floor. dt AT or ABOVE
     # this cutoff is excluded from the y-range computation only; the values
     # are still plotted (they go off-chart) and x_lim is untouched, so all
-    # panels keep the same dt range.
-    # Cutoff computed from the RAW dz0 displacement binned by dt -- NOT via
-    # _grp, whose per-run coverage filter drops exactly the sparse high-dt
-    # bins where convergence lives, which would hide the cliff and leave the
-    # cutoff at inf (no effect). Bin raw |dz0| by the same dt bins the panels
-    # use, take each bin's mean, and find the first dt where that mean has
-    # dropped below a third of its plateau max.
-    _sat_dt_cutoff = float("inf")
-    _dz0_binx = _px(_dt_x)
-    _raw_dz0abs = np.asarray(results.dz0_abs, dtype=float)
-    _uniq_dt = np.unique(_dz0_binx[np.isfinite(_dz0_binx)])
-    if len(_uniq_dt):
-        _dz0_bin_means = np.array([
-            np.nanmean(_raw_dz0abs[_dz0_binx == u]) if np.any(_dz0_binx == u) else np.nan
-            for u in _uniq_dt])
-        _finite = np.isfinite(_dz0_bin_means)
-        if _finite.any():
-            _dz0max = float(np.nanmax(_dz0_bin_means[_finite]))
-            # The peak's own index: mean|dz0| RISES from a small value at the
-            # shortest dt (little displacement in little time), plateaus, then
-            # CLIFFS at convergence. 'Below a third of max' is true at BOTH
-            # ends -- the rising left edge and the converged right edge -- so
-            # scanning from dt=0 catches the left edge (wrong: that is early,
-            # well-resolved data). Anchor at the peak and take the first
-            # sub-threshold bin to the RIGHT of it: that is the convergence
-            # cliff.
-            _peak_idx = int(np.nanargmax(np.where(_finite, _dz0_bin_means, -np.inf)))
-            _after_peak = np.arange(len(_dz0_bin_means)) > _peak_idx
-            _below = np.where(_finite & _after_peak
-                              & (_dz0_bin_means < _dz0max / 3.0))[0]
-            if len(_below):
-                _sat_dt_cutoff = float(_uniq_dt[_below[0]])
+    # panels keep the same dt range. _sat_dt_cutoff was already computed above
+    # (for the bubble panels' colorbar range) via _saturation_dt_cutoff --
+    # reuse it here rather than recomputing.
     if np.isfinite(_sat_dt_cutoff):
         print(f"left-column y-range: excluding dt >= {_sat_dt_cutoff:.4g} "
               f"(mean|dz0| fell below 1/3 of its max -> converged, error/dt "
@@ -2347,8 +2410,8 @@ def _build_and_save_figures(
     _ax_run.set_xlabel("temperature")
     _ax_run.set_ylabel("noise")
     _ax_run.set_ylim(bottom=0)
-    _ax_run.set_title("z0(t+dt): mean|pred - true| per run")
-    fig.colorbar(sc, ax=_ax_run, label="z0(t+dt): mean|pred - true|")
+    _ax_run.set_title("mean|delta z0| per run")
+    fig.colorbar(sc, ax=_ax_run, label="mean|delta z0|")
 
     # Two curves per panel -- mean(error) (signed -- can be negative,
     # shows whether the bias itself has a consistent direction) and
@@ -2400,10 +2463,10 @@ def _build_and_save_figures(
         ax.axhline(0, color="gray", linewidth=0.7, linestyle=":")
         ax.plot(x, mean_signed, "-", color="tab:blue", linewidth=1, zorder=1)
         ax.scatter(x, mean_signed, s=sizes, color="tab:blue", zorder=2,
-                   edgecolors="black", linewidths=0.3, label="z0(t+dt): mean(pred - true)")
+                   edgecolors="black", linewidths=0.3, label="mean(delta z0)")
         twin.plot(x, mean_abs, "-", color="tab:orange", linewidth=1, zorder=1)
         twin.scatter(x, mean_abs, s=sizes, color="tab:orange", zorder=2,
-                     edgecolors="black", linewidths=0.3, label="z0(t+dt): mean|pred - true|")
+                     edgecolors="black", linewidths=0.3, label="mean|delta z0|")
         ax.set_xlabel(xlabel)
         # Precise, not just "error": pred = z0(t) + z1(t)*dt [+
         # f_theta(...)*dt^2/2 when this is the "full", not euler-only,
@@ -2411,15 +2474,15 @@ def _build_and_save_figures(
         # see the dt panels' own comment for the exact euler-only
         # reduction (z0_pred(t+dt) - z0_true(t+dt), divided by dt, is exactly
         # z1 - dz0/dt there specifically).
-        ax.set_ylabel("z0(t+dt): mean(pred - true)", color="tab:blue")
-        twin.set_ylabel("z0(t+dt): mean|pred - true|", color="tab:orange")
+        ax.set_ylabel("mean(delta z0)", color="tab:blue")
+        twin.set_ylabel("mean|delta z0|", color="tab:orange")
         ax.tick_params(axis="y", labelcolor="tab:blue")
         twin.tick_params(axis="y", labelcolor="tab:orange")
         # Condensed: corr(...) stated once, not once per value -- the
         # variable being correlated against (xlabel) is the shared part,
         # error/|error| are the two values, matching the console print's
         # own format just above.
-        ax.set_title(f"corr w.r.t. {xlabel}: error {corr_s * 100:.0f}%, |error| {corr_a * 100:.0f}%")
+        ax.set_title(f"corr w.r.t. {xlabel}: delta z0 {corr_s * 100:.0f}%, |delta z0| {corr_a * 100:.0f}%")
         lines1, labels1 = ax.get_legend_handles_labels()
         lines2, labels2 = twin.get_legend_handles_labels()
         ax.legend(lines1 + lines2, labels1 + labels2, fontsize=6, loc="best")
@@ -2495,8 +2558,8 @@ def _build_and_save_figures(
         # handled the same way as every other log panel.
         _shared_log_scale(ax, axis="y")
         ax.set_xlabel(param_label)
-        ax.set_ylabel(f"|error|{_euler_tag}: mean|z0(t+dt) pred - true|")
-        ax.set_title(f"|error| vs {param_label}")
+        ax.set_ylabel(f"mean|delta z0|{_euler_tag}")
+        ax.set_title(f"|delta z0| vs {param_label}")
         ax.legend(fontsize=7, loc="best")
 
     _plot_abs_error_vs_param(_ax_err_temp, results.temperatures, "temperature")

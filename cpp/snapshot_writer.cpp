@@ -23,21 +23,53 @@ namespace fs = std::filesystem;
 
 
 // Saving file
+//
+// float32 -> float16 (IEEE binary16), ROUND-TO-NEAREST-EVEN, with correct
+// subnormal and inf/NaN handling. The earlier version did `mantissa >> 13`
+// (truncation toward zero), which put a systematic ~2^-12 (~2.4e-4 relative)
+// BIAS on every stored pixel -- not noise, a bias, of the same order as the
+// neural surrogate's own error floor -- flushed everything below the smallest
+// NORMAL half (|v| < 6.1e-5) to zero instead of using subnormals (which reach
+// ~6e-8, exactly where near-interface pixels live), and silently turned NaN
+// into +/-inf, masking solver divergence. All three are fixed here.
 uint16_t writer::float_to_half(float f)
 {
-    uint32_t x = std::bit_cast<uint32_t>(f);
+    const uint32_t x    = std::bit_cast<uint32_t>(f);
+    const uint32_t sign = (x >> 16) & 0x8000;
+    const uint32_t e32  = (x >> 23) & 0xFF;   // raw float32 exponent
+    uint32_t       man  =  x & 0x007FFFFF;    // 23-bit mantissa
 
-    uint32_t sign = (x >> 16) & 0x8000;
-    uint32_t mantissa = x & 0x007FFFFF;
-    int exp = ((x >> 23) & 0xFF) - 127 + 15;
+    // inf / NaN: preserve (NaN stays NaN via a non-zero half mantissa)
+    if (e32 == 0xFF)
+        return static_cast<uint16_t>(sign | 0x7C00 | (man ? 0x0200 : 0));
 
-    if (exp <= 0)
-        return sign; // underflow → 0
+    const int exp = static_cast<int>(e32) - 127 + 15;   // rebiased for half
 
-    if (exp >= 31)
-        return sign | 0x7C00; // inf
+    if (exp >= 31)                       // overflow -> inf
+        return static_cast<uint16_t>(sign | 0x7C00);
 
-    return sign | (exp << 10) | (mantissa >> 13);
+    if (exp <= 0)                        // subnormal half (or underflow)
+    {
+        if (exp < -10)                   // below smallest subnormal -> 0
+            return static_cast<uint16_t>(sign);
+        man |= 0x00800000;               // restore the implicit leading 1
+        const uint32_t shift = static_cast<uint32_t>(14 - exp);  // 14..24
+        uint32_t half = man >> shift;
+        // round to nearest even on the shifted-out bits
+        const uint32_t rem     = man & ((1u << shift) - 1);
+        const uint32_t halfway = 1u << (shift - 1);
+        if (rem > halfway || (rem == halfway && (half & 1)))
+            ++half;                      // may carry up into the exponent -- fine
+        return static_cast<uint16_t>(sign | half);
+    }
+
+    // normal half: round-to-nearest-even on the 13 dropped mantissa bits
+    uint32_t half = (static_cast<uint32_t>(exp) << 10) | (man >> 13);
+    const uint32_t rem     = man & 0x1FFF;   // 13 low bits
+    const uint32_t halfway = 0x1000;         // 2^12
+    if (rem > halfway || (rem == halfway && (half & 1)))
+        ++half;                          // carry propagates mantissa->exponent correctly
+    return static_cast<uint16_t>(sign | half);
 }
 
 void writer::save_phi_half(const std::vector<double>& phi,

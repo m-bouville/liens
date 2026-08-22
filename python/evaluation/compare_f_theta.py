@@ -1601,13 +1601,17 @@ def _stage2_rollout_figure(models, dt_totals, temps, n_steps, output_path):
     axes[1, 3].set_ylabel("median correlation (%) (band: quartiles)")
 
     # y-caps + alignment (mirrors _stats_figure's end block):
-    # loss panels get a median-driven range; the vs-dt and vs-steps panels
-    # share it so they read together. Correlation panels share a floored range.
+    # the endpoint loss panels (CDF [0,0], vs-dt [0,1], vs-T [0,2]) share one
+    # median-driven range so their differing decades read together. loss-vs-
+    # steps [0,3] is EXCLUDED: it plots every step from the near-zero step-0
+    # loss and spans decades the endpoint panels never reach, so it keeps its
+    # own median-driven scale (identical rationale to _stats_figure).
+    # Correlation panels share a floored range.
     _ylim_from_medians(axes[0, 1], dt_loss_meds)
     _ylim_from_medians(axes[0, 3], step_loss_meds)
     _ylim_from_medians(axes[0, 0], loss_dist_meds)
     loss_ref = axes[0, 1].get_ylim()
-    for ax in (axes[0, 0], axes[0, 2], axes[0, 3]):
+    for ax in (axes[0, 0], axes[0, 2]):
         ax.set_ylim(loss_ref)
     corr_panels = [axes[1, 0], axes[1, 1], axes[1, 2], axes[1, 3]]
     corr_lo = max(min(ax.get_ylim()[0] for ax in corr_panels), _CORR_FLOOR)

@@ -216,16 +216,54 @@ def test_dt_dependence_has_raw_delta_z0_column():
 
 
 def test_dt_dependence_has_dt_temperature_scatter():
-    """dt_dependence.png gained a per-window (dt, T) scatter colored by |error|
-    ([0,2]): dt on a LOG x-axis, temperature on y. Guard the wiring."""
+    """dt_dependence.png has a (dt, T) bubble scatter colored by |delta z0|
+    at [1,2], drawn via the shared _dtT_bubbles helper. Guard the wiring."""
     import inspect
     src = inspect.getsource(m._build_and_save_figures)
-    assert "_ax_dtT = axes_dt[1, 2]" in src, (
-        "the (dt,T) scatter should sit at [1,1] (square 2x2, sharing the slot "
-        "with the decode-only pixel panel)")
-    # per-window: colored by the raw error, x is dt (log), y is temperature
-    block = src[src.index("_ax_dtT = axes_dt[1, 2]"):
-                src.index("fig_dt.colorbar(_sc_dtT")]
+    # the scatter is now a _dtT_bubbles call into axes_dt[1, 2]
+    assert "_dtT_bubbles(axes_dt[1, 2]" in src, (
+        "the (dt,T) |delta z0| scatter should be drawn at [1,2] via _dtT_bubbles")
+    block = src[src.index("_dtT_bubbles(axes_dt[1, 2]"):
+                src.index("_dtT_bubbles(axes_dt[1, 2]") + 400]
     assert "results.temperatures" in block and "results.latent_losses" in block
-    # x is dt on a log axis, routed through the shared guard (not a raw set_xscale)
-    assert '_shared_log_scale(_ax_dtT' in src
+    # the helper log-scales x through the shared guard (no raw set_xscale)
+    helper = inspect.getsource(m._dtT_bubbles)
+    assert "_shared_log_scale(ax" in helper
+
+
+def test_parameter_figure_uses_delta_z0_not_error_in_labels():
+    """Both figures use the 'delta z0' convention (delta z0 = z0_pred - z0_true),
+    not 'error' / 'pred - true', in their VISIBLE labels. Guards against the
+    parameter figure drifting back to 'error' while dt_dependence uses delta z0.
+    (Comments may still say 'error' as a concept -- only display strings matter,
+    so this checks the set_title/set_ylabel/label= calls, not the whole source.)"""
+    import inspect, re
+    src = inspect.getsource(m._build_and_save_figures)
+    # pull the string literals passed to set_title / set_ylabel / label= / colorbar
+    label_strs = re.findall(r'set_title\(\s*f?"([^"]*)"', src)
+    label_strs += re.findall(r'set_ylabel\(\s*f?"([^"]*)"', src)
+    label_strs += re.findall(r'label=f?"([^"]*)"', src)
+    joined = " ".join(label_strs)
+    assert "error" not in joined.lower(), (
+        f"a visible label still says 'error' (use 'delta z0'): "
+        f"{[s for s in label_strs if 'error' in s.lower()]}")
+    assert "pred - true" not in joined, (
+        f"a visible label still says 'pred - true' (use 'delta z0'): "
+        f"{[s for s in label_strs if 'pred - true' in s]}")
+
+
+def test_dt_dependence_has_minus_trivial_difference_panels():
+    """dt_dependence.png col 3: (dt,T) bubble panels of causal - trivial [0,3]
+    and euler - trivial [1,3], diverging colormap centered at 0 (blue beats
+    trivial, red loses). Guards the wiring + the diverging map."""
+    import inspect
+    src = inspect.getsource(m._build_and_save_figures)
+    assert "plt.subplots(2, 4" in src, "dt figure is not the 2x4 grid holding the difference panels"
+    assert "axes_dt[0, 3]" in src and "axes_dt[1, 3]" in src
+    assert "causal - trivial over (dt, T)" in src
+    assert "euler - trivial over (dt, T)" in src
+    # the difference panels must use the diverging path of the helper
+    assert "diverging=True" in src
+    # the shared bubble helper exists and centers the diverging map at 0
+    helper = inspect.getsource(m._dtT_bubbles)
+    assert 'cmap="coolwarm"' in helper and "vmin=-_amax" in helper

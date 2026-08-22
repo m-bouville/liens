@@ -142,12 +142,20 @@ def build_models_from_components(
         # when a later edit (adding dt_cap to the LatentDynamics
         # construction further below) was built from an outdated
         # snapshot of this file rather than the actual, current one.
+        # head_kind/head_hidden carried over for the SAME reason: a
+        # head_kind='residual' stream's Encoder has a real residual_heads.<name>
+        # submodule with trained weights in the checkpoint; omitting it here
+        # rebuilds a linear-head Encoder that then rejects those keys as
+        # "unexpected" -- again a structurally wrong model misreported as
+        # version skew, not a real skew.
         pure_latent_stream_configs = {
             name: (cfg if name == recon_stream_name
                    else LatentStreamConfig(name=cfg.name, channels=cfg.channels,
                                             spatial_size=cfg.spatial_size,
                                             mode=LatentStreamMode.PURE_LATENT,
-                                            condition_on_theta=cfg.condition_on_theta))
+                                            condition_on_theta=cfg.condition_on_theta,
+                                            head_kind=cfg.head_kind,
+                                            head_hidden=cfg.head_hidden))
             for name, cfg in stream_configs.items()
         }
         final_stream_configs = pure_latent_stream_configs
