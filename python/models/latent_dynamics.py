@@ -35,6 +35,10 @@ _MEANING_FIELDS = {
     "n_substeps": 1,          # 1 is the historical default
     "alpha": None,            # None = fixed count, i.e. behaviour before alpha
     "max_substeps": 256,
+    "dynamics_mode": "z1_taylor",  # historical form; "deriv_linear" changes the
+                                   # update equation (f*dt, f sees dt) with the
+                                   # SAME weights -- meaning-changing, so it must
+                                   # round-trip like dt_cap/n_substeps.
     # truncate_bptt is deliberately ABSENT. Every other field here changes what
     # f_theta MEANS -- two checkpoints with the same weights and different
     # values integrate differently, so a rebuild must reproduce them. Truncation
@@ -121,7 +125,8 @@ class LatentDynamics(nn.Module):
                  latent_spatial: int = LATENT_SPATIAL_SIZE, hidden_dim: int = 256,
                  n_hidden_layers: int = 2, dt_cap: float = float("inf"),
                  n_substeps: int = 1, alpha: float | None = None,
-                 max_substeps: int = 256, truncate_bptt: int | None = None):
+                 max_substeps: int = 256, truncate_bptt: int | None = None,
+                 dynamics_mode: str = "z1_taylor"):
         super().__init__()
         self.latent_channels = latent_channels
         self.latent_spatial = latent_spatial
@@ -190,6 +195,35 @@ class LatentDynamics(nn.Module):
         # reversal back toward the correct euler-dominated large-dt
         # regime, not just a delay of the point where it breaks down.
         self.dt_cap = dt_cap
+        # STEP A (correction order). "z1_taylor" is the historical form
+        # exactly. "deriv_linear" lets f own its dt-scaling: f takes dt as an
+        # input and the second-order term uses a LINEAR prefactor (f*dt), not
+        # f*dt^2/2. dt_cap exists ONLY to contain the dt^2 explosion, so it is
+        # FORBIDDEN in deriv_linear -- asserted, not silently coerced, so a
+        # stale params file cannot quietly reintroduce the containment this
+        # mode is measuring without. Remove the guard only once proven.
+        if dynamics_mode not in ("z1_taylor", "deriv_linear"):
+            raise ValueError(
+                f"dynamics_mode must be 'z1_taylor' or 'deriv_linear', got {dynamics_mode!r}")
+        self.dynamics_mode = dynamics_mode
+        if dynamics_mode == "deriv_linear" and math.isfinite(dt_cap):
+            raise ValueError(
+                f"dynamics_mode='deriv_linear' forbids a finite dt_cap (got {dt_cap}): "
+                "the linear-dt prefactor has no dt^2 term for the cap to contain, and "
+                "keeping it would confound the order measurement. Set dt_cap=inf.")
+        if dynamics_mode == "deriv_linear" and (alpha is not None or n_substeps != 1):
+            # deriv_linear is a FULL-STEP object: forward() implements its
+            # linear update (z0 + z1*dt + f(.,dt)*dt), but the sub-stepping
+            # integrator (_integrate) implements the OLD Taylor form and would
+            # NOT be the linear update even if reached. Sub-stepping is also the
+            # other lever on large-dt, so allowing it here would confound the
+            # order change this mode exists to measure. Forbid it -- rollout's
+            # fast path (n_substeps==1, alpha None, z1_resync) routes through
+            # forward(), which is the only place deriv_linear is defined.
+            raise ValueError(
+                f"dynamics_mode='deriv_linear' requires n_substeps=1 and alpha=None "
+                f"(full-step; sub-stepping runs the Taylor integrator, not the linear "
+                f"update), got n_substeps={n_substeps}, alpha={alpha}.")
 
         # alpha: the TAYLOR-VALIDITY RATIO that replaces n_substeps as the
         # thing held constant. Every sub-step contributes a linear term
@@ -293,7 +327,9 @@ class LatentDynamics(nn.Module):
         self._last_counts: list = []
 
         flat_dim = latent_channels * latent_spatial * latent_spatial
-        in_dim = 2 * flat_dim + n_theta  # z0 + z1 + theta -- dt is not a network input (see forward())
+        # deriv_linear feeds log(dt) so f can pick its own order; z1_taylor
+        # keeps f dt-blind (its dt-dependence is imposed by the dt^2/2 form).
+        in_dim = 2 * flat_dim + n_theta + (1 if dynamics_mode == "deriv_linear" else 0)
 
         # LeakyReLU, not ReLU: ReLU's own gradient is EXACTLY zero for
         # negative inputs, so a unit pushed sufficiently negative by any
@@ -336,7 +372,8 @@ class LatentDynamics(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
-    def f(self, z0: torch.Tensor, z1: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    def f(self, z0: torch.Tensor, z1: torch.Tensor, theta: torch.Tensor,
+          dt: torch.Tensor | None = None) -> torch.Tensor:
         """
         f_theta(z0, z1, theta): predicted curvature of z0 (equivalently,
         z1's own rate of change) -- independent of dt itself. Exposed
@@ -347,7 +384,20 @@ class LatentDynamics(nn.Module):
         network is systematically correcting in one direction.
         """
         batch_size = z0.shape[0]
-        x = torch.cat([z0.flatten(start_dim=1), z1.flatten(start_dim=1), theta], dim=1)
+        parts = [z0.flatten(start_dim=1), z1.flatten(start_dim=1), theta]
+        if self.dynamics_mode == "deriv_linear":
+            # log(dt) as the order-selection input. REQUIRED here -- the net's
+            # in_dim includes it, so a direct f() call (e.g. check_f_theta,
+            # OUTSIDE forward()) that omits dt is a silent shape error, which
+            # is exactly the trap flagged for this change: pass the same dt
+            # forward() would.
+            if dt is None:
+                raise ValueError(
+                    "f() requires dt in dynamics_mode='deriv_linear' (it is a "
+                    "network input); a direct caller must pass the transition's dt.")
+            dt_flat = dt.reshape(batch_size, 1)
+            parts.append(torch.log(dt_flat))
+        x = torch.cat(parts, dim=1)
         f_flat = self.net(x)
         return f_flat.view(batch_size, self.latent_channels, self.latent_spatial, self.latent_spatial)
 
@@ -372,10 +422,28 @@ class LatentDynamics(nn.Module):
         responsibility to supply (real data during training/testing;
         g_theta's own job once it exists).
         """
-        f_val = self.f(z0, z1, theta)
         dt_r = dt.view(-1, 1, 1, 1)  # broadcast against (B, C, 8, 8), works for (B,) or (B,1) input
+        if self.dynamics_mode == "deriv_linear":
+            # f owns its dt-scaling: LINEAR prefactor, f conditioned on dt.
+            # No dt_cap (forbidden in __init__), so no dt_capped term here.
+            f_val = self.f(z0, z1, theta, dt=dt_r)
+            return z0 + z1 * dt_r + f_val * dt_r
+        f_val = self.f(z0, z1, theta)
         dt_capped = torch.clamp(dt_r, max=self.dt_cap)
         return z0 + z1 * dt_r + f_val * (dt_capped ** 2 / 2)
+
+    @property
+    def supports_autonomous_rollout(self) -> bool:
+        """Can rollout() propagate z1 from its own predictions (z1_resync=False)?
+
+        False for deriv_linear: its f is a derivative CORRECTION, not z0's
+        curvature, so there is no z1-update equation to advance z1 with -- only
+        the teacher-forced path (z1_resync=True, via forward()) is defined.
+        z1_taylor advances z1 by f*dt inside _integrate, so it can. A diagnostic
+        should read this before asking for an autonomous rollout rather than
+        discover the limitation via the guard in rollout()/_integrate.
+        """
+        return self.dynamics_mode != "deriv_linear"
 
     def _substeps_for(self, z0: torch.Tensor, z1: torch.Tensor, dt: torch.Tensor,
                        theta: torch.Tensor, f_n: torch.Tensor) -> torch.Tensor:
@@ -763,8 +831,33 @@ class LatentDynamics(nn.Module):
         z0_hats = [z0]
         z0_cur = z0
 
-        if self.n_substeps == 1 and self.alpha is None and z1_resync:
-            # The historical path, kept EXACTLY as it was rather than being
+        if self.dynamics_mode == "deriv_linear" and not z1_resync and n_steps > 1:
+            # deriv_linear's f is a derivative CORRECTION, not z0's curvature, so
+            # there is no z1-update equation to PROPAGATE z1 across steps -- an
+            # autonomous (z1_resync=False) rollout of more than one step would
+            # have to, and that is undefined until the q-scheme (Step B).
+            # A SINGLE step never propagates z1 (no next step to carry it into),
+            # so z1_resync is moot at n_steps==1 and the step is well-defined via
+            # forward() below -- only n_steps > 1 is forbidden. Fire on the
+            # OPERATION (propagation), not the config, so 1-step and
+            # teacher-forced calls are never wrongly rejected.
+            raise ValueError(
+                "dynamics_mode='deriv_linear' cannot roll out autonomously for >1 "
+                "step: f is a derivative correction, not z0's curvature, so there is no "
+                "z1-update equation to propagate z1 across steps (the q-scheme, Step B). "
+                "Use z1_resync=True, or a single step.")
+
+        if self.n_substeps == 1 and self.alpha is None and (
+                z1_resync or self.dynamics_mode == "deriv_linear"):
+            # The z1_resync path uses forward() per step, teacher-forcing z1 from
+            # z1_sequence -- for z1_taylor this is the historical fast path, kept
+            # EXACTLY as it was. deriv_linear ALSO routes here unconditionally:
+            # it always has n_substeps==1/alpha None (ctor guard), and by the
+            # guard just above it only reaches this line when z1_resync is True
+            # or n_steps==1 -- in both cases teacher-forcing z1 is exactly right
+            # (at one step there is no propagated z1 to differ from), and it is
+            # the ONLY defined path for deriv_linear (the _integrate path below
+            # is the Taylor form and has no dt-conditioned f).
             # expressed as a special case of the loop below. _integrate's
             # trapezoidal z1 update produces a different (better) z1, and with
             # z1 resynced at every frame that z1 is discarded anyway -- so the

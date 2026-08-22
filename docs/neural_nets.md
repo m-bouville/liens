@@ -66,7 +66,7 @@ Currently, the first type works more reliably than the other.
 |---|-----------------|------------|-----------|----------------------------|
 | 1 | autoencoder (C$_0$)| $x_0$ | $z_0$ | $D[z_0(t)] \approx x_0(t)$ |
 | 2 | derivative (C$_1$) | $x_0$ | $z_1$ | $z_0(t) + z_1(t)\,\delta t \approx z_0(t+\delta t)$, i.e. $z_1(t) \approx \dot{z}_0(t)$; while maintaining $D[z_0(t)] \approx x_0(t)$ |
-| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^*$ | $z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t)) \, (\Delta t^2/2) \approx z_0(t+\Delta t)$ |
+| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^*$ | $z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t), Delta t) \, \Delta t \approx z_0(t+\Delta t)$ |
 | 3b | LDS, rollout   |        "        | "    |  as 3a, chained, + $z_1(t) + f_\theta(z_0(t), z_1(t))\,\delta t + g_\theta(z_0(t), z_1(t)) \,(\delta t^2/2) \approx z_1(t+\delta t)$ |
 
 Note:
@@ -84,10 +84,10 @@ There are six losses, which can be mixed and matched at the different stages:
 - one-step latent prediction loss: $L_\mathrm{1step}$,
 - multi-step rollout loss: $L_\mathrm{rollout}$.
 
-For each loss:
-- `*_scale` normalize the loss for it to be around 1 (objective),
-- `*_weight` is the importance given to a certain loss at a certain stage (a choice).
-What is used in the loss function: `*_weight * L_* / *_scale`.
+For each loss `XX`:
+- `XX_scale` normalize the loss for it to be around 1 (objective),
+- `XX_weight` is the importance given to a certain loss at a certain stage (a choice).
+What is concretely used in the loss function: `XX_weight * L_XX / XX_scale`.
 
 
 | \#| Stage             | Trained | Frozen | Unused | Space | Snapshots | Loss                            |
@@ -101,7 +101,7 @@ What is used in the loss function: `*_weight * L_* / *_scale`.
 
 Notes:
 - `L_interp` requires three consecutive snapshots: adding it to stage 1 would double the computational cost (3 E + 1D instead of 1 E + 1 D);
-- SH: `stats_head`, $n$: `n_rollout_steps;
+- SH: `stats_head`, $n$: `n_rollout_steps`;
 - ${}^*$: outter layers frozen;
 - ${}^\dagger$: mostly.
 
@@ -220,17 +220,17 @@ Perturbation is currently used as _post-hoc_ diagnostic, not as loss function.
 
 ## Stage 3: latent dynamics (LDS)
 
-Provided with $x(t)$, stage 1 trained the model to make $z_0(t)$ and stage 2 added $z_1(t)$. One must now learn $z_0(t+\Delta t)$ and $z_1(t+\Delta t)$ from them.
+Provided with $x(t)$, stage 1 trained the model to make $z_0(t)$ and stage 2 added $z_1(t)$ (initialization). One must now learn $z_0(t+\Delta t)$ and $z_1(t+\Delta t)$ from them.
 
 Since the autoencoder is frozen in stages 3a and 3b, the latent representation of each microstructure in the `datasets/` can be calculated just once and cached: it will not change in the loop over epochs. This makes this stage run faster (but encoder errors are necessarily inherited).
 
 
 ### fθ and dz1 / dt
 $f_\theta$ does not need to be trained to the first-order term, it only needs to learn $\ddot{z}_0$ (curvature, $\approx \dot{z}_1$), plus the gap between $z_1$ and $\dot{z}_0$. Thus $f_\theta(z_0(t), z_1(t))$ should be trained against
-$$[z_0(t + \Delta t) - z_0(t) - z_1(t)\,\Delta t] / (\Delta t^2/2),$$
+$$[z_0(t + \Delta t) - z_0(t) - z_1(t)\,\Delta t] / \Delta t,$$
 with $\theta$ (currently just the temperature: in the form of $T-T_0$, and $\ln(T_0-T)$ to handle $T$ close to $T_0$) as further input.
 Finally,
-$$z_0(t + \delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(z_0(t), z_1(t)) \, (\delta t^2/2) + o(\delta t^2).$$
+$$z_0(t + \delta t) \approx z_0(t) + z_1(t)\,\delta t + f_\theta(z_0(t), z_1(t), \delta t) \, \delta t.$$
 
 In practice, the second order is not multiplied by $\delta t ^2$ but by  $\min(\delta t, \delta t_\mathrm{cap})^2$, to avoid the risk of a blow-up at large $\delta t$.
 
@@ -245,7 +245,7 @@ By having several predictions in a row, we let error accumulate:
 $$z_0(t_{k}) \xrightarrow{f} \hat{z}_0(t_{k+1}) \xrightarrow{f} \hat{z}_0(t_{k+2}) \xrightarrow{f} \hat{z}_0(t_{k+3}) \xrightarrow{f} \ldots.$$
 When starting from the snapshot at time $t_k$, the rollout loss is:
 $$L_\mathrm{rollout} = \sum_{i=1}^{N_r} \left\| \hat{z}_0(t_k + i \Delta t) - z_0(t_k + i \Delta t) \right\|_2^2,$$
-where $\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \Delta t)\,\Delta t + f_\theta(t_k + i \Delta t) \, (\delta t^2/2)$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
+where $\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \Delta t)\,\Delta t + f_\theta(t_k + i \Delta t) \, \delta t$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
 
 ### Semi-implicit (predictor-corrector) velocity-Verlet
 Integration of the latent state $(z_0,\, z_1)$ over one sub-step $dt$.
@@ -277,8 +277,7 @@ The training (stage 3b) initially used steps $\delta t = \Delta t / n_\mathrm{su
 - we rely on $\Delta t$ to scale sensibly with $t$.
 This could be unstable (low `n_substeps`) or slow (high).
 
-Every sub-step of the latent integrator advances the state by a linear term and a curvature correction, $z_0(t+\delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(t)*\delta t^2/2$. Stability requires that the quadratic term be small enough compared to the linear one: $\delta t \le \alpha \|z_1\| / \|f_\theta\|$.
-For stability, `δt` is updated to `min(δt_target, (δt_prev + δt_target)/2)`.
+Every sub-step of the latent integrator advances the state by a linear term and a correction, $z_0(t+\delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(t)*\delta t$. 
 
 
 ## Stages 4 and 5: encoder refinement and end-to-end
@@ -329,6 +328,6 @@ Blocks are labelled by index and channel transition. Under same-`dx` scaling, in
 | **Max batch (fp32, 8 GB card)**| **256** | **63** |  **15** |   **3** |
 | **Max batch (fp16 activations)**|**465** |**115** |  **28** |   **6** |
 |-------------------------------|-------:|--------:|---------:|--------:|
-|`tau_down` (millions)          |    0.6 |     2.5 |       10 |      50 |
+|`tau_down` (millions)          |    0.6 |     2.5 |       10 |      35 |
 
 `tau_down​` is the number of phase-field time steps needed for full coarsening. It is an indication of the length of C++ runs needed, and a potential limiting factor. (off-table: `tau_down​` = 80e3 at 32×32.)

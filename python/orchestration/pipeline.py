@@ -430,6 +430,18 @@ def run_from_params_file(params_path: Path, default_base: Path,
                                             own_keys=renamed_keys(stages.get(stage_key, {})))
         kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
             kwargs, resume_from, f"Stage {stage_key}")
+        # The encoder ancestor is normally the pipeline's own resolved stage-2
+        # OUTPUT, but a stage-3 section may name a SPECIFIC stage-2 checkpoint to
+        # build on -- e.g. a hand-picked knee checkpoint rather than the
+        # (possibly overtrained) canonical output. Same override mechanism as
+        # resume_from, different key: ae_checkpoint_path is train_lds's own name
+        # for the encoder ancestor, so this is NOT resume_from's "continue a
+        # prior f_theta run" role -- it swaps which stage-2 encoder a FRESH
+        # f_theta trains on. Provenance stays in the log + signature (the
+        # resolver prints the override) rather than forcing an overwrite of the
+        # canonical stage-2 file, which would corrupt its mtime-keyed archive.
+        kwargs, ae_ancestor, ae_overridden = _resolve_stage_specific_ancestor(
+            kwargs, stage2_checkpoint, f"Stage {stage_key}", key="ae_checkpoint_path")
         # Default to quiet (only print on save/early-stop), not train_lds()'s
         # own default of every-epoch -- stage 3 commonly runs hundreds of
         # epochs, and setdefault respects an explicit log_every_epoch in
@@ -446,7 +458,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
         # stage1_checkpoint field.
         signature = {"base_path": str(base_path),
                       "stage1_checkpoint": str(stage1_checkpoint),
-                      "stage2_checkpoint": str(stage2_checkpoint),
+                      "stage2_checkpoint": str(ae_ancestor),
                       **({"resumed_from": str(resume_from)} if resume_from is not None else {}),
                       **extra_signature, **_signature_kwargs(kwargs)}
         checkpoint = resolve_checkpoint(stage_key, force, signature, kwargs.get("epochs"))
@@ -467,7 +479,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 print("=" * 70)
                 registry_path = stage_dir(stage_key) / f"registry-stage{stage_key}.csv"
                 checkpoint = train_lds(
-                    size=size, base_path=base_path, ae_checkpoint_path=stage2_checkpoint,
+                    size=size, base_path=base_path, ae_checkpoint_path=ae_ancestor,
                     # ONE cache root for the whole params file, so 3b reads
                     # what 3a wrote. Under checkpoints/ rather than output/
                     # because it derives from a checkpoint's weights and is

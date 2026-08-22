@@ -514,6 +514,7 @@ def train_lds(
     use_dt_decade_weights: bool = False,
     z0_noise_scale: float = 0.0,
     dt_cap: float = float("inf"), n_substeps: int = 1, alpha: float | None = None,
+    dynamics_mode: str = "z1_taylor",
     max_substeps: int = 256, truncate_bptt: int | None = None,
     target_vram_gib: float | None = None,
     memory_cost_a_bytes: float | None = None,
@@ -824,7 +825,8 @@ def train_lds(
                               latent_spatial=ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
                               dt_cap=dt_cap, n_substeps=n_substeps, alpha=alpha,
-                              max_substeps=max_substeps, truncate_bptt=truncate_bptt).to(device)
+                              max_substeps=max_substeps, dynamics_mode=dynamics_mode,
+                              truncate_bptt=truncate_bptt).to(device)
 
     # Global per-decade loss weights, computed ONCE from train_set's own
     # full dt distribution AND its own raw per-transition loss
@@ -1219,6 +1221,23 @@ def train_lds(
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
+    # Batch counts -- printed HERE, not with the window counts above, because
+    # they need the FINAL loaders: which path built train_loader (plain vs
+    # BudgetedBatchSampler) and drop_last both change len(loader), so
+    # ceil(windows/batch_size) would lie. Surfaced because a large batch_size on
+    # a small window population can silently collapse to a handful of optimizer
+    # steps per epoch -- noising the epoch stats and the val criterion this
+    # stage reads, exactly where they most need to be trusted.
+    if train_loader is not None:
+        print(f"{len(train_set)} train windows in {len(train_loader)} batches, "
+              f"{len(val_set)} val windows in {len(val_loader)} batches "
+              f"(batch_size={batch_size})\n")
+    else:
+        # epochs==0 ablation: no train set/loader is built (see the epochs==0
+        # branch above), so there are no train batches to report -- val only.
+        print(f"{len(val_set)} val windows in {len(val_loader)} batches "
+              f"(batch_size={batch_size}); no training (epochs=0)\n")
+
     # THE COLUMN HEADER LAST, immediately before the first epoch line it
     # labels. It used to be printed with the "Starting N epochs" banner, which
     # is before the sampler exists -- so the batching report landed BELOW the
@@ -1525,6 +1544,7 @@ def train_lds(
                     # with the same weights and different alpha are corrections
                     # calibrated to different step sizes.
                     "alpha": alpha,
+                    "dynamics_mode": dynamics_mode,
                     # Recorded for provenance only. Deliberately NOT in
                     # _MEANING_FIELDS: truncation changes how the gradient was
                     # computed, not what f_theta means, so a rebuild without it

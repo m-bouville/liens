@@ -138,7 +138,7 @@ _LIST_VALUED_KEYS = {"stat_names"}
 # genuinely mean the same thing everywhere. A STAGE'S OWN section
 # setting resume_from directly is unaffected by this and still works
 # exactly as documented -- this only blocks the GLOBAL-default path.
-_NEVER_GLOBAL_DEFAULT_KEYS = {"resume_from"}
+_NEVER_GLOBAL_DEFAULT_KEYS = {"resume_from", "ae_checkpoint_path"}
 
 
 def _prepare_stage_kwargs(raw_params: dict[str, str], global_params: dict[str, str] | None = None) -> dict:

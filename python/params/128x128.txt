@@ -93,66 +93,73 @@ spike_skip_factor= 10
 
 val_aug_averaging= True
 
-force 	      = True
+# force 	      = True
 
 
 
 # Stage 3a
 #   latent dynamics surrogate (1step)
-n_rollout_steps= 2			# always 1 for 3a
-z1_resync       = False		# always True for 3a
+n_rollout_steps	= 1			# always 1 for 3a
+z1_resync       = True		# always True for 3a
 
-alpha			=  0.5		# adaptative sub-step (higher: more lenient)
-max_substeps    = 512		# default: 256
+# alpha			=  0.5		# adaptative sub-step (higher: more lenient)
+# max_substeps    = 512		# default: 256
+n_substeps		= 1			# TEST
 target_vram_gib = 6.5		# leave 1 GB as headroom for driver/context
 truncate_bptt 	=  32
 bucket_refresh_epochs=0
+
+dynamics_mode=deriv_linear	# NEW
 
 memory_cost_a_bytes= None
 memory_cost_b_bytes= None
 memory_cost_p 	   = None
 
 # resume_from 	= checkpoints/stage3a/128x128-stage3a.pt
+ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260821_13h05.pt
 
 rollout_scale = 1e-6
 ae_stats_weight= 1.
 
 use_dt_decade_weights = False  # was True before alpha
 
-epochs 		  = 1000		# increase?
-patience 	  =  100
+epochs 		  = 5000		# increase?
+patience 	  =  500
 
-num_workers	  =   0   # was 4
-batches		  = 2048
+num_workers	  =   4   # was 4, then 0
+batches		  = 8192
 spike_skip_factor= 10
 
-lr 			  = 0.1e-6  # was 1.e-6; default: 1.e-3
+lr 			  = 0.5e-3  # was 1.e-6; default: 1.e-3
 z0_noise_scale=   0.1	# was 0.175
 
 dt_cap		  = inf		# for second order
-max_dt        = 2500   # 2500/0.05 = 50'000 time steps (last: 550'000 -> 600'000)
+max_dt        = 100000   # 100'000/0.05 = 2'000'000 time steps (last: 13'000'000 -> 15'000'000)
 
-# force 	      = True
+force 	      = True
 
 
 
 # Stage 3b
 #   latent dynamics surrogate (rollout)
-n_rollout_steps=  3			# always > 1 for 3b
+n_rollout_steps=  2			# always > 1 for 3b
 z1_resync      = False		# always False for 3b
 
-alpha			= same		# adaptative sub-step
-max_substeps    = same		# default: 256
+# alpha			= same		# adaptative sub-step
+# max_substeps    = same		# default: 256
 bucket_batches 	= True		# default: True
 batch_cost_budget = 2000000000     # ~2.8 GiB, i.e. 5.5 GiB / 1.9
 target_vram_gib =  6.
 truncate_bptt 	= same
 bucket_refresh_epochs=0
 
+dynamics_mode=deriv_linear	# NEW
+
 memory_cost_a_bytes= 120787
 memory_cost_b_bytes= 18469
 memory_cost_p      = 0.79
 
+resume_from = checkpoints/stage3a/128x128-stage3a-20260822_23h35.pt
 # resume_from = checkpoints/stage3b/128x128-stage3b-20260806_18h10.pt
 
 rollout_scale  = 1.e-6			# was 1e-6
@@ -170,7 +177,7 @@ batches		  = 3072
 spike_skip_factor= same
 # grad_spike_factor = 0        # disable the gradient guard; grad_clip does the bounding
 
-lr 			  =   0.02e-6  	# was 3.e-6; default: 1.e-3
+lr 			  =   5.e-6  	# was 3.e-6; default: 1.e-3
 z0_noise_scale= same
 
 dt_cap		  = same		# must be
