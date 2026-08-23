@@ -213,3 +213,71 @@ def test_z1_taylor_autonomous_multistep_is_unchanged():
     z0, z1_sequence, dts, theta = _rollout_inputs(n_steps=3)
     z0_hats = f_theta.rollout(z0, z1_sequence, dts, theta, z1_resync=False)
     assert z0_hats.shape == (2, 4, 4, 4, 4)
+
+
+# --------------------------------------------------------------------------
+# q-scheme (Step B): derivative_source='previous_quotient'.
+# --------------------------------------------------------------------------
+
+def _make_q(**kw):
+    return _make_taylor(dynamics_mode="deriv_linear",
+                        derivative_source="previous_quotient", **kw)
+
+
+def test_previous_quotient_requires_deriv_linear():
+    with pytest.raises(ValueError, match="only defined for dynamics_mode"):
+        _make_taylor(dynamics_mode="z1_taylor", derivative_source="previous_quotient")
+
+
+def test_previous_quotient_supports_autonomous_rollout():
+    assert _make_q().supports_autonomous_rollout is True
+    assert _make_dl().supports_autonomous_rollout is False   # derivative_source='z1'
+
+
+def test_q_scheme_autonomous_multistep_does_not_raise():
+    f_theta = _make_q()
+    z0, z1_sequence, dts, theta = _rollout_inputs(n_steps=3)
+    z0_hats = f_theta.rollout(z0, z1_sequence, dts, theta, z1_resync=False)
+    assert z0_hats.shape == (2, 4, 4, 4, 4)
+    assert torch.equal(z0_hats[:, 0], z0)
+
+
+def test_q_scheme_propagates_the_backward_quotient_of_its_own_trajectory():
+    """Step 0 uses the seed z1; each later step feeds q_i=(z0_i-z0_{i-1})/dt_{i-1}.
+    Reconstruct the rollout by hand from forward() and the quotient rule."""
+    f_theta = _make_q()
+    with torch.no_grad():
+        f_theta.net[-1].bias.fill_(0.02)
+    z0, z1_sequence, dts, theta = _rollout_inputs(n_steps=3)
+
+    z0_hats = f_theta.rollout(z0, z1_sequence, dts, theta, z1_resync=False)
+
+    # hand rollout
+    z0_cur = z0
+    z0_prev = z0
+    deriv = z1_sequence[:, 0]
+    manual = [z0]
+    for i in range(3):
+        if i > 0:
+            deriv = (z0_cur - z0_prev) / dts[:, i - 1].view(-1, 1, 1, 1)
+        z0_prev = z0_cur
+        z0_cur = f_theta(z0_cur, deriv, dts[:, i], theta)
+        manual.append(z0_cur)
+    manual = torch.stack(manual, dim=1)
+    assert torch.allclose(z0_hats, manual, atol=1e-6)
+
+    # step 1's derivative is literally the step-0 quotient, not the seed z1
+    q1 = (z0_hats[:, 1] - z0_hats[:, 0]) / dts[:, 0].view(-1, 1, 1, 1)
+    expected_step2 = f_theta(z0_hats[:, 1], q1, dts[:, 1], theta)
+    assert torch.allclose(z0_hats[:, 2], expected_step2, atol=1e-6)
+
+
+def test_q_scheme_one_step_equals_forward_with_seed():
+    """At one step the q-scheme is just forward() on the seed derivative."""
+    f_theta = _make_q()
+    with torch.no_grad():
+        f_theta.net[-1].bias.fill_(0.02)
+    z0, z1_sequence, dts, theta = _rollout_inputs(n_steps=1)
+    z0_hats = f_theta.rollout(z0, z1_sequence, dts, theta, z1_resync=False)
+    assert torch.allclose(z0_hats[:, 1],
+                          f_theta(z0, z1_sequence[:, 0], dts[:, 0], theta))

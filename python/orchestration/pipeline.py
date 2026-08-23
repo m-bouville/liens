@@ -22,7 +22,7 @@ from orchestration.checkpoint_registry import (
 from utils.logging_utils import _log_to_file
 from orchestration.paths import default_latent_cache_dir, _PYTHON_ROOT, _STAGE_DIRS
 from orchestration.stage_params import (
-    _backup_before_overwrite, _prepare_stage_kwargs, _resolve_stage_specific_ancestor,
+    _archive_ancestor, _backup_before_overwrite, _prepare_stage_kwargs, _resolve_stage_specific_ancestor,
     _strip_unrecognized_params, parse_stage_params, renamed_keys,
     report_unrecognized_global_params,
 )
@@ -430,6 +430,12 @@ def run_from_params_file(params_path: Path, default_base: Path,
                                             own_keys=renamed_keys(stages.get(stage_key, {})))
         kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
             kwargs, resume_from, f"Stage {stage_key}")
+        if resume_from is not None and not overridden:
+            # Auto-chained ancestor (3a -> 3b, 3b -> 4): pin its timestamped
+            # identity so the log and cache signature name the ACTUAL ancestor,
+            # not the rotating canonical the next run of that stage overwrites.
+            # An EXPLICIT override is already a durable, named path -- left as-is.
+            resume_from = _archive_ancestor(Path(resume_from))
         # The encoder ancestor is normally the pipeline's own resolved stage-2
         # OUTPUT, but a stage-3 section may name a SPECIFIC stage-2 checkpoint to
         # build on -- e.g. a hand-picked knee checkpoint rather than the
@@ -442,6 +448,10 @@ def run_from_params_file(params_path: Path, default_base: Path,
         # canonical stage-2 file, which would corrupt its mtime-keyed archive.
         kwargs, ae_ancestor, ae_overridden = _resolve_stage_specific_ancestor(
             kwargs, stage2_checkpoint, f"Stage {stage_key}", key="ae_checkpoint_path")
+        if not ae_overridden:
+            # Same pinning for the encoder ancestor (stage-2 -> stage-3): record
+            # WHICH stage-2 the LDS trained on, not the rotating canonical.
+            ae_ancestor = _archive_ancestor(Path(ae_ancestor))
         # Default to quiet (only print on save/early-stop), not train_lds()'s
         # own default of every-epoch -- stage 3 commonly runs hundreds of
         # epochs, and setdefault respects an explicit log_every_epoch in
@@ -615,6 +625,12 @@ def run_from_params_file(params_path: Path, default_base: Path,
                                             own_keys=renamed_keys(stages.get(stage_key, {})))
         kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
             kwargs, resume_from, f"Stage {stage_key}")
+        if resume_from is not None and not overridden:
+            # Auto-chained ancestor (3a -> 3b, 3b -> 4): pin its timestamped
+            # identity so the log and cache signature name the ACTUAL ancestor,
+            # not the rotating canonical the next run of that stage overwrites.
+            # An EXPLICIT override is already a durable, named path -- left as-is.
+            resume_from = _archive_ancestor(Path(resume_from))
         if resume_from is not None:
             signature = {"base_path": str(base_path), "resumed_from": str(resume_from),
                           **extra_signature, **_signature_kwargs(kwargs)}

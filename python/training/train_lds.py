@@ -514,7 +514,7 @@ def train_lds(
     use_dt_decade_weights: bool = False,
     z0_noise_scale: float = 0.0,
     dt_cap: float = float("inf"), n_substeps: int = 1, alpha: float | None = None,
-    dynamics_mode: str = "z1_taylor",
+    dynamics_mode: str = "z1_taylor", derivative_source: str = "z1",
     max_substeps: int = 256, truncate_bptt: int | None = None,
     target_vram_gib: float | None = None,
     memory_cost_a_bytes: float | None = None,
@@ -826,6 +826,7 @@ def train_lds(
                               hidden_dim=hidden_dim, n_hidden_layers=n_hidden_layers,
                               dt_cap=dt_cap, n_substeps=n_substeps, alpha=alpha,
                               max_substeps=max_substeps, dynamics_mode=dynamics_mode,
+                              derivative_source=derivative_source,
                               truncate_bptt=truncate_bptt).to(device)
 
     # Global per-decade loss weights, computed ONCE from train_set's own
@@ -1545,6 +1546,7 @@ def train_lds(
                     # calibrated to different step sizes.
                     "alpha": alpha,
                     "dynamics_mode": dynamics_mode,
+                    "derivative_source": derivative_source,
                     # Recorded for provenance only. Deliberately NOT in
                     # _MEANING_FIELDS: truncation changes how the gradient was
                     # computed, not what f_theta means, so a rebuild without it

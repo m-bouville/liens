@@ -39,6 +39,12 @@ _MEANING_FIELDS = {
                                    # update equation (f*dt, f sees dt) with the
                                    # SAME weights -- meaning-changing, so it must
                                    # round-trip like dt_cap/n_substeps.
+    "derivative_source": "z1",     # which derivative feeds forward()/rollout:
+                                   # "z1" (encoder's, teacher-forced -- Step A)
+                                   # or "previous_quotient" (backward quotient of
+                                   # the model's OWN trajectory -- the q-scheme,
+                                   # Step B). Changes what rollout computes with
+                                   # the SAME weights, so it round-trips too.
     # truncate_bptt is deliberately ABSENT. Every other field here changes what
     # f_theta MEANS -- two checkpoints with the same weights and different
     # values integrate differently, so a rebuild must reproduce them. Truncation
@@ -126,7 +132,8 @@ class LatentDynamics(nn.Module):
                  n_hidden_layers: int = 2, dt_cap: float = float("inf"),
                  n_substeps: int = 1, alpha: float | None = None,
                  max_substeps: int = 256, truncate_bptt: int | None = None,
-                 dynamics_mode: str = "z1_taylor"):
+                 dynamics_mode: str = "z1_taylor",
+                 derivative_source: str = "z1"):
         super().__init__()
         self.latent_channels = latent_channels
         self.latent_spatial = latent_spatial
@@ -206,6 +213,16 @@ class LatentDynamics(nn.Module):
             raise ValueError(
                 f"dynamics_mode must be 'z1_taylor' or 'deriv_linear', got {dynamics_mode!r}")
         self.dynamics_mode = dynamics_mode
+        if derivative_source not in ("z1", "previous_quotient"):
+            raise ValueError(
+                f"derivative_source must be 'z1' or 'previous_quotient', got "
+                f"{derivative_source!r}")
+        if derivative_source == "previous_quotient" and dynamics_mode != "deriv_linear":
+            raise ValueError(
+                "derivative_source='previous_quotient' (the q-scheme) is only "
+                "defined for dynamics_mode='deriv_linear'; z1_taylor propagates z1 "
+                f"by its own update, got dynamics_mode={dynamics_mode!r}.")
+        self.derivative_source = derivative_source
         if dynamics_mode == "deriv_linear" and math.isfinite(dt_cap):
             raise ValueError(
                 f"dynamics_mode='deriv_linear' forbids a finite dt_cap (got {dt_cap}): "
@@ -439,11 +456,16 @@ class LatentDynamics(nn.Module):
         False for deriv_linear: its f is a derivative CORRECTION, not z0's
         curvature, so there is no z1-update equation to advance z1 with -- only
         the teacher-forced path (z1_resync=True, via forward()) is defined.
-        z1_taylor advances z1 by f*dt inside _integrate, so it can. A diagnostic
-        should read this before asking for an autonomous rollout rather than
-        discover the limitation via the guard in rollout()/_integrate.
+        z1_taylor advances z1 by f*dt inside _integrate, so it can. deriv_linear
+        can too WHEN derivative_source='previous_quotient' (the q-scheme): it
+        then propagates the backward quotient of its own z0 trajectory, which
+        needs no z1-update equation. With derivative_source='z1' it cannot.
+        A diagnostic should read this before asking for an autonomous rollout
+        rather than discover the limitation via the guard in rollout().
         """
-        return self.dynamics_mode != "deriv_linear"
+        if self.dynamics_mode != "deriv_linear":
+            return True
+        return self.derivative_source == "previous_quotient"
 
     def _substeps_for(self, z0: torch.Tensor, z1: torch.Tensor, dt: torch.Tensor,
                        theta: torch.Tensor, f_n: torch.Tensor) -> torch.Tensor:
@@ -831,21 +853,46 @@ class LatentDynamics(nn.Module):
         z0_hats = [z0]
         z0_cur = z0
 
-        if self.dynamics_mode == "deriv_linear" and not z1_resync and n_steps > 1:
-            # deriv_linear's f is a derivative CORRECTION, not z0's curvature, so
-            # there is no z1-update equation to PROPAGATE z1 across steps -- an
-            # autonomous (z1_resync=False) rollout of more than one step would
-            # have to, and that is undefined until the q-scheme (Step B).
-            # A SINGLE step never propagates z1 (no next step to carry it into),
-            # so z1_resync is moot at n_steps==1 and the step is well-defined via
-            # forward() below -- only n_steps > 1 is forbidden. Fire on the
-            # OPERATION (propagation), not the config, so 1-step and
-            # teacher-forced calls are never wrongly rejected.
+        if (self.dynamics_mode == "deriv_linear"
+                and self.derivative_source == "previous_quotient"
+                and not z1_resync):
+            # The q-scheme (Step B): autonomous rollout with the derivative
+            # PROPAGATED as the backward quotient of the model's OWN z0
+            # trajectory, q_i = (z0_i - z0_{i-1}) / dt_{i-1}, instead of
+            # teacher-forced from z1_sequence. This is what lets deriv_linear
+            # roll out without a z1-update equation: forward()'s f consumes a
+            # derivative channel and is indifferent to whether it holds z1 or q.
+            # Step 0 is seeded from the real z1 (z1_sequence[:, 0]) -- the only
+            # real derivative available at the window start, and the value f saw
+            # at step 0 during Step-A training; every LATER step has no real
+            # frame to draw on and feeds its own quotient back in. (A q-trained
+            # model with a real predecessor frame would seed step 0 from a
+            # quotient too; that needs the dataset predecessor and is not this
+            # reuse path.)
+            deriv = z1_sequence[:, 0]
+            z0_prev = z0_cur
+            for i in range(n_steps):
+                if i > 0:
+                    dt_minus = dts[:, i - 1].view(-1, 1, 1, 1)
+                    deriv = (z0_cur - z0_prev) / dt_minus
+                z0_prev = z0_cur
+                z0_cur = self.forward(z0_cur, deriv, dts[:, i], theta)
+                z0_hats.append(z0_cur)
+            return torch.stack(z0_hats, dim=1)
+
+        if (self.dynamics_mode == "deriv_linear" and self.derivative_source == "z1"
+                and not z1_resync and n_steps > 1):
+            # derivative_source='z1' has no equation to PROPAGATE z1 across steps
+            # (f is a correction, not z0's curvature), so an autonomous >1-step
+            # rollout is undefined -- use derivative_source='previous_quotient'
+            # (the q-scheme, the branch just above) to roll out autonomously, or
+            # z1_resync=True to teacher-force, or a single step (which never
+            # propagates). Fire on the OPERATION, not the config.
             raise ValueError(
-                "dynamics_mode='deriv_linear' cannot roll out autonomously for >1 "
-                "step: f is a derivative correction, not z0's curvature, so there is no "
-                "z1-update equation to propagate z1 across steps (the q-scheme, Step B). "
-                "Use z1_resync=True, or a single step.")
+                "dynamics_mode='deriv_linear' with derivative_source='z1' cannot roll "
+                "out autonomously for >1 step: there is no z1-update equation to "
+                "propagate z1. Use derivative_source='previous_quotient' (the q-scheme), "
+                "z1_resync=True, or a single step.")
 
         if self.n_substeps == 1 and self.alpha is None and (
                 z1_resync or self.dynamics_mode == "deriv_linear"):

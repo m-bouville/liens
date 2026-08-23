@@ -331,6 +331,52 @@ def _find_existing_backup(source: Path, backup_name: str) -> Path | None:
     return None
 
 
+def _timestamped_name(path: Path) -> Path:
+    """The archive name for `path`: <stem>-<mtime as YYYYMMDD_HHhMM><suffix>.
+    Taken from the file's OWN mtime (not "now"), so the name answers "when was
+    THIS file produced" and is DETERMINISTIC for an unchanged file -- see
+    _backup_before_overwrite for the full rationale. One place, so the archive
+    and provenance paths can never disagree on the convention."""
+    timestamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y%m%d_%Hh%M")
+    return path.with_name(f"{path.stem}-{timestamp}{path.suffix}")
+
+
+def _archive_ancestor(path: Path) -> Path:
+    """Ensure a durable, timestamped copy of an AUTO-CHAINED ancestor exists and
+    return its path.
+
+    The pipeline chains stages through rotating canonical names
+    (128x128-stage3a.pt, 128x128-stage2.pt, ...) that the NEXT run of the
+    ancestor stage overwrites in place. So a log/signature that records the
+    canonical name ("resumed from 128x128-stage3a.pt") is unfalsifiable later:
+    it no longer identifies WHICH stage-3a produced this descendant. This copies
+    the canonical to its mtime-timestamped name (128x128-stage3a-20260823_04h26
+    .pt) so the identity is pinned, and returns that name for the caller to log
+    and to put in the cache signature.
+
+    Distinct from _backup_before_overwrite: that protects an OUTPUT about to be
+    overwritten and is scoped away from auto-chains; this protects the PROVENANCE
+    of an ancestor precisely ON the auto-chain. It never overwrites anything --
+    reuses an already-filed archive (deterministic name) or creates the copy.
+
+    Bonus correctness: recording the timestamped name in the signature means a
+    RETRAINED ancestor (new mtime -> new name) correctly invalidates the
+    descendant's cache, which the canonical name (unchanged across retrains)
+    silently did not.
+    """
+    if not path.exists():
+        return path
+    target = _timestamped_name(path)
+    existing = _find_existing_backup(path, target.name)
+    if existing is not None:
+        return existing
+    shutil.copy2(path, target)
+    print(f"NOTE: pinned ancestor {path} -> {target} (timestamped copy) so its "
+          f"identity is durable in the log and cache signature; the canonical "
+          f"name is overwritten by the next run of that stage.")
+    return target
+
+
 def _backup_before_overwrite(path: Path) -> None:
     """
     If `path` already exists, copies it to `<stem>-<timestamp><suffix>`
@@ -374,9 +420,8 @@ def _backup_before_overwrite(path: Path) -> None:
     """
     if not path.exists():
         return
-    timestamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y%m%d_%Hh%M")
-    backup_name = f"{path.stem}-{timestamp}{path.suffix}"
-    backup_path = path.with_name(backup_name)
+    backup_path = _timestamped_name(path)
+    backup_name = backup_path.name
     # Sibling archive directories too, not just this one: a backup that has
     # been tidied into checkpoints/stage2/_archives/ is still a backup, and
     # re-copying it defeats the point of having filed it away.

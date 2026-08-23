@@ -63,6 +63,7 @@ from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 # output/ wherever it is invoked from.
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent
 from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates, N_THETA
+from orchestration.paths import default_latent_cache_dir
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
@@ -145,6 +146,11 @@ def _select_windows(model: dict, n_samples: int, n_steps: int, seed: int,
         max_dt=max_dt if max_dt is not None else data_config.get("max_dt"),
         min_step=data_config.get("min_step", 0),
         min_stdev_phi=data_config.get("min_stdev_phi"),
+        # Share the trainers' latent cache (keyed on encoder fingerprint + run +
+        # step list), so a repeated diagnostic re-uses its own encodings instead
+        # of re-encoding all runs every invocation. Omitting this disables the
+        # cache entirely (datasets.py: latent_cache_dir=None -> no cache).
+        latent_cache_dir=default_latent_cache_dir(_PYTHON_ROOT),
     )
     if len(dataset) < n_samples:
         # CLAMP, don't abort. "Give me 5000" means "give me as many as you
@@ -461,7 +467,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
                    output_path: Path) -> Path:
     """Four panels: loss and correlation, as distributions and against dt."""
     dt = np.array(stats["dt"], dtype=float)
-    fig, axes = plt.subplots(2, 4, figsize=(25, 9))
+    fig, axes = plt.subplots(2, 5, figsize=(31, 9))
     colours = {"a": "tab:blue", "b": "tab:red", "causal": "tab:green",
                 "stage2": "tab:purple"}
     labels = {"a": a["label"], "b": b["label"],
@@ -628,6 +634,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     # than elapsed time -- this is that axis, over the whole sample.
     step_loss_medians = []
     step_keys = _keys()
+    step_med = {}  # (kind, key) -> {step_index: median}; feeds the 5th column
     for panel, kind in ((axes[0, 3], "loss"), (axes[1, 3], "corr")):
         for key in step_keys:
             series = stats.get(f"step_{kind}_{key}") or []
@@ -651,6 +658,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
                             label=labels[key])
                 panel.fill_between(centres, lo, hi, color=colours[key],
                                     alpha=0.15)
+                step_med[(kind, key)] = dict(zip(centres, med))
                 if kind == "loss":
                     step_loss_medians.append(med)
         panel.set_xlabel("chained steps applied")
@@ -671,6 +679,49 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     axes[1, 3].set_ylabel("median correlation (%) (band: quartiles)")
     axes[1, 3].set_title("correlation vs number of steps (all windows per step)")
     _corr_axis(axes[1, 3])
+
+    # (0,4) and (1,4): the vs-steps medians NORMALIZED to expose the per-step
+    # law, from n=1 (both are undefined at n=0: 1/n, and ln(1)/0).
+    #   [0,4] loss:  g(n) = ln[loss(n)/loss(0)] / n  -- the per-step log-growth
+    #                rate; FLAT across n => loss grows exponentially at rate g
+    #                (the compounding signature), rising/falling => the rate
+    #                itself changes with n.
+    #   [1,4] corr:  (1 - corr(n)) / n  (corr as a FRACTION, so _corr_axis's %
+    #                is divided by 100) -- the per-step decorrelation; FLAT =>
+    #                correlation falls linearly (constant coherence lost per
+    #                step), rising => accumulation accelerates.
+    # OWN y-ranges, deliberately NOT joined to the loss-row (log loss) or the
+    # correlation-row (shared 0..100) unions below: these are rates in
+    # different units, and inheriting either scale would make them unreadable.
+    for key in step_keys:
+        ml = step_med.get(("loss", key), {})
+        if ml and ml.get(0, 0.0) > 0.0:
+            ks = sorted(n for n in ml if n >= 1 and ml.get(n, 0.0) > 0.0)
+            g = [np.log(ml[n] / ml[0]) / n for n in ks]
+            if ks:
+                axes[0, 4].plot(ks, g, "o-", color=colours[key], label=labels[key])
+        mc = step_med.get(("corr", key), {})
+        if mc:
+            ks = sorted(n for n in mc if n >= 1)
+            d = [(100.0 - mc[n]) / n for n in ks]  # percent per step
+            if ks:
+                axes[1, 4].plot(ks, d, "o-", color=colours[key], label=labels[key])
+    axes[0, 4].set_xlabel("chained steps applied")
+    axes[0, 4].set_ylabel("ln[loss(n)/loss(0)] / n")
+    axes[0, 4].set_title("loss log-growth rate per step")
+    axes[0, 4].grid(alpha=0.3, which="both")
+    axes[0, 4].legend(fontsize=7)
+    axes[1, 4].set_xlabel("chained steps applied")
+    axes[1, 4].set_ylabel("(1 - corr(n)) / n  [% per step]")
+    axes[1, 4].set_title("decorrelation rate per step")
+    axes[1, 4].grid(alpha=0.3, which="both")
+    axes[1, 4].legend(fontsize=7)
+    # (1-corr)/n is non-negative -- pin the floor to 0% (top stays auto).
+    axes[1, 4].set_ylim(bottom=0.0)
+    # Series start at n=1, but share the x range with the vs-steps column
+    # beside them (which starts at step 0) so the two columns align.
+    axes[0, 4].set_xlim(left=0)
+    axes[1, 4].set_xlim(left=0)
 
     # The three ENDPOINT loss panels -- CDF [0,0], vs-dt [0,1], vs-T [0,2] --
     # share one y range, set by loss-vs-dt's MEDIANS. The CDF used to set the
@@ -1190,6 +1241,17 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
                                    device)
     window_strings = [f"{run_dir}:{':'.join(str(sp) for sp in steps)}"
                        for run_dir, steps in windows]
+    if not z1_resync:
+        _cant = [m["label"] for m in (a, b)
+                 if not m["f_theta"].supports_autonomous_rollout]
+        if _cant:
+            print(f"NOTE: {', '.join(_cant)} cannot roll out autonomously (no "
+                  f"z1-update equation -- deriv_linear with derivative_source='z1'); "
+                  f"forcing z1_resync=True for BOTH so the comparison runs "
+                  f"teacher-forced. To read an AUTONOMOUS rollout, compare only "
+                  f"models that support it (z1_taylor or "
+                  f"derivative_source='previous_quotient').")
+            z1_resync = True
     print(f"z1_resync={z1_resync} for BOTH models (forced equal; the comparison "
           f"is void if one resyncs and the other propagates).")
     for sw in window_strings:
@@ -1199,12 +1261,24 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
     if a["prefix"] and b["prefix"] and a["prefix"] != b["prefix"]:
         prefix = f"{a['prefix']} vs {b['prefix']}"
     n_steps_used = len(windows[0][1]) - 1
+    # Show the RESOLVED per-transition max_dt: when the CLI gives none,
+    # _select_windows silently falls back to model A's TRAINING max_dt
+    # (data_config), so two runs can share a filter without the invoker
+    # realizing -- e.g. --max-dt 10000 on a checkpoint trained at max_dt=10000
+    # is a no-op that looks like a cap. Note it is PER-TRANSITION: the loss-vs-
+    # dt axis is dt_total (the sum over the horizon), which reaches ~n_steps
+    # times higher under the geometric schedule.
+    resolved_max_dt = max_dt if max_dt is not None else a["max_dt"]
     regime = (f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}, "
+              f"z1 {'resynced at each real frame' if z1_resync else 'not resynchronized'}, "
+              f"max_dt={resolved_max_dt:g}/transition"
+              if resolved_max_dt is not None else
+              f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}, "
               f"z1 {'resynced at each real frame' if z1_resync else 'not resynchronized'}")
     title = (f"{prefix}: {a['label']} vs. {b['label']}" if prefix
               else f"{a['label']} vs. {b['label']}")
     title = f"{title}\n{regime}"
-    return device, a, b, windows, window_strings, prefix, title, n_steps_used
+    return device, a, b, windows, window_strings, prefix, title, n_steps_used, z1_resync
 
 
 def _default_figure_path(prefix, a, b, seed, n_steps_used, z1_resync,
@@ -1233,7 +1307,7 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
     operate on the n_samples window set -- the windows chosen to be looked
     at. For the numbers a verdict rests on, use compare_statistics."""
     (device, a, b, windows, window_strings, prefix, title,
-     n_steps_used) = _setup_comparison(path_a, path_b, device, n_samples,
+     n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device, n_samples,
                                          n_steps, seed, fixed_windows, max_dt,
                                          z1_resync)
     recon_loss = ReconLoss()
@@ -1642,7 +1716,7 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
     combined function, no panel window is drawn to define it, so n_samples
     has no meaning here."""
     (device, a, b, windows, window_strings, prefix, title,
-     n_steps_used) = _setup_comparison(path_a, path_b, device, 0, n_steps,
+     n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device, 0, n_steps,
                                          seed, None, max_dt, z1_resync)
     if n_stats:
         stat_windows = _select_windows(a, n_stats, n_steps, seed, max_dt, device)
@@ -1749,7 +1823,7 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
     if result is None:
         device_r = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         (_d, a, b, _w, window_strings, prefix, _t,
-         n_steps_used) = _setup_comparison(path_a, path_b, device_r, n_samples,
+         n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device_r, n_samples,
                                             n_steps, seed, fixed_windows,
                                             max_dt, z1_resync)
         out = output_path or _default_figure_path(prefix, a, b, seed,
