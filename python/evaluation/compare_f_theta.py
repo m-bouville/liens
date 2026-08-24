@@ -44,6 +44,7 @@ tool itself prints, for a repeatable rerun on later checkpoints.
 """
 import argparse
 import re
+import math
 import contextlib
 from pathlib import Path
 
@@ -126,7 +127,8 @@ def _load_model(lds_checkpoint_path: Path, device) -> dict:
 
 
 def _select_windows(model: dict, n_samples: int, n_steps: int, seed: int,
-                     max_dt: float | None, device) -> list[tuple]:
+                     max_dt: float | None, device,
+                     t0_range: tuple | None = None) -> list[tuple]:
     """Pick windows ONCE, from model A's test split, at the COMMON horizon.
 
     window_length = n_steps + 1 regardless of either checkpoint's own
@@ -162,11 +164,28 @@ def _select_windows(model: dict, n_samples: int, n_steps: int, seed: int,
               f"window_length={n_steps + 1} (asked for {n_samples}); "
               f"using all of them")
         n_samples = len(dataset)
+    # --t0-range LO HI: restrict to windows whose STARTING step (t0) is in
+    # [LO, HI], sampling within that band. Lets an early-t0 and a late-t0 run at
+    # the SAME step count (== matched Delta-u span) be compared: equal coherence
+    # across bands => the stability box is set by log-time span, not absolute dt.
+    eligible = list(range(len(dataset)))
+    if t0_range is not None:
+        lo, hi = t0_range
+        eligible = [i for i in eligible
+                    if lo <= dataset.window_info(i)[1][0] <= hi]
+        print(f"  --t0-range [{lo:g}, {hi:g}]: {len(eligible)} of {len(dataset)} "
+              f"windows start in band")
+        if not eligible:
+            raise ValueError(
+                f"no windows start in t0-range [{lo:g}, {hi:g}] -- widen the band "
+                f"or check it is in STEP units (e.g. 7000 30000), not physical time")
+    if len(eligible) < n_samples:
+        n_samples = len(eligible)
     generator = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(len(dataset), generator=generator)[:n_samples].tolist()
+    perm = torch.randperm(len(eligible), generator=generator)[:n_samples].tolist()
     windows = []
-    for idx in indices:
-        run_dir, steps = dataset.window_info(idx)
+    for j in perm:
+        run_dir, steps = dataset.window_info(eligible[j])
         windows.append((run_dir, list(steps)))
     return windows
 
@@ -234,8 +253,10 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
         meta = load.read_metadata(Path(run_dir) / "metadata.txt")
         temperature = meta.temperature
 
+        _tc = getattr(a["f_theta"], "time_coordinate", "t")
         stage2 = compute_stage2_trajectory(run_dir, steps, a["ae"],
-                                            a["ae_config"], device)
+                                            a["ae_config"], device,
+                                            time_coordinate=_tc)
         s2_loss, s2_corr = _series(real_frames, stage2)
         out["step_loss_stage2"].append(s2_loss)
         out["step_corr_stage2"].append(s2_corr)
@@ -243,7 +264,8 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
         out["corr_stage2"].append(s2_corr[-1])
 
         causal = compute_causal_trajectory(run_dir, steps, a["ae"],
-                                            a["ae_config"], device)
+                                            a["ae_config"], device,
+                                            time_coordinate=_tc)
         if causal is not None:
             c_loss, c_corr = _series(real_frames, causal)
             out["step_loss_causal"].append(c_loss)
@@ -464,15 +486,23 @@ def _ylim_from_medians(ax, medians) -> None:
 
 
 def _stats_figure(stats: dict, a: dict, b: dict, title: str,
-                   output_path: Path) -> Path:
+                   output_path: Path, *, n_steps: int = 1) -> Path:
     """Four panels: loss and correlation, as distributions and against dt."""
     dt = np.array(stats["dt"], dtype=float)
     fig, axes = plt.subplots(2, 5, figsize=(31, 9))
     colours = {"a": "tab:blue", "b": "tab:red", "causal": "tab:green",
                 "stage2": "tab:purple"}
+    # Stage 2 RE-ENCODES the predicted state each step (the models never do), so
+    # its rollout is a same-methodology baseline only at 1 step. At multi-step it
+    # uses information the models cannot; draw it DOTTED so "3a below stage 2"
+    # there reads as the re-encoding advantage, not f_theta worsening things.
+    _stage2_comparable = (n_steps == 1)
     labels = {"a": a["label"], "b": b["label"],
               "causal": "causal (frozen dz0/dt)",
-              "stage2": "stage 2 (z0 + z1 dt)"}
+              "stage2": "stage 2 (z0 + z1 dt)" + (
+                  "" if _stage2_comparable else "  [re-encodes -- not comparable]")}
+    linestyles = {"a": "-", "b": "-", "causal": "-",
+                  "stage2": "-" if _stage2_comparable else ":"}
     has_causal = bool(stats.get("step_loss_causal"))
     has_stage2 = bool(stats.get("step_loss_stage2"))
 
@@ -506,7 +536,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
         v = v[np.isfinite(v) & (v > 0)]
         if v.size:
             ax.plot(np.arange(1, v.size + 1) / v.size, v,
-                    color=colours[key], label=labels[key])
+                    color=colours[key], linestyle=linestyles[key], label=labels[key])
     ax.set_yscale("log")
     ax.set_ylabel("end-to-end loss")
     ax.set_xlabel("cumulative fraction of windows")
@@ -522,7 +552,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
         if v.size:
             v = np.sort(v)
             ax.plot(np.arange(1, v.size + 1) / v.size, v,
-                    color=colours[key], label=labels[key])
+                    color=colours[key], linestyle=linestyles[key], label=labels[key])
     ax.set_ylabel("correlation of predicted vs real dx (%)")
     ax.set_xlabel("cumulative fraction of windows")
     ax.set_title("correlation distribution (higher is better)")
@@ -539,8 +569,8 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
         c, med, lo, hi = _binned(key_dt, np.array(stats[f"loss_{key}"],
                                                    dtype=float))
         if c.size:
-            ax.plot(c, med, "o-", color=colours[key], label=labels[key])
-            ax.fill_between(c, lo, hi, color=colours[key], alpha=0.15)
+            ax.plot(c, med, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
+            ax.fill_between(c, lo, hi, color=colours[key], linestyle=linestyles[key], alpha=0.15)
             dt_loss_medians.append(med)
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -567,8 +597,8 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
                                                        dtype=float)
         c, med, lo, hi = _binned(key_dt, corr)
         if c.size:
-            ax.plot(c, med, "o-", color=colours[key], label=labels[key])
-            ax.fill_between(c, lo, hi, color=colours[key], alpha=0.15)
+            ax.plot(c, med, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
+            ax.fill_between(c, lo, hi, color=colours[key], linestyle=linestyles[key], alpha=0.15)
     ax.set_xscale("log")
     ax.set_xlabel("dt_total (binned)")
     ax.set_ylabel("median correlation (%) (band: quartiles)")
@@ -592,8 +622,8 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
         c, med, lo, hi, n_win = _moving_window(
             key_temp, np.array(stats[f"loss_{key}"], dtype=float))
         if c.size:
-            ax.plot(c, med, "o-", color=colours[key], label=labels[key])
-            ax.fill_between(c, lo, hi, color=colours[key], alpha=0.15)
+            ax.plot(c, med, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
+            ax.fill_between(c, lo, hi, color=colours[key], linestyle=linestyles[key], alpha=0.15)
             # How thin the tails get is not visible on the panel, and a
             # quartile band over 2-3 windows is not a quartile band. Report
             # it once per model rather than cluttering the figure.
@@ -618,8 +648,8 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
                     else np.array(stats["temp_causal"], dtype=float))
         c, med, lo, hi, _n = _moving_window(key_temp, corr)
         if c.size:
-            ax.plot(c, med, "o-", color=colours[key], label=labels[key])
-            ax.fill_between(c, lo, hi, color=colours[key], alpha=0.15)
+            ax.plot(c, med, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
+            ax.fill_between(c, lo, hi, color=colours[key], linestyle=linestyles[key], alpha=0.15)
     ax.set_xlabel("temperature (SMA)")
     _temperature_axis(ax)
     ax.set_ylabel("median correlation (%) (band: quartiles)")
@@ -654,9 +684,9 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
                 lo.append(float(np.percentile(vals, 25)))
                 hi.append(float(np.percentile(vals, 75)))
             if centres:
-                panel.plot(centres, med, "o-", color=colours[key],
+                panel.plot(centres, med, "o", color=colours[key], linestyle=linestyles[key],
                             label=labels[key])
-                panel.fill_between(centres, lo, hi, color=colours[key],
+                panel.fill_between(centres, lo, hi, color=colours[key], linestyle=linestyles[key],
                                     alpha=0.15)
                 step_med[(kind, key)] = dict(zip(centres, med))
                 if kind == "loss":
@@ -699,13 +729,13 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
             ks = sorted(n for n in ml if n >= 1 and ml.get(n, 0.0) > 0.0)
             g = [np.log(ml[n] / ml[0]) / n for n in ks]
             if ks:
-                axes[0, 4].plot(ks, g, "o-", color=colours[key], label=labels[key])
+                axes[0, 4].plot(ks, g, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
         mc = step_med.get(("corr", key), {})
         if mc:
             ks = sorted(n for n in mc if n >= 1)
             d = [(100.0 - mc[n]) / n for n in ks]  # percent per step
             if ks:
-                axes[1, 4].plot(ks, d, "o-", color=colours[key], label=labels[key])
+                axes[1, 4].plot(ks, d, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
     axes[0, 4].set_xlabel("chained steps applied")
     axes[0, 4].set_ylabel("ln[loss(n)/loss(0)] / n")
     axes[0, 4].set_title("loss log-growth rate per step")
@@ -919,7 +949,7 @@ def scaled_f_theta(f_theta, scale: float):
 
 
 def compute_stage2_trajectory(run_dir: Path, steps: list[int], ae,
-                               ae_config: dict, device):
+                               ae_config: dict, device, time_coordinate: str = "t"):
     """Stage 2 alone, CAUSAL -- only frame t0 is ever read.
 
         z0(t+(n+1)dt) = z0(t+n dt) + z1(t+n dt) dt
@@ -963,8 +993,17 @@ def compute_stage2_trajectory(run_dir: Path, steps: list[int], ae,
 
         out = [ae_decoder(z0)[0, 0].cpu().numpy()]
         for k in range(len(steps) - 1):
-            dt = (steps[k + 1] - steps[k]) * metadata.dt
-            z0 = z0 + z1 * dt
+            # u-scheme: z0 + z̃1*Delta-u (z̃1=ln10*t*z1) instead of z0 + z1*dt,
+            # so the baseline integrates in the SAME coordinate as the model --
+            # the only difference measured is then the correction network, not
+            # the coordinate.
+            if time_coordinate == "log10_t":
+                dt = math.log10(steps[k + 1] / steps[k])
+                z1_use = z1 * (math.log(10.0) * metadata.dt * steps[k])
+            else:
+                dt = (steps[k + 1] - steps[k]) * metadata.dt
+                z1_use = z1
+            z0 = z0 + z1_use * dt
             x_pred = ae_decoder(z0)
             out.append(x_pred[0, 0].cpu().numpy())
             # z1 for the NEXT step, from the predicted state alone.
@@ -973,7 +1012,7 @@ def compute_stage2_trajectory(run_dir: Path, steps: list[int], ae,
 
 
 def compute_causal_trajectory(run_dir: Path, steps: list[int], ae,
-                               ae_config: dict, device):
+                               ae_config: dict, device, time_coordinate: str = "t"):
     """Backward-difference baseline: what the PAST alone predicts.
 
     z0_dot_back = (z0(t) - z0(t - dt_minus)) / dt_minus, from the two real
@@ -999,7 +1038,13 @@ def compute_causal_trajectory(run_dir: Path, steps: list[int], ae,
     if steps[0] not in saved or saved.index(steps[0]) == 0:
         return None
     prev_step = saved[saved.index(steps[0]) - 1]
-    dt_minus = (steps[0] - prev_step) * metadata.dt
+    # Backward gap in the model's coordinate: Delta-u=log10(t0/t_prev) for a
+    # log10_t model (dividing the backward difference by it yields dz0/du, the
+    # u-derivative -- equivalent to ln10*t0*dz0/dt to leading order), else Delta-t.
+    if time_coordinate == "log10_t":
+        dt_minus = math.log10(steps[0] / prev_step)
+    else:
+        dt_minus = (steps[0] - prev_step) * metadata.dt
     if dt_minus <= 0:
         return None
 
@@ -1022,7 +1067,12 @@ def compute_causal_trajectory(run_dir: Path, steps: list[int], ae,
         elapsed = 0.0
         out = [ae_decoder(z0_t)[0, 0].cpu().numpy()]
         for i in range(len(steps) - 1):
-            elapsed += (steps[i + 1] - steps[i]) * metadata.dt
+            # elapsed accumulates in the model's coordinate; summing Delta-u
+            # increments telescopes to log10(t_{i+1}/t0), the cumulative log-time.
+            if time_coordinate == "log10_t":
+                elapsed += math.log10(steps[i + 1] / steps[i])
+            else:
+                elapsed += (steps[i + 1] - steps[i]) * metadata.dt
             out.append(ae_decoder(z0_t + z0_dot_back * elapsed)[0, 0].cpu().numpy())
     return out
 
@@ -1045,8 +1095,16 @@ def compute_trajectory(run_dir: Path, steps: list[int], ae, f_theta,
     theta_vec = theta_coordinates(metadata.temperature, metadata.T0)
     real_frames = [load.read_phi_half(run_dir / load.snapshot_filename(s), nx, ny)
                     for s in steps]
-    dt_per_step = [(steps[i + 1] - steps[i]) * metadata.dt
-                    for i in range(len(steps) - 1)]
+    # u-scheme: a log10_t model steps in Delta-u=log10(t_{i+1}/t_i) and consumes
+    # z̃1=dz0/du=ln10*t*z1, not Delta-t and z1=dz0/dt. Coordinate read straight
+    # off the model (a non-model f_theta -- e.g. a test stub -- defaults to "t").
+    _tc = getattr(f_theta, "time_coordinate", "t")
+    if _tc == "log10_t":
+        dt_per_step = [math.log10(steps[i + 1] / steps[i])
+                        for i in range(len(steps) - 1)]
+    else:
+        dt_per_step = [(steps[i + 1] - steps[i]) * metadata.dt
+                        for i in range(len(steps) - 1)]
 
     with torch.no_grad():
         _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
@@ -1060,6 +1118,10 @@ def compute_trajectory(run_dir: Path, steps: list[int], ae, f_theta,
         encoded = ae_encoder(x_all, theta=theta_encode)
         z0_t = encoded[recon_stream_name][0:1]
         z1_sequence = encoded["deriv"].unsqueeze(0)
+        if _tc == "log10_t":
+            _sc = torch.tensor([math.log(10.0) * metadata.dt * s for s in steps],
+                               device=device, dtype=z1_sequence.dtype)
+            z1_sequence = z1_sequence * _sc[None, :, None, None, None]  # z1 -> z̃1
         dts = torch.tensor([dt_per_step], dtype=torch.float32, device=device)
         theta = torch.tensor([theta_vec], dtype=torch.float32, device=device)
 
@@ -1099,13 +1161,14 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     # TEACHER-FORCED, unlike the model rows: it sees a real frame at every
     # step. That makes it an upper bound on a causal one-step predictor
     # rather than a rollout competitor, and the row label says so.
+    _tc = getattr(a["f_theta"], "time_coordinate", "t")
     causal = compute_causal_trajectory(run_dir, steps, a["ae"], a["ae_config"],
-                                        device)
+                                        device, time_coordinate=_tc)
     # STAGE 2 alone -- z0 + z1*dt, no f_theta. Sits between the causal
     # baseline and the models: it uses the encoder's own derivative rather
     # than a backward difference, but has no dt^2/2 correction.
     stage2 = compute_stage2_trajectory(run_dir, steps, a["ae"], a["ae_config"],
-                                        device)
+                                        device, time_coordinate=_tc)
     n_cols = len(steps)
     # (label, frames, metrics-key) -- the key is carried WITH the row rather
     # than derived from its index, which stopped being readable the moment
@@ -1210,7 +1273,7 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
 
 
 def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
-                       fixed_windows, max_dt, z1_resync):
+                       fixed_windows, max_dt, z1_resync, t0_range=None):
     """Shared prologue for the panel and statistics tools: load both models,
     resolve the window set and the title/prefix, print the z1_resync banner.
 
@@ -1238,12 +1301,16 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
                               f"the comparison needs one common horizon")
     else:
         windows = _select_windows(a, max(n_samples, 1), n_steps, seed, max_dt,
-                                   device)
+                                   device, t0_range=t0_range)
     window_strings = [f"{run_dir}:{':'.join(str(sp) for sp in steps)}"
                        for run_dir, steps in windows]
     if not z1_resync:
         _cant = [m["label"] for m in (a, b)
-                 if not m["f_theta"].supports_autonomous_rollout]
+                 # getattr default True: a non-model f_theta (e.g. a test stub,
+                 # or any path where it is a name not a LatentDynamics) is
+                 # assumed autonomous-capable, so it never forces teacher-forcing
+                 # -- only a real model that reports False triggers the override.
+                 if not getattr(m["f_theta"], "supports_autonomous_rollout", True)]
         if _cant:
             print(f"NOTE: {', '.join(_cant)} cannot roll out autonomously (no "
                   f"z1-update equation -- deriv_linear with derivative_source='z1'); "
@@ -1268,7 +1335,7 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
     # is a no-op that looks like a cap. Note it is PER-TRANSITION: the loss-vs-
     # dt axis is dt_total (the sum over the horizon), which reaches ~n_steps
     # times higher under the geometric schedule.
-    resolved_max_dt = max_dt if max_dt is not None else a["max_dt"]
+    resolved_max_dt = max_dt if max_dt is not None else a.get("max_dt")
     regime = (f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}, "
               f"z1 {'resynced at each real frame' if z1_resync else 'not resynchronized'}, "
               f"max_dt={resolved_max_dt:g}/transition"
@@ -1297,6 +1364,7 @@ def _default_figure_path(prefix, a, b, seed, n_steps_used, z1_resync,
 
 
 def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
+                    t0_range=None,
                     n_steps: int = 2, seed: int = 0,
                     fixed_windows: list[str] | None = None,
                     max_dt: float | None = None, z1_resync: bool = False,
@@ -1309,7 +1377,7 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
     (device, a, b, windows, window_strings, prefix, title,
      n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device, n_samples,
                                          n_steps, seed, fixed_windows, max_dt,
-                                         z1_resync)
+                                         z1_resync, t0_range=t0_range)
     recon_loss = ReconLoss()
     n_rows = len(windows)
     fig, axes = plt.subplots(n_rows, 7, figsize=(29, 3.2 * n_rows))
@@ -1414,6 +1482,7 @@ def _load_stage2_ae(path: Path, device) -> dict:
 
 
 def compare_stage2_rollouts(paths: list[Path], n_stats: int = 200,
+                             t0_range=None,
                             n_steps: int = 10, seed: int = 0,
                             max_dt: float | None = None,
                             output_path: Path | None = None,
@@ -1445,7 +1514,8 @@ def compare_stage2_rollouts(paths: list[Path], n_stats: int = 200,
     for m in models:
         m["label"] = _pretty_label(m["label"], _need_year)
 
-    windows = _select_windows(models[0], n_stats, n_steps, seed, max_dt, device)
+    windows = _select_windows(models[0], n_stats, n_steps, seed, max_dt, device,
+                               t0_range=t0_range)
     print(f"\nstage-2 rollout comparison over {len(windows)} windows "
           f"(same windows for all {len(models)} checkpoints), "
           f"horizon {n_steps} steps...")
@@ -1701,6 +1771,7 @@ def _stage2_rollout_figure(models, dt_totals, temps, n_steps, output_path):
 
 
 def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
+                       t0_range=None,
                         n_steps: int = 2, seed: int = 0,
                         max_dt: float | None = None, z1_resync: bool = False,
                         f_scale_sweep: bool = False, alpha_sweep: bool = False,
@@ -1717,9 +1788,10 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
     has no meaning here."""
     (device, a, b, windows, window_strings, prefix, title,
      n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device, 0, n_steps,
-                                         seed, None, max_dt, z1_resync)
+                                         seed, None, max_dt, z1_resync, t0_range=t0_range)
     if n_stats:
-        stat_windows = _select_windows(a, n_stats, n_steps, seed, max_dt, device)
+        stat_windows = _select_windows(a, n_stats, n_steps, seed, max_dt, device,
+                                        t0_range=t0_range)
         print(f"\ncollecting statistics over {len(stat_windows)} windows "
               f"(both models, same windows)...")
         stats = collect_stats(a, b, stat_windows, device, z1_resync)
@@ -1740,7 +1812,30 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
         corrs_k = np.array([c for c in stats[f"corr_{key}"]
                              if c is not None], dtype=float)
         print(f"  {m['label']}: median loss {np.median(losses_k):.5g}, "
-              f"median corr {np.median(corrs_k):.0f}%")
+              f"median corr {np.median(corrs_k):.1f}%")
+    if stats is not None:
+        # Causal (frozen dz0/dt extrapolation) never re-encodes -- same rollout
+        # methodology as the models -- so it is comparable at every step count.
+        _cl = np.array([x for x in stats["loss_causal"] if np.isfinite(x)], dtype=float)
+        _cc = np.array([c for c in stats["corr_causal"] if c is not None], dtype=float)
+        if _cl.size:
+            print(f"  causal (frozen dz0/dt): median loss {np.median(_cl):.5g}, "
+                  f"median corr {np.median(_cc):.1f}%")
+        # Stage 2 (z0+z1*dt) RE-ENCODES the predicted state every step -- the
+        # models never do -- so it is a fair, same-methodology baseline ONLY at
+        # 1 step (no re-encode yet). At multi-step it uses information the models
+        # cannot, so "3a below stage 2" there is the re-encoding advantage, not
+        # f_theta worsening things: the figure draws it DOTTED and its median is
+        # printed as reference-only, not as a comparable baseline.
+        _sl = np.array([x for x in stats["loss_stage2"] if np.isfinite(x)], dtype=float)
+        _sc = np.array([c for c in stats["corr_stage2"] if c is not None], dtype=float)
+        if _sl.size and n_steps == 1:
+            print(f"  stage 2 (z0+z1*dt): median loss {np.median(_sl):.5g}, "
+                  f"median corr {np.median(_sc):.1f}%  [comparable: 1 step]")
+        elif _sl.size:
+            print(f"  stage 2 (z0+z1*dt): median corr {np.median(_sc):.1f}% "
+                  f"-- NOT comparable at {n_steps} steps (re-encodes each step; "
+                  f"dotted in the figure), reference only")
     for key, m in ((("a", a), ("b", b)) if stats is not None else ()):
         per_step = stats["n_corr_undefined_per_step"][key]
         flagged = [k for k, n in enumerate(per_step)
@@ -1768,7 +1863,7 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
             print(f"saved {traj_path}")
     if stats is not None:
         stats_path = output_path.with_name(output_path.stem + "-stats.png")
-        _stats_figure(stats, a, b, title, stats_path)
+        _stats_figure(stats, a, b, title, output_path=stats_path, n_steps=n_steps)
         print(f"saved {stats_path}")
     # Return the BASE path (not the -stats one): callers derive both the
     # stats and trajectory names from this stem, as the panel tool's return
@@ -1777,6 +1872,7 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
 
 
 def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
+                    t0_range=None,
                      n_steps: int = 2, seed: int = 0,
                      fixed_windows: list[str] | None = None,
                      max_dt: float | None = None, z1_resync: bool = False,
@@ -1814,6 +1910,7 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
         want_traj_here = trajectory and not draw_panels
         stats_result = compare_statistics(
             path_a, path_b, n_stats=n_stats, n_steps=n_steps, seed=seed,
+            t0_range=t0_range,
             max_dt=max_dt, z1_resync=z1_resync, f_scale_sweep=f_scale_sweep,
             alpha_sweep=alpha_sweep, trajectory=want_traj_here,
             output_path=output_path, device=device)
@@ -1825,7 +1922,7 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
         (_d, a, b, _w, window_strings, prefix, _t,
          n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device_r, n_samples,
                                             n_steps, seed, fixed_windows,
-                                            max_dt, z1_resync)
+                                            max_dt, z1_resync, t0_range=t0_range)
         out = output_path or _default_figure_path(prefix, a, b, seed,
                                                    n_steps_used, z1_resync,
                                                    fixed_windows)
@@ -1855,6 +1952,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fixed-windows", type=str, nargs="+", default=None)
     parser.add_argument("--max-dt", type=float, default=None)
+    parser.add_argument("--t0-range", type=float, nargs=2, default=None,
+                         metavar=("LO", "HI"),
+                         help="restrict to windows whose STARTING step t0 is in "
+                              "[LO, HI] (step units, e.g. 7000 30000). Run twice "
+                              "-- an early-t0 and a late-t0 band at the SAME "
+                              "--steps (== matched Delta-u span) -- to test "
+                              "whether coherence tracks log-time span or absolute "
+                              "dt: equal corr across bands => the box is log-time.")
     parser.add_argument("--trajectory", action="store_true",
                          help="ALSO save a 3 x (N+1) panel PER WINDOW, "
                               "following it frame by frame: rows real / A / B, "
@@ -1906,6 +2011,7 @@ def main() -> None:
         compare_stage2_rollouts(
             args.checkpoints, n_stats=args.n_stats or 200,
             n_steps=args.steps, seed=args.seed, max_dt=args.max_dt,
+            t0_range=tuple(args.t0_range) if args.t0_range else None,
             output_path=args.output, device=args.device)
         return
 
@@ -1922,6 +2028,7 @@ def main() -> None:
             n_stats=args.n_stats or 200, n_steps=args.steps, seed=args.seed,
             max_dt=args.max_dt, z1_resync=args.z1_resync,
             f_scale_sweep=args.f_scale_sweep, alpha_sweep=args.alpha_sweep,
+            t0_range=tuple(args.t0_range) if args.t0_range else None,
             trajectory=args.trajectory, output_path=args.output,
             device=args.device)
     elif args.panels_only:
@@ -1930,6 +2037,7 @@ def main() -> None:
             n_samples=args.n_samples, n_steps=args.steps, seed=args.seed,
             fixed_windows=args.fixed_windows, max_dt=args.max_dt,
             z1_resync=args.z1_resync, trajectory=args.trajectory,
+            t0_range=tuple(args.t0_range) if args.t0_range else None,
             output_path=args.output, device=args.device)
     else:
         compare_f_theta(checkpoint_a, checkpoint_b,
@@ -1938,6 +2046,7 @@ def main() -> None:
                          max_dt=args.max_dt, z1_resync=args.z1_resync,
                          f_scale_sweep=args.f_scale_sweep,
                          alpha_sweep=args.alpha_sweep,
+                         t0_range=tuple(args.t0_range) if args.t0_range else None,
                          n_stats=args.n_stats, trajectory=args.trajectory,
                          output_path=args.output, device=args.device)
 

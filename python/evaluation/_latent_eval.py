@@ -288,6 +288,15 @@ def _load_ae_f_theta_and_dataset(
         test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
         min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
         max_dt=max_dt, encode_both_streams=True,
+        # A log10_t (u-scheme) model steps in Delta-u and consumes z̃1=ln10*t*z1,
+        # not Delta-t and z1. Build the dataset in the MODEL's coordinate (read
+        # off its checkpoint) so f_theta is fed what it was trained on. Absent
+        # (t-model / old checkpoint) => "t", byte-identical to before. Without
+        # this, a u-model's correction f (trained for Delta-u ~ 0.1 steps) gets
+        # multiplied by physical dt (~1e4), inflating the "full" delta-z0 by
+        # ~dt/Delta-u while euler-only (z1*dt == z̃1*Delta-u to leading order)
+        # stays correct -- the spurious orange blow-up in dt_dependence.
+        time_coordinate=lds_config.get("time_coordinate", "t"),
         # The diagnostics re-encoded their whole population on every run while
         # the trainers had been caching since the feature landed. Nothing about
         # the cache is training-specific: the key is the ENCODER's own

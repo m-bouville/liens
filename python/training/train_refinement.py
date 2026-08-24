@@ -174,6 +174,25 @@ def train_refinement(
     cross_check_ancestor_config(components["encoder"].config, {"size": size},
                                  ae_checkpoint_path or resume_from, what="encoder ancestor")
     size = components["encoder"].config["size"]
+
+    # u-scheme guard: stage 4/5 refine the encoder against a ROLLOUT loss that
+    # encodes z1=dz0/dt live and steps in dt_window. A log10_t f_theta needs
+    # z̃1=ln10*t*z1 and Delta-u instead -- and compute_stage45_loss has no
+    # per-frame t to build z̃1 from, so it would feed the frozen u-model physical
+    # dt and the f*dt term overflows to NaN on the large-dt windows (exactly the
+    # observed dt_max=2.5e4 all-batches-skipped failure). Fail loud on the actual
+    # undefined operation rather than churning NaNs. To support u here: thread
+    # per-frame t/steps into the stage-4 batch and convert z1->z̃1 (and dt->Delta-u)
+    # inside compute_stage45_loss, the same conversion the dataset/diagnostics got.
+    _f_theta_tc = getattr(f_theta, "time_coordinate", "t")
+    if _f_theta_tc != "t":
+        raise ValueError(
+            f"stage 4/5 (encoder refinement) does not yet support a "
+            f"time_coordinate={_f_theta_tc!r} f_theta: its rollout loss would feed "
+            f"the u-model physical dt and diverge to NaN (no per-frame t is available "
+            f"to build z̃1=ln10*t*z1). Skip stage 4/5 for u-models for now, or "
+            f"implement the u-branch in compute_stage45_loss (thread per-frame t into "
+            f"the stage-4 batch, convert z1->z̃1 and dt->Delta-u).")
     print(f"Stage {'4' if freeze_decoder else '5'}: loaded {ancestor_note}")
     print(f"size={size}, latent_channels={components['encoder'].config['latent_channels']}, "
           f"freeze_decoder={freeze_decoder}")

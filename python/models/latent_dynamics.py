@@ -45,6 +45,14 @@ _MEANING_FIELDS = {
                                    # the model's OWN trajectory -- the q-scheme,
                                    # Step B). Changes what rollout computes with
                                    # the SAME weights, so it round-trips too.
+    "time_coordinate": "t",        # the TIME VARIABLE the derivative and step
+                                   # size are expressed in: "t" (physical time,
+                                   # h = dt, D = dz0/dt -- historical) or
+                                   # "log10_t" (u = log10 t, h = Delta-u,
+                                   # D = dz0/du = ln(10)*t*dz0/dt). A checkpoint
+                                   # trained in one coordinate mis-scales its
+                                   # derivative if fed the other, so it must
+                                   # round-trip; absent (old checkpoints) => "t".
     # truncate_bptt is deliberately ABSENT. Every other field here changes what
     # f_theta MEANS -- two checkpoints with the same weights and different
     # values integrate differently, so a rebuild must reproduce them. Truncation
@@ -54,6 +62,44 @@ _MEANING_FIELDS = {
     # actively wrong for the diagnostics, which run under no_grad and would pay
     # detach calls for a graph they never build.
 }
+
+
+_LN10 = math.log(10.0)
+
+
+def convert_derivative_coordinate(deriv, t, from_coordinate: str,
+                                   to_coordinate: str):
+    """Rescale a latent derivative between time coordinates.
+
+    The step map is z0(next) = z0 + (D + f)*h. In physical time, h = dt and
+    D = dz0/dt. In log-time u = log10(t), h = Delta-u and D = dz0/du. Since
+    du = dt / (t * ln 10),
+
+        D_u = dz0/du = (t * ln 10) * dz0/dt = ln(10) * t * D_t .
+
+    So converting a derivative t -> log10_t multiplies by ln(10)*t, and the
+    inverse divides by it. `t` is the PHYSICAL TIME at the frame the derivative
+    is taken at (step index * sim_dt), broadcastable to `deriv`.
+
+    This is the conversion applied when a source's recorded time_coordinate does
+    not match the coordinate the model runs in -- e.g. a stage-2 encoder whose
+    z1 stream is dz0/dt (or a checkpoint with NO recorded coordinate, which is
+    assumed 't' via _MEANING_FIELDS' default) feeding a log10_t model. It
+    converts the DERIVATIVE, not weights: an f_theta trained in one coordinate
+    sees a different input distribution in the other and is NOT convertible by
+    rescaling -- a coordinate mismatch on an f_theta RESUME is fatal, not
+    converted (see _resume_f_theta_from_checkpoint). This helper is for the
+    derivative that DATA supplies.
+    """
+    if from_coordinate == to_coordinate:
+        return deriv
+    if (from_coordinate, to_coordinate) == ("t", "log10_t"):
+        return deriv * (_LN10 * t)
+    if (from_coordinate, to_coordinate) == ("log10_t", "t"):
+        return deriv / (_LN10 * t)
+    raise ValueError(
+        f"cannot convert derivative from {from_coordinate!r} to "
+        f"{to_coordinate!r}: expected each to be 't' or 'log10_t'.")
 
 
 def integration_kwargs_from_config(config: dict) -> dict:
@@ -133,7 +179,8 @@ class LatentDynamics(nn.Module):
                  n_substeps: int = 1, alpha: float | None = None,
                  max_substeps: int = 256, truncate_bptt: int | None = None,
                  dynamics_mode: str = "z1_taylor",
-                 derivative_source: str = "z1"):
+                 derivative_source: str = "z1",
+                 time_coordinate: str = "t"):
         super().__init__()
         self.latent_channels = latent_channels
         self.latent_spatial = latent_spatial
@@ -223,6 +270,10 @@ class LatentDynamics(nn.Module):
                 "defined for dynamics_mode='deriv_linear'; z1_taylor propagates z1 "
                 f"by its own update, got dynamics_mode={dynamics_mode!r}.")
         self.derivative_source = derivative_source
+        if time_coordinate not in ("t", "log10_t"):
+            raise ValueError(
+                f"time_coordinate must be 't' or 'log10_t', got {time_coordinate!r}")
+        self.time_coordinate = time_coordinate
         if dynamics_mode == "deriv_linear" and math.isfinite(dt_cap):
             raise ValueError(
                 f"dynamics_mode='deriv_linear' forbids a finite dt_cap (got {dt_cap}): "

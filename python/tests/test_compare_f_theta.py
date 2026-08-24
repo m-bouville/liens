@@ -271,7 +271,7 @@ def _model(stem):
             "prefix": prefix, "label": label}
 
 
-def _flat_stage2(run_dir, steps, ae, ae_config, device):
+def _flat_stage2(run_dir, steps, ae, ae_config, device, time_coordinate="t"):
     """A stage-2 trajectory of the right length, VARYING frame to frame.
 
     The row is present for every window, so tests that do not care about its
@@ -399,9 +399,9 @@ def test_the_stats_figure_has_eight_panels_and_reports_the_window_count(monkeypa
     monkeypatch.setattr(plt, "subplots", spy)
     out = cf._stats_figure(stats, a, b, "t", tmp_path / "s.png")
     assert out.exists()
-    assert captured["axes"].shape == (2, 4)
+    assert captured["axes"].shape == (2, 5)   # 4 base columns + the rate column
     titles = [captured["axes"][r, c].get_title()
-              for r in range(2) for c in range(4)]
+              for r in range(2) for c in range(5)]
     assert any("loss distribution" in t for t in titles)
     assert any("correlation distribution" in t for t in titles)
     assert any("loss vs dt" in t for t in titles)
@@ -1030,10 +1030,16 @@ def test_the_stats_figure_has_a_steps_column(monkeypatch, tmp_path):
     monkeypatch.setattr(plt, "subplots", spy)
     cf._stats_figure(stats, a, b, "T", tmp_path / "s.png")
     axes = captured["axes"]
-    assert axes.shape == (2, 4), f"grid is {axes.shape}, expected 2 x 4"
+    assert axes.shape == (2, 5), f"grid is {axes.shape}, expected 2 x 5"
     assert "number of steps" in axes[0, 3].get_title()
     assert "number of steps" in axes[1, 3].get_title()
     assert axes[0, 3].get_xlabel() == "chained steps applied"
+    # 5th column: the normalized per-step rate panels (ln[loss(n)/loss(0)]/n and
+    # (1-corr(n))/n), sharing the vs-steps x-axis.
+    assert "per step" in axes[0, 4].get_title()
+    assert "per step" in axes[1, 4].get_title()
+    assert axes[0, 4].get_xlabel() == "chained steps applied"
+    assert axes[1, 4].get_xlabel() == "chained steps applied"
     # the new temperature column
     assert "temperature" in axes[0, 2].get_title()
     assert "temperature" in axes[1, 2].get_title()
@@ -1052,7 +1058,7 @@ def test_n_samples_zero_runs_statistics_without_the_panel(monkeypatch, tmp_path)
     monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
     monkeypatch.setattr(
         cf, "_select_windows",
-        lambda m, n, ns, seed, mx, dev: [(Path(f"T{500 + i}_n020_s{i}"),
+        lambda m, n, ns, seed, mx, dev, t0_range=None: [(Path(f"T{500 + i}_n020_s{i}"),
                                           list(range(ns + 1)))
                                          for i in range(max(n, 1))])
     out, _ = cf.compare_f_theta("128x128-stage3a", "128x128-stage3b",
@@ -1073,7 +1079,7 @@ def test_n_samples_zero_still_honours_trajectory(monkeypatch, tmp_path):
     monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
     monkeypatch.setattr(
         cf, "_select_windows",
-        lambda m, n, ns, seed, mx, dev: [(Path("T925_n020_s79"),
+        lambda m, n, ns, seed, mx, dev, t0_range=None: [(Path("T925_n020_s79"),
                                           list(range(ns + 1)))])
     out, _ = cf.compare_f_theta("128x128-stage3a", "128x128-stage3b",
                                  n_samples=0, n_steps=4, seed=2,
@@ -1106,7 +1112,7 @@ def test_a_wholly_undefined_step_is_reported(monkeypatch, capsys):
     monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
     monkeypatch.setattr(
         cf, "_select_windows",
-        lambda m, n, ns, seed, mx, dev: [(Path(f"r{i}"), list(range(ns + 1)))
+        lambda m, n, ns, seed, mx, dev, t0_range=None: [(Path(f"r{i}"), list(range(ns + 1)))
                                          for i in range(max(n, 1))])
     cf.compare_f_theta("128x128-stage3a", "128x128-stage3b", n_samples=0,
                         n_steps=4, n_stats=6, device="cpu")
@@ -1149,7 +1155,7 @@ def test_a_partly_undefined_step_is_NOT_flagged(monkeypatch, capsys):
     monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
     monkeypatch.setattr(
         cf, "_select_windows",
-        lambda m, n, ns, seed, mx, dev: [(Path(f"r{i}"), list(range(ns + 1)))
+        lambda m, n, ns, seed, mx, dev, t0_range=None: [(Path(f"r{i}"), list(range(ns + 1)))
                                          for i in range(6)])
     cf.compare_f_theta("128x128-stage3a", "128x128-stage3b", n_samples=0,
                         n_steps=4, n_stats=6, device="cpu")
@@ -1591,7 +1597,7 @@ def _stats_with_causal(monkeypatch, n=40):
         real = [rng.normal(size=(8, 8)) * (1 + 0.05 * k) for k in range(m)]
         return real, [real[k] + 0.02 * k for k in range(m)], [250.0] * (m - 1)
 
-    def caus(run_dir, steps, ae, ae_config, device):
+    def caus(run_dir, steps, ae, ae_config, device, time_coordinate="t"):
         m = len(steps)
         i = zlib.crc32(str(run_dir).encode()) % 997
         rng = np.random.default_rng(i)
@@ -1685,7 +1691,7 @@ def test_causal_vs_dt_uses_its_OWN_dt_array(monkeypatch, tmp_path):
         dt = 100.0 * (i % 20 + 1)
         return real, [real[k] + 0.02 * k for k in range(n)], [dt] * (n - 1)
 
-    def caus(run_dir, steps, ae, ae_config, device):
+    def caus(run_dir, steps, ae, ae_config, device, time_coordinate="t"):
         # No baseline for the first few runs -> causal arrays are SHORTER
         if str(run_dir).endswith(("s0", "s1", "s2")):
             return None
@@ -2136,7 +2142,7 @@ def test_stage2_uses_no_f_theta_and_no_resync():
     src = inspect.getsource(cf.compute_stage2_trajectory)
     code = src.split('"""')[2]
     assert "f_theta" not in code, "stage 2 must not touch f_theta"
-    assert "z0 = z0 + z1 * dt" in code, "the step is not z0 += z1*dt"
+    assert "z0 = z0 + z1_use * dt" in code, "the step is not z0 += z1*dt (z1_use == z1 in t-mode)"
     assert 'ae_encoder(x_pred, theta=theta_encode)["deriv"]' in code, (
         "z1 is not re-derived from the predicted state"
     )
@@ -2547,7 +2553,7 @@ def test_compare_statistics_runs_without_touching_the_panel_tool(monkeypatch, tm
     monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
     monkeypatch.setattr(
         cf, "_select_windows",
-        lambda m, n, ns, seed, mx, dev: [(Path(f"T{500 + i}_n020_s{i}"),
+        lambda m, n, ns, seed, mx, dev, t0_range=None: [(Path(f"T{500 + i}_n020_s{i}"),
                                           list(range(ns + 1)))
                                          for i in range(max(n, 1))])
     # if the panel tool were reached it would call plt.subplots(_, 7); make
@@ -2575,7 +2581,7 @@ def test_compare_panels_runs_without_computing_statistics(monkeypatch, tmp_path)
     monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
     monkeypatch.setattr(
         cf, "_select_windows",
-        lambda m, n, ns, seed, mx, dev: [(Path(f"T{500 + i}_n020_s{i}"),
+        lambda m, n, ns, seed, mx, dev, t0_range=None: [(Path(f"T{500 + i}_n020_s{i}"),
                                           list(range(ns + 1)))
                                          for i in range(max(n, 1))])
     called = {"stats": False}

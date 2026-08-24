@@ -4,6 +4,14 @@
 `pytest -n 4 tests/ -q`, or `pytest -n 4 tests/ -q -m "not slow"` to skip the longer tests.
 
 
+
+## datasets (not models)
+Everything else is about models at various stages.
+
+### stdev_phi_time
+`python -m evaluation.check_stdev_phi_time --base-path ../datasets --size 128 --min-step 1500 --min-run-fraction 0.5`
+
+
 ## compare_f_theta
 
 ### compare_panels — per-window microstructure figures
@@ -24,6 +32,8 @@ The combined `compare_f_theta` (no `--*-only` flag) still runs both.
 
 ## Returning microstructures
 
+Note: `python -m evaluation.compare_f_theta --trajectory` (above) also returns microstructures.
+
 ### reconstruction (returns µstructures for AE verification)
 `python -m evaluation.check_reconstruction --checkpoint checkpoints/stage2/64x64-stage2-20260815_06h43.pt --size 64 --min-step 1500 --min-stdev-phi 0.01 --device cuda`
 
@@ -37,23 +47,21 @@ Then
 
 
 
-## Others
+## Other diagnostics for models
+
+## parameter_dependence
+Generates several plots: one for $\delta t$ and one for other parameters (temperature, noise amplitude).
+`python -m evaluation.check_parameter_dependence --lds-checkpoint checkpoints/stage4/128x128-stage4.pt --base-path ../datasets --min-step 1500 --min-stdev-phi 0.01 --min-passing-steps 12`
+
 
 ### Parameters used to generate a checkpoint
 `python -m evaluation.inspect_checkpoint checkpoints/stage3a/128x128-stage3a.pt`
-`python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` prints just: 0.15
-
-
-### stdev_phi_time (dataset)
-`python -m evaluation.check_stdev_phi_time --base-path ../datasets --size 128 --min-step 1500 --min-run-fraction 0.5`
-
-
-### parameter_dependence
-`python -m evaluation.check_parameter_dependence --lds-checkpoint checkpoints/stage4/128x128-stage4.pt --base-path ../datasets --min-step 1500 --min-stdev-phi 0.01 --min-passing-steps 12`
+Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` prints just: 0.15
 
 
 ### dt_vs_time (returns tables, not figures)
 `python -m evaluation.check_dt_vs_time --lds-checkpoint checkpoints/stage3b/128x128-stage3b.pt --min-step 2000 --min-stdev-phi 0.01 --min-passing-steps 12  --max-dt 1e9`
+
 
 ### z1_degeneracy (returns tables, not figures)
 `python -m evaluation.check_z1_degeneracy checkpoints/stage2/128x128-stage2.pt --size 128 --n-windows 515`

@@ -342,3 +342,45 @@ def _build_sweep(tmp_path, *args, **kwargs):
     """
     return cached_sweep((__name__, args, tuple(sorted(kwargs.items()))),
                         lambda d: _build_sweep_uncached(d, *args, **kwargs))
+
+
+def _build_lds_checkpoint_u(path: Path):
+    """Like _build_lds_checkpoint but a log10_t (u-scheme) f_theta -- its
+    config carries time_coordinate='log10_t', so build_models_from_components
+    rebuilds a u-model and stage 4's guard should fire."""
+    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=N_THETA,
+                             hidden_dim=8, n_hidden_layers=1,
+                             dynamics_mode="deriv_linear", time_coordinate="log10_t",
+                             dt_cap=float("inf"))
+    checkpoint = {
+        "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05,
+        "val_loss_ema": 0.05, "ae_checkpoint": "fake", "test_dirs": [],
+        "config": {"latent_channels": LATENT_CHANNELS, "n_theta": N_THETA, "hidden_dim": 8,
+                   "n_hidden_layers": 1, "dynamics_mode": "deriv_linear",
+                   "time_coordinate": "log10_t", "dt_cap": float("inf")},
+        "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2,
+                         "n_rollout_steps": 1},
+    }
+    torch.save(checkpoint, path)
+
+
+@pytest.mark.slow
+def test_stage4_refuses_log10_t_f_theta(tmp_path, isolated_project_root):
+    """Stage 4/5 does not yet support a log10_t f_theta: its rollout loss would
+    feed the u-model physical dt and NaN. The guard must fire (loud), not churn."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_checkpoint_path = tmp_path / "fake-stage2.pt"
+    lds_checkpoint_path = tmp_path / "fake-stage3-u.pt"
+    _build_ae_checkpoint(ae_checkpoint_path, include_stats_head=True)
+    _build_lds_checkpoint_u(lds_checkpoint_path)
+
+    with pytest.raises(ValueError, match="does not yet support"):
+        train_refinement(
+            base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
+            lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=True,
+            rollout_weight=1.0, recon0_weight=0.1, stats0_weight=0.1,
+            epochs=2, batch_size=4, n_rollout_steps=1,
+            min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+            checkpoint_path=tmp_path / "stage4_u_out.pt", device="cpu",
+            log_every_epoch=True,
+        )

@@ -907,7 +907,8 @@ class MicrostructureEvolutionDataset(Dataset):
                  max_dt: float | None = None, latent_cache_dir: Path | str | None = None,
                  stats_frame_index: int = 0,
                  fixed_aug_indices: tuple[int, ...] | list[int] | None = None,
-                 read_workers: int = 16, split_label: str = ""):
+                 read_workers: int = 16, split_label: str = "",
+                 time_coordinate: str = "t", return_phys_dt: bool = False):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
@@ -1202,7 +1203,20 @@ class MicrostructureEvolutionDataset(Dataset):
                     )
         self.fixed_aug_indices = tuple(fixed_aug_indices) if fixed_aug_indices is not None else None
         self._run_dirs: list[Path] = []         # run_dir per run_idx, for tracing samples back
+        if time_coordinate not in ("t", "log10_t"):
+            raise ValueError(
+                f"time_coordinate must be 't' or 'log10_t', got {time_coordinate!r}")
+        self.time_coordinate = time_coordinate
+        # return_phys_dt: when True (only the LDS trainer opts in), the
+        # encode_both_streams __getitem__ appends PHYSICAL dt as a 5th element,
+        # alongside dt_window (which is Delta-u in log10_t mode -- the model's
+        # STEP). The loss weights by physical dt so a u-run's objective matches a
+        # t-run's, isolating the coordinate change from the (dt-dependent) loss
+        # weighting. Off by default => the 4-tuple is byte-identical, so every
+        # diagnostic and test is untouched. In t-mode phys dt == dt_window.
+        self.return_phys_dt = return_phys_dt
         self._run_steps: list[list[int]] = []   # kept step numbers per run, in order
+        self._run_du: list[list[float] | None] = []  # per run: log10(t_{i+1}/t_i) when u-mode
         self._run_data: list[torch.Tensor] = []  # per run, on CPU: "state" latents (n_kept,C,8,8) if
                                                    # encoder given, else raw frames (n_kept,1,ny,nx)
         self._run_data_deriv: list[torch.Tensor] = []  # per run, on CPU: "deriv" latents (n_kept,C,8,8)
@@ -1558,8 +1572,28 @@ class MicrostructureEvolutionDataset(Dataset):
             self._run_dirs.append(run_dir)
             self._run_steps.append(kept_steps)
             self._run_data.append(run_data)
+            # u-scheme (time_coordinate="log10_t"): the cached deriv stream is
+            # z1 = dz0/dt (the encoder's deriv head produces a PHYSICAL-time
+            # derivative). Convert ONCE here to z̃1 = dz0/du = ln10 * t * z1,
+            # t = step * sim_dt. ln10 and sim_dt are both run-invariant, so fold
+            # them: scale = (ln10 * sim_dt) * step -- one multiply per frame. Done
+            # at construction, not per __getitem__ draw, and in place (the t-form
+            # is not needed in a u-run; the DISK cache stays dz0/dt, shared across
+            # t/u runs -- this is the in-memory view only). Per-run kept_steps
+            # suffice (a prefix of the global schedule). This is
+            # convert_derivative_coordinate specialised to t -> log10_t with the
+            # constants folded; that helper stays the canonical definition.
+            if self.time_coordinate == "log10_t" and run_data_deriv is not None:
+                _k = math.log(10.0) * metadata.dt
+                _scale = torch.tensor([_k * s for s in kept_steps],
+                                      dtype=run_data_deriv.dtype)
+                run_data_deriv = run_data_deriv * _scale[:, None, None, None]
             self._run_data_deriv.append(run_data_deriv)
             self._run_dt_scale.append(metadata.dt)
+            self._run_du.append(
+                [math.log10(kept_steps[i + 1] / kept_steps[i])
+                 for i in range(len(kept_steps) - 1)]
+                if self.time_coordinate == "log10_t" else None)
             self._run_nx.append(metadata.nx)
             self._run_ny.append(metadata.ny)
             # T0 (metadata: "threshold temperature in Landau potential") is
@@ -1720,15 +1754,31 @@ class MicrostructureEvolutionDataset(Dataset):
 
         steps = self._run_steps[run_idx][start:end]
         dt_scale = self._run_dt_scale[run_idx]
-        dt_window = torch.tensor(
-            [(steps[i + 1] - steps[i]) * dt_scale for i in range(len(steps) - 1)],
-            dtype=torch.float32,
-        )  # (window_length - 1,)
+        if self.time_coordinate == "log10_t":
+            # step size is Delta-u = log10(t_{i+1}/t_i), precomputed per run;
+            # window_deriv is already z̃1 (converted in place at construction).
+            dt_window = torch.tensor(
+                self._run_du[run_idx][start:start + len(steps) - 1],
+                dtype=torch.float32,
+            )
+        else:
+            dt_window = torch.tensor(
+                [(steps[i + 1] - steps[i]) * dt_scale for i in range(len(steps) - 1)],
+                dtype=torch.float32,
+            )  # (window_length - 1,)
 
         theta = self._run_theta[run_idx]  # (n_theta,) -- constant across the window (same run)
 
         if self.encode_both_streams:
             window_deriv = self._run_data_deriv[run_idx][start:end]
+            if self.return_phys_dt:
+                # physical Delta-t = (step_{i+1}-step_i)*sim_dt, ALWAYS (== dt_window
+                # in t-mode). The loss weights by this; the model steps in dt_window.
+                dt_phys_window = torch.tensor(
+                    [(steps[i + 1] - steps[i]) * dt_scale for i in range(len(steps) - 1)],
+                    dtype=torch.float32,
+                )
+                return window, window_deriv, dt_window, dt_phys_window, theta
             return window, window_deriv, dt_window, theta
 
         if self.stat_names is None:

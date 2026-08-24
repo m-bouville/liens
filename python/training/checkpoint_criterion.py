@@ -108,6 +108,13 @@ class CheckpointCriterionTracker:
     # thrown away.
     reference_val_loss: float | None = None
     best_val_loss: float = field(default=float("inf"), init=False)
+    # best RAW val_loss (min_valid) -- the second minimum the save gate needs.
+    # A save requires BOTH the smoothed EMA and the raw val to be at new lows:
+    # EMA-only kept saving as the EMA drifted down even after raw val bottomed
+    # and started rising (overtraining), silently selecting an overtrained
+    # checkpoint. Requiring raw val < min_valid stops saves the moment raw val
+    # stops making new lows, regardless of where the EMA drifts.
+    best_raw_val_loss: float = field(default=float("inf"), init=False)
     val_ema: float | None = field(default=None, init=False)
     in_grace_period: bool = field(default=False, init=False)
     _grace_remaining: int = field(default=0, init=False)
@@ -174,6 +181,8 @@ class CheckpointCriterionTracker:
         self.reference_val_loss = reference_val_loss
         self.best_val_loss = (float("inf") if reference_val_loss is None
                                else reference_val_loss)
+        self.best_raw_val_loss = (float("inf") if reference_val_loss is None
+                                   else reference_val_loss)
         self._grace_remaining = grace_epochs
         self.in_grace_period = grace_epochs > 0
 
@@ -198,6 +207,11 @@ class CheckpointCriterionTracker:
             # license saving something worse than the run started from.
             self.best_val_loss = (self.val_ema if self.reference_val_loss is None
                                    else min(self.val_ema, self.reference_val_loss))
+            # best_raw_val_loss is NOT lowered by grace epochs -- it changes
+            # only on a real save (below). Grace may only CAP it at the ancestor
+            # (reference), never let a lucky grace-window raw val plant a bar.
+            if self.reference_val_loss is not None:
+                self.best_raw_val_loss = min(self.best_raw_val_loss, self.reference_val_loss)
             self._grace_remaining -= 1
             self.in_grace_period = self._grace_remaining > 0
             return self.val_ema, False
@@ -215,10 +229,20 @@ class CheckpointCriterionTracker:
             # never True there.
             self.best_val_loss = (float("inf") if self.reference_val_loss is None
                                    else self.reference_val_loss)
+            self.best_raw_val_loss = (float("inf") if self.reference_val_loss is None
+                                       else self.reference_val_loss)
 
-        should_save = criterion < self.best_val_loss
+        # THE GATE: save iff BOTH the raw val and the EMA reach new lows this
+        # epoch. The two running minima update every epoch (independent of the
+        # save decision), so a save requires them to dip together -- an EMA dip
+        # while raw val rises (overtraining onset) no longer saves.
+        should_save = (criterion < self.best_val_loss) and (val_loss < self.best_raw_val_loss)
         if should_save:
+            # Both bars advance together, only on a save -- so best_raw_val_loss
+            # is the raw val of the LAST SAVED checkpoint, not a running min that
+            # a low-val/high-EMA epoch could quietly lower.
             self.best_val_loss = criterion
+            self.best_raw_val_loss = val_loss
         return criterion, should_save
 
 

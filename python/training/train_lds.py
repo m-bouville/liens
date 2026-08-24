@@ -102,10 +102,20 @@ def compute_euler_only_losses(
     all_losses_parts = []
     with torch.no_grad():
         for batch in loader:
-            window0, window1, dt_window, theta = batch
+            # 5-tuple when the dataset was built with return_phys_dt=True (the LDS
+            # trainer's own datasets), else the historical 4-tuple. dt_phys_window
+            # (physical dt for loss weighting) falls back to dt_window when absent
+            # -- identical in t-mode, and the only consumers that pass the 5-tuple
+            # are u-runs, so a 4-tuple loader (tests, other callers) is unaffected.
+            if len(batch) == 5:
+                window0, window1, dt_window, dt_phys_window, theta = batch
+            else:
+                window0, window1, dt_window, theta = batch
+                dt_phys_window = dt_window
             window0 = window0.to(device, non_blocking=True)
             window1 = window1.to(device, non_blocking=True)
             dt_window = dt_window.to(device, non_blocking=True)
+            dt_phys_window = dt_phys_window.to(device, non_blocking=True)
             theta = theta.to(device, non_blocking=True)
 
             z0 = window0[:, 0]
@@ -130,7 +140,7 @@ def compute_euler_only_losses(
             # only, BEFORE any weighting) -- (B, n_r).
             per_window_step = diff.pow(2).mean(dim=(2, 3, 4))
 
-            all_dts_parts.append(dt_window.detach().cpu().numpy().reshape(-1))
+            all_dts_parts.append(dt_phys_window.detach().cpu().numpy().reshape(-1))
             all_losses_parts.append(per_window_step.detach().cpu().numpy().reshape(-1))
     if was_training:
         f_theta.train()
@@ -296,6 +306,7 @@ def _resume_f_theta_from_checkpoint(
     hidden_dim: int, n_hidden_layers: int, dt_cap: float, n_substeps: int,
     n_rollout_steps: int,
     device: torch.device, alpha: float | None = None,
+    dynamics_mode: str = "z1_taylor", time_coordinate: str = "t",
 ) -> float | None:
     """
     Loads f_theta's weights from a prior LDS checkpoint (curriculum
@@ -349,6 +360,35 @@ def _resume_f_theta_from_checkpoint(
             raise ValueError(f"{resume_from}'s architecture doesn't match the requested one: "
                               + ", ".join(f"{k}={old} (checkpoint) vs {new} (requested)"
                                           for k, old, new in mismatch))
+        # MEANING fields (distinct from architecture: the weights LOAD fine, but a
+        # different value makes them COMPUTE something else). Fatal, because none
+        # is convertible by loading:
+        #   - dynamics_mode: a different update equation (z1_taylor's f*dt^2/2
+        #     Taylor step vs deriv_linear's f*dt linear step).
+        #   - time_coordinate: the derivative and step are in log-time (D is
+        #     ln10*t larger, f's conditioning input is Delta-u not dt), so a
+        #     t-trained f sees an out-of-distribution input in log10_t -- the
+        #     convert_derivative_coordinate helper rescales DATA-supplied
+        #     derivatives, NOT weights, so a resume across coordinates must retrain.
+        # derivative_source is DELIBERATELY NOT here: z1 -> previous_quotient is
+        # the intended q-reuse path (same f, rolled out autonomously), so a
+        # mismatch there is expected, not fatal.
+        meaning_mismatch = []
+        prev_dynamics_mode = prev_config.get("dynamics_mode", "z1_taylor")
+        if prev_dynamics_mode != dynamics_mode:
+            meaning_mismatch.append(("dynamics_mode", prev_dynamics_mode, dynamics_mode))
+        prev_time_coordinate = prev_config.get("time_coordinate", "t")
+        if prev_time_coordinate != time_coordinate:
+            meaning_mismatch.append(("time_coordinate", prev_time_coordinate, time_coordinate))
+        if meaning_mismatch:
+            raise ValueError(
+                f"{resume_from} was trained under a different MEANING field than "
+                f"requested -- the same weights compute something else under it and "
+                f"it is not convertible by loading (retrain instead): "
+                + ", ".join(f"{k}={old} (checkpoint) vs {new} (requested)"
+                            for k, old, new in meaning_mismatch)
+                + ". (derivative_source is intentionally exempt: z1 -> "
+                "previous_quotient is the q-reuse path.)")
         from models.encoder import zero_pad_theta_columns
         f_theta.load_state_dict(
             zero_pad_theta_columns(prev_lds["model_state"], f_theta))
@@ -515,6 +555,7 @@ def train_lds(
     z0_noise_scale: float = 0.0,
     dt_cap: float = float("inf"), n_substeps: int = 1, alpha: float | None = None,
     dynamics_mode: str = "z1_taylor", derivative_source: str = "z1",
+    time_coordinate: str = "t",
     max_substeps: int = 256, truncate_bptt: int | None = None,
     target_vram_gib: float | None = None,
     memory_cost_a_bytes: float | None = None,
@@ -762,6 +803,8 @@ def train_lds(
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
+            time_coordinate=time_coordinate,
+            return_phys_dt=(time_coordinate == "log10_t"),
             split_label="validation",
         )
         # Defined on BOTH branches: the epochs=0 ablation builds no train
@@ -780,6 +823,8 @@ def train_lds(
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
+            time_coordinate=time_coordinate,
+            return_phys_dt=(time_coordinate == "log10_t"),
             split_label="training",
         )
         val_set = MicrostructureEvolutionDataset(
@@ -788,6 +833,8 @@ def train_lds(
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
+            time_coordinate=time_coordinate,
+            return_phys_dt=(time_coordinate == "log10_t"),
             split_label="validation",
         )
         print(f"{len(train_set)} train windows, {len(val_set)} val windows "
@@ -827,6 +874,7 @@ def train_lds(
                               dt_cap=dt_cap, n_substeps=n_substeps, alpha=alpha,
                               max_substeps=max_substeps, dynamics_mode=dynamics_mode,
                               derivative_source=derivative_source,
+                              time_coordinate=time_coordinate,
                               truncate_bptt=truncate_bptt).to(device)
 
     # Global per-decade loss weights, computed ONCE from train_set's own
@@ -852,6 +900,7 @@ def train_lds(
     _ancestor_reference = _resume_f_theta_from_checkpoint(
         f_theta, resume_from, ae_config, hidden_dim, n_hidden_layers, dt_cap, n_substeps,
         n_rollout_steps, device, alpha=alpha,
+        dynamics_mode=dynamics_mode, time_coordinate=time_coordinate,
     )
 
     step_weights_tensor = torch.tensor(step_weights, dtype=torch.float32, device=device) \
@@ -889,10 +938,19 @@ def train_lds(
         )
 
     def step(batch, train: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        window0, window1, dt_window, theta = batch
+        if len(batch) == 5:
+            window0, window1, dt_window, dt_phys_window, theta = batch
+        else:
+            window0, window1, dt_window, theta = batch
+            dt_phys_window = dt_window   # 4-tuple loader (t-mode / tests): identical
         window0 = window0.to(device, non_blocking=True)
         window1 = window1.to(device, non_blocking=True)
         dt_window = dt_window.to(device, non_blocking=True)
+        # dt_phys_window: PHYSICAL dt for LOSS WEIGHTING (== dt_window in t-mode).
+        # The model steps in dt_window (Delta-u in u-mode); the loss's dt-weighting
+        # uses physical dt so a u-run's objective matches a t-run's -- see the
+        # dataset's return_phys_dt. Decoupling these is the whole point.
+        dt_phys_window = dt_phys_window.to(device, non_blocking=True)
         theta = theta.to(device, non_blocking=True)
 
         z0 = window0[:, 0]
@@ -956,8 +1014,8 @@ def train_lds(
         # dominate the gradient the way they otherwise do. TRAIN
         # only -- val_loss must stay an unweighted, naturally-
         # distributed measure of real performance.
-        weights = dt_decade_weights_fn(dt_window) if (train and dt_decade_weights_fn is not None) else None
-        z0_loss, z0_per_step = rollout_loss(z0_hat, z0_true, dt=dt_window, weights=weights, return_per_step=True)
+        weights = dt_decade_weights_fn(dt_phys_window) if (train and dt_decade_weights_fn is not None) else None
+        z0_loss, z0_per_step = rollout_loss(z0_hat, z0_true, dt=dt_phys_window, weights=weights, return_per_step=True)
         # per_step[0] is L_1step -- the loss restricted to just the first
         # predicted step, directly comparable to a model trained with
         # n_rollout_steps=1 (see RolloutLoss.forward()'s docstring: this
@@ -1547,6 +1605,7 @@ def train_lds(
                     "alpha": alpha,
                     "dynamics_mode": dynamics_mode,
                     "derivative_source": derivative_source,
+                    "time_coordinate": time_coordinate,
                     # Recorded for provenance only. Deliberately NOT in
                     # _MEANING_FIELDS: truncation changes how the gradient was
                     # computed, not what f_theta means, so a rebuild without it

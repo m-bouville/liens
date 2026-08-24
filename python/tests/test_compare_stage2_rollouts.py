@@ -20,7 +20,7 @@ def _stub(monkeypatch, n_steps=10):
         return {"path": path, "ck": {}, "ae": str(path), "ae_encoder": None,
                 "ae_config": {"size": 8}, "label": cf._parse_stem(path.stem)[1]}
 
-    def fake_windows(model, n, steps, seed, max_dt, device):
+    def fake_windows(model, n, steps, seed, max_dt, device, t0_range=None):
         return [("run_A", list(range(steps + 1))),
                 ("run_B", list(range(steps + 1)))]
 
@@ -194,7 +194,7 @@ def test_diverged_loss_is_capped_not_inf(monkeypatch, tmp_path):
         return {"path": path, "ck": {}, "ae": str(path), "ae_encoder": None,
                 "ae_config": {"size": 8}, "label": cf._parse_stem(path.stem)[1]}
 
-    def fake_windows(model, n, steps, seed, max_dt, device):
+    def fake_windows(model, n, steps, seed, max_dt, device, t0_range=None):
         return [("r1", list(range(steps + 1)))]
 
     def blown_up_traj(run_dir, steps, ae, ae_config, device):
@@ -274,7 +274,7 @@ def test_loss_panels_y_range_is_capped_to_medians(monkeypatch, tmp_path):
         return {"path": path, "ck": {}, "ae": str(path), "ae_encoder": None,
                 "ae_config": {"size": 8}, "label": cf._parse_stem(path.stem)[1]}
 
-    def fake_windows(model, n, steps, seed, max_dt, device):
+    def fake_windows(model, n, steps, seed, max_dt, device, t0_range=None):
         return [(f"r{i}", list(range(steps + 1))) for i in range(6)]
 
     def fake_traj(run_dir, steps, ae, ae_config, device):

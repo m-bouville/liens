@@ -142,7 +142,11 @@ def test_regression_grace_period_produces_more_genuine_saves_than_raw_warmup():
     assert all(epoch > 5 for epoch in saves), (
         "no epoch during the 5-epoch grace window should ever save"
     )
-    assert len(saves) == 32
+    # The save gate now requires BOTH the raw val_loss and the EMA to reach new
+    # lows (a save advances both bars together); with this noisy data that is
+    # 12 saves, not the EMA-only gate's 32. The grace invariants are unchanged:
+    # no save during the 5-epoch window, first eligible save at epoch 6.
+    assert len(saves) == 12
     assert saves[0] == 6  # first epoch eligible to save at all
 
 
@@ -375,3 +379,29 @@ def test_the_grace_window_tracks_the_ema_decay():
     assert grace_epochs_for_ema(0.7) == 3
     for decay in (0.0, 0.3, 0.5, 1.0):
         assert grace_epochs_for_ema(decay) >= 2, "the two-epoch floor is unconditional"
+
+
+def test_save_requires_both_raw_val_and_ema_to_improve():
+    """The core gate: an epoch whose EMA dips while its raw val_loss RISES must
+    NOT save (the e260 regression -- valid up, EMA down, yet it saved before)."""
+    t = CheckpointCriterionTracker(val_ema_decay=0.7, ema_warmup_epochs=0)
+    for v in [1.0, 0.8, 0.6, 0.4, 0.3, 0.25, 0.227]:
+        t.update(0, v)                       # descend; best raw val -> 0.227
+    _, save_up = t.update(260, 0.231)        # raw RISES (0.231 > 0.227); EMA still dips
+    assert save_up is False
+    _, save_down = t.update(261, 0.220)      # raw a new low AND EMA a new low
+    assert save_down is True
+
+
+def test_low_raw_val_with_worse_ema_does_not_save_or_move_the_raw_bar():
+    """Symmetric guard: a low raw val while the EMA is WORSE must not save, and
+    must not lower the raw bar (best_raw advances only on a real save)."""
+    t = CheckpointCriterionTracker(val_ema_decay=0.7, ema_warmup_epochs=0)
+    t.update(1, 1.0)                         # saves; best_raw=1.0, best_ema=1.0
+    raw_bar_before = t.best_raw_val_loss
+    # A spike raises the EMA well above 1.0; then a single low raw val arrives
+    # while the EMA is still above its best -> no save, raw bar unmoved.
+    t.update(2, 9.0)                         # EMA spikes up, no save
+    _, save = t.update(3, 0.5)               # raw 0.5 < 1.0 but EMA still > best_ema
+    assert save is False
+    assert t.best_raw_val_loss == raw_bar_before   # raw bar NOT lowered off-save

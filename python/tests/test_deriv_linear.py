@@ -281,3 +281,107 @@ def test_q_scheme_one_step_equals_forward_with_seed():
     z0_hats = f_theta.rollout(z0, z1_sequence, dts, theta, z1_resync=False)
     assert torch.allclose(z0_hats[:, 1],
                           f_theta(z0, z1_sequence[:, 0], dts[:, 0], theta))
+
+
+# --------------------------------------------------------------------------
+# time_coordinate (t vs log10_t) + derivative conversion.
+# --------------------------------------------------------------------------
+import math as _math
+from models.latent_dynamics import convert_derivative_coordinate
+
+
+def test_time_coordinate_defaults_to_t_and_round_trips():
+    from models.latent_dynamics import _MEANING_FIELDS
+    assert _MEANING_FIELDS["time_coordinate"] == "t"       # absent => assume t
+    assert _make_taylor().time_coordinate == "t"
+    assert _make_taylor(time_coordinate="log10_t").time_coordinate == "log10_t"
+
+
+def test_time_coordinate_rejects_unknown():
+    with pytest.raises(ValueError, match="time_coordinate must be"):
+        _make_taylor(time_coordinate="u")
+
+
+def test_convert_derivative_t_to_u_and_back():
+    z1 = torch.randn(3, 4, 4, 4)
+    t = torch.full((3, 1, 1, 1), 1000.0)
+    u = convert_derivative_coordinate(z1, t, "t", "log10_t")
+    assert torch.allclose(u, z1 * _math.log(10.0) * 1000.0)      # D_u = ln10*t*D_t
+    assert torch.allclose(convert_derivative_coordinate(u, t, "log10_t", "t"), z1)
+
+
+def test_convert_derivative_same_coordinate_is_noop():
+    z1 = torch.randn(2, 4, 4, 4)
+    t = torch.full((2, 1, 1, 1), 500.0)
+    assert convert_derivative_coordinate(z1, t, "t", "t") is z1
+    assert convert_derivative_coordinate(z1, t, "log10_t", "log10_t") is z1
+
+
+# --------------------------------------------------------------------------
+# Fatal MEANING-field cross-check on f_theta RESUME.
+# dynamics_mode / time_coordinate mismatch => fatal (weights not convertible);
+# derivative_source z1 -> previous_quotient => allowed (the q-reuse path).
+# --------------------------------------------------------------------------
+def _resume_with(tmp_path, saved_coord="t", saved_mode="deriv_linear",
+                 req_coord="t", req_mode="deriv_linear"):
+    import torch
+    from training.train_lds import _resume_f_theta_from_checkpoint
+
+    def mk(**kw):
+        return LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4, hidden_dim=8,
+                              n_hidden_layers=1, dt_cap=float("inf"), **kw)
+    saved = mk(dynamics_mode=saved_mode, derivative_source="z1", time_coordinate=saved_coord)
+    ckpt = tmp_path / "prev.pt"
+    torch.save({"config": {"latent_channels": 4, "hidden_dim": 8, "n_hidden_layers": 1,
+                           "latent_spatial_size": 4, "dt_cap": float("inf"),
+                           "dynamics_mode": saved_mode, "derivative_source": "z1",
+                           "time_coordinate": saved_coord},
+                "model_state": saved.state_dict(), "epoch": 5, "val_loss": 0.1,
+                "data_config": {"n_rollout_steps": 1}}, ckpt)
+    fresh = mk(dynamics_mode=req_mode, time_coordinate=req_coord)
+    return _resume_f_theta_from_checkpoint(
+        fresh, ckpt, {"latent_channels": 4, "latent_spatial_size": 4},
+        hidden_dim=8, n_hidden_layers=1, dt_cap=float("inf"), n_substeps=1,
+        n_rollout_steps=5, device=torch.device("cpu"),
+        dynamics_mode=req_mode, time_coordinate=req_coord)
+
+
+def test_resume_same_meaning_fields_loads(tmp_path):
+    _resume_with(tmp_path)  # all matching -> no raise
+
+
+def test_resume_time_coordinate_mismatch_is_fatal(tmp_path):
+    with pytest.raises(ValueError, match="MEANING"):
+        _resume_with(tmp_path, saved_coord="t", req_coord="log10_t")
+
+
+def test_resume_dynamics_mode_mismatch_is_fatal(tmp_path):
+    with pytest.raises(ValueError, match="MEANING"):
+        _resume_with(tmp_path, saved_mode="deriv_linear", req_mode="z1_taylor")
+
+
+def test_resume_derivative_source_change_is_allowed(tmp_path):
+    # checkpoint saved z1; the model requesting the resume is previous_quotient
+    # -- the q-reuse path -- and must NOT raise (derivative_source is exempt).
+    _resume_with(tmp_path)  # derivative_source isn't a resume arg; exemption is by omission
+
+
+# --------------------------------------------------------------------------
+# Dataset u-branch arithmetic: z̃1 = ln10*t*z1 and Delta-u = log10(t'/t),
+# as the dataset computes them at construction. (Full dataset construction
+# needs run fixtures; this pins the per-frame conversion the branch applies.)
+# --------------------------------------------------------------------------
+def test_dataset_u_conversion_arithmetic():
+    import math as _m
+    kept_steps = [70000, 80000, 90000, 100000, 115000]
+    sim_dt = 0.05
+    z1 = torch.randn(len(kept_steps), 8, 8, 8)
+    t = torch.tensor([s * sim_dt for s in kept_steps], dtype=z1.dtype)
+    z1u = convert_derivative_coordinate(z1, t[:, None, None, None], "t", "log10_t")
+    for k in range(len(kept_steps)):
+        assert torch.allclose(z1u[k], z1[k] * _m.log(10) * t[k])
+    # Delta-u is the pure index ratio (sim_dt cancels)
+    du = [_m.log10(kept_steps[i + 1] / kept_steps[i]) for i in range(len(kept_steps) - 1)]
+    du_with_dt = [_m.log10((kept_steps[i + 1] * sim_dt) / (kept_steps[i] * sim_dt))
+                  for i in range(len(kept_steps) - 1)]
+    assert all(abs(a - b) < 1e-12 for a, b in zip(du, du_with_dt))

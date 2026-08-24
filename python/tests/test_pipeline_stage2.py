@@ -471,10 +471,23 @@ stats0_weight = 0.01
     def _backup_glob(suffix):
         return list(_STAGE_DIRS[2].glob(f"test_pipeline_self_resume-stage2-*{suffix}"))
 
-    assert not _backup_glob(".pt") and not _backup_glob(".log"), (
-        "the normal stage1->stage2 flow must never produce a backup file -- "
-        "found one after the FIRST pass, before any resume_from override was even used"
-    )
+    # Stage 3a runs after stage 2 (the caught train_lds() error above is it
+    # failing on this tiny fixture) and consumes the stage-2 checkpoint as its
+    # frozen-encoder ANCESTOR. That resolution now PINS the ancestor to a
+    # timestamped copy so a later reader can tell WHICH stage-2 this run built
+    # on -- intended, controlled provenance, not stray clutter. A checkpoint is
+    # identified uniquely by <stem>-<mtime>, so the pin shares the naming a
+    # self-resume backup would use (that is the point: same file, one name).
+    # The pin archives the CHECKPOINT only, not its log. So after pass 1:
+    # exactly one .pt (the pin, holding the original bytes), and no .log yet.
+    pins_pt = _backup_glob(".pt")
+    assert len(pins_pt) == 1, (
+        f"expected exactly the stage-2 ancestor pin after pass 1, got {pins_pt}")
+    assert pins_pt[0].read_bytes() == original_pt_bytes, (
+        "the ancestor pin must hold the ORIGINAL stage-2 bytes")
+    assert not _backup_glob(".log"), (
+        "the ancestor pin archives the .pt only -- no .log until an overwrite "
+        "backup runs")
 
     # Second pass: the SAME params file, now with an explicit
     # resume_from pointing at the SAME checkpoint the first pass just
@@ -492,14 +505,21 @@ stats0_weight = 0.01
         if "train_lds()" not in str(e):
             raise
 
+    # The explicit self-resume overwrote stage 2 in place, so
+    # _backup_before_overwrite ran FIRST, backing up the ORIGINAL (pass-1) .pt
+    # and .log. The .pt backup has the same source mtime as pass-1's ancestor
+    # pin, so it dedups to that ONE file (no redundant byte-identical copy).
+    # The .log backup is new. Pass 2's OWN stage 3a then pins the freshly
+    # retrained stage-2, adding a second, different-bytes .pt. So the invariant
+    # to check is that the ORIGINAL bytes survive -- not an exact .pt count.
     backup_pts = _backup_glob(".pt")
     backup_logs = _backup_glob(".log")
-    assert len(backup_pts) == 1, f"expected exactly one .pt backup, got {backup_pts}"
-    assert len(backup_logs) == 1, f"expected exactly one .log backup, got {backup_logs}"
-    assert backup_pts[0].read_bytes() == original_pt_bytes, (
-        "the backed-up .pt doesn't match the ORIGINAL checkpoint's own bytes -- "
-        "backup must happen BEFORE the overwrite, not after"
-    )
+    assert any(pt.read_bytes() == original_pt_bytes for pt in backup_pts), (
+        "the ORIGINAL checkpoint's bytes must survive in a timestamped .pt -- "
+        "the overwrite backup (== pass-1's pin, same mtime) must happen BEFORE "
+        f"the overwrite. Got {backup_pts}")
+    assert len(backup_logs) == 1, (
+        f"expected exactly one .log backup (the overwrite backup), got {backup_logs}")
     assert backup_logs[0].read_bytes() == original_log_bytes, (
         "the backed-up .log doesn't match the ORIGINAL log's own bytes -- "
         "backup must happen BEFORE _log_to_file's own truncating open(..., 'w')"
