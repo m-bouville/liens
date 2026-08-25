@@ -54,11 +54,6 @@ Generates several plots: one for $\delta t$ and one for other parameters (temper
 `python -m evaluation.check_parameter_dependence --lds-checkpoint checkpoints/stage4/128x128-stage4.pt --base-path ../datasets --min-step 1500 --min-stdev-phi 0.01 --min-passing-steps 12`
 
 
-### Parameters used to generate a checkpoint
-`python -m evaluation.inspect_checkpoint checkpoints/stage3a/128x128-stage3a.pt`
-Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` prints just: 0.15
-
-
 ### dt_vs_time (returns tables, not figures)
 `python -m evaluation.check_dt_vs_time --lds-checkpoint checkpoints/stage3b/128x128-stage3b.pt --min-step 2000 --min-stdev-phi 0.01 --min-passing-steps 12  --max-dt 1e9`
 
@@ -84,3 +79,24 @@ Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` p
 
 ### memory
 `python -m evaluation.check_memory checkpoints/stage3b/128x128-stage3b.pt --batch-size 2048 --size 128 --device cuda --truncate-bptt 64 --fixed-n 256 --calibrate`
+
+
+
+## Input parameters
+
+### Parameters used to generate a checkpoint
+`python -m evaluation.inspect_checkpoint checkpoints/stage3a/128x128-stage3a.pt`
+Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` prints just: 0.15
+
+
+### Sweep over `min_stdev_phi`, `min_std_deriv` and `min_passing_steps`
+`python -m evaluation.sweep_min_stdev_phi --base-path ../datasets --size 128 --max-runs 1000`
+
+`python -m evaluation.sweep_min_std_deriv --base-path ../datasets --size 128 --min-step 1000 --min-passing-steps 12 --max-runs 1000 --output ../output/min_std_deriv_sweep.png`
+
+`python -m evaluation.sweep_min_passing_steps --base-path ../datasets --size 128 --max-runs 1000`
+
+Optional arguments:
+- `--sma 3` to average times (x-axis from t-1 to t+1) if the plot is too choppy;
+- `--output` with path (default: `../output/datasets/128x128-min_std_deriv_sweep.png`);
+- `--min-bin-count` ignores steps with too few windows (default: 10).

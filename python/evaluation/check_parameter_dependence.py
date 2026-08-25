@@ -46,6 +46,7 @@ import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import math
 import numpy as np
 
 from evaluation._plot_helpers import log_scale_if_positive as _shared_log_scale
@@ -487,6 +488,14 @@ def _print_oracle_z1_attribution(dataset, results, device, max_dist: int | None 
 
             z0_before, z0_t, z0_next = run_state[start - 1], run_state[start], run_state[start + 1]
             z1_t = run_deriv[start]
+            # u-mode: run_deriv holds z̃1 = ln10*t*z1 (the dataset converted it in
+            # place). err_actual below is z0 + z1*dt_plus with dt_plus PHYSICAL,
+            # and the causal/oracle rows are physical z0-derivatives -- so z1_t
+            # must be the PHYSICAL z1 too. Left as z̃1 it inflates err_actual by
+            # ln10*t (~1e5 at large t), overflowing float32 and making err_actual
+            # meaningless. Convert back: z1 = z̃1 / (ln10 * t), t = step*sim_dt.
+            if getattr(dataset, "time_coordinate", "t") == "log10_t":
+                z1_t = z1_t / (math.log(10.0) * steps[start] * scale)
             dt_minus = (steps[start] - steps[start - 1]) * scale
             dt_plus = (steps[start + 1] - steps[start]) * scale
             if dt_minus <= 0 or dt_plus <= 0:

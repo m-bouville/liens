@@ -52,7 +52,7 @@ from matplotlib.colors import TwoSlopeNorm
 import numpy as np
 import torch
 
-from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates, N_THETA
+from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 from evaluation._window_parsing import parse_fixed_window
@@ -152,9 +152,26 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
         # covering the whole span. A single f_theta call with a large
         # dt is a fundamentally different (and untrained-for) operation
         # from n_rollout_steps chained calls at the actual per-step dts.
+        # dt_per_step stays PHYSICAL for display/return regardless of coordinate.
         dt_per_step = [(steps[i + 1] - steps[i]) * metadata.dt for i in range(len(steps) - 1)]
-        dts = torch.tensor([dt_per_step], dtype=torch.float32, device=device)
         theta = torch.tensor([theta_vec], dtype=torch.float32, device=device)
+
+        # u-scheme: a log10_t f_theta consumes z̃1 = ln10*t*z1 and steps in
+        # Delta-u = log10(step_{i+1}/step_i), NOT the raw encoder z1 and physical
+        # dt. check_rollout encodes LIVE (bypassing the dataset's own conversion),
+        # so without this it feeds the u-model physical z1/dt: f*dt overflows and
+        # z0_next_pred decodes to a solid (red) field. Convert here; t-models are
+        # unchanged (model_dts == dt_per_step, z1 untouched).
+        import math as _math
+        if getattr(f_theta, "time_coordinate", "t") == "log10_t":
+            _ln10 = _math.log(10.0)
+            _t = torch.tensor([s * metadata.dt for s in steps],
+                              dtype=z1_sequence.dtype, device=device)
+            z1_sequence = z1_sequence * (_ln10 * _t).view(1, len(steps), 1, 1, 1)
+            model_dts = [_math.log10(steps[i + 1] / steps[i]) for i in range(len(steps) - 1)]
+        else:
+            model_dts = dt_per_step
+        dts = torch.tensor([model_dts], dtype=torch.float32, device=device)
 
         z0_hat_full = f_theta.rollout(z0_t, z1_sequence, dts, theta,
                                        z1_resync=z1_resync)
@@ -317,7 +334,7 @@ def check_rollout(
     ae_config = ae_checkpoint["config"]
 
     f_theta = LatentDynamics(
-        latent_channels=lds_config["latent_channels"], n_theta=N_THETA,
+        latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
         latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
         # EVERY meaning-changing field, from ONE list -- see
@@ -329,8 +346,7 @@ def check_rollout(
         # at dt=500. One list, one call, and a new field cannot miss a site.
         **integration_kwargs_from_config(lds_config),
     ).to(device)
-    from models.encoder import zero_pad_theta_columns
-    f_theta.load_state_dict(zero_pad_theta_columns(lds_checkpoint["model_state"], f_theta))
+    f_theta.load_state_dict(lds_checkpoint["model_state"])
     f_theta.eval()
 
     data_config = lds_checkpoint.get("data_config")
