@@ -988,8 +988,15 @@ def train_lds(
         z0_hat = z0_hat_full[:, 1:]
 
         # exponent_deriv=0.0 (set at RolloutLoss's own construction
-        # above) DOES apply here now, via dt=dt_window below -- this
-        # reverses an earlier decision, made on reasoning that turned
+        # above) DOES apply here now, via dt=dt_phys_window below -- the
+        # PHYSICAL dt, NOT the model's step dt_window. In u-mode those
+        # differ: the model steps in Delta-u (dt_window) but the loss
+        # weights by physical Delta-t (dt_phys_window) so a u-run's
+        # objective matches a t-run's, isolating the coordinate from the
+        # loss weighting -- weighting by the ~constant Delta-u instead
+        # would make exponent_deriv=0.0 inert (dividing by a near-constant).
+        # In t-mode dt_phys_window == dt_window, so this is a no-op there.
+        # This reverses an earlier decision, made on reasoning that turned
         # out to be incomplete: the claim was that reweighting "no
         # longer holds cleanly" once the update rule mixes dt and dt^2
         # terms, since f_theta's own architecture (self.f takes z0, z1,
@@ -1571,7 +1578,8 @@ def train_lds(
         _nonfinite_reported = _all_nonfinite
         _line = _skip_reporter.epoch(
             epoch, _new, spike_guard.last_worst, _newg, grad_guard.last_worst,
-            _n_train_batches, n_nonfinite_new=_new_nonfinite)
+            _n_train_batches, n_nonfinite_new=_new_nonfinite,
+            dt_label=("du_max" if time_coordinate == "log10_t" else "dt_max"))
         if _line:
             print(_line)
 

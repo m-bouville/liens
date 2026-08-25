@@ -15,8 +15,10 @@ Everything else is about models at various stages.
 ## compare_f_theta
 
 ### compare_panels — per-window microstructure figures
-- `python -m evaluation.compare_f_theta checkpoints/stage3a/128x128-stage3a.pt checkpoints/stage3b/128x128-stage3b.pt --panels-only --n-samples 6 --steps 12 --seed 0` produce a 7-column plot (real / A / B deltas, both errors, B−A), with one row per window.
+- `python -m evaluation.compare_f_theta checkpoints/stage3a/128x128-stage3a.pt checkpoints/stage3b/128x128-stage3b.pt --panels-only --n-samples 6 --steps 12 --seed 0` produce an 8-column plot (state | real dx | stage-2 dx | pred A | pred B | error A | error B | B−A), with one row per window.
 - add `--trajectory` for one frame-by-frame figure per window.
+- add `--t0-range LO HI` to select allowed window start-step interval
+
 
 ### compare_statistics — loss/correlation over many windows
 - `python -m evaluation.compare_f_theta checkpoints/stage3a/128x128-stage3a.pt checkpoints/stage3b/128x128-stage3b.pt --stats-only --n-stats 200 --steps 10 --seed 0`

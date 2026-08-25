@@ -385,3 +385,30 @@ def test_dataset_u_conversion_arithmetic():
     du_with_dt = [_m.log10((kept_steps[i + 1] * sim_dt) / (kept_steps[i] * sim_dt))
                   for i in range(len(kept_steps) - 1)]
     assert all(abs(a - b) < 1e-12 for a, b in zip(du, du_with_dt))
+
+
+def test_u_mode_routes_physical_dt_to_loss_and_delta_u_to_model():
+    """Load-bearing wiring: in u-mode the MODEL steps in Delta-u (dt_window)
+    while the LOSS weights by PHYSICAL dt (dt_phys_window). Decoupling them is
+    the whole point -- it isolates the coordinate from the (dt-dependent) loss
+    weighting. Swapping them silently reverts the objective to the inert q=0
+    one (dividing by ~constant Delta-u^2), which trains green but corrupts
+    every u-run's numbers. The routing lives in train_lds's step() closure,
+    which isn't cheaply exercised in isolation, so this guards it at the
+    source level the same way the project guards its other wiring."""
+    import pathlib
+    from conftest import source_without_comments
+    src = source_without_comments(
+        pathlib.Path(__file__).resolve().parent.parent / "training/train_lds.py")
+    # model rollout steps in Delta-u; loss + decade weights use PHYSICAL dt
+    assert "f_theta.rollout(z0, window1, dt_window, theta" in src, \
+        "model rollout no longer steps in dt_window (Delta-u)"
+    assert "rollout_loss(z0_hat, z0_true, dt=dt_phys_window" in src, \
+        "loss no longer weights by physical dt (dt_phys_window)"
+    assert "dt_decade_weights_fn(dt_phys_window)" in src, \
+        "decade weights no longer computed on physical dt"
+    # the swaps that would revert to the inert objective must be ABSENT
+    assert "dt=dt_window" not in src, \
+        "loss weighting swapped to Delta-u -- reverts to the inert q=0 objective"
+    assert "rollout(z0, window1, dt_phys_window" not in src, \
+        "model stepping swapped to physical dt instead of Delta-u"

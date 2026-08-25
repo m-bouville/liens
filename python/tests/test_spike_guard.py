@@ -172,7 +172,8 @@ def test_the_report_names_what_was_IN_the_batch():
     max_dt at low noise" is. dt_max and theta are what turn one into the other.
     """
     src = source_without_comments(_ROOT / "training/spike_guard.py")
-    assert "dt_max=" in src and "theta[0]" in src
+    assert "{dt_label}=" in src and "theta[0]" in src
+    assert 'dt_label: str = "dt_max"' in src   # default label; u-mode passes du_max
     # _record_spike moved to training/spike_guard.py when stages 4 and 5
     # became a second caller; train_lds re-exports it.
     shared = source_without_comments(_ROOT / "training/spike_guard.py")
@@ -1885,3 +1886,16 @@ def test_the_loss_guard_itself_never_claims_an_ordinary_loss():
             f"{stage}'s LOSS guard passes loss_was_ordinary; only the gradient "
             f"guard has an independent verdict to report"
         )
+
+
+def test_report_label_is_du_max_in_u_mode_dt_max_otherwise():
+    """In log10_t (u) mode the batch step is Delta-u, not physical dt, so the
+    spike report must say du_max -- calling it dt_max mislabels every u-run's
+    guard message (the reader can't tell Delta-u=0.079 from a physical dt).
+    Default stays dt_max for t-mode."""
+    from training.spike_guard import skip_report
+    worst = (4.3e7, 1.0, 0.07918, -0.276)   # loss, median, step-max, theta0
+    u_line = skip_report(120, 1, worst, 0, None, 13, verbose=False, dt_label="du_max")
+    assert "du_max=0.07918" in u_line and "dt_max=" not in u_line, u_line
+    t_line = skip_report(120, 1, worst, 0, None, 13, verbose=False)  # default
+    assert "dt_max=0.07918" in t_line, t_line

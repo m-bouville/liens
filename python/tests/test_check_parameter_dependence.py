@@ -979,3 +979,26 @@ def test_per_point_aggregation_merges_near_duplicate_floats():
     per_point = _aggregate_per_point(temperatures, noises, latent_losses)
     assert len(per_point) == 1
     assert len(list(per_point.values())[0]["losses"]) == 2
+
+
+def test_ylim_from_below_cutoff_ignores_the_converged_regime():
+    """The dt-dependence y-range must come ONLY from points below the
+    convergence cutoff -- points at/above it (dz0->0, error/dt meaningless)
+    would blow the range up. This logic caused a three-iteration y-range saga
+    when it lived inline in _build_and_save_figures; now a module-level unit."""
+    from evaluation.check_parameter_dependence import _ylim_from_below_cutoff
+    fb = (-9.0, 9.0)
+    # below-cutoff points [0,10] set the range (padded 5%); x=100 (converged) excluded
+    lo, hi = _ylim_from_below_cutoff([([1.0, 2.0, 100.0], [0.0, 10.0, 999.0])],
+                                     dt_cutoff=50.0, fallback=fb)
+    assert (round(lo, 9), round(hi, 9)) == (-0.5, 10.5)
+    # nothing below the cutoff -> fall back (e.g. cutoff=inf, no convergence)
+    assert _ylim_from_below_cutoff([([1.0, 2.0], [0.0, 10.0])],
+                                   dt_cutoff=0.5, fallback=fb) == fb
+    # degenerate (all equal) -> fallback, not a zero-height range
+    assert _ylim_from_below_cutoff([([1.0, 2.0], [5.0, 5.0])],
+                                   dt_cutoff=10.0, fallback=fb) == fb
+    # non-finite points ignored
+    lo, hi = _ylim_from_below_cutoff([([1.0, float("nan"), 3.0], [2.0, 100.0, 4.0])],
+                                     dt_cutoff=10.0, fallback=fb)
+    assert (round(lo, 9), round(hi, 9)) == (1.9, 4.1)

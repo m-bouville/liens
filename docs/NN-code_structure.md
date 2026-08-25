@@ -158,6 +158,34 @@ checkpoint at a coarser alpha asks a finely-fitted field to act as a
 one-shot corrector, which produced one 3b run at loss ~1e19 (the log's own
 NOTE warns when this mismatch is configured).
 
+Two newer, checkpointed (`_MEANING_FIELDS`, so they round-trip through
+save/rebuild) axes sit on top of this:
+
+- **`dynamics_mode='deriv_linear'`** — `f_theta` takes `log(dt)` as an input
+  and its output is applied with a LINEAR `f*dt` prefactor, so the network
+  owns the dt-scaling instead of the integrator.
+- **`time_coordinate='log10_t'`** (the u-scheme) — the model steps in
+  `Δu = log10(t_end/t_start)` rather than physical `Δt`. The dataset performs
+  the conversion at construction (`z1 -> z̃1 = ln10 · t · z1`, see Datasets),
+  and `train_lds` DECOUPLES the coordinate from the loss weighting: the
+  rollout receives `Δu` but `RolloutLoss` (and the decade weights) receive the
+  PHYSICAL `Δt` via the dataset's `return_phys_dt` 5-tuple — weighting by the
+  near-constant `Δu` would silently make `exponent_deriv=0.0` inert. The
+  spike/grad guard reports label the batch step `du_max` (not `dt_max`) in
+  this mode. Stage 4/5 refuses a `log10_t` `f_theta` outright.
+- **`derivative_source='previous_quotient'`** (the q-scheme, 3b) — during
+  autonomous rollout the derivative at each step is the backward quotient
+  `q_i = (z0_i - z0_{i-1})/dt_{i-1}` from the model's OWN trajectory, so
+  training matches the test-time regime (training on encoder-z1 then rolling
+  out on q was a confirmed train/test mismatch). Inert in a 1-step
+  `z1_resync=True` 3a, by construction.
+
+Empirical status (as of the u-arc): u-trained-on-q improves IN-BOX accuracy
+(97% 5-step in the active regime vs ~92% t-scheme) but does NOT widen the
+stable envelope — late-`t` windows are low-SNR (`|Δz0| -> 0` is physical) and
+the frozen tail destabilises the guard; the binding constraint is the box,
+not the training horizon.
+
 ### Stages 4 and 5
 Stages 4 and 5 are similarly one function, `train_refinement()`, selected by
 `freeze_decoder` (`True` for 4, `False` for 5) — stage 4's `D` stays frozen as a "tether"
@@ -271,8 +299,20 @@ end.
   the window's starting frame) when `stat_names` is given, for stage 2's anchor term and
   stage 4/5's `L_stats` term.
 - `build_good_steps()` — shared step-filtering logic (`min_step`, `min_stdev_phi`,
-  missing/corrupt snapshot exclusion) used by all three dataset classes, so they agree on
-  which steps are usable for the same `run_dirs`/filters.
+  `min_passing_steps` — the latter drops an ENTIRE run when fewer than that many steps
+  clear `min_stdev_phi`; time-agnostic in its rule, late-leaning in effect because the
+  short runs are the near-critical ones — plus missing/corrupt snapshot exclusion) used
+  by all three dataset classes, so they agree on which steps are usable for the same
+  `run_dirs`/filters. `min_std_deriv` is NOT part of this set: it is a **stage-2-only**
+  window filter (rejected outright in cached-latent mode), saved in the config for
+  *reportability, not reproducibility* — it shapes what the ENCODER trains on, and
+  reaches stage 3 only through the encoder's representation quality. The measured
+  per-`t` survival of all three filters lives in the sweep tools (see `NN-tools.md`).
+- **u-scheme support** — with `time_coordinate='log10_t'`, the cached `deriv` latents
+  are converted in place at construction (`z̃1 = ln10 · t · z1`) and window steps become
+  `Δu`; the opt-in `return_phys_dt=True` makes batches 5-tuples carrying the PHYSICAL
+  per-transition `Δt` alongside, which `train_lds` routes to the loss (coordinate/loss
+  decoupling — see Stage 3). t-mode batches are byte-identical 4-tuples.
 - **`split_label`** — an optional label (`"training"`/`"validation"`/`"test"`) threaded
   through `build_good_steps()`, `MicrostructureSnapshotDataset` and
   `MicrostructureEvolutionDataset` into their construction-time diagnostic lines (runs
@@ -336,6 +376,12 @@ Two interactions are easy to get wrong and are now guarded:
   struggle to clear. Observed on a 128x128 run: epoch 1 was the minimum of all
   11 epochs, nothing saved again, early stop at 11 with train loss still falling
   19.6% — and stage 2 then trained from that epoch-1 checkpoint.
+
+- **Saving is an AND-gate: raw `val_loss` AND its EMA must both be at new lows**,
+  and both bars advance ONLY on an actual save. A low-EMA epoch whose raw valid was
+  *up* used to save (observed: e260 saved with valid rising); and a non-saving
+  low-raw epoch must not quietly lower the raw bar for later epochs. Grace periods
+  cap the raw bar at the reference rather than letting grace epochs move it.
 
 Stages 2 and 3 also raise a clear `RuntimeError` when a run finishes without
 ever saving, rather than letting the next `torch.load` fail with a bare
@@ -437,7 +483,11 @@ learning to match it, since nothing else in the loss would catch it.
   sequence the real work depends on.**
 
 - **`train_lds.py`**: `train_lds()`, shared by stages 3a and 3b (`n_rollout_steps`
-  distinguishes them; `resume_from` chains 3a→3b). Recently gained `one_step_weight`
+  distinguishes them; `resume_from` chains 3a→3b). Carries the u/q-scheme axes
+  (`time_coordinate`, `derivative_source`, `dynamics_mode` — see Stage 3) including
+  the `Δu`-to-model / physical-`Δt`-to-loss routing (source-guarded in
+  `test_deriv_linear`, since swapping them silently reverts the objective) and the
+  coordinate-aware `du_max`/`dt_max` guard-report label. Also `one_step_weight`
   (adds `ε·L_1step` on top of `L_rollout`, hoping to regularize 3b's instability — tried
   at two different weights, both made rollout quality *worse*, not better, on most test
   windows; not resolved as of this writing).
@@ -490,7 +540,12 @@ Each has a real, importable function (not just CLI logic) so `main.py` can call 
 - **`check_reconstruction.py`**: AE reconstruction quality on held-out samples.
 - **`check_rollout.py`**: multi-step rollout comparison (`state(t)`, `real Δx`, `predicted Δx`, `error`, over the full window chain via `f_theta.rollout()`). Also has `_padded_bounds()` for predictable, comparable color scales across different checkpoints/runs — derived only from the *real* data, never from the prediction, so a bad prediction shows as visible saturation instead of stretching its own scale.
 - **`check_interpolation.py`** and **`check_perturbation.py`** are stage 2's two latent-space  diagnostics (the letter post-hoc only: not used as loss function).
-- **`check_parameter_dependence.py`** scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `pipeline.py`'s stage 3 sanity checks alongside `check_rollout`. Also reports the oracle-z1 attribution (whether the euler error is z0's or z1's), the bias-vs-variance split of z1's error, and correlations against temperature / noise / autocorrelation length scale with a saturation confound-control cross-tab. The console output is data-by-default: the static explanatory prose (how to read each metric, the oracle-verdict caveat) is routed through a `_vprint` gate and appears only under `--verbose`/`-v`; every number, table and run-specific conclusion always prints, so the default output is paste-able. On this project's data at adequate (128×128) resolution the clean single error driver is the microstructural length scale (~63% correlation) — temperature and noise correlations (~1%/0%) are spurious, an artifact of finite-size autocorrelation-length saturation that the small-domain (64×64) analysis could not separate.
+- **`check_parameter_dependence.py`** scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `pipeline.py`'s stage 3 sanity checks alongside `check_rollout`. Also reports the oracle-z1 attribution (whether the euler error is z0's or z1's), the bias-vs-variance split of z1's error, and correlations against temperature / noise / autocorrelation length scale with a saturation confound-control cross-tab. The console output is data-by-default: the static explanatory prose (how to read each metric, the oracle-verdict caveat) is routed through a `_vprint` gate and appears only under `--verbose`/`-v`; every number, table and run-specific conclusion always prints, so the default output is paste-able. On this project's data at adequate (128×128) resolution the clean single error driver is the microstructural length scale (~63% correlation) — temperature and noise correlations (~1%/0%) are spurious, an artifact of finite-size autocorrelation-length saturation that the small-domain (64×64) analysis could not separate. The dt-dependence y-range logic (`_ylim_from_below_cutoff`:
+range from below-saturation points only, fallback on empty/degenerate) is a
+module-level unit-tested function — it caused a three-iteration y-range saga while it
+lived inline. The remaining figure body (`_build_and_save_figures`, ~1000 lines) draws
+TWO figures interleaved (each computed quantity onto both) and is at its documented
+safe stopping point: splitting it is a draw-reorder that needs a render gate.
 - **`compare_f_theta.py`** — the maintained model-vs-model comparison: chained-rollout
   trajectory figures (real / causal frozen-dz0 / stage-2 Euler / 3a / 3b rows, absolute-time
   headers) and a 2x4 statistics figure (loss + correlation vs CDF / dt_total / temperature-SMA
@@ -499,7 +554,13 @@ Each has a real, importable function (not just CLI logic) so `main.py` can call 
   current verdict: `--f-scale-sweep` (scale `f_theta`'s output by lambda in [0,1]; 0 reproduces
   stage 2 bit-exactly through the real integrator) and `--alpha-sweep` (h -> 0 refinement;
   refuses fixed-`n_substeps` checkpoints, whose `f_theta` is a dt-averaged corrector with no
-  h -> 0 meaning).
+  h -> 0 meaning). The dx panel is 8 columns — `state | real dx | stage-2 dx | pred a |
+  pred b | error a | error b | b-a` — where the stage-2 column (pure `z0 + z1·dt`, no
+  `f_theta`, coordinate-aware) gets its OWN robust scale (99th-pct, floored at the
+  real-dx range) so a diverged `z1` shows as saturated pixels with the magnitude printed
+  in the title instead of washing out the shared scale; it is the per-window exhibit of
+  "z1 fails past its skill horizon, f_theta compensates". `--t0-range LO HI` restricts
+  windows by starting step (behaviourally tested — the t0-split verdicts rest on it).
 - **`check_z2_measurability.py`** — is a second-derivative latent stream learnable at all?
   Nonuniform 3-point stencils (the uniform formula is ~256% wrong on the geometric schedule)
   over two DISJOINT frame triplets — (0,1,2)/(3,4,5), sharing no frame, because shared-centre
@@ -514,6 +575,10 @@ Each has a real, importable function (not just CLI logic) so `main.py` can call 
   signal from noise here — the ratio `E|z2|*dt^2 / E|d1|*dt` (step-to-step change over step
   size) is the discriminating number: ~0.14-0.30 for a smooth path on this schedule, 2.0 for
   uncorrelated steps.
+- **`check_stdev_phi_time.py`** — steady-state onset/saturation of `stdev_phi` vs time
+  per temperature. Data loading (per-run metadata + statistics.csv into the per-cell
+  accumulators) is factored into `_load_run_data` (pure IO/compute, covered end-to-end
+  by the file's own test fixtures); drawing is quarantined in the single-figure `_plot`.
 - **`compare_integrators.py`** and **`compare_rollout_training.py`** are one-off exploratory   comparison scripts, not part of the maintained by-stage output/checkpoint conventions; treat as needing an explicit refactor-or-archive decision rather than assuming they stay current automatically.
 
 

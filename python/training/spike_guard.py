@@ -274,7 +274,7 @@ class _SpikeGuard:
 
 
 def skip_report(epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst,
-                 n_batches: int, verbose: bool) -> str:
+                 n_batches: int, verbose: bool, dt_label: str = "dt_max") -> str:
     """One line per epoch for both guards, verbose only the FIRST time.
 
     The original printed a three-line paragraph PER GUARD PER EPOCH, each
@@ -310,7 +310,7 @@ def skip_report(epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst
                 f"guard cannot see."
                 + ("" if grad_worst is None else
                    f" worst: grad_norm {grad_worst[0]:.4g} vs median "
-                   f"{_SpikeGuard.median_display(grad_worst[1])}, dt_max={grad_worst[2]:.4g}, "
+                   f"{_SpikeGuard.median_display(grad_worst[1])}, {dt_label}={grad_worst[2]:.4g}, "
                    f"mean theta[0]={grad_worst[3]:.4g}")
                 + "]")
         if loss_new:
@@ -320,7 +320,7 @@ def skip_report(epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst
                 f"statistics its forward pass moved were restored, so the model is untouched."
                 + ("" if loss_worst is None else
                    f" worst: loss {loss_worst[0]:.4g} vs median "
-                   f"{_SpikeGuard.median_display(loss_worst[1])}, dt_max={loss_worst[2]:.4g}, "
+                   f"{_SpikeGuard.median_display(loss_worst[1])}, {dt_label}={loss_worst[2]:.4g}, "
                    f"mean theta[0]={loss_worst[3]:.4g}")
                 + "]")
         parts.append(
@@ -334,7 +334,7 @@ def skip_report(epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst
     if loss_new:
         bits.append(f"{loss_new} loss ({_ratio(loss_worst)})")
     worst = grad_worst if grad_new else loss_worst
-    band = "" if worst is None else f" @ dt_max={worst[2]:.4g}"
+    band = "" if worst is None else f" @ {dt_label}={worst[2]:.4g}"
     return f"  [epoch {epoch}: skipped {' + '.join(bits)} of {n_batches}{band}]"
 
 
@@ -380,7 +380,7 @@ class SkipReporter:
         return worst[0] / worst[1]
 
     def epoch(self, epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst,
-               n_batches: int, n_nonfinite_new: int = 0) -> str:
+               n_batches: int, n_nonfinite_new: int = 0, dt_label: str = "dt_max") -> str:
         """The line(s) to print for this epoch -- possibly empty."""
         lines = []
         total = loss_new + grad_new
@@ -393,7 +393,8 @@ class SkipReporter:
             if notable:
                 lines.append(skip_report(epoch, loss_new, loss_worst, grad_new,
                                           grad_worst, n_batches,
-                                          verbose=not self._explained))
+                                          verbose=not self._explained,
+                                          dt_label=dt_label))
                 self._explained = True
             else:
                 self._quiet_epochs += 1

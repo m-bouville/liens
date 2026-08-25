@@ -795,6 +795,77 @@ def _report_collapse_tests(curves: dict, taus: dict, taus_down: dict, temperatur
     return collapse_temps, down_temps
 
 
+def _load_run_data(run_dirs, exclude_seeds, min_step):
+    """Read every run's metadata + statistics.csv into the per-cell
+    accumulators the rest of check_stdev_phi_time consumes. Lifted VERBATIM
+    from that function (inits + the per-run loop); pure IO/compute, no
+    drawing -- so it is unit-testable and byte-for-byte equivalent."""
+    by_cell: dict[tuple[float, int, float, int], list[float]] = defaultdict(list)
+    by_cell_ac: dict[tuple[float, int, float, int], list[float]] = defaultdict(list)
+    grid_nx = grid_ny = 0
+    T0_value = 1.0  # overwritten from the first run's own metadata; never assumed
+    temp_amplitude: dict[float, float] = {}
+    temp_save_steps: dict[float, list[int]] = {}
+    temp_dt_scale: dict[float, float] = {}
+    temp_run_count: dict[float, int] = defaultdict(int)
+    temp_seeds: dict[float, set] = defaultdict(set)
+    run_max_steps: list[float] = []  # per run, for the saturation cap below
+    n_skipped_incomplete = n_skipped_no_stats = n_skipped_excluded_seed = 0
+
+    for run_dir in run_dirs:
+        metadata_path = run_dir / "metadata.txt"
+        if not metadata_path.exists():
+            continue
+        metadata = load.read_metadata(metadata_path)
+        if not metadata.is_complete:
+            n_skipped_incomplete += 1
+            continue
+        stats_path = run_dir / "statistics.csv"
+        if not stats_path.exists():
+            n_skipped_no_stats += 1
+            continue
+        stats_df = load.read_statistics_csv(stats_path)
+        if "stdev_phi" not in stats_df.columns:
+            n_skipped_no_stats += 1
+            continue
+
+        temp = round(float(metadata.temperature), 6)
+        # Same Landau construction check_stdev_phi_temperature.py uses,
+        # and for the same reason read from THIS run's own metadata
+        # rather than hardcoded: stable phases at +-sqrt(-a(T)/b) with
+        # a(T) = a0*(T-T0), clipped at 0 for T >= T0 where phi=0 is the
+        # only stable point.
+        a_T = metadata.a0 * (metadata.temperature - metadata.T0)
+        temp_amplitude[temp] = float(np.sqrt(max(-a_T / metadata.b, 0.0)))
+        temp_save_steps[temp] = list(metadata.save_steps)
+        temp_dt_scale[temp] = float(metadata.dt)
+        if exclude_seeds and metadata.seed in exclude_seeds:
+            n_skipped_excluded_seed += 1
+            continue
+        temp_run_count[temp] += 1
+        temp_seeds[temp].add(metadata.seed)
+        grid_nx, grid_ny = metadata.nx, metadata.ny
+        T0_value = float(metadata.T0)
+
+        has_autocorr = "autocorr_length" in stats_df.columns
+        this_run_max = 0
+        for step in metadata.save_steps:
+            if step < min_step or step not in stats_df.index:
+                continue
+            value = _finite_number(stats_df.loc[step, "stdev_phi"])
+            if value is not None:
+                by_cell[(temp, metadata.seed, float(metadata.noise), int(step))].append(value)
+                if has_autocorr:
+                    ac = _finite_number(stats_df.loc[step, "autocorr_length"])
+                    if ac is not None:
+                        by_cell_ac[(temp, metadata.seed, float(metadata.noise),
+                                     int(step))].append(ac)
+                this_run_max = max(this_run_max, int(step))
+        if this_run_max > 0:
+            run_max_steps.append(float(this_run_max))
+    return (by_cell, by_cell_ac, grid_nx, grid_ny, T0_value, temp_amplitude, temp_save_steps, temp_dt_scale, temp_run_count, temp_seeds, run_max_steps, n_skipped_incomplete, n_skipped_no_stats, n_skipped_excluded_seed)
+
+
 def check_stdev_phi_time(
     base_path: Path, size: int, min_step: int = 1, ref_fraction: float = 0.5,
     min_run_fraction: float = 0.9, exclude_seeds: set[int] | None = None,
@@ -905,69 +976,7 @@ def check_stdev_phi_time(
     # collection so that a flagged seed can be broken down into its own
     # runs afterwards -- deciding "is this the seed, or a few runs of it"
     # is impossible once noise has been collapsed.
-    by_cell: dict[tuple[float, int, float, int], list[float]] = defaultdict(list)
-    by_cell_ac: dict[tuple[float, int, float, int], list[float]] = defaultdict(list)
-    grid_nx = grid_ny = 0
-    T0_value = 1.0  # overwritten from the first run's own metadata; never assumed
-    temp_amplitude: dict[float, float] = {}
-    temp_save_steps: dict[float, list[int]] = {}
-    temp_dt_scale: dict[float, float] = {}
-    temp_run_count: dict[float, int] = defaultdict(int)
-    temp_seeds: dict[float, set] = defaultdict(set)
-    run_max_steps: list[float] = []  # per run, for the saturation cap below
-    n_skipped_incomplete = n_skipped_no_stats = n_skipped_excluded_seed = 0
-
-    for run_dir in run_dirs:
-        metadata_path = run_dir / "metadata.txt"
-        if not metadata_path.exists():
-            continue
-        metadata = load.read_metadata(metadata_path)
-        if not metadata.is_complete:
-            n_skipped_incomplete += 1
-            continue
-        stats_path = run_dir / "statistics.csv"
-        if not stats_path.exists():
-            n_skipped_no_stats += 1
-            continue
-        stats_df = load.read_statistics_csv(stats_path)
-        if "stdev_phi" not in stats_df.columns:
-            n_skipped_no_stats += 1
-            continue
-
-        temp = round(float(metadata.temperature), 6)
-        # Same Landau construction check_stdev_phi_temperature.py uses,
-        # and for the same reason read from THIS run's own metadata
-        # rather than hardcoded: stable phases at +-sqrt(-a(T)/b) with
-        # a(T) = a0*(T-T0), clipped at 0 for T >= T0 where phi=0 is the
-        # only stable point.
-        a_T = metadata.a0 * (metadata.temperature - metadata.T0)
-        temp_amplitude[temp] = float(np.sqrt(max(-a_T / metadata.b, 0.0)))
-        temp_save_steps[temp] = list(metadata.save_steps)
-        temp_dt_scale[temp] = float(metadata.dt)
-        if exclude_seeds and metadata.seed in exclude_seeds:
-            n_skipped_excluded_seed += 1
-            continue
-        temp_run_count[temp] += 1
-        temp_seeds[temp].add(metadata.seed)
-        grid_nx, grid_ny = metadata.nx, metadata.ny
-        T0_value = float(metadata.T0)
-
-        has_autocorr = "autocorr_length" in stats_df.columns
-        this_run_max = 0
-        for step in metadata.save_steps:
-            if step < min_step or step not in stats_df.index:
-                continue
-            value = _finite_number(stats_df.loc[step, "stdev_phi"])
-            if value is not None:
-                by_cell[(temp, metadata.seed, float(metadata.noise), int(step))].append(value)
-                if has_autocorr:
-                    ac = _finite_number(stats_df.loc[step, "autocorr_length"])
-                    if ac is not None:
-                        by_cell_ac[(temp, metadata.seed, float(metadata.noise),
-                                     int(step))].append(ac)
-                this_run_max = max(this_run_max, int(step))
-        if this_run_max > 0:
-            run_max_steps.append(float(this_run_max))
+    (by_cell, by_cell_ac, grid_nx, grid_ny, T0_value, temp_amplitude, temp_save_steps, temp_dt_scale, temp_run_count, temp_seeds, run_max_steps, n_skipped_incomplete, n_skipped_no_stats, n_skipped_excluded_seed) = _load_run_data(run_dirs, exclude_seeds, min_step)
 
     if not by_cell:
         raise ValueError(f"No (temperature, step, stdev_phi) samples found under {base_path} "

@@ -43,13 +43,14 @@ def _stub_models(monkeypatch, pred_noise=(0.05, 0.20)):
         calls.append({"steps": list(steps), "model": f_theta,
                        "z1_resync": z1_resync})
         rng = np.random.default_rng(len(calls))
-        x_t = rng.normal(size=(16, 16))
-        x_real = x_t + rng.normal(0, 0.1, (16, 16))
+        x_t = rng.normal(size=(8, 8))
+        x_real = x_t + rng.normal(0, 0.1, (8, 8))
         noise = pred_noise[0] if f_theta == "A" else pred_noise[1]
-        x_pred = x_real + noise * rng.normal(size=(16, 16))
+        x_pred = x_real + noise * rng.normal(size=(8, 8))
         return x_t, x_real, x_pred, x_real, 500.0, [250.0, 250.0]
 
     monkeypatch.setattr(cf, "compute_sample", fake_compute_sample)
+    monkeypatch.setattr(cf, "compute_stage2_trajectory", _flat_stage2)
     monkeypatch.setattr(cf, "_load_model", lambda p, d: {
         "path": p, "ck": {}, "config": {}, "ae": None, "ae_encoder": None,
         "ae_config": {}, "ae_path": "shared.pt", "f_theta": str(p)[-1],
@@ -178,7 +179,7 @@ def test_the_seventh_column_is_b_minus_a_on_the_error_scale():
     assert "_padded_bounds(diff" not in src, (
         "the diff column still computes a scale of its own"
     )
-    assert "plt.subplots(n_rows, 7" in src
+    assert "plt.subplots(n_rows, 8" in src
 
 
 def test_title_and_filename_use_the_parsed_names(monkeypatch, tmp_path):
@@ -199,6 +200,7 @@ def test_title_and_filename_use_the_parsed_names(monkeypatch, tmp_path):
                 "f_theta": str(p), "prefix": pre, "label": lab}
 
     monkeypatch.setattr(cf, "compute_sample", fake)
+    monkeypatch.setattr(cf, "compute_stage2_trajectory", _flat_stage2)
     monkeypatch.setattr(cf, "_load_model", load)
     titles = []
     import matplotlib.figure
@@ -280,7 +282,8 @@ def _flat_stage2(run_dir, steps, ae, ae_config, device, time_coordinate="t"):
     that check frame 0 is a real number.
     """
     rng = np.random.default_rng(0)
-    return [rng.normal(size=(8, 8)) * (1 + 0.05 * k)
+    sz = (ae_config or {}).get("size", 8)   # match the paired compute_sample stub's grid
+    return [rng.normal(size=(sz, sz)) * (1 + 0.05 * k)
             for k in range(len(steps))]
 
 
@@ -425,7 +428,7 @@ def test_n_stats_is_wired_and_off_by_default():
 
 def test_one_colorbar_per_row_for_the_three_columns_that_share_a_scale(monkeypatch, tmp_path):
     """
-    Columns 4, 5 and 6 (error A, error B, B-A) share one scale, so a second
+    Columns 5, 6 and 7 (error A, error B, B-A) share one scale, so a second
     bar repeating the same range is clutter on an already-wide figure. There
     must be exactly one colorbar per row.
     """
@@ -452,7 +455,7 @@ def test_one_colorbar_per_row_for_the_three_columns_that_share_a_scale(monkeypat
         f"being drawn more than once per row"
     )
     # and the three really do share it, which is what makes one bar enough
-    clims = [axes[0, c].get_images()[0].get_clim() for c in (4, 5, 6)]
+    clims = [axes[0, c].get_images()[0].get_clim() for c in (5, 6, 7)]
     assert clims[0] == clims[1] == clims[2]
 
 
@@ -2556,14 +2559,14 @@ def test_compare_statistics_runs_without_touching_the_panel_tool(monkeypatch, tm
         lambda m, n, ns, seed, mx, dev, t0_range=None: [(Path(f"T{500 + i}_n020_s{i}"),
                                           list(range(ns + 1)))
                                          for i in range(max(n, 1))])
-    # if the panel tool were reached it would call plt.subplots(_, 7); make
+    # if the panel tool were reached it would call plt.subplots(_, 8); make
     # that a failure
     import matplotlib.pyplot as plt
     real_subplots = plt.subplots
 
     def guard(*a, **k):
         ncols = (a[1] if len(a) > 1 else k.get("ncols"))
-        assert ncols != 7, "compare_statistics drew the 7-column panel figure"
+        assert ncols != 8, "compare_statistics drew the 8-column panel figure"
         return real_subplots(*a, **k)
 
     monkeypatch.setattr(plt, "subplots", guard)
@@ -2599,3 +2602,73 @@ def test_stats_only_and_panels_only_flags_are_exclusive(monkeypatch):
                         ["x", "a", "b", "--panels-only", "--stats-only"])
     with __import__("pytest").raises(SystemExit):
         cf.main()
+
+
+def test_t0_range_selects_only_windows_starting_in_band(monkeypatch):
+    """--t0-range must keep ONLY windows whose starting step t0 is in [lo,hi]
+    and raise when the band is empty. Every t0-split verdict in the project
+    rests on this filter selecting the right band, so it is tested against the
+    REAL _select_windows (the dataset is stubbed, the filter logic is not)."""
+    from pathlib import Path
+
+    class _FakeDS:
+        # window i starts at step t0s[i]; window_info(i) -> (run_dir, steps)
+        t0s = [50, 100, 150, 200, 250]
+        def __len__(self): return len(self.t0s)
+        def window_info(self, i):
+            t0 = self.t0s[i]
+            return (Path(f"run{i}"), [t0, t0 + 10])
+
+    monkeypatch.setattr(cf, "MicrostructureEvolutionDataset",
+                        lambda *a, **k: _FakeDS())
+    monkeypatch.setattr(cf.load, "validate_run_dirs", lambda dirs, **k: dirs)
+    monkeypatch.setattr(cf, "default_latent_cache_dir", lambda *a, **k: None)
+    model = {"path": "p", "ae_encoder": None, "ae_config": {},
+             "ck": {"data_config": {}, "test_dirs": ["d"]}}
+
+    # in-band [100, 200] -> only t0 in {100,150,200} survive
+    got = cf._select_windows(model, n_samples=10, n_steps=1, seed=0,
+                             max_dt=None, device="cpu", t0_range=(100, 200))
+    starts = sorted(steps[0] for _run, steps in got)
+    assert starts == [100, 150, 200], f"out-of-band windows leaked in: {starts}"
+
+    # empty band -> raise (not silently return nothing)
+    import pytest
+    with pytest.raises(ValueError, match="no windows start in t0-range"):
+        cf._select_windows(model, n_samples=10, n_steps=1, seed=0,
+                           max_dt=None, device="cpu", t0_range=(1000, 2000))
+
+
+def test_stage2_dx_column_uses_its_own_scale_not_the_shared_one(monkeypatch, tmp_path):
+    """The stage-2 dx column (col 2) must get its OWN scale, wider than real dx
+    (col 1) when z1 diverges -- else a diverged z1 saturates the whole panel to
+    a flat block. A regression putting it back on the shared d_lo/d_hi would
+    make the two clims equal; this asserts they differ when stage 2 blows up."""
+    import numpy as np
+    import matplotlib.pyplot as plt
+    _stub_models(monkeypatch)
+
+    # stage-2 trajectory that DIVERGES (>> real dx), like z1 past its horizon
+    def _big_stage2(run_dir, steps, ae, ae_config, device, time_coordinate="t"):
+        rng = np.random.default_rng(0)
+        sz = (ae_config or {}).get("size", 8)
+        return [rng.normal(size=(sz, sz)) * 1e6 for _ in range(len(steps))]
+    monkeypatch.setattr(cf, "compute_stage2_trajectory", _big_stage2)
+
+    captured = {}
+    orig = plt.subplots
+    def spy(*a, **k):
+        fig, axes = orig(*a, **k)
+        captured.setdefault("axes", axes)
+        return fig, axes
+    monkeypatch.setattr(plt, "subplots", spy)
+
+    cf.compare_f_theta("128x128-stage3a", "128x128-stage3b",
+                       fixed_windows=["r:1:2:3", "q:4:5:6"],
+                       output_path=tmp_path / "f.png", device="cpu")
+    axes = captured["axes"]
+    real_clim = axes[0, 1].get_images()[0].get_clim()      # col 1 = real dx
+    stage2_clim = axes[0, 2].get_images()[0].get_clim()     # col 2 = stage 2 dx
+    assert stage2_clim[1] > real_clim[1] * 100, (
+        "stage-2 dx column is not on its own scale -- a diverged z1 should give "
+        "it a far wider range than real dx, not the shared one")

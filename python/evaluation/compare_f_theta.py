@@ -3,7 +3,7 @@ Side-by-side f_theta comparison: TWO checkpoints, IDENTICAL windows.
 
 Seven columns per sample row, labelled with the parsed stage names:
 
-    state(t) | real dx | pred dx (stage 3a) | pred dx (stage 3b)
+    state(t) | real dx | stage 2 dx (z0+z1 dt) | pred dx (3a) | pred dx (3b)
              | error stage 3a | error stage 3b | stage 3b - stage 3a
 
 The last column is the DIFFERENCE OF PREDICTIONS -- "is there a pattern
@@ -1380,7 +1380,7 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
                                          z1_resync, t0_range=t0_range)
     recon_loss = ReconLoss()
     n_rows = len(windows)
-    fig, axes = plt.subplots(n_rows, 7, figsize=(29, 3.2 * n_rows))
+    fig, axes = plt.subplots(n_rows, 8, figsize=(33, 3.2 * n_rows))
     if n_rows == 1:
         axes = axes[None, :]
     fig.suptitle(title, fontsize=13)
@@ -1411,11 +1411,28 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
         diff = per["b"]["pred_delta"] - per["a"]["pred_delta"]
         f_lo, f_hi = e_lo, e_hi
 
+        # Stage 2 = pure z0 + z1 dt (no f_theta), propagated -- the AE-only
+        # prediction whose z1 diverges past its skill horizon at late t. Same
+        # encoder for a and b, so compute once (uses a's coordinate). Its OWN
+        # robust symmetric scale (99th pct, floored at the real-dx range): a
+        # shared scale would saturate the whole panel once z1 blows up, so here
+        # divergence shows as a few saturated pixels while the printed scale
+        # reports the magnitude.
+        s2_tc = a.get("config", {}).get("time_coordinate", "t")
+        stage2_frames = compute_stage2_trajectory(
+            run_dir, steps, a["ae"], a["ae_config"], device, time_coordinate=s2_tc)
+        stage2_delta = stage2_frames[-1] - x_t
+        s2_corr = _correlation_pct(stage2_delta, real_delta)
+        s2_scale = max(float(np.percentile(np.abs(stage2_delta), 99.0)), d_hi)
+
         steps_txt = f"{run_dir.name}:{steps[0]}\u2192{steps[-1]} ({len(steps) - 1} steps)"
         cells = [
             (x_t, -state_scale, state_scale,
              f"state(t)\n{steps_txt}\ndt_total={dt_total:g}"),
             (real_delta, d_lo, d_hi, f"real dx\nscale=[{d_lo:.3f}, {d_hi:.3f}]"),
+            (stage2_delta, -s2_scale, s2_scale,
+             f"stage 2 dx (z0+z1 dt)\nscale=[-{s2_scale:.2g}, {s2_scale:.2g}], "
+             f"corr={_fmt_corr_pct(s2_corr)}"),
             (per["a"]["pred_delta"], d_lo, d_hi,
              f"pred dx ({a['label']})\nloss={_format_small(per['a']['loss'])}, "
              f"corr={_fmt_corr_pct(per['a']['corr'])}"),
@@ -1434,8 +1451,8 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
             ax.set_title(cell_title, fontsize=8)
             ax.set_xticks([])
             ax.set_yticks([])
-            if col == 6:
-                fig.colorbar(im, ax=axes[row, 6], fraction=0.046)
+            if col == 7:
+                fig.colorbar(im, ax=axes[row, 7], fraction=0.046)
 
     med_a = float(np.median(losses["a"]))
     med_b = float(np.median(losses["b"]))

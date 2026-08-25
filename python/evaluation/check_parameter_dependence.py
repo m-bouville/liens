@@ -1634,6 +1634,28 @@ def _figure_dz0dt(results, _t_x, _dt_x, _grp, _t_label, _dt_label,
     print(f"Saved figure to {dz0dt_output_path}")
 
 
+def _ylim_from_below_cutoff(xy_curves, dt_cutoff, fallback):
+    """y-range from only the points with dt < dt_cutoff, across the given
+    (x_array, y_array) curves. Points at/above the cutoff are the
+    converged regime, where error/dt is meaningless (dz0 -> 0) and would
+    blow the range up; they stay plotted but do not set the limits.
+    Falls back to the passed-in (lo, hi) if nothing is below the cutoff
+    (e.g. cutoff is inf because no convergence was detected)."""
+    vals = []
+    for xs, ys in xy_curves:
+        xs = np.asarray(xs, dtype=float)
+        ys = np.asarray(ys, dtype=float)
+        m = np.isfinite(xs) & np.isfinite(ys) & (xs < dt_cutoff)
+        vals.extend(ys[m].tolist())
+    if not vals:
+        return fallback
+    lo, hi = min(vals), max(vals)
+    if lo == hi:            # single value / degenerate -> keep fallback span around it
+        return fallback
+    pad = 0.05 * (hi - lo)
+    return lo - pad, hi + pad
+
+
 def _build_and_save_figures(
     results: _EvaluationResults, stats: _DerivedStats, lds_checkpoint_path: Path, output_path: Path,
     dz0dt_output_path: Path, dt_dependence_output_path: Path, decode: bool, euler_only: bool,
@@ -1694,26 +1716,6 @@ def _build_and_save_figures(
         _coverage_report["dropped"] += int((~keep).sum())
         return unique_x[keep], mean_signed[keep], mean_abs[keep], n[keep]
 
-    def _ylim_from_below_cutoff(xy_curves, dt_cutoff, fallback):
-        """y-range from only the points with dt < dt_cutoff, across the given
-        (x_array, y_array) curves. Points at/above the cutoff are the
-        converged regime, where error/dt is meaningless (dz0 -> 0) and would
-        blow the range up; they stay plotted but do not set the limits.
-        Falls back to the passed-in (lo, hi) if nothing is below the cutoff
-        (e.g. cutoff is inf because no convergence was detected)."""
-        vals = []
-        for xs, ys in xy_curves:
-            xs = np.asarray(xs, dtype=float)
-            ys = np.asarray(ys, dtype=float)
-            m = np.isfinite(xs) & np.isfinite(ys) & (xs < dt_cutoff)
-            vals.extend(ys[m].tolist())
-        if not vals:
-            return fallback
-        lo, hi = min(vals), max(vals)
-        if lo == hi:            # single value / degenerate -> keep fallback span around it
-            return fallback
-        pad = 0.05 * (hi - lo)
-        return lo - pad, hi + pad
 
 
     # left=10 was correct for raw dt (whose smallest value on this sweep

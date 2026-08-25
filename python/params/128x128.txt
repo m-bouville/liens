@@ -7,14 +7,14 @@ Ny			  = 128
 val_fraction  =  0.25
 
 min_step 	  = 2000       	# skip snapshots earlier than this step
-min_stdev_phi = 0.01      	# skip snapshots whose stdev_phi is below this
-min_std_deriv = 0.15e-3		# skip time derivatives whose stdev is below this
+min_stdev_phi = 5e-3      	# was 1e-3; skip snapshots whose stdev_phi is below this
+min_std_deriv = 1.e-5		# was 1.5e-4; TARGET: 1.e-8; skip time derivatives (w.r.t. t, not its log) whose stdev is below this (for: late, converged microstructures)
 min_passing_steps= 12		# any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
-recon0_scale  = 0.17e-3
-stats0_scale  = 0.018
+recon0_scale  = 0.1e-3		# was 0.17e-3
+stats0_scale  = 0.18		# was 0.018
 
-deriv_scale   = 0.7e-6		# was 0.02e-3
+deriv_scale   = 0.2e-6		# was 0.7e-6
 interp_scale  = 0.01		# was 5.e-3
 
 # force 	      = True
@@ -54,22 +54,22 @@ augment       = False		# takes hours per epoch otherwise
 # latent_channels = 8
 
 
-# ## Stage 2a (train only z1 head, not z0: faster)
-# stage2a	  	= True		# was implicitly False
-# batches   	= 384		# can be larger for `stage2a`
-# lr 		  	= 5.e-4  	# can be larger for `stage2a`: 5.e-4, instead of 1.e-4
+## Stage 2a (train only z1 head, not z0: faster)
+stage2a	  	= True		# was implicitly False
+batches   	= 384		# can be larger for `stage2a`
+lr 		  	= 1.e-4  	# was 5.e-4; can be larger for `stage2a`: 5.e-4, instead of 1.e-4
 # resume_from = checkpoints/stage2/128x128-stage2-20260812_20h08.pt
 
 ## or
 
-## Stage 2b (trains both z0 and z1 heads)
-stage2a			= False
-batches 	  	= 48
-lr 			  	= 1.e-4  	# was 1.e-4
+# ## Stage 2b (trains both z0 and z1 heads)
+# stage2a			= False
+# batches 	  	= 48
+# lr 			  	= 1.e-4  	# was 1.e-4
 resume_from = checkpoints/stage2/128x128-stage2-20260821_13h05.pt
 ## the following are used only if `stage2a == False`:
-trunk_from_deriv_weight=0.2
-z0_from_deriv_weight=0.05  # was 0.	# in [0, 1]: 0 means z0 is trained on reconstruction alone, not `L_deriv`
+# trunk_from_deriv_weight=0.2
+# z0_from_deriv_weight=0.05  # was 0.	# in [0, 1]: 0 means z0 is trained on reconstruction alone, not `L_deriv`
 
 
 stats0_weight   = 0.25     	# was 0.5; weight of L_stats0 relative to L_recon0
@@ -93,7 +93,7 @@ spike_skip_factor= 10
 
 val_aug_averaging= True
 
-# force 	      = True
+force 	      = True
 
 
 
@@ -112,16 +112,12 @@ bucket_refresh_epochs=0
 dynamics_mode=deriv_linear	# NEW
 time_coordinate = log10_t	# NEWER
 
-memory_cost_a_bytes= None
-memory_cost_b_bytes= None
-memory_cost_p 	   = None
-
-rollout_scale = 0.2e-6
+rollout_scale = 0.05e-6
 ae_stats_weight= 1.
 
 use_dt_decade_weights = False  # incompatible with `deriv_linear`
 
-epochs 		  = 2000	# improvements are barely noticeable after that
+epochs 		  = 4000	# improvements are barely noticeable after that
 patience 	  =  500
 
 num_workers	  =    4 	# was 4, then 0
@@ -136,9 +132,9 @@ dt_cap		  = inf		# for second order
 max_dt        = inf   # possible with `deriv_linear`
 # max_dt        = 100000   # 100'000/0.05 = 2'000'000 time steps (last: 13'000'000 -> 15'000'000)
 
-# force 	      = True
-## resume_from   = checkpoints/stage3a/128x128-stage3a.pt
-# ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260821_13h05.pt
+force 	      = True
+resume_from   = checkpoints/stage3a/128x128-stage3a-20260825_02h51.pt
+ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260821_13h05.pt
 
 
 
@@ -160,14 +156,14 @@ memory_cost_a_bytes= 120787
 memory_cost_b_bytes= 18469
 memory_cost_p      = 0.79
 
-rollout_scale  = same			# was 1e-6
+rollout_scale  = 0.25e-6			# was 1e-6
 ae_stats_weight= same
 one_step_weight= 0.5 		# was 0.5
 
 use_dt_decade_weights = False 	# incompatible with `deriv_linear`
 
-epochs 		  = 2000
-patience 	  =  200
+epochs 		  = 4000
+patience 	  =  500
 
 num_workers	  =    0
 batches		  = 3072
@@ -184,7 +180,7 @@ alpha            = None                # UNSET: deriv_linear forbids sub-steppin
 n_substeps       = 1                    # full-step
 
 
-lr 			  =   2.e-3  	# was 0.2e-4; default: 1.e-3
+lr 			  =   1.e-3  	# was 0.2e-4; default: 1.e-3
 z0_noise_scale= same
 
 dt_cap		  = same		# must be
