@@ -835,18 +835,30 @@ def train_stage2(
     print("=" * 70)
     print("Baseline (pre-stage-2): latent geometry of the stage 1 checkpoint")
     print("=" * 70)
-    check_interpolation(
-        checkpoint_path=resume_from, min_step=min_step, device=device,
-        output_path=(_PYTHON_ROOT.parent / "output" / "stage1"
-                     / f"{resume_from.stem}-pre_stage2-interpolation.png"),
-    )
-    print()
-    check_perturbation(
-        checkpoint_path=resume_from, min_step=min_step, device=device,
-        output_path=(_PYTHON_ROOT.parent / "output" / "stage1"
-                     / f"{resume_from.stem}-pre_stage2-perturbation.png"),
-    )
-    print()
+    if stage2a and interp_weight == 0:
+        # These measure z0-space geometry (stats of interpolated z0 vs encoded
+        # z2). stage2a freezes trunk/decoder/z0 and the stats head, so with no
+        # L_interp the measured quantities CANNOT change this run -- the two
+        # recent restarts printed bit-identical numbers (mean 0.0376). Minutes
+        # of repeated cost per restart, zero information: skip with a note.
+        print("  (skipping check_interpolation/check_perturbation: stage2a freezes"
+              " trunk/decoder/z0\n   and interp_weight=0, so the latent geometry"
+              " these measure cannot change this run;\n   the ancestor's numbers"
+              " stand)")
+        print()
+    else:
+        check_interpolation(
+            checkpoint_path=resume_from, min_step=min_step, device=device,
+            output_path=(_PYTHON_ROOT.parent / "output" / "stage1"
+                         / f"{resume_from.stem}-pre_stage2-interpolation.png"),
+        )
+        print()
+        check_perturbation(
+            checkpoint_path=resume_from, min_step=min_step, device=device,
+            output_path=(_PYTHON_ROOT.parent / "output" / "stage1"
+                         / f"{resume_from.stem}-pre_stage2-perturbation.png"),
+        )
+        print()
 
     # stats_head frozen (not optimized here); ae itself may also have
     # frozen outer layers (see freeze_outer_layers/n_frozen_stages) --

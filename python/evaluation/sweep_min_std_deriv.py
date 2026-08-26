@@ -94,8 +94,10 @@ def sweep(base_path, size, window_length, min_step, min_stdev_phi,
     # thresholds: TWO PER DECADE across a fixed 1e-8 .. 1e-4 range, plus the
     # current value -- the SAME grid drives both the table and the plot below.
     grid = (np.unique(np.concatenate([
-        10.0 ** (np.arange(-16, -7) / 2.0), [current]]))   # -8 .. -4 step 0.5
-        if deriv_grid is None else np.unique(np.array(deriv_grid + [current])))
+        10.0 ** (np.arange(-16, -7) / 2.0),
+        [] if current is None else [current]]))   # -8 .. -4 step 0.5
+        if deriv_grid is None else np.unique(np.array(
+            deriv_grid + ([] if current is None else [current]))))
 
     print(f"\nper-window std_space(dphi/dt) over {n} windows at min_stdev_phi="
           f"{min_stdev_phi:g}  (min={vals.min():.3e}  median={np.median(vals):.3e}  "
@@ -113,7 +115,7 @@ def sweep(base_path, size, window_length, min_step, min_stdev_phi,
     print("-" * (48 + len(t_hdr)))
     for thr in grid:
         kept = int((vals >= thr).sum())
-        mark = "  <- current" if abs(thr - current) < 1e-12 else ""
+        mark = "  <- current" if (current is not None and abs(thr - current) < 1e-12) else ""
         cells = []
         for t in targets:
             m = t_bands[t]
@@ -145,7 +147,7 @@ def sweep(base_path, size, window_length, min_step, min_stdev_phi,
             surv = np.bincount(inv, weights=(vals >= thr).astype(float), minlength=len(uniq_t))
             rate = np.where(keep_t, surv / np.maximum(counts_t, 1), np.nan)
             rate = _sma(rate, sma)
-            is_cur = abs(thr - current) < 1e-12
+            is_cur = current is not None and abs(thr - current) < 1e-12
             ax.plot(uniq_t, 100.0 * rate, "-o", ms=2,
                     color=("tab:red" if is_cur else col),
                     lw=(2.5 if is_cur else 1.2),
@@ -184,7 +186,7 @@ def main():
                    help="SWEPT threshold values (default log-spaced across the observed range)")
     p.add_argument("--max-runs", type=int, default=400,
                    help="subsample this many runs (memory holds raw frames); 0 = all")
-    p.add_argument("--current", type=float, default=0.15e-3,
+    p.add_argument("--current-value", type=float, default=None,
                    help="the min_std_deriv you're running, marked in table/plot")
     p.add_argument("--min-bin-count", type=int, default=10,
                    help="blank save-steps with fewer than this many windows (noisy rate)")
@@ -197,7 +199,7 @@ def main():
                    help="survival-curve png (default output/datasets/128x128-...)")
     a = p.parse_args()
     sweep(a.base_path, a.size, a.window_length, a.min_step, a.min_stdev_phi,
-          a.min_passing_steps, a.max_dt, a.max_runs, a.min_std_deriv, a.current, a.output,
+          a.min_passing_steps, a.max_dt, a.max_runs, a.min_std_deriv, a.current_value, a.output,
           min_bin_count=a.min_bin_count, sma=a.sma)
 
 

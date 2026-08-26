@@ -388,6 +388,7 @@ def read_statistics_csv(path: str | Path) -> pd.DataFrame:
     return df.set_index("step")
 
 
+# OBSOLETE: no longer called anywhere; kept for now, may be removed later.
 def parse_step(filename: str | Path) -> int:
     """Extract the integer step number from a snapshot filename like 't0100000'."""
     name = Path(filename).name
@@ -402,6 +403,7 @@ def parse_step(filename: str | Path) -> int:
 # ---------------------------------------------------------------------------
 
 
+# OBSOLETE: no longer called anywhere; kept for now, may be removed later.
 def read_config(path: str | Path) -> SweepConfig:
     """Parse the sweep config.txt written before a batch of simulations.
     Simulation-sweep parameters ONLY -- min_step/min_stdev_phi/

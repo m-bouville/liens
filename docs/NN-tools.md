@@ -99,6 +99,7 @@ Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` p
 `python -m evaluation.sweep_min_passing_steps --base-path ../datasets --size 128 --max-runs 1000`
 
 Optional arguments:
-- `--sma 3` to average times (x-axis from t-1 to t+1) if the plot is too choppy;
+- `--sma 3` to average times (x-axis from t-1 to t+1) if the plot is too choppy (default 1, i.e. no moving average);
 - `--output` with path (default: `../output/datasets/128x128-min_std_deriv_sweep.png`);
-- `--min-bin-count` ignores steps with too few windows (default: 10).
+- `--min-bin-count 10` ignores steps with fewer than 10 windows (default: 10);
+- `--current-value​ 0.01` includes a curve for the value of the parameter currently used in the code, e.g. 0.01 (default: no curve).

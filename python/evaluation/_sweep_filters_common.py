@@ -64,7 +64,7 @@ def render(name, values, starts_by_value, baseline_starts, current, scale,
     print("-" * (46 + len(t_hdr)))
     for v in values:
         st = starts_by_value[v]
-        m = "  <- current" if abs(v - current) < 1e-12 else ""
+        m = "  <- current" if (current is not None and abs(v - current) < 1e-12) else ""
         cells = []
         for t in targets:
             b = base_band[t]
@@ -92,7 +92,7 @@ def render(name, values, starts_by_value, baseline_starts, current, scale,
                         for t in uniq_t])
         ret = np.where(keep_t, ret, np.nan)
         ret = _sma(ret, sma)
-        is_cur = abs(v - current) < 1e-12
+        is_cur = current is not None and abs(v - current) < 1e-12
         ax.plot(uniq_t, ret, "-o", ms=2, color=("tab:red" if is_cur else col),
                 lw=(2.5 if is_cur else 1.2),
                 label=f"{v:g}  ({100 * len(st) / base_n:.0f}%)" + ("  <- current" if is_cur else ""))

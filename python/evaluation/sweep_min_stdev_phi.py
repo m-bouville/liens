@@ -39,7 +39,8 @@ def main():
                    default=[0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3],
                    help="SWEPT (displayed rows). Retention denominator is the NO-FILTER "
                         "population, computed separately, so these are fraction-of-all-windows")
-    p.add_argument("--current", type=float, default=0.01, help="value marked in table/plot")
+    p.add_argument("--current-value", type=float, default=None,
+                   help="optional: value to mark '<- current' in table/plot")
     p.add_argument("--max-runs", type=int, default=0, help="0 = all runs")
     p.add_argument("--min-bin-count", type=int, default=10)
     p.add_argument("--sma", type=int, default=3)
@@ -74,7 +75,7 @@ def main():
                               min_stdev_phi=msp, min_passing_steps=a.min_passing_steps)
         starts[msp] = window_start_times(gs, dts, a.window_length, a.max_dt)
 
-    render("min_stdev_phi", values, starts, baseline_starts, a.current, scale,
+    render("min_stdev_phi", values, starts, baseline_starts, a.current_value, scale,
            frac, f"min_passing_steps={a.min_passing_steps}", a.output,
            min_bin_count=a.min_bin_count, sma=a.sma,
            baseline_label="no filter, min_stdev_phi=0")

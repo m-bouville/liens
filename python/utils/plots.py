@@ -90,7 +90,6 @@ def should_write_loss_figure(epoch: int, log_every_epoch: bool, every: int = LOS
     epoch 0) still produces its figures either way.
     """
     return log_every_epoch or epoch % every == 0
-    return epoch % every == 0
 
 
 def write_loss_history(output_path: Path, epochs: list[int], train_loss: list[float],
@@ -684,6 +683,10 @@ def show_snapshot(path: str | Path, nx: int, ny: int,
     return ax
 
 
+# NOTE: called nowhere in the codebase, but kept for direct use from the
+# command line / an interactive session: do not remove. (Reported not
+# working as of 2026-08; works in isolation on synthetic data, failure
+# mode not yet pinned down -- see session notes.)
 def make_video(run_dir: str | Path, metadata: "load.RunMetadata", output_path: str | Path,
                 fps: int = 10, cmap: str = "RdBu", vmin: float | None = None,
                 vmax: float | None = None):
