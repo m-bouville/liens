@@ -165,6 +165,18 @@ def _upsert_registry(registry_path: Path, checkpoint_path: Path, params: dict,
     params = {k: _resolve_checkpoint_field(k, str(v)) for k, v in params.items()}
     backfill_defaults = backfill_defaults or {}
     fieldnames, rows = _read_registry(registry_path)
+    for row in rows:
+        # A line with MORE fields than the header (e.g. written by a run whose
+        # signature grew without this rewrite) makes DictReader stuff the extras
+        # under key None -- and DictWriter then refuses the whole rewrite
+        # ("dict contains fields not in fieldnames: None"), crashing the save
+        # callback mid-training. The extras are unattributable (no column
+        # name), so drop them; this rewrite then normalizes the file.
+        extras = row.pop(None, None)
+        if extras is not None:
+            print(f"  registry NOTE: {registry_path.name} row "
+                  f"'{row.get('checkpoint_path', '?')}' had {len(extras)} field(s) "
+                  f"beyond the header ({extras}); dropped, file normalized on this save")
     if not fieldnames:
         fieldnames = ["checkpoint_path"]
     new_keys = [k for k in params.keys() if k not in fieldnames]

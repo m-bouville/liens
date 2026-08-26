@@ -1743,7 +1743,15 @@ def train_stage2(
             # without this there was no way to tell WHICH epoch a given .pt is.
             msg += f" at {time.strftime('%H:%M')}"
             if on_checkpoint_saved is not None:
-                on_checkpoint_saved(checkpoint_path, epoch)
+                try:
+                    on_checkpoint_saved(checkpoint_path, epoch)
+                except Exception as e:
+                    # Bookkeeping must never kill training: a failed registry
+                    # upsert crashed one real run BETWEEN the save and the epoch
+                    # line (checkpoint one epoch newer than the log). Announce
+                    # and continue -- a lost registry row, never a lost run.
+                    print(f"  WARNING: on_checkpoint_saved failed "
+                          f"({type(e).__name__}: {e}) -- continuing training")
         elif not was_in_grace_period:
             epochs_since_improvement += 1
         # During a grace window should_save is UNCONDITIONALLY False (see
