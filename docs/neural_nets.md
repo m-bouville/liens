@@ -1,7 +1,7 @@
 # Neural networks: autoencoder and surrogate evolution
 
 
-See [./docs/NN-code_structure.md](`docs/NN-code_structure.md`) (written by Claude) for more details on the structure of the code.
+See [./docs/NN-code_structure.md](NN-code_structure.md) (written by Claude) for more details on the structure of the code.
 
 
 
@@ -67,7 +67,7 @@ Currently, the first type works more reliably than the other.
 |---|-----------------|------------|-----------|----------------------------|
 | 1 | autoencoder (C${}_0$)| $x_0$ | $z_0$ | $D[z_0(t)] \approx x_0(t)$ |
 | 2 | derivative (C${}_1$) | $x_0$ | $z_1$ | $z_0(t) + z_1(t)\,\delta t \approx z_0(t+\delta t)$, i.e. $z_1(t) \approx \dot{z}_0(t)$; while maintaining $D[z_0(t)] \approx x_0(t)$ |
-| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^\ast$ | $z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t), Delta t) \, \Delta t \approx z_0(t+\Delta t)$ |
+| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^\ast$ | $z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t), \Delta t) \, \Delta t \approx z_0(t+\Delta t)$ |
 | 3b | LDS, rollout   |        "        | "    |  as 3a, chained, + $z_1(t) + f_\theta(z_0(t), z_1(t))\,\delta t + g_\theta(z_0(t), z_1(t)) \,(\delta t^2/2) \approx z_1(t+\delta t)$ |
 
 Note:
@@ -234,6 +234,7 @@ Since the autoencoder is frozen in stages 3a and 3b, the latent representation o
 ### fθ and dz1 / dt
 $f_\theta$ does not need to be trained to the first-order term, it only needs to learn $\ddot{z}_0$ (curvature, ${}\approx \dot{z}_1$), plus the gap between $z_1$ and $\dot{z}_0$. 
 Thus $f_\theta(z_0(t), z_1(t))$ should be trained against
+
 $$[z_0(t + \Delta t) - z_0(t) - z_1(t)\,\Delta t] / \Delta t,$$
 
 with $\theta$ (currently just the temperature: in the form of $T-T_0$, and $\ln(T_0-T)$ to handle $T$ close to $T_0$) as further input.
@@ -274,9 +275,11 @@ $$z_0^{(n+1)} = z_0^{(n)} + z_1^{(n)}\,\delta t
 predictor (Euler): $\tilde{z}_1  = z_1^{(n)} + f_n\,\delta t$.
 
 Semi-implicit, not implicit: $z1^{(n+1)}$ appears inside $f_{n+1}$, and that dependence is resolved by the Euler predictor $\tilde z_1$ rather than by a solve. Nothing is evaluated at a state that has not yet been computed.
+
 $$f_{n+1} = f_\theta\left(z_0^{(n+1)},\, \tilde z_1,\, \theta\right).$$
 
 corrector (trapezoidal):
+
 $$  z_1^{(n+1)} = z_1^{(n)} + \frac{f_n + f_{n+1}}{2}\,\delta t.$$
 
 Stage 3a uses only one step, `L_1step`, whereas stage 3b involves several consecutive steps (`L_rollout`)​.
@@ -300,7 +303,7 @@ D is frozen, even though `L_recon` is in the loss function: this is what disting
 
 ### Diagnostic tools
 
-See [./docs/NN-code_structure.md](`docs/NN-code_structure.md`) for command-line instructions.
+See [./docs/NN-code_structure.md](./docs/NN-code_structure.md) for command-line instructions.
 
 
 ### System size: 64×64 → 512×512
