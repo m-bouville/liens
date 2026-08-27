@@ -24,10 +24,11 @@ Training the AE (stage 1) ensures that the microstructure (the state) can be rec
 
 ### Split latent space
 One wants to get a latent representation which could reconstruct, while preserving internal logic. We introduce a split latent channel:
-- C${}_0$ encodes the microstructure (the "state", 0th order): $z_0(t)$ is such that $D(z_0(t))$ recovers $x_0(t)$;
-- C${}_1$ encodes the time derivative (1st order): $\mathrm{d}z_0 / \mathrm{d}t = \dot{z}_0$ (unlike C${}_0$, C${}_1$ is not decoded: it works purely in latent space). 
+- $z_0$ encodes the microstructure (the "state", 0th order): $z_0(t)$ is such that $D(z_0(t))$ recovers $x_0(t)$;
+- $z_1$ encodes the time derivative (1st order): $\mathrm{d}z_0 / \mathrm{d}t = \dot{z}_0$ (unlike $z_0$, $z_1$ is not decoded: it works purely in latent space). 
 
 A Taylor expansion of $z_0$ gives
+
 $$z_0(t + \delta t) = z_0(t) + \dot{z}_0(t)\,\delta t + \ddot{z}_0(t)\,(\delta t^2/2) + o(\delta t^2).$$
 
 The idea is to replace $\dot{z}_0$ with $z_1$ by training in stage 2, and $\ddot{z}_0$ with $f_\theta$ (stage 3).
@@ -65,8 +66,8 @@ Currently, the first type works more reliably than the other.
 
 | \# | stage          | input      | output    | aim                        |
 |---|-----------------|------------|-----------|----------------------------|
-| 1 | autoencoder (C${}_0$)| $x_0$ | $z_0$ | $D[z_0(t)] \approx x_0(t)$ |
-| 2 | derivative (C${}_1$) | $x_0$ | $z_1$ | $z_0(t) + z_1(t)\,\delta t \approx z_0(t+\delta t)$, i.e. $z_1(t) \approx \dot{z}_0(t)$; while maintaining $D[z_0(t)] \approx x_0(t)$ |
+| 1 | autoencoder ($z_0$)| $x_0$ | $z_0$ | $D[z_0(t)] \approx x_0(t)$ |
+| 2 | derivative ($z_1$) | $x_0$ | $z_1$ | $z_0(t) + z_1(t)\,\delta t \approx z_0(t+\delta t)$, i.e. $z_1(t) \approx \dot{z}_0(t)$; while maintaining $D[z_0(t)] \approx x_0(t)$ |
 | 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^\ast$ | $z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t), \Delta t) \, \Delta t \approx z_0(t+\Delta t)$ |
 | 3b | LDS, rollout   |        "        | "    |  as 3a, chained, + $z_1(t) + f_\theta(z_0(t), z_1(t))\,\delta t + g_\theta(z_0(t), z_1(t)) \,(\delta t^2/2) \approx z_1(t+\delta t)$ |
 
@@ -93,11 +94,11 @@ What is concretely used in the loss function: `XX_weight * L_XX / XX_scale`.
 
 | \#| Stage             | Trained | Frozen | Unused | Space | Snapshots | Loss                            |
 |---|-------------------|--------------|------|------|-------|-------|---------------------------------|
-| 1 a| autoencoder (C${}_0$)|E, D, SH|   | f    | real  | 1    | `L_recon0 + λ L_stats0`           |
-| 2 | derivative (C${}_1$) |E${}^\ast$, D${}^\ast$| SH | f | both | 3 | `L_recon0 + λ L_stats0 + λ₁ L_deriv + ε L_interp` |
+| 1 a| autoencoder ($z_0$)|E, D, SH|   | f    | real  | 1    | `L_recon0 + λ L_stats0`           |
+| 2 | derivative ($z_1$) |E*, D*| SH | f | both | 3 | `L_recon0 + λ L_stats0 + λ₁ L_deriv + ε L_interp` |
 | 3a| LDS               | f       | E, SH | D | latent| 2    | `L_1step + λ₁ L_deriv`           |
 | 3b| LDS               | f       | E, SH | D | latent| $n+1$  | `L_rollout + ε L_1step + λ₁ L_deriv` |
-| 4 | encoder refinement| E, f  | D, SH|  | latent${}^\dagger$|$n+1$|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
+| 4 | encoder refinement| E, f  | D, SH|  | latent†|$n+1$|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
 | 5 | end-to-end        | E, f, D | SH  |      | real  | $n+1$ | `L_recon + λ L_stats + λ₂ L_rollout + λ₁ L_deriv` |
 
 Notes:
@@ -123,20 +124,19 @@ The encoder terminates with a 1×1 convolution reducing the feature dimension to
 ### Dataset expansion
 From each snapshot, more are created through
 - mirror (horizontal and vertical);
-- rotation by ${}\pm$90°, 180°;
+- rotation by ±90°, 180°;
 - transposing;
 - translation by (Nx/2, 0), (0, Ny/2), (Nx/2, Ny/2) thanks to periodic boundaries
 
 
 ### Reconstruction loss
-Compare $x' = D(E(x))$, the microstructure recovered by the AE, to $x$:
-$$L_\mathrm{recon} = \left\| x' - x \right\|_2^2.$$
-
+Compare $x' = D(E(x))$, the microstructure recovered by the AE, to $x$: $L_\mathrm{recon} = \left\| x' - x \right\|_2^2$. 
 This is done in real space. $L_1$ may be used if sharper interfaces are desired.
 
 
 ### Physics-informed statistics loss
 Letting $s_i(x)$ denote the normalized _i_-th (out of $N_s$) microstructural statistic (measured, real), $g_i(z)$ the value of that normalized statistic in the `stats_head` (latent) and $w_i$ its weight,
+
 $$L_\mathrm{stats} = \sum_{i=1}^{N_s} w_i \left[g_i(z) - s_i(x)\right]^2.$$
 
 (Currently, $w_i \forall i$.) 
@@ -180,6 +180,7 @@ Linear(16 → Ns)
 
 #### Anisotropy
 Compute, pixel by pixel, 
+
 $$J_\sigma = G_\sigma \ast \left(\nabla z\ \nabla z^{\top}\right),$$
 
 with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ and eigenvectors $v_1$ and $v_2$. Derive:
@@ -193,18 +194,20 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 
 
 ### Derivative loss
-The goal of stage 2 is to have a meaningful latent representation of the relationship between C${}_0$ and C${}_1$, $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against (something like) $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can have the prediction 
+The goal of stage 2 is to have a meaningful latent representation of the relationship between $C_0$ and $C_1$, $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against (something like) $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can have the prediction 
+
 $$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
 
 This involves adding `L_deriv` to the loss function of stage 1 (with a paired-window dataset for derivative calculation). Note: in stage 1 the small dense NN for the statistics is trained along the encoder and decoder, in 2 it is frozen.
 
-In stage 2, we are changing the latent representation, while maintaining the reconstruction of C${}_0$. We can freeze the outter layers of both encoder and decoder (not those close to the latent space) for regularization.
+In stage 2, we are changing the latent representation, while maintaining the reconstruction of $z_0$. We can freeze the outter layers of both encoder and decoder (not those close to the latent space) for regularization.
 
 #### Calculating the derivative
 To be precise, we use a symmetric, second-order discretization. We expand $z_0(t+\Delta t_+)$ and $z_0(t-\Delta t_-)$. The weighted sum, $z_0(t+\Delta t_+) / {\Delta t_+}^2 - z_0(t-\Delta t_-) / {\Delta t_-}^2$, removes the second-order term, and one finally obtains 
+
 $$\dot{z}_0(t)  =
-{} \frac{z_0(t+\Delta t_+) \, {\Delta t_-}^2 - z_0(t-\Delta t_-) \, {\Delta t_+}^2 - z_0(t) ( {\Delta t_-}^2 - {\Delta t_+}^2) }{(\Delta t_+ + \Delta t_-)\Delta t_+ \, \Delta t_- }
-{} + o(\Delta t_+) + o(\Delta t_-).$$
+ \frac{z_0(t+\Delta t_+) \, {\Delta t_-}^2 - z_0(t-\Delta t_-) \, {\Delta t_+}^2 - z_0(t) ( {\Delta t_-}^2 - {\Delta t_+}^2) }{(\Delta t_+ + \Delta t_-)\Delta t_+ \, \Delta t_- }
+ + o(\Delta t_+) + o(\Delta t_-).$$
 
 $z_1(t)$ is trained against this.
 
@@ -239,6 +242,7 @@ $$[z_0(t + \Delta t) - z_0(t) - z_1(t)\,\Delta t] / \Delta t,$$
 
 with $\theta$ (currently just the temperature: in the form of $T-T_0$, and $\ln(T_0-T)$ to handle $T$ close to $T_0$) as further input.
 Finally,
+
 $$z_0(t + \delta t) \approx z_0(t) + z_1(t)\,\delta t + f_\theta(z_0(t), z_1(t), \delta t) \, \delta t.$$
 
 In practice, the second order is not multiplied by $\delta t ^2$ but by  $\min(\delta t, \delta t_\mathrm{cap})^2$, to avoid the risk of a blow-up at large $\delta t$.
@@ -246,15 +250,18 @@ In practice, the second order is not multiplied by $\delta t ^2$ but by  $\min(\
 
 ### One-step latent prediction loss
 Compare the prediction to the ground truth in latent space:
+
 $$L_\mathrm{1step} = \left\| z_0(t+\Delta t) - [z_0(t) + z_1(t)\, \Delta t] \right\|_2^2.$$
 
 Doing so in latent space avoids reliance on the decoder, cleanly separating decoder loss and prediction loss.
 
 ### Multi-step rollout loss
 By having several predictions in a row, we let error accumulate:
+
 $$z_0(t_{k}) \xrightarrow{f} \hat{z}_0(t_{k+1}) \xrightarrow{f} \hat{z}_0(t_{k+2}) \xrightarrow{f} \hat{z}_0(t_{k+3}) \xrightarrow{f} \ldots.$$
 
 When starting from the snapshot at time $t_k$, the rollout loss is:
+
 $$L_\mathrm{rollout} = \sum_{i=1}^{N_r} \left\| \hat{z}_0(t_k + i \Delta t) - z_0(t_k + i \Delta t) \right\|_2^2,$$
 
 where $\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \Delta t)\,\Delta t + f_\theta(t_k + i \Delta t) \, \delta t$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)

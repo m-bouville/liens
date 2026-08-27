@@ -20,7 +20,7 @@ The model uses an autoencoder (AE) based on convolutional neural networks (CNN).
 - encode: $z_0 = E(x)$,
 - decode: $x'= D(z_0)$, i.e. $D(E(x_0))$.
 
-The convolutional autoencoder has a symmetric encoder–decoder architecture. The latent representation retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. For details on the architecture of the autoencoder, see [./docs/NN-neural_nets.md](docs/NN-neural_nets.md) and [./docs/NN-code_structure.md](docs/NN-code_structure.md).
+The convolutional autoencoder has a symmetric encoder–decoder architecture. The latent representation retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. For details on the architecture of the autoencoder, see [./docs/neural_nets.md](docs/neural_nets.md) and [./docs/NN-code_structure.md](docs/NN-code_structure.md).
 
 
 ## Latent representation
@@ -45,7 +45,7 @@ The underlying hypothesis is two-fold. Phase-field evolution occurs on a smooth 
 
 For phase-field systems, the latent variables are expected to behave similarly to coordinates on a reduced thermodynamic manifold, dynamics should approximate gradient flow.
 
-See [./docs/NN-neural_nets.md](docs/NN-neural_nets.md) for the full derivation, including the Taylor expansions.
+See [./docs/neural_nets.md](docs/neural_nets.md) for the full derivation, including the Taylor expansions.
 
 
 ## Process
@@ -57,7 +57,7 @@ In fact, the encoding occurs only once at the beginning and the decoding once at
 
 $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\theta} z(2 \delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(T).$$
 
-(Writing $z$ loosely for the full latent state $(z_0,\ z_1)$; see [./docs/NN-neural_nets.md](docs/NN-neural_nets.md) for the actual split-stream mechanics.)
+(Writing $z$ loosely for the full latent state $(z_0,\ z_1)$; see [./docs/neural_nets.md](docs/neural_nets.md) for the actual split-stream mechanics.)
 
 
 ```text
@@ -94,7 +94,7 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\t
 ## Workflow
 0.	Generate several thousands of  phase-field simulations. 
 1.	Train a CNN autoencoder on individual microstructures (no time evolution yet) to learn a latent representation that is reconstructive and physically descriptive.
-2.  Train a second latent stream, $z_1$, to represent $\dot{z}_0$ via a derivative loss (see [./docs/NN-neural_nets.md](docs/NN-neural_nets.md) for more details).
+2.  Train a second latent stream, $z_1$, to represent $\dot{z}_0$ via a derivative loss (see [./docs/neural_nets.md](docs/neural_nets.md) for more details).
 3.	Freeze the encoder and train the Latent Dynamics Surrogate (LDS) to predict future microstructures in latent space. (Two sub-steps: 3a and 3b.)
 4.	Fine-tune the encoder and the LDS for prediction, including a small input from reconstruction.
 5.	Fine-tune the latent representation and the LDS to both predict future microstructures and reconstruct the original microstructure.

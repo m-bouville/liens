@@ -4,21 +4,29 @@ Phase-field simulations are implemented in C++ using the STL to generate trainin
 
 ## High-level choices
 The phase-field model is based on the Landau–Ginzburg free-energy functional,
-$$F[\phi] = \!\int_\Omega \left[f(\phi,T) + \frac{\kappa}{2} \lvert\nabla\phi\rvert^2
-\right]\!dV.$$
+
+$$F[\phi] = \int_\Omega \left[f(\phi,T) + \frac{\kappa}{2} \lvert\nabla\phi\rvert^2
+\right]dV.$$
+
 Its local free-energy density is given by a temperature-dependent Landau potential:
-$$f(\phi,T) = \frac{a(T)}{2}\phi^2 + \frac{b}{4}\phi^4\!,$$
+
+$$f(\phi,T) = \frac{a(T)}{2}\phi^2 + \frac{b}{4}\phi^4,$$
+
 where $a(T)=a_0(T-T_0)$. Its derivative is $\frac{\partial f}{\partial\phi} = a(T)\phi + b\phi^3$. 
 
 Above the critical temperature $T_0$, the potential has a single minimum at $\phi=0$. Below $T_0$, it becomes a symmetric double well: minima at $\pm \sqrt{a_0(T_0-T)/b}$ and a maximum at 0. The potential at the minima is $-a^2(T)/(4b)$.
 Dedimensionalization: $T_0$ and $b$ are typically set to 1 without loss of generality.
 
 A single non-conserved order parameter is evolved using the Allen–Cahn equation:
-$$\frac{\partial\phi}{\partial t} = M\!\left(\!\kappa\nabla^2\phi - \frac{\partial f}{\partial\phi}\right)\!\!.$$
+
+$$\frac{\partial\phi}{\partial t} = M\left(\kappa\nabla^2\phi - \frac{\partial f}{\partial\phi}\right).$$
+
 Here $M$ is the mobility, it is (at least initially) temperature-independent. The Cahn–Hilliard equation (conserved) may be run later if and when a latent-space model is shown to learn phase-field evolution. 
 
 Simulations are performed on two-dimensional periodic domains. The chemical potential is computed as 
+
 $$\mu = \frac{\partial f}{\partial \phi} - \kappa\,\nabla^2 \phi,$$
+
 after which the Allen–Cahn equation is integrated using an explicit forward-Euler time step. A Fourier pseudo-spectral discretization (FFTW) may be implemented later (but this is not a priority).
 During simulation, total free energy is computed every saved timestep and should decrease monotonically.
 
@@ -39,7 +47,7 @@ The larger the system the longer computing a single step takes. But larger syste
 
 
 ### Initial conditions
-Initial conditions consist of a homogeneous state perturbed by uniform white noise in [$-$`noise`/2, `noise`/2] (the parameter `noise` is set in the configuration file). Different seeds are also used in `config.txt`.
+Initial conditions consist of a homogeneous state perturbed by uniform white noise in [-`noise`/2, `noise`/2] (the parameter `noise` is set in the configuration file). Different seeds are also used in `config.txt`.
 
 
 ## Input parameter file
@@ -59,7 +67,7 @@ Simulation parameters are stored in a plain text file at `./config.txt`. Its for
 ## Storing simulation results
 Simulation results are stored in binary format (no need for human access) readable in Python. Half precision (`float16`) values are used to reduce storage requirements while preserving sufficient numerical accuracy for neural-network training. 
 
-There is one subdirectory for each simulation run, containing one binary file per stored snapshot (named by time index). Subdirectories are named by system size, then by parameters (temperature, initial conditions): `/datasets/256x256/T980_n050_s97/t0001100`for $T=0.980$, noise amplitude of 0.050 and 97 for seed. Unlike a single file for the whole trajectory, this allows random access to individual snapshots during autoencoder training while preserving temporal ordering for training the latent surrogate model.
+There is one subdirectory for each simulation run, containing one binary file per stored snapshot (named by time index). Subdirectories are named by system size, then by parameters (temperature, initial conditions): `/datasets/256x256/T980_n050_s97/t0001100` for $T=0.980$, noise amplitude of 0.050 and 97 for seed. Unlike a single file for the whole trajectory, this allows random access to individual snapshots during autoencoder training while preserving temporal ordering for training the latent surrogate model.
 
 Physics-based statistics are also computed (see `./neural_nets.md` for more details).
 
