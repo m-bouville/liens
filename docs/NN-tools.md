@@ -3,6 +3,8 @@
 ## Tests
 `pytest -n 4 tests/ -q`, or `pytest -n 4 tests/ -q -m "not slow"` to skip the longer tests.
 
+Note: Two checkpoint binaries required for the test suite (32x32-stage2.pt, architecture_v1_golden_master.pt) are not distributed; contact the author.
+
 
 
 ## datasets (not models)
@@ -45,7 +47,7 @@ Note: `python -m evaluation.compare_f_theta --trajectory` (above) also returns m
 #### find_windows
 `python -m evaluation.find_windows --base ../datasets --size 128   --dt 125 --theta0 -0.28 --min-step 2000 --min-stdev-phi 0.01   --min-passing-steps 12`
 Then
-`python -m evaluation.check_rollout --lds-checkpoint checkpoints/stage3b/128x128-stage3b.pt --no-z1-resync  --min-step 1500 --min-stdev-phi 0.01 --fixed-windows   ..\datasets\128x128\T725_n003_s123:15000:17500:20000 ..\datasets\128x128\T725_n003_s131:15000:17500:20000 ..\datasets\128x128\T725_n003_s191:15000:17500:20000 ..\datasets\128x128\T725_n003_s401:15000:17500:20000 ..\datasets\128x128\T725_n003_s599:15000:17500:20000 ..\datasets\128x128\T725_n003_s79:15000:17500:20000`
+`python -m evaluation.check_rollout --lds-checkpoint checkpoints/stage3b/128x128-stage3b.pt --no-z1-resync  --min-step 1500 --min-stdev-phi 0.01 --fixed-windows   ../datasets/128x128/T725_n003_s123:15000:17500:20000 ../datasets/128x128/T725_n003_s131:15000:17500:20000 ../datasets/128x128/T725_n003_s191:15000:17500:20000 ../datasets/128x128/T725_n003_s401:15000:17500:20000 ../datasets/128x128/T725_n003_s599:15000:17500:20000 ../datasets/128x128/T725_n003_s79:15000:17500:20000`
 
 
 

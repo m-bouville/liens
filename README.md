@@ -1,5 +1,5 @@
 # LIENS — Latent Interface Evolution Neural Surrogate
-## A latent-space neural surrogate for phase-field microstructure evolution
+## A latent-space neural emulator for Allen–Cahn phase-field microstructure evolution
 
 
 This project investigates neural-network surrogate models for phase-field microstructure evolution in materials science and engineering (MSE). Instead of repeatedly solving the governing partial differential equations (PDE), a neural network (NN) learns a reduced-order representation of the phase-field state together with a surrogate evolution operator acting in that latent space. The objective is to use this mapping between successive microstructures to accelerate phase-field simulations while preserving the underlying physics.
@@ -9,7 +9,7 @@ This project investigates neural-network surrogate models for phase-field micros
 ## A quick introduction to phase field
 Phase-field simulates the evolution of microstructures without explicitly tracking sharp interfaces (e.g. grain boundaries). Instead the method introduces one or more continuous order parameters (OP) that vary smoothly across space, so that interfaces have a finite width. These fields take different equilibrium values in different phases. The evolution of the system is typically governed by PDEs describing gradient flow of a free-energy functional: the Cahn-Hilliard equation is used for conserved OP (e.g. composition) and Allen-Cahn if not conserved (phases).
 
-For details (equations, implementation), see `./docs/phase_field.md`.
+For details (equations, implementation), see [./docs/phase_field.md](`docs/phase_field.md`).
 
 
 
@@ -20,7 +20,7 @@ The model uses an autoencoder (AE) based on convolutional neural networks (CNN).
 - encode: $z_0 = E(x)$,
 - decode: $x'= D(z_0)$, i.e. $D(E(x_0))$.
 
-The convolutional autoencoder has a symmetric encoder–decoder architecture. The latent representation retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. For details on the architecture of the autoencoder, see `./docs/neural_nets.md` and `./docs/NN-code_structure.md`.
+The convolutional autoencoder has a symmetric encoder–decoder architecture. The latent representation retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. For details on the architecture of the autoencoder, see [./docs/NN-neural_nets.md](`docs/NN-neural_nets.md`) and [./docs/NN-code_structure.md](`docs/NN-code_structure.md`).
 
 
 ## Latent representation
@@ -30,6 +30,7 @@ The latent representation is split into two streams:
 
 A Latent Dynamics Surrogate (LDS), $f_\theta$, predicts the next state from both:
 $$z_0(t + \delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(z_0(t), z_1(t), \theta)\,\delta t^2/2,$$
+
 with $\theta$ physical parameters (e.g. temperature). $z_1(t)\,\delta t$ is the first-order (linear) term; $f_\theta$ predicts the second-order (curvature) correction on top of it. 
 
 As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\delta t$ a multiple of the phase-field time step) — in practice the second-order term is capped for large $\delta t$, to avoid a blow-up.
@@ -43,16 +44,17 @@ The underlying hypothesis is two-fold. Phase-field evolution occurs on a smooth 
 
 For phase-field systems, the latent variables are expected to behave similarly to coordinates on a reduced thermodynamic manifold, dynamics should approximate gradient flow.
 
-See `./docs/neural_nets.md` for the full derivation, including the Taylor expansions.
+See [./docs/NN-neural_nets.md](`docs/NN-neural_nets.md`) for the full derivation, including the Taylor expansions.
 
 
 ## Process
 The process is:
 $$x(t) \xrightarrow{E} z(t) \xrightarrow{f_\theta} z(t+\delta t) \xrightarrow{D} x(t+\delta t).$$
+
 In fact, the encoding occurs only once at the beginning and the decoding once at the end (plus when plots are needed):
 $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\theta} z(2 \delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(T).$$
 
-(Writing $z$ loosely for the full latent state $(z_0,\ z_1)$; see `./docs/neural_nets.md` for the actual split-stream mechanics.)
+(Writing $z$ loosely for the full latent state $(z_0,\ z_1)$; see [./docs/NN-neural_nets.md](`docs/NN-neural_nets.md`) for the actual split-stream mechanics.)
 
 
 ```text
@@ -89,7 +91,7 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\t
 ## Workflow
 0.	Generate several thousands of  phase-field simulations. 
 1.	Train a CNN autoencoder on individual microstructures (no time evolution yet) to learn a latent representation that is reconstructive and physically descriptive.
-2.  Train a second latent stream, $z_1$, to represent $\dot{z}_0$ via a derivative loss (see `./docs/neural_nets.md` for more details).
+2.  Train a second latent stream, $z_1$, to represent $\dot{z}_0$ via a derivative loss (see [./docs/NN-neural_nets.md](`docs/NN-neural_nets.md`) for more details).
 3.	Freeze the encoder and train the Latent Dynamics Surrogate (LDS) to predict future microstructures in latent space. (Two sub-steps: 3a and 3b.)
 4.	Fine-tune the encoder and the LDS for prediction, including a small input from reconstruction.
 5.	Fine-tune the latent representation and the LDS to both predict future microstructures and reconstruct the original microstructure.
@@ -117,7 +119,7 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\t
 └── README.md 				# written by hand
 ```
 
-For more details on the structure of the `python` directory, see `./docs/NN-code_structure.md`.
+For more details on the structure of the `python` directory, see [./docs/NN-code_structure.md](`docs/NN-code_structure.md`).
 
 
 
@@ -126,8 +128,8 @@ For more details on the structure of the `python` directory, see `./docs/NN-code
 ### For those who like checklists
 - [X] C++ phase-field solver
 - [X] Dataset generation
-- [X] 1. CNN autoencoder (C$_0$)
-- [X] 2. Derivative (C$_1$)
+- [X] 1. CNN autoencoder `C0`
+- [X] 2. Derivative `C1`
 - [X] 3. Latent dynamics surrogate
 - [X] 4-5. End-to-end training
 - [X] Obtaining satisfactory results for short times
