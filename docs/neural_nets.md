@@ -29,7 +29,7 @@ One wants to get a latent representation which could reconstruct, while preservi
 
 A Taylor expansion of $z_0$ gives
 
-$$z_0(t + \delta t) = z_0(t) + \dot{z}_0(t)\,\delta t + \ddot{z}_0(t)\,(\delta t^2/2) + o(\delta t^2).$$
+$$z_0(t + \delta t) = z_0(t) + \dot{z}_0(t) \delta t + \ddot{z}_0(t) (\delta t^2/2) + o(\delta t^2).$$
 
 The idea is to replace $\dot{z}_0$ with $z_1$ by training in stage 2, and $\ddot{z}_0$ with $f_\theta$ (stage 3).
 
@@ -46,6 +46,19 @@ The idea, in stage 3b, is to mimic inference on an unknown time evolution, where
 If $\delta t$ is small enough, error can be contained. Note: at $\delta t \to 0$, the convergence is towards a model, not an underlying truth (e.g. phase field).
 
 
+### Stepping in log-time (the `u`-scheme)
+The microstructure does not evolve according to a linear clock. This is why the phase-field simulations save with an incresing $\Delta t$ step.
+
+The *u-scheme* steps in log-time. We define
+
+$$u = \log_{10} t, \qquad \Delta u = \log_{10}(t_\mathrm{end}/t_\mathrm{start}),$$
+
+and train $f_\theta$ to advance $z_0$ by $\Delta u$ rather than $\Delta t$. A fixed $\Delta u$ corresponds to a geometric step in physical time.
+
+Two first consequence is that the derivative rescales: since
+$\mathrm{d}z_0/\mathrm{d}u = \ln(10)\, t \, \mathrm{d}z_0/\mathrm{d}t$, 
+the stored derivative latent becomes $\tilde{z}_1 = \ln(10)\, t\, z_1$ (the dataset applies this at construction). 
+Second, the loss weighting must stay in physical time: $f_\theta$ steps in $\Delta u$, but $L_\mathrm{rollout}$ and its per-decade weights are computed against the physical $\Delta t$ ($\Delta u$ is nearly constant). 
 
 
 ## The pipeline at a glance
@@ -67,9 +80,9 @@ Currently, the first type works more reliably than the other.
 | \# | stage          | input      | output    | aim                        |
 |---|-----------------|------------|-----------|----------------------------|
 | 1 | autoencoder ($z_0$)| $x_0$ | $z_0$ | $D[z_0(t)] \approx x_0(t)$ |
-| 2 | derivative ($z_1$) | $x_0$ | $z_1$ | $z_0(t) + z_1(t)\,\delta t \approx z_0(t+\delta t)$, i.e. $z_1(t) \approx \dot{z}_0(t)$; while maintaining $D[z_0(t)] \approx x_0(t)$ |
-| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^\ast$ | $z_0(t) + z_1(t)\,\Delta t + f_\theta(z_0(t), z_1(t), \Delta t) \, \Delta t \approx z_0(t+\Delta t)$ |
-| 3b | LDS, rollout   |        "        | "    |  as 3a, chained, + $z_1(t) + f_\theta(z_0(t), z_1(t))\,\delta t + g_\theta(z_0(t), z_1(t)) \,(\delta t^2/2) \approx z_1(t+\delta t)$ |
+| 2 | derivative ($z_1$) | $x_0$ | $z_1$ | $z_0(t) + z_1(t) \delta t \approx z_0(t+\delta t)$, i.e. $z_1(t) \approx \dot{z}_0(t)$; while maintaining $D[z_0(t)] \approx x_0(t)$ |
+| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^\ast$ | $z_0(t) + z_1(t) \Delta t + f_\theta(z_0(t), z_1(t), \Delta t)   \Delta t \approx z_0(t+\Delta t)$ |
+| 3b | LDS, rollout   |        "        | "    |  as 3a, chained, + $z_1(t) + f_\theta(z_0(t), z_1(t)) \delta t + g_\theta(z_0(t), z_1(t))  (\delta t^2/2) \approx z_1(t+\delta t)$ |
 
 Note:
 ${}^\ast$: not yet implemented.
@@ -196,7 +209,7 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 ### Derivative loss
 The goal of stage 2 is to have a meaningful latent representation of the relationship between $C_0$ and $C_1$, $z_1 \approx \mathrm{d}z_0 / \mathrm{d}t$, by training $z_1(t)$ against (something like) $[z_0(t+\Delta t) - z_0(t)] / \Delta t$ directly (`L_deriv`). This makes latent-space arithmetic more intuitive: we can have the prediction 
 
-$$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t)\,\Delta t + \dot{z}_1(t)\,(\Delta t^2/2).$$
+$$\tilde{z}_0(t + \Delta t) = z_0(t) + z_1(t) \Delta t + \dot{z}_1(t) (\Delta t^2/2).$$
 
 This involves adding `L_deriv` to the loss function of stage 1 (with a paired-window dataset for derivative calculation). Note: in stage 1 the small dense NN for the statistics is trained along the encoder and decoder, in 2 it is frozen.
 
@@ -205,9 +218,7 @@ In stage 2, we are changing the latent representation, while maintaining the rec
 #### Calculating the derivative
 To be precise, we use a symmetric, second-order discretization. We expand $z_0(t+\Delta t_+)$ and $z_0(t-\Delta t_-)$. The weighted sum, $z_0(t+\Delta t_+) / {\Delta t_+}^2 - z_0(t-\Delta t_-) / {\Delta t_-}^2$, removes the second-order term, and one finally obtains 
 
-$$\dot{z}_0(t)  =
- \frac{z_0(t+\Delta t_+) \, {\Delta t_-}^2 - z_0(t-\Delta t_-) \, {\Delta t_+}^2 - z_0(t) ( {\Delta t_-}^2 - {\Delta t_+}^2) }{(\Delta t_+ + \Delta t_-)\Delta t_+ \, \Delta t_- }
- + o(\Delta t_+) + o(\Delta t_-).$$
+$$\dot{z}_0(t) = \frac{z_0(t+\Delta t_+) {\Delta t_-}^2 - z_0(t-\Delta t_-) {\Delta t_+}^2 - z_0(t) ( {\Delta t_-}^2 - {\Delta t_+}^2) }{(\Delta t_+ + \Delta t_-)\Delta t_+ \Delta t_- } + o(\Delta t_+) + o(\Delta t_-).$$
 
 $z_1(t)$ is trained against this.
 
@@ -218,7 +229,7 @@ One takes $t_1 < t_2 < t_3$ three successive time steps in the same simulation, 
 
 
 ### Perturbation
-Let $z_{\varepsilon} = z + \varepsilon \, \eta$, with $\eta \sim \mathcal{N}(0, 1)$. One expects that $\mathrm{stats}(z_{\varepsilon}) \approx \mathrm{stats}(z) + \varepsilon \Delta S$. So a linear regression of $\|\mathrm{stats}(z_{\varepsilon}) - \mathrm{stats}(z)\|$ with several values of $\varepsilon$ can nudge towards:
+Let $z_{\varepsilon} = z + \varepsilon   \eta$, with $\eta \sim \mathcal{N}(0, 1)$. One expects that $\mathrm{stats}(z_{\varepsilon}) \approx \mathrm{stats}(z) + \varepsilon \Delta S$. So a linear regression of $\|\mathrm{stats}(z_{\varepsilon}) - \mathrm{stats}(z)\|$ with several values of $\varepsilon$ can nudge towards:
 - intercept $\approx 0$ (no discontinuity),
 - $R^2 \approx 1$ (e.g. not curvature). 
 Variant: structured perturbations (directional latent shifts) instead of isotropic noise.
@@ -238,20 +249,21 @@ Since the autoencoder is frozen in stages 3a and 3b, the latent representation o
 $f_\theta$ does not need to be trained to the first-order term, it only needs to learn $\ddot{z}_0$ (curvature, ${}\approx \dot{z}_1$), plus the gap between $z_1$ and $\dot{z}_0$. 
 Thus $f_\theta(z_0(t), z_1(t))$ should be trained against
 
-$$[z_0(t + \Delta t) - z_0(t) - z_1(t)\,\Delta t] / \Delta t,$$
+$$[z_0(t + \Delta t) - z_0(t) - z_1(t) \Delta t] / \Delta t,$$
 
 with $\theta$ (currently just the temperature: in the form of $T-T_0$, and $\ln(T_0-T)$ to handle $T$ close to $T_0$) as further input.
 Finally,
 
-$$z_0(t + \delta t) \approx z_0(t) + z_1(t)\,\delta t + f_\theta(z_0(t), z_1(t), \delta t) \, \delta t.$$
+$$z_0(t + \delta t) \approx z_0(t) + z_1(t) \delta t + f_\theta(z_0(t), z_1(t), \delta t)   \delta t.$$
 
-In practice, the second order is not multiplied by $\delta t ^2$ but by  $\min(\delta t, \delta t_\mathrm{cap})^2$, to avoid the risk of a blow-up at large $\delta t$.
+Under the `u`-scheme (above) the same $f_\theta$ steps in $u = \log_{10} t$: read $\Delta u$ for $\Delta t$, $\tilde{z}_1 = \ln(10)\,t\,z_1$ for $z_1$, and the integration $z_0(u+\Delta u) \approx z_0 + \tilde{z}_1\,\Delta u +
+f_\theta(\cdot)\,\Delta u$ is identical in form.
 
 
 ### One-step latent prediction loss
 Compare the prediction to the ground truth in latent space:
 
-$$L_\mathrm{1step} = \left\| z_0(t+\Delta t) - [z_0(t) + z_1(t)\, \Delta t] \right\|_2^2.$$
+$$L_\mathrm{1step} = \left\| z_0(t+\Delta t) - [z_0(t) + z_1(t)  \Delta t] \right\|_2^2.$$
 
 Doing so in latent space avoids reliance on the decoder, cleanly separating decoder loss and prediction loss.
 
@@ -264,10 +276,10 @@ When starting from the snapshot at time $t_k$, the rollout loss is:
 
 $$L_\mathrm{rollout} = \sum_{i=1}^{N_r} \left\| \hat{z}_0(t_k + i \Delta t) - z_0(t_k + i \Delta t) \right\|_2^2,$$
 
-where $\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \Delta t)\,\Delta t + f_\theta(t_k + i \Delta t) \, \delta t$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
+where $\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \Delta t) \Delta t + f_\theta(t_k + i \Delta t)   \delta t$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
 
 ### Semi-implicit (predictor-corrector) velocity-Verlet
-Integration of the latent state $(z_0,\, z_1)$ over one sub-step $dt$.
+Integration of the latent state $(z_0,  z_1)$ over one sub-step $dt$.
 
 $f_\theta(z_0, z_1, \theta)$ approximates $\dot z_1 = \ddot z_0$.
 One $f_\theta$ evaluation per sub-step: $f_{n+1}$ is carried into the next step.
@@ -276,18 +288,18 @@ Measured order of convergence in $dt$: 2.00.
 
 one sub-step, $n \to n+1$
 
-$$z_0^{(n+1)} = z_0^{(n)} + z_1^{(n)}\,\delta t
-                 + f_n\,\frac{\delta t^{2}}{2}.$$
+$$z_0^{(n+1)} = z_0^{(n)} + z_1^{(n)} \delta t
+                 + f_n \frac{\delta t^{2}}{2}.$$
 
-predictor (Euler): $\tilde{z}_1  = z_1^{(n)} + f_n\,\delta t$.
+predictor (Euler): $\tilde{z}_1  = z_1^{(n)} + f_n \delta t$.
 
 Semi-implicit, not implicit: $z1^{(n+1)}$ appears inside $f_{n+1}$, and that dependence is resolved by the Euler predictor $\tilde z_1$ rather than by a solve. Nothing is evaluated at a state that has not yet been computed.
 
-$$f_{n+1} = f_\theta\left(z_0^{(n+1)},\, \tilde z_1,\, \theta\right).$$
+$$f_{n+1} = f_\theta\left(z_0^{(n+1)},  \tilde z_1,  \theta\right).$$
 
 corrector (trapezoidal):
 
-$$  z_1^{(n+1)} = z_1^{(n)} + \frac{f_n + f_{n+1}}{2}\,\delta t.$$
+$$  z_1^{(n+1)} = z_1^{(n)} + \frac{f_n + f_{n+1}}{2} \delta t.$$
 
 Stage 3a uses only one step, `L_1step`, whereas stage 3b involves several consecutive steps (`L_rollout`)​.
 
@@ -297,7 +309,7 @@ The training (stage 3b) initially used steps $\delta t = \Delta t / n_\mathrm{su
 - we rely on $\Delta t$ to scale sensibly with $t$.
 This could be unstable (low `n_substeps`) or slow (high).
 
-Every sub-step of the latent integrator advances the state by a linear term and a correction, $z_0(t+\delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(t)*\delta t$. 
+Every sub-step of the latent integrator advances the state by a linear term and a correction, $z_0(t+\delta t) = z_0(t) + z_1(t) \delta t + f_\theta(t)*\delta t$. 
 
 
 ## Stages 4 and 5: encoder refinement and end-to-end
@@ -310,7 +322,7 @@ D is frozen, even though `L_recon` is in the loss function: this is what disting
 
 ### Diagnostic tools
 
-See [./docs/NN-code_structure.md](./docs/NN-code_structure.md) for command-line instructions.
+See [./docs/NN-code_structure.md](NN-code_structure.md) for command-line instructions.
 
 
 ### System size: 64×64 → 512×512
@@ -328,26 +340,26 @@ Blocks are labelled by index and channel transition. Under same-`dx` scaling, in
 | enc down_blocks[4] (256 → 512)| —      | —       |5'901'824|5'901'824 |
 | enc down_blocks[5] (512 →1024)| —      | —       | —      |23'600'128 |
 | **TOTAL encoder** |**490'664**|**1'976'488**|**7'897'256**|**31'535'272**|
-|-------------------------------|-------:|--------:|---------:|--------:|
+|-------------------------------|--------|---------|----------|---------|
 | enc bottleneck (1×1, per stream)|1'032|    2'056 |    4'104 |   8'200 |
 | enc theta_conditioner (FiLM)  |  8'544 |  16'992 |   33'888 |  67'680 |
 | dec unbottleneck (1×1)        |  1'152 |   2'304 |    4'608 |   9'216 |
-|-------------------------------|-------:|--------:|---------:|--------:|
+|-------------------------------|--------|---------|----------|---------|
 | dec up_blocks[0] (deepest, new)|106'944| 426'880 |1'705'728|6'819'328 |
 | dec up_blocks (all shallower) | 49'600 | 156'544 |  583'424|2'288'152 |
 | dec output_conv               |    289 |     289 |      289 |     289 |
 | **TOTAL decoder**   |**157'985**|**586'017**|**2'294'049**|**9'117'985**|
-|-------------------------------|-------:|--------:|---------:|--------:|
+|-------------------------------|--------|---------|----------|---------|
 | `f_θ` (dense MLP)             |460'544 | 460'544 |  460'544 | 460'544 |
 | stats_head (dense)            |  8'344 |   8'344 |    8'344 |   8'344 |
-|-------------------------------|-------:|--------:|---------:|--------:|
+|-------------------------------|--------|---------|----------|---------|
 | **TOTAL AE + stats**|**656'993**|**2'570'849**|**10'199'649**|**40'661'601**|
-|-------------------------------|-------:|--------:|---------:|--------:|
+|-------------------------------|--------|---------|----------|---------|
 | **VRAM: activations [MB/sample]**|**29** |**115** | **460** |**1'841**|
 | **VRAM: params + Adam [MB]**   |  **10** | **39** | **156** | **620** |
 | **Max batch (fp32, 8 GB card)**| **256** | **63** |  **15** |   **3** |
 | **Max batch (fp16 activations)**|**465** |**115** |  **28** |   **6** |
-|-------------------------------|-------:|--------:|---------:|--------:|
+|-------------------------------|--------|---------|----------|---------|
 |`tau_down` (millions)          |    0.6 |     2.5 |       10 |      35 |
 
 `tau_down​` is the number of phase-field time steps needed for full coarsening. It is an indication of the length of C++ runs needed, and a potential limiting factor. (off-table: `tau_down​` = 80e3 at 32×32.)

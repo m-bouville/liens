@@ -681,7 +681,9 @@ def test_no_curve_marker_when_already_centered_at_epoch_one(tmp_path, capsys,
         "no reference level either -- an already-centered run should be "
         "annotated with the bar it started from"
     )
-    assert any("reference" in label for _, label in all_levels), all_levels
+    # the level is labelled with the ANCESTOR it started from (was generically
+    # "reference (...)"; now names the ancestor, e.g. "ancestor (26/08 at 14:55)")
+    assert any("ancestor" in label for _, label in all_levels), all_levels
 
 
 @pytest.mark.slow

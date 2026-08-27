@@ -1281,8 +1281,14 @@ def train_stage2(
         ref_deriv_sum = torch.zeros((), device=device)
         ref_interp_sum = torch.zeros((), device=device)
         n_val = len(val_set)
+        # The ancestor's val_loss (the "ref" line) runs a full validation pass
+        # BEFORE epoch 1 -- minutes at 128x128 with no output, looking hung.
+        # EpochProgress stays silent unless it's actually slow (its own delay).
+        _ref_prog = EpochProgress(len(val_loader), label="reference validation",
+                                  unit="batches")
         with torch.no_grad():
             for batch in val_loader:
+                _ref_prog.tick()
                 bs = batch[0].size(0)
                 total, recon, stats, stats1, deriv, interp_val = step(
                     batch, train=False, deriv_weight_used=deriv_weight,
@@ -1293,6 +1299,7 @@ def train_stage2(
                 ref_stats1_sum += stats1 * bs
                 ref_deriv_sum += deriv * bs
                 ref_interp_sum += interp_val * bs
+        _ref_prog.close()
         ref_total = (ref_total_sum / n_val).item()
         # The reference IS the ancestor's val_loss under this run's own
         # objective, and this pass has just measured it -- previously it was
@@ -1578,8 +1585,15 @@ def train_stage2(
         val_deriv_sum = torch.zeros((), device=device)
         val_interp_sum = torch.zeros((), device=device)
         n_val = len(val_set)
+        # Per-epoch validation pass: after the train bar finishes, this full
+        # val_loader pass runs unbarred before the epoch summary. Same silent-
+        # tail issue as the reference pass; EpochProgress self-gates on its
+        # delay, so it only shows for a genuinely slow val pass, not every epoch.
+        _val_prog = EpochProgress(len(val_loader), label="validation",
+                                  unit="batches")
         with torch.no_grad():
             for batch in val_loader:
+                _val_prog.tick()
                 bs = batch[0].size(0)
                 total, recon, stats, stats1, deriv, interp_val = step(
                     batch, train=False, deriv_weight_used=val_deriv_weight,
@@ -1590,6 +1604,7 @@ def train_stage2(
                 val_stats1_sum += stats1 * bs
                 val_deriv_sum += deriv * bs
                 val_interp_sum += interp_val * bs
+        _val_prog.close()
         val_total = (val_total_sum / n_val).item()
         val_recon = (val_recon_sum / n_val).item()
         val_stats = (val_stats_sum / n_val).item()

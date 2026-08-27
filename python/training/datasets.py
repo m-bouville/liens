@@ -5,6 +5,7 @@ PyTorch Dataset classes for loading phase-field runs off disk.
 import inspect
 import math
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -14,6 +15,17 @@ from torch.utils.data import Dataset
 
 import training.latent_cache as latent_cache
 from utils.logging_utils import format_progress_count
+
+
+def _progress_eta(done: int, total: int, t0: float) -> str:
+    """Compact '~MmSSs left' from elapsed rate, for the in-place counters below.
+    Empty until a rate exists (first tick)."""
+    el = time.monotonic() - t0
+    if done <= 0 or el <= 0:
+        return "estimating"
+    rem = el / done * (total - done)
+    m, s = divmod(int(rem + 0.5), 60)
+    return f"~{m}m{s:02d}s left" if m else f"~{s}s left"
 from models.constants import (LATENT_SPATIAL_SIZE as _LATENT_SPATIAL_SIZE,
                                N_THETA, theta_coordinates)
 from models.latent_streams import DEFAULT_STREAM_NAME
@@ -578,11 +590,13 @@ class MicrostructureSnapshotDataset(Dataset):
         # format_progress_count).
         _show_progress = len(run_dirs) >= 20
         _n_runs = len(run_dirs)
+        _t0 = time.monotonic()
 
         for _run_pos, run_dir in enumerate(run_dirs):
             if _show_progress and (_run_pos % 25 == 0 or _run_pos == _n_runs - 1):
                 sys.stdout.write(
-                    f"\r  indexing runs: {format_progress_count(_run_pos + 1, _n_runs)}   ")
+                    f"\r  indexing runs: {format_progress_count(_run_pos + 1, _n_runs)}  "
+                    f"({_progress_eta(_run_pos + 1, _n_runs, _t0)})   ")
                 sys.stdout.flush()
             metadata = load.read_metadata(run_dir / "metadata.txt")
             kept_steps = good_steps[run_dir]
@@ -1385,13 +1399,15 @@ class MicrostructureEvolutionDataset(Dataset):
         # a warm-cache run visibly flies (cache hits skip the encode entirely).
         _show_progress = self.encoder_given and len(run_dirs) >= 20
         _n_total = len(run_dirs)
+        _t0 = time.monotonic()
 
         with ThreadPoolExecutor(max_workers=read_workers) as read_pool:
             for _run_pos, run_dir in enumerate(run_dirs):
                 if _show_progress and (_run_pos % 25 == 0 or _run_pos == _n_total - 1):
                     sys.stdout.write(
                         f"\r  encoding runs: {format_progress_count(_run_pos + 1, _n_total)} "
-                        f"({n_cache_hits} cache hit{'' if n_cache_hits == 1 else 's'})   ")
+                        f"({n_cache_hits} cache hit{'' if n_cache_hits == 1 else 's'}, "
+                        f"{_progress_eta(_run_pos + 1, _n_total, _t0)})   ")
                     sys.stdout.flush()
                 metadata = load.read_metadata(run_dir / "metadata.txt")
                 kept_steps = good_steps[run_dir]

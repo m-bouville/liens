@@ -1,6 +1,6 @@
 # Phase-field simulations
 
-Phase-field simulations are implemented in C++ using the STL to generate training data for the neural networks, which are implemented separately in Python using PyTorch. 
+Phase-field simulations are implemented in C++ using the STL to generate training data for the neural networks, which are implemented separately in Python using PyTorch (see [./docs/neural_nets.md](neural_nets.md)). 
 
 ## High-level choices
 The phase-field model is based on the Landau–Ginzburg free-energy functional,
@@ -25,7 +25,7 @@ Here $M$ is the mobility, it is (at least initially) temperature-independent. Th
 
 Simulations are performed on two-dimensional periodic domains. The chemical potential is computed as 
 
-$$\mu = \frac{\partial f}{\partial \phi} - \kappa\,\nabla^2 \phi,$$
+$$\mu = \frac{\partial f}{\partial \phi} - \kappa \nabla^2 \phi,$$
 
 after which the Allen–Cahn equation is integrated using an explicit forward-Euler time step. A Fourier pseudo-spectral discretization (FFTW) may be implemented later (but this is not a priority).
 During simulation, total free energy is computed every saved timestep and should decrease monotonically.

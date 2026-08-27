@@ -30,9 +30,9 @@ The latent representation is split into two streams:
 
 A Latent Dynamics Surrogate (LDS), $f_\theta$, predicts the next state from both:
 
-$$z_0(t + \delta t) = z_0(t) + z_1(t)\,\delta t + f_\theta(z_0(t), z_1(t), \theta)\,\delta t^2/2,$$
+$$z_0(t + \delta t) = z_0(t) + z_1(t) \delta t + f_\theta(z_0(t), z_1(t), \theta)\,\delta t^2/2,$$
 
-with $\theta$ physical parameters (e.g. temperature). $z_1(t)\,\delta t$ is the first-order (linear) term; $f_\theta$ predicts the second-order (curvature) correction on top of it. 
+with $\theta$ physical parameters (e.g. temperature). $z_1(t) \delta t$ is the first-order (linear) term; $f_\theta$ predicts the second-order (curvature) correction on top of it. 
 
 As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\delta t$ a multiple of the phase-field time step) — in practice the second-order term is capped for large $\delta t$, to avoid a blow-up.
 
