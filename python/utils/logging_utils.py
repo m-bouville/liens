@@ -197,13 +197,21 @@ class EpochProgress:
     The per-batch cost is one time comparison (and, once past the delay, a
     formatted write every `every` batches); the common fast-epoch path does no
     I/O at all.
+
+    `label`/`unit` name what is being counted, so the counter is meaningful for
+    non-epoch loops too, e.g. EpochProgress(n, label="interpolation check",
+    unit="triples") -> "interpolation check 2.8/27.1 thousand triples (~1m03s
+    left)". The defaults reproduce the epoch-batch wording byte-for-byte, so
+    existing callers are unchanged.
     """
 
     def __init__(self, n_batches, delay_s: float = 20.0, every: int = 50,
-                 stream=None):
+                 stream=None, label: str = "epoch progress: batch", unit: str = ""):
         self._n = n_batches
         self._delay = delay_s
         self._every = max(1, every)
+        self._label = label            # what is being counted (default: the
+        self._unit = unit              # epoch-batch wording, unchanged)
         self._stream = stream if stream is not None else sys.stdout
         self._start = time.monotonic()
         self._i = 0
@@ -235,8 +243,9 @@ class EpochProgress:
                 eta = f"~{_format_duration(remaining)} left"
             else:
                 eta = "estimating..."
-            line = (f"\r  epoch progress: batch "
-                    f"{format_progress_count(self._i, self._n)}  ({eta})   ")
+            _u = f" {self._unit}" if self._unit else ""
+            line = (f"\r  {self._label} "
+                    f"{format_progress_count(self._i, self._n)}{_u}  ({eta})   ")
             self._max_width = max(self._max_width, len(line))
             self._stream.write(line)
             self._stream.flush()

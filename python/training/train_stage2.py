@@ -30,6 +30,7 @@ from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save, clamp_grace_epochs,
     grace_epochs_for_ema,
 )
+import re
 from training.checkpoint_components import cross_check_ancestor_config
 from training.extend_encoder import extend_state_checkpoint_with_deriv_stream
 from training.datasets import VAL_DECORRELATED_AUG_INDICES, MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
@@ -404,6 +405,9 @@ def train_stage2(
         raise ValueError("train_stage2() requires min_step to be given explicitly -- "
                           "config.txt no longer provides ML training defaults.")
 
+    _am = re.search(r"(\d{4})(\d{2})(\d{2})_(\d{2})h(\d{2})", resume_from.stem)
+    _ancestor_stamp = (f"{_am.group(3)}/{_am.group(2)} at {_am.group(4)}:{_am.group(5)}"
+                       if _am else resume_from.stem)
     prev = torch.load(resume_from, map_location=device, weights_only=True)
     model_cfg = prev["config"]
     stats_config = prev.get("stats_config")
@@ -1332,7 +1336,7 @@ def train_stage2(
         )
         if not switch_lands_mid_run:
             loss_curve_levels.append(
-                (ref_total, "reference (ancestor, this run's objective)"))
+                (ref_total, f"ancestor ({_ancestor_stamp})"))
         ref_recon = (ref_recon_sum / n_val).item()
         ref_stats = (ref_stats_sum / n_val).item()
         ref_stats1 = (ref_stats1_sum / n_val).item()
@@ -1544,9 +1548,10 @@ def train_stage2(
                           f"(band median {_SpikeGuard.median_display(_worst[1])}, "
                           f"dt_max={_worst[2]:.0f}, theta0={_worst[3]:.4f})"
                           if _worst else "")
+                    _pct = 100.0 * _n_skipped / _n_train_batches if _n_train_batches else 0.0
                     print(f"  spike guard: skipped {_n_skipped}/{_n_train_batches} "
-                          f"train batch(es) this epoch (loss > {spike_skip_factor}x "
-                          f"band median).{_w}")
+                          f"({_pct:.1f}%) train batch(es) this epoch (loss > "
+                          f"{spike_skip_factor}x band median).{_w}")
                 if _deadlocked:
                     print(f"  spike guard: WARNING every train batch skipped this "
                           f"epoch -- weights took no step. If this persists the run "
@@ -1664,6 +1669,7 @@ def train_stage2(
                 epoch_history, component_histories, loss_components_path,
                 title="Stage 2 loss components",
                 ref_components=ref_components_for_scatter,
+                ref_label=f"ancestor ({_ancestor_stamp})",
             )
 
         train_terms = " ".join(f"+{tw*tv/s:7.4f}" for lbl, (tw, _, s, tv, _) in term_values.items()
@@ -1883,6 +1889,7 @@ def train_stage2(
             epoch_history, component_histories, loss_components_path,
             title="Stage 2 loss components",
             ref_components=ref_components_for_scatter,
+            ref_label=f"ancestor ({_ancestor_stamp})",
         )
 
     print("\nPer-block PARAMETER drift (L2 norm of change from stage-1 starting point):")

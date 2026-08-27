@@ -432,7 +432,8 @@ def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
 
     if min_passing_steps is not None and n_runs_dropped_for_too_few_passing:
         _what = f"{split_label} runs" if split_label else "runs"
-        print(f"build_good_steps: {n_runs_dropped_for_too_few_passing}/{len(run_dirs)} {_what} "
+        _pct = 100.0 * n_runs_dropped_for_too_few_passing / len(run_dirs) if run_dirs else 0.0
+        print(f"build_good_steps: {n_runs_dropped_for_too_few_passing}/{len(run_dirs)} ({_pct:.1f}%) {_what} "
               f"dropped ENTIRELY -- fewer than min_passing_steps={min_passing_steps} steps "
               f"cleared min_stdev_phi={min_stdev_phi}")
 
@@ -1532,7 +1533,8 @@ class MicrostructureEvolutionDataset(Dataset):
                       else "consider a shorter window_length or looser filtering if this "
                            "is a large fraction")
             _runs_word = f"{self._split_label} runs" if self._split_label else "runs"
-            print(f"MicrostructureEvolutionDataset: {n_windowless_runs}/{len(run_dirs)} {_runs_word} "
+            _pct = 100.0 * n_windowless_runs / len(run_dirs) if run_dirs else 0.0
+            print(f"MicrostructureEvolutionDataset: {n_windowless_runs}/{len(run_dirs)} ({_pct:.1f}%) {_runs_word} "
                   f"had fewer than window_length={window_length} {cause} and were skipped "
                   f"entirely ({advice})")
 
@@ -1564,6 +1566,7 @@ class MicrostructureEvolutionDataset(Dataset):
         """
         n_degenerate_deriv_windows = 0
         n_max_dt_windows = 0
+        n_candidate_windows = 0
 
         for (run_dir, metadata, kept_steps), run_data, run_data_deriv in zip(
             pending_meta, run_data_list, run_data_deriv_list
@@ -1609,6 +1612,7 @@ class MicrostructureEvolutionDataset(Dataset):
             )
 
             for start in range(len(kept_steps) - self.window_length + 1):
+                n_candidate_windows += 1
                 if self.stat_names is not None:
                     start_step = kept_steps[start + self.stats_frame_index]
                     stats_df = self._stats_by_run[run_dir]
@@ -1637,14 +1641,18 @@ class MicrostructureEvolutionDataset(Dataset):
 
         _split_suffix = f" in {self._split_label} runs" if self._split_label else ""
         if n_max_dt_windows:
-            print(f"MicrostructureEvolutionDataset: {n_max_dt_windows} candidate window(s){_split_suffix} skipped "
+            _pct = 100.0 * n_max_dt_windows / n_candidate_windows if n_candidate_windows else 0.0
+            print(f"MicrostructureEvolutionDataset: {n_max_dt_windows}/{n_candidate_windows} "
+                  f"({_pct:.1f}%) candidate window(s){_split_suffix} skipped "
                   f"for having a transition longer than max_dt={self.max_dt}. Beyond that dt the "
                   f"first-order (z0 + z1*dt) term's own error is large enough that f_theta can only "
                   f"add a correction on top of an already-wrong prediction -- excluding those "
                   f"windows trains f_theta only where it can actually help.")
 
         if n_degenerate_deriv_windows:
-            print(f"MicrostructureEvolutionDataset: {n_degenerate_deriv_windows} candidate window(s){_split_suffix} "
+            _pct = 100.0 * n_degenerate_deriv_windows / n_candidate_windows if n_candidate_windows else 0.0
+            print(f"MicrostructureEvolutionDataset: {n_degenerate_deriv_windows}/{n_candidate_windows} "
+                  f"({_pct:.1f}%) candidate window(s){_split_suffix} "
                   f"skipped for having a near-degenerate first-transition derivative "
                   f"(std < min_std_deriv={self.min_std_deriv}) -- spatially complex but "
                   f"essentially stationary between those two specific steps (e.g. a straight, "

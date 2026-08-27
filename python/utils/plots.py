@@ -325,6 +325,7 @@ def loss_component_scatter(
     epoch_history: list[int], component_histories: dict[str, dict[str, list[float]]],
     output_path: Path, title: str = "",
     ref_components: dict[str, float] | None = None,
+    ref_label: str = "ref (pre-run)",
 ) -> Path | None:
     """
     Companion to loss_curve(): for a COMPOSITE loss (total = sum of
@@ -477,7 +478,7 @@ def loss_component_scatter(
                     and rx > 0 and ry > 0):
                 ax.scatter([rx], [ry], s=70, marker="o", facecolors="none",
                            edgecolors="tab:purple", linewidths=2.0, zorder=6,
-                           label="ref (pre-run)")
+                           label=ref_label)
 
         # FINITE values only, everywhere below. An epochs=0 ablation never
         # iterates the train set, so every train component is NaN -- and while

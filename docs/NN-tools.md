@@ -37,7 +37,7 @@ The combined `compare_f_theta` (no `--*-only` flag) still runs both.
 Note: `python -m evaluation.compare_f_theta --trajectory` (above) also returns microstructures.
 
 ### reconstruction (returns µstructures for AE verification)
-`python -m evaluation.check_reconstruction --checkpoint checkpoints/stage2/64x64-stage2-20260815_06h43.pt --size 64 --min-step 1500 --min-stdev-phi 0.01 --device cuda`
+`python -m evaluation.check_reconstruction --checkpoint checkpoints/stage2/128x128-stage2.pt --size 128 --min-step 1500 --min-stdev-phi 0.01 --device cuda`
 
 ### rollout (returns µstructures for 1 stage)
 `python -m evaluation.check_rollout --lds-checkpoint checkpoints/stage3a/128x128-stage3a.pt --no-z1-resync  --min-step 1500 --min-stdev-phi 0.01`

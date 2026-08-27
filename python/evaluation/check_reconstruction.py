@@ -32,6 +32,7 @@ import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import utils.load_datasets as load
 
@@ -265,18 +266,32 @@ def check_reconstruction(
             x_recon_np = x_recon[0, 0].cpu().numpy()
             diff_np = x_recon_np - x_np
 
-            scale = _scale(x_np)
-            diff_scale = _scale(diff_np, floor=1e-6)
+            # cols 0/1 share a state scale (floor 0.05); the error panel is
+            # ALWAYS a tenth of it, so error structure is read on a fixed,
+            # comparable-to-state scale rather than its own auto-range.
+            scale = _scale(x_np, floor=0.05)
+            diff_scale = scale / 10.0
+            # pixel correlation of reconstruction vs real state (constant real
+            # state -> undefined; report n/a rather than a NaN)
+            if x_np.std() > 0 and x_recon_np.std() > 0:
+                corr_pct = 100.0 * np.corrcoef(x_np.ravel(), x_recon_np.ravel())[0, 1]
+                corr_str = f"{corr_pct:.1f}%"
+            else:
+                corr_str = "n/a"
 
-            axes[row, 0].imshow(x_np, cmap="RdBu", vmin=-scale, vmax=scale)
+            im_state = axes[row, 0].imshow(x_np, cmap="RdBu", vmin=-scale, vmax=scale)
             axes[row, 0].set_title(f"real state (idx={idx}, scale=+-{scale:.3f})" if row == 0
                                     else f"scale=+-{scale:.3f}")
             axes[row, 1].imshow(x_recon_np, cmap="RdBu", vmin=-scale, vmax=scale)
-            axes[row, 1].set_title(f"predicted state (loss={loss:.4f})" if row == 0 else
-                                    f"loss={loss:.4f}")
+            axes[row, 1].set_title(f"predicted state (loss={loss:.4f}, corr={corr_str})" if row == 0 else
+                                    f"loss={loss:.4f}, corr={corr_str}")
             im_diff = axes[row, 2].imshow(diff_np, cmap="RdBu", vmin=-diff_scale, vmax=diff_scale)
             axes[row, 2].set_title(f"error (scale=+-{diff_scale:.3f})" if row == 0
                                     else f"scale=+-{diff_scale:.3f}")
+            # TWO colorbars: cols 0/1 share the STATE scale (bar after col 1),
+            # col 2 has the ERROR scale (bar after col 2) -- one shared bar
+            # would mislabel two genuinely different scales.
+            fig.colorbar(im_state, ax=axes[row, 1], fraction=0.046)
             fig.colorbar(im_diff, ax=axes[row, 2], fraction=0.046)
 
             if deriv_stream_name is not None:

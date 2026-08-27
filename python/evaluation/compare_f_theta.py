@@ -72,6 +72,7 @@ from training.losses import ReconLoss
 from utils import load_datasets as load
 from utils.logging_utils import format_progress_count
 import sys
+import time
 
 
 def _fmt_corr_pct(corr: float | None) -> str:
@@ -497,9 +498,18 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     # uses information the models cannot; draw it DOTTED so "3a below stage 2"
     # there reads as the re-encoding advantage, not f_theta worsening things.
     _stage2_comparable = (n_steps == 1)
+    # Tag the baselines with WHICH stage-2 encoder produced them (a's frozen
+    # encoder; a and b share it). Compact timestamp from a["ae_path"] so the
+    # legend says e.g. "causal (frozen dz0/dt) [26/08 14:55]" instead of a
+    # generic label that could be any stage-2 run.
+    # tag with the stage-2 encoder's timestamp in the SAME "DD/MM at HH:MM"
+    # style as every other label (via _pretty_label on its stem).
+    _enc_pretty = _pretty_label(Path(a.get("ae_path", "")).stem, include_year=False)
+    _es = re.search(r"\((.*?)\)", _enc_pretty)   # pull just the "26/08 at 14:55"
+    _enc = f"  [{_es.group(1)}]" if _es else ""
     labels = {"a": a["label"], "b": b["label"],
-              "causal": "causal (frozen dz0/dt)",
-              "stage2": "stage 2 (z0 + z1 dt)" + (
+              "causal": "causal (frozen dz0/dt)" + _enc,
+              "stage2": "stage 2 (z0 + z1 dt)" + _enc + (
                   "" if _stage2_comparable else "  [re-encodes -- not comparable]")}
     linestyles = {"a": "-", "b": "-", "causal": "-",
                   "stage2": "-" if _stage2_comparable else ":"}
@@ -1286,6 +1296,12 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     a = _load_model(path_a, device)
     b = _load_model(path_b, device)
+    # readable legend/row labels: 'stage 3a-20260826_17h09' -> 'stage 3a
+    # (26/08 at 17:09)', same style as --stage2-compare; year only if the two
+    # checkpoints span different years.
+    _need_year = _labels_need_year([a["label"], b["label"]])
+    a["label"] = _pretty_label(a["label"], _need_year)
+    b["label"] = _pretty_label(b["label"], _need_year)
 
     if a["ae_path"] != b["ae_path"]:
         print(f"NOTE: the two checkpoints decode through DIFFERENT AEs\n"
@@ -1552,16 +1568,26 @@ def compare_stage2_rollouts(paths: list[Path], n_stats: int = 200,
     # Total rollout evaluations for the progress bar: each model runs both the
     # stage-2 and the causal trajectory over every window.
     _total_evals = 2 * len(models) * len(windows)
-    _progress = {"done": 0}
+    _progress = {"done": 0, "t0": None}
     _show_progress = _total_evals >= 500   # silent for small/test runs
 
     def _tick():
         _progress["done"] += 1
+        if _progress["t0"] is None:
+            _progress["t0"] = time.monotonic()
         if _show_progress and (_progress["done"] % 50 == 0
                                or _progress["done"] == _total_evals):
+            _done = _progress["done"]
+            _el = time.monotonic() - _progress["t0"]
+            if _done > 0 and _el > 0:
+                _rem = _el / _done * (_total_evals - _done)
+                _m, _s = divmod(int(_rem + 0.5), 60)
+                _eta = f"~{_m}m{_s:02d}s left" if _m else f"~{_s}s left"
+            else:
+                _eta = "estimating"
             sys.stdout.write(
                 f"\r  rollout progress: "
-                f"{format_progress_count(_progress['done'], _total_evals)}   ")
+                f"{format_progress_count(_done, _total_evals)}  ({_eta})   ")
             sys.stdout.flush()
 
     # A diverged rollout produces frames large enough that ReconLoss's squaring
@@ -1637,7 +1663,7 @@ def compare_stage2_rollouts(paths: list[Path], n_stats: int = 200,
 
     if output_path is None:
         prefix = _parse_stem(models[0]["path"].stem)[0] or "compare"
-        output_path = (_PYTHON_ROOT.parent / "output" / "rollout_check_png" /
+        output_path = (_PYTHON_ROOT.parent / "output" / "stage2" /
                        f"{prefix}-stage2_rollout-{len(models)}ckpts-seed{seed}"
                        f"-{n_steps}steps.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
