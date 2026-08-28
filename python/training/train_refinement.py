@@ -175,24 +175,10 @@ def train_refinement(
                                  ae_checkpoint_path or resume_from, what="encoder ancestor")
     size = components["encoder"].config["size"]
 
-    # u-scheme guard: stage 4/5 refine the encoder against a ROLLOUT loss that
-    # encodes z1=dz0/dt live and steps in dt_window. A log10_t f_theta needs
-    # z̃1=ln10*t*z1 and Delta-u instead -- and compute_stage45_loss has no
-    # per-frame t to build z̃1 from, so it would feed the frozen u-model physical
-    # dt and the f*dt term overflows to NaN on the large-dt windows (exactly the
-    # observed dt_max=2.5e4 all-batches-skipped failure). Fail loud on the actual
-    # undefined operation rather than churning NaNs. To support u here: thread
-    # per-frame t/steps into the stage-4 batch and convert z1->z̃1 (and dt->Delta-u)
-    # inside compute_stage45_loss, the same conversion the dataset/diagnostics got.
-    _f_theta_tc = getattr(f_theta, "time_coordinate", "t")
-    if _f_theta_tc != "t":
-        raise ValueError(
-            f"stage 4/5 (encoder refinement) does not yet support a "
-            f"time_coordinate={_f_theta_tc!r} f_theta: its rollout loss would feed "
-            f"the u-model physical dt and diverge to NaN (no per-frame t is available "
-            f"to build z̃1=ln10*t*z1). Skip stage 4/5 for u-models for now, or "
-            f"implement the u-branch in compute_stage45_loss (thread per-frame t into "
-            f"the stage-4 batch, convert z1->z̃1 and dt->Delta-u).")
+    # u-scheme: log10_t f_theta is now supported -- the stage-4 dataset emits
+    # per-frame physical t (return_frame_t) and compute_stage45_loss converts
+    # z1->z̃1 and dt->Delta-u before the rollout (mirrors the stage-3 dataset).
+    _needs_frame_t = getattr(f_theta, "time_coordinate", "t") == "log10_t"
     print(f"Stage {'4' if freeze_decoder else '5'}: loaded {ancestor_note}")
     print(f"size={size}, latent_channels={components['encoder'].config['latent_channels']}, "
           f"freeze_decoder={freeze_decoder}")
@@ -307,7 +293,7 @@ def train_refinement(
             val_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
-            split_label="validation",
+            split_label="validation", return_frame_t=_needs_frame_t,
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
               f"{len(test_dirs)} test dirs")
@@ -319,13 +305,13 @@ def train_refinement(
             train_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
-            split_label="training",
+            split_label="training", return_frame_t=_needs_frame_t,
         )
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
-            split_label="validation",
+            split_label="validation", return_frame_t=_needs_frame_t,
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
               f"{len(test_dirs)} test dirs")
@@ -372,14 +358,19 @@ def train_refinement(
 
     def unpack(batch):
         if stat_names is not None:
-            x_window, dt_window, theta, true_stats = batch
+            if len(batch) == 5:      # return_frame_t on (u-scheme): + per-frame t
+                x_window, dt_window, theta, true_stats, t_window = batch
+            else:
+                x_window, dt_window, theta, true_stats = batch
+                t_window = None
             return (x_window.to(device), dt_window.to(device), theta.to(device),
-                    true_stats.to(device))
+                    true_stats.to(device),
+                    t_window.to(device) if t_window is not None else None)
         x_window, dt_window, theta = batch
-        return x_window.to(device), dt_window.to(device), theta.to(device), None
+        return x_window.to(device), dt_window.to(device), theta.to(device), None, None
 
     def step(batch, train: bool, effective_rollout_weight: float | None = None):
-        x_window, dt_window, theta, true_stats = unpack(batch)
+        x_window, dt_window, theta, true_stats, t_window = unpack(batch)
         # BEFORE the forward, because the forward is what moves the buffers.
         # A skipped batch must leave the model exactly as it found it, and
         # "the optimizer step was not taken" only covers PARAMETERS -- see
@@ -394,7 +385,7 @@ def train_refinement(
             rollout_scale=rollout_scale, recon0_scale=recon0_scale, stats0_scale=stats0_scale,
             stats_loss_fn=stats_loss_fn, true_stats=true_stats,
             recon_stream_name=recon_stream_name, return_components=True,
-            z1_resync=lds_z1_resync,
+            z1_resync=lds_z1_resync, t_window=t_window,
         )
         if train:
             # SAME MACHINERY AS STAGE 3, for the same observed failure.
@@ -473,6 +464,9 @@ def train_refinement(
     _grad_spikes_reported = 0
     _n_train_batches = 0
 
+    _prev_val_seconds = None   # previous epoch's validation duration, added to
+    #                            the training bar's ETA so it reflects the WHOLE
+    #                            epoch (shown as "+ validation" on the first).
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         ae.train()
         f_theta.train()
@@ -575,7 +569,9 @@ def train_refinement(
         if epoch > 0:
             n_train = len(train_set)
             _n_train_batches = 0
-            _epoch_progress = EpochProgress(len(train_loader))
+            _epoch_progress = EpochProgress(
+                len(train_loader),
+                tail_label="validation", tail_seconds=_prev_val_seconds)
             for batch in train_loader:
                 _epoch_progress.tick()
                 _n_train_batches += 1
@@ -604,14 +600,23 @@ def train_refinement(
         val_recon0_sum = torch.zeros((), device=device)
         val_stats0_sum = torch.zeros((), device=device)
         n_val = len(val_set)
+        # Stage 4's validation runs a full val_loader pass after training with
+        # no output -- looks hung on a large sweep. Bar it (self-gating delay)
+        # and time it so the NEXT epoch's training ETA can include it.
+        _val_prog = EpochProgress(len(val_loader), label="validation",
+                                  unit="batches")
+        _val_t0 = time.monotonic()
         with torch.no_grad():
             for batch in val_loader:
+                _val_prog.tick()
                 bs = batch[0].size(0)
                 loss, rollout, recon0, stats0 = step(batch, train=False)
                 val_loss_sum += loss * bs
                 val_rollout_sum += rollout * bs
                 val_recon0_sum += recon0 * bs
                 val_stats0_sum += stats0 * bs
+        _val_prog.close()
+        _prev_val_seconds = time.monotonic() - _val_t0   # feeds next epoch's ETA
         val_loss = (val_loss_sum / n_val).item()
         val_rollout = (val_rollout_sum / n_val).item()
         val_recon0 = (val_recon0_sum / n_val).item()
@@ -818,9 +823,7 @@ def train_refinement(
                     on_checkpoint_saved(checkpoint_path, epoch)
                 except Exception as e:
                     # Bookkeeping must never kill training: a failed registry
-                    # upsert crashed one real run BETWEEN the save and the epoch
-                    # line (checkpoint one epoch newer than the log). Announce
-                    # and continue -- a lost registry row, never a lost run.
+                    # upsert must announce and continue, never lose the run.
                     print(f"  WARNING: on_checkpoint_saved failed "
                           f"({type(e).__name__}: {e}) -- continuing training")
         else:

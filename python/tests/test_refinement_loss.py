@@ -220,3 +220,67 @@ def test_default_return_is_just_total_tensor():
     x_window, dt_window, theta = _make_batch()
     result = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta)
     assert isinstance(result, torch.Tensor)
+
+
+# --------------------------------------------------------------------
+# stage-4 u-scheme (log10_t f_theta) conversion
+# --------------------------------------------------------------------
+import math  # noqa: E402
+
+
+def _make_u_models(**kw):
+    """Same as _make_models but a log10_t f_theta: it steps in Delta-u and
+    consumes z̃1=dz0/du, so compute_stage45_loss must convert before rollout."""
+    ae, _, stats_head = _make_models(**kw)
+    f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=1,
+                              hidden_dim=16, n_hidden_layers=1,
+                              dynamics_mode="deriv_linear", time_coordinate="log10_t",
+                              dt_cap=float("inf"))
+    return ae, f_theta, stats_head
+
+
+def _t_window(batch_size=2, n_rollout_steps=2):
+    """Per-frame physical time, strictly > 0 (u=log10(t) is singular at 0).
+    (B, n_r+1). Monotonically increasing within each window."""
+    base = torch.tensor([50.0, 100.0, 200.0])[:n_rollout_steps + 1]
+    return base.unsqueeze(0).expand(batch_size, -1).contiguous()
+
+
+def test_stage45_u_scheme_runs_finite_and_differentiable():
+    """The end-to-end guard: a log10_t f_theta fed per-frame t must produce a
+    FINITE loss and real encoder gradient -- catching the large-dt divergence
+    (physical dt into a u-model -> NaN) the old guard used to refuse."""
+    ae, f_theta, stats_head = _make_u_models()
+    x_window, dt_window, theta = _make_batch()
+    total = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=1.0, recon0_weight=0.1, stats0_weight=0.0,
+        t_window=_t_window())
+    assert total.dim() == 0
+    assert torch.isfinite(total), f"u-scheme loss not finite: {total}"
+    total.backward()  # must not raise
+    enc_grads = [p.grad for p in ae.encoders["shared"].parameters() if p.grad is not None]
+    assert enc_grads and any(torch.any(torch.isfinite(g) & (g != 0)) for g in enc_grads)
+
+
+def test_stage45_u_scheme_without_t_window_raises():
+    """A log10_t f_theta with NO t_window cannot build z̃1=ln10*t*z1 -- must fail
+    loud (the plumbing guard), never silently feed physical dt and NaN."""
+    ae, f_theta, stats_head = _make_u_models()
+    x_window, dt_window, theta = _make_batch()
+    with pytest.raises(ValueError, match="needs per-frame physical time"):
+        compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
+                             rollout_weight=1.0)
+
+
+def test_stage45_t_scheme_ignores_t_window_and_is_unchanged():
+    """Backward-compat: a plain-t f_theta is not converted -- passing t_window
+    (or not) yields the SAME loss, so the u-branch is truly gated on the model's
+    own coordinate, not on the batch."""
+    ae, f_theta, stats_head = _make_models()   # time_coordinate defaults to 't'
+    x_window, dt_window, theta = _make_batch()
+    a = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
+                             rollout_weight=1.0, recon0_weight=0.1)
+    b = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
+                             rollout_weight=1.0, recon0_weight=0.1, t_window=_t_window())
+    assert torch.allclose(a, b), "t-scheme loss must not depend on t_window"

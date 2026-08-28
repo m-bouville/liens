@@ -21,6 +21,7 @@ import torch
 
 from models.latent_streams import DEFAULT_STREAM_NAME
 from training.losses import ReconLoss, RolloutLoss, StatsLoss
+from models.latent_dynamics import convert_derivative_coordinate
 
 
 def compute_stage45_loss(
@@ -31,7 +32,7 @@ def compute_stage45_loss(
     stats_loss_fn: StatsLoss | None = None,
     true_stats: torch.Tensor | None = None, return_components: bool = False,
     recon_stream_name: str = DEFAULT_STREAM_NAME, deriv_stream_name: str = "deriv",
-    z1_resync: bool = True,
+    z1_resync: bool = True, t_window: torch.Tensor | None = None,
 ):
     """
     x_window: (B, n_r+1, 1, ny, nx) raw pixel window -- x_window[:,0] is
@@ -132,6 +133,22 @@ def compute_stage45_loss(
     # are inherited from the LDS checkpoint; this one was missed because the
     # rollout call sits in refinement_loss.py rather than beside the model
     # construction in model_assembly.py.
+    # u-scheme: a log10_t f_theta steps in Delta-u and consumes z̃1=dz0/du,
+    # NOT physical dt and z1=dz0/dt. Convert both here, sourced from the
+    # per-frame physical time t_window (step*sim_dt) the batch now carries.
+    # ln10*t and log10(t ratio) match the dataset's own z̃1/Delta-u construction
+    # EXACTLY (sim_dt cancels in the ratio). convert_derivative_coordinate is
+    # the canonical t->log10_t definition (deriv * ln10 * t).
+    if getattr(f_theta, "time_coordinate", "t") == "log10_t":
+        if t_window is None:
+            raise ValueError(
+                "compute_stage45_loss got a log10_t f_theta but no t_window: "
+                "the u-conversion z̃1=ln10*t*z1 needs per-frame physical time. "
+                "Construct the stage-4 dataset with return_frame_t=True.")
+        _t = t_window[:, :, None, None, None]          # (B, n_r+1, 1,1,1)
+        z1_sequence = convert_derivative_coordinate(z1_sequence, _t, "t", "log10_t")
+        dt_window = torch.log10(t_window[:, 1:] / t_window[:, :-1])   # (B, n_r) = Delta-u
+
     z_hat_full = f_theta.rollout(z0, z1_sequence, dt_window, theta,
                                   z1_resync=z1_resync)
     z_hat = z_hat_full[:, 1:]

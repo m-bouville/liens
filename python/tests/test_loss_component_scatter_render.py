@@ -12,7 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 import pytest  # noqa: E402
 
-from utils.plots import _iso_total_levels, loss_component_scatter  # noqa: E402
+from utils.plots import _iso_total_levels, loss_component_scatter, rollout_vs_1step_scatter  # noqa: E402
 
 
 def _histories(n_epochs=4, every_epoch_saves=True):
@@ -693,3 +693,48 @@ def test_sub_decade_range_still_shows_axis_numbers(monkeypatch, tmp_path):
     has_x, has_y = any_numbers(bl)
     assert has_x, "x-axis has no numbers on a sub-decade range (minor labels wrongly blanked)"
     assert has_y, "y-axis has no numbers on a sub-decade range (minor labels wrongly blanked)"
+
+
+# --------------------------------------------------------------------
+# rollout_vs_1step_scatter (stage-3b L_rollout vs L_1step, saved epochs)
+# --------------------------------------------------------------------
+
+def test_rollout_vs_1step_renders_train_and_valid(tmp_path):
+    """Both series draw on shared log-log square axes; returns the path."""
+    n = 6
+    epochs = [25 * (i + 1) for i in range(n)]
+    l_rollout_v = [15.0 / (i + 1) for i in range(n)]
+    l_1step_v = [0.5 + 0.05 * i for i in range(n)]
+    l_rollout_t = [14.0 / (i + 1) for i in range(n)]
+    l_1step_t = [0.48 + 0.05 * i for i in range(n)]
+    out = rollout_vs_1step_scatter(
+        l_1step_v, l_rollout_v, tmp_path / "rv1.png",
+        title="s", saved_epochs=epochs,
+        l_1step_train=l_1step_t, l_rollout_train=l_rollout_t)
+    assert out is not None and Path(out).exists()
+
+    import inspect
+    from utils import plots
+    src = inspect.getsource(plots.rollout_vs_1step_scatter)
+    # log-log SQUARE axes are the whole point of the plot
+    assert 'set_xscale("log")' in src and 'set_yscale("log")' in src
+    assert 'set_aspect("equal")' in src
+    # both series are labelled (train + valid), matching loss_curve's convention
+    assert '"train"' in src and '"valid"' in src
+
+
+def test_rollout_vs_1step_valid_only_still_renders(tmp_path):
+    """train series is optional (None) -- val alone must still draw."""
+    out = rollout_vs_1step_scatter(
+        [0.5, 0.55, 0.6], [10.0, 5.0, 2.0], tmp_path / "vo.png")
+    assert out is not None and Path(out).exists()
+
+
+def test_rollout_vs_1step_needs_two_points(tmp_path):
+    """Fewer than 2 finite saved points -> nothing to trade off -> None,
+    writes nothing (a 1-step 3a, or a run that never saved twice)."""
+    assert rollout_vs_1step_scatter([1.0], [2.0], tmp_path / "one.png") is None
+    # non-finite / non-positive entries are filtered before the count
+    import math
+    assert rollout_vs_1step_scatter(
+        [1.0, math.inf, -1.0], [2.0, 3.0, 4.0], tmp_path / "nf.png") is None

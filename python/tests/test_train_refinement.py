@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import math
 import torch
 import pytest
 
@@ -365,22 +366,38 @@ def _build_lds_checkpoint_u(path: Path):
 
 
 @pytest.mark.slow
-def test_stage4_refuses_log10_t_f_theta(tmp_path, isolated_project_root):
-    """Stage 4/5 does not yet support a log10_t f_theta: its rollout loss would
-    feed the u-model physical dt and NaN. The guard must fire (loud), not churn."""
+def test_stage4_handles_log10_t_f_theta(tmp_path, isolated_project_root):
+    """Stage 4/5 now SUPPORTS a log10_t (u-scheme) f_theta: the dataset emits
+    per-frame physical t (return_frame_t) and compute_stage45_loss converts
+    z1->z̃1=ln10*t*z1 and dt->Delta-u before the rollout, so the u-model is fed
+    its own coordinate instead of physical dt (which previously NaN'd).
+
+    NOTE min_step=1000 (not 0): the u-coordinate u=log10(t) is SINGULAR at t=0
+    -- a window starting at step 0 gives t0=0, Delta-u=log10(t1/0)=inf, NaN loss.
+    Real runs never hit this (min_step=2000); the STEPS fixture starts at 0, so
+    the test must exclude that first frame. This is a property of log-time, not
+    a conversion bug: t>0 is required for the coordinate to be defined."""
     base_path = _build_sweep(tmp_path, n_runs=6)
     ae_checkpoint_path = tmp_path / "fake-stage2.pt"
     lds_checkpoint_path = tmp_path / "fake-stage3-u.pt"
     _build_ae_checkpoint(ae_checkpoint_path, include_stats_head=True)
     _build_lds_checkpoint_u(lds_checkpoint_path)
 
-    with pytest.raises(ValueError, match="does not yet support"):
-        train_refinement(
-            base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
-            lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=True,
-            rollout_weight=1.0, recon0_weight=0.1, stats0_weight=0.1,
-            epochs=2, batch_size=4, n_rollout_steps=1,
-            min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
-            checkpoint_path=tmp_path / "stage4_u_out.pt", device="cpu",
-            log_every_epoch=True,
-        )
+    checkpoint_path = tmp_path / "stage4_u_out.pt"
+    result_path = train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
+        lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=True,
+        rollout_weight=1.0, recon0_weight=0.1, stats0_weight=0.1,
+        epochs=2, batch_size=4, n_rollout_steps=1,
+        min_step=1000, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+        checkpoint_path=checkpoint_path, device="cpu", log_every_epoch=True,
+    )
+
+    # It ran to completion (no refusal, no NaN-driven never-saved) and produced
+    # a real, reloadable checkpoint with a FINITE val_loss -- the end-to-end
+    # guard that the u-conversion did not diverge on the large-dt windows.
+    assert result_path == checkpoint_path
+    assert checkpoint_path.exists()
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert math.isfinite(saved["val_loss"]), saved["val_loss"]
+    assert saved["stage45_config"]["freeze_decoder"] is True

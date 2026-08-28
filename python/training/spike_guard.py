@@ -301,11 +301,16 @@ def skip_report(epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst
             return "n/a"
         return f"{worst[0] / worst[1]:.3g}x"
 
+    def _count(n: int) -> str:
+        # "210/1951 (10.8%)" -- the raw count alone hides whether 210 is a
+        # crisis or routine; the denominator and percent make it legible.
+        return f"{n}/{n_batches} ({100 * n / n_batches:.1f}%)" if n_batches else str(n)
+
     if verbose:
         parts = []
         if grad_new:
             parts.append(
-                f"  [epoch {epoch}: skipped {grad_new} batch(es) whose GRADIENT NORM was a "
+                f"  [epoch {epoch}: skipped {_count(grad_new)} batch(es) whose GRADIENT NORM was a "
                 f"catastrophic outlier, despite an ordinary loss. This is the case the loss "
                 f"guard cannot see."
                 + ("" if grad_worst is None else
@@ -315,7 +320,7 @@ def skip_report(epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst
                 + "]")
         if loss_new:
             parts.append(
-                f"  [epoch {epoch}: skipped {loss_new} batch(es) whose loss was a catastrophic "
+                f"  [epoch {epoch}: skipped {_count(loss_new)} batch(es) whose loss was a catastrophic "
                 f"outlier. The optimizer step was NOT taken, and the BatchNorm running "
                 f"statistics its forward pass moved were restored, so the model is untouched."
                 + ("" if loss_worst is None else

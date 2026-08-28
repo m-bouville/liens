@@ -923,7 +923,8 @@ class MicrostructureEvolutionDataset(Dataset):
                  stats_frame_index: int = 0,
                  fixed_aug_indices: tuple[int, ...] | list[int] | None = None,
                  read_workers: int = 16, split_label: str = "",
-                 time_coordinate: str = "t", return_phys_dt: bool = False):
+                 time_coordinate: str = "t", return_phys_dt: bool = False,
+                 return_frame_t: bool = False):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
@@ -1222,6 +1223,16 @@ class MicrostructureEvolutionDataset(Dataset):
             raise ValueError(
                 f"time_coordinate must be 't' or 'log10_t', got {time_coordinate!r}")
         self.time_coordinate = time_coordinate
+        # u-mode is SINGULAR at t=0: u=log10(t) -> -inf and Delta-u=log10(t1/0)
+        # -> inf, so a window containing step 0 emits NaN downstream. If a
+        # log10_t dataset is built without excluding step 0 (min_step<1), raise
+        # min_step to 1 and SAY SO, rather than silently producing NaN windows.
+        if self.time_coordinate == "log10_t" and min_step < 1:
+            print(f"MicrostructureEvolutionDataset: WARNING time_coordinate="
+                  f"'log10_t' is singular at t=0 -- raising min_step from "
+                  f"{min_step} to 1 to drop the step-0 frame (u=log10(t) is "
+                  f"undefined there). Pass min_step>=1 explicitly to silence.")
+            min_step = 1
         # return_phys_dt: when True (only the LDS trainer opts in), the
         # encode_both_streams __getitem__ appends PHYSICAL dt as a 5th element,
         # alongside dt_window (which is Delta-u in log10_t mode -- the model's
@@ -1230,6 +1241,10 @@ class MicrostructureEvolutionDataset(Dataset):
         # weighting. Off by default => the 4-tuple is byte-identical, so every
         # diagnostic and test is untouched. In t-mode phys dt == dt_window.
         self.return_phys_dt = return_phys_dt
+        # return_frame_t: raw-pixel path appends per-frame PHYSICAL time
+        # t=(step*sim_dt) (n_r+1,) so a stage-4 u-scheme loss can build
+        # z̃1=ln10*t*z1 and Delta-u. Gated -> default 4-tuple byte-identical.
+        self.return_frame_t = return_frame_t
         self._run_steps: list[list[int]] = []   # kept step numbers per run, in order
         self._run_du: list[list[float] | None] = []  # per run: log10(t_{i+1}/t_i) when u-mode
         self._run_data: list[torch.Tensor] = []  # per run, on CPU: "state" latents (n_kept,C,8,8) if
@@ -1820,6 +1835,10 @@ class MicrostructureEvolutionDataset(Dataset):
         if aug_idx is not None and "angle" in self.stat_names:
             angle_idx = self.stat_names.index("angle")
             true_stats[angle_idx] = _transform_angle(true_stats[angle_idx], aug_k, aug_flip)
+        if self.return_frame_t:
+            dt_scale = self._run_dt_scale[run_idx]
+            t_window = torch.tensor([st * dt_scale for st in steps], dtype=torch.float32)
+            return window, dt_window, theta, true_stats, t_window
         return window, dt_window, theta, true_stats
 
     def window_info(self, idx: int) -> tuple[Path, list[int]]:

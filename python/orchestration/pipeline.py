@@ -635,13 +635,20 @@ def run_from_params_file(params_path: Path, default_base: Path,
             signature = {"base_path": str(base_path), "resumed_from": str(resume_from),
                           **extra_signature, **_signature_kwargs(kwargs)}
         else:
+            # Pin BOTH auto-chained ancestors (stage-2 encoder + stage-3b
+            # f_theta) to their timestamped identity, exactly as run_lds_stage
+            # does -- otherwise the log/registry name the rotating canonical
+            # (128x128-stage3b.pt) the next run of that stage overwrites, and
+            # the record of WHICH 3b this stage-4 was built on is lost.
+            ae_ancestor = _archive_ancestor(Path(stage2_checkpoint))
+            lds_ancestor = _archive_ancestor(Path(stage3_checkpoint))
             # Both ancestors recorded explicitly, same rationale as
             # run_lds_stage: full ancestry visible from this one
             # registry, without following stage2_checkpoint into ITS
             # own registry to find stage1_checkpoint, etc.
             signature = {"base_path": str(base_path),
-                          "stage2_checkpoint": str(stage2_checkpoint),
-                          "stage3_checkpoint": str(stage3_checkpoint),
+                          "stage2_checkpoint": str(ae_ancestor),
+                          "stage3_checkpoint": str(lds_ancestor),
                           **extra_signature, **_signature_kwargs(kwargs)}
         checkpoint = resolve_checkpoint(stage_key, force, signature, kwargs.get("epochs"))
         if checkpoint is None:
@@ -673,7 +680,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
                     checkpoint = train_refinement(resume_from=resume_from, **common_args)
                 else:
                     checkpoint = train_refinement(
-                        ae_checkpoint_path=stage2_checkpoint, lds_checkpoint_path=stage3_checkpoint,
+                        ae_checkpoint_path=ae_ancestor, lds_checkpoint_path=lds_ancestor,
                         **common_args,
                     )
                 print(f"\nStage {stage_key} complete: {checkpoint}\n")

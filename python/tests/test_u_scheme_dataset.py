@@ -97,3 +97,59 @@ def test_u_mode_five_tuple_only_when_return_phys_dt(tmp_run_dir):
     run_dir, _ = tmp_run_dir
     assert len(_both(run_dir, "log10_t")[0]) == 4                       # no opt-in
     assert len(_both(run_dir, "log10_t", return_phys_dt=True)[0]) == 5  # opt-in
+
+
+def test_raw_pixel_return_frame_t_emits_per_frame_physical_time(tmp_run_dir_with_stats):
+    """Stage 4's path: raw-pixel mode (encoder=None) + stats + return_frame_t
+    appends per-frame physical time t=(step*sim_dt), (n_r+1,), as a 5th element.
+    This is what compute_stage45_loss uses to build z~1=ln10*t*z1 and Delta-u for
+    a u-scheme f_theta. Default (flag off) must stay the 4-tuple every other
+    consumer sees."""
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+    kept = [s for s in steps if s >= 1000]
+    win = kept[:3]                                   # first window (window_length=3)
+
+    def _raw(**extra):
+        return MicrostructureEvolutionDataset(
+            [run_dir], encoder=None, window_length=3, min_step=1000,
+            min_stdev_phi=None, stat_names=stat_names, **extra)
+
+    # default: no t element -> 4-tuple (window, dt_window, theta, true_stats)
+    assert len(_raw()[0]) == 4, "raw-pixel default must stay a 4-tuple"
+
+    # opt-in: 5-tuple with per-frame physical t appended
+    item = _raw(return_frame_t=True)[0]
+    assert len(item) == 5, "return_frame_t must append t_window"
+    _window, _dt, _theta, _stats, t_window = item
+    assert t_window.shape == (len(win),), "t_window is per-FRAME (n_r+1,)"
+    for k in range(len(win)):
+        assert t_window[k].item() == pytest.approx(win[k] * _SIM_DT), \
+            f"frame {k}: t must be step*sim_dt"
+    # every t strictly positive: the u-conversion is singular at t=0.
+    assert torch.all(t_window > 0)
+
+
+def test_u_mode_forces_min_step_to_1_and_warns(tmp_run_dir_with_stats, capsys):
+    """u=log10(t) is singular at t=0. A log10_t dataset built with min_step=0
+    (step 0 admissible) must auto-raise min_step to 1 and WARN, so no step-0
+    (t=0) window ever reaches the conversion. t-mode is unaffected."""
+    run_dir, steps, stat_names = tmp_run_dir_with_stats
+
+    # log10_t + min_step=0 -> forced to 1, with a warning naming the reason
+    ds_u = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=3, min_step=0,
+        min_stdev_phi=None, stat_names=stat_names, time_coordinate="log10_t",
+        return_frame_t=True)
+    out = capsys.readouterr().out
+    assert "raising min_step from 0 to 1" in out
+    assert "singular at t=0" in out
+    # and no emitted window contains step 0 -> every t strictly positive
+    for i in range(len(ds_u)):
+        *_, t_window = ds_u[i]
+        assert torch.all(t_window > 0)
+
+    # t-mode with min_step=0 does NOT warn and keeps step 0
+    _ = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=3, min_step=0,
+        min_stdev_phi=None, stat_names=stat_names, time_coordinate="t")
+    assert "raising min_step" not in capsys.readouterr().out
