@@ -25,12 +25,12 @@ The convolutional autoencoder has a symmetric encoder–decoder architecture. Th
 
 ## Latent representation
 The latent representation is split into two streams: 
-- $z_0(t)$, the "state" (from which the decoder can recover $x(t)$), 
+- $z_0(t)$, the "state" (from which the decoder can recover $x(t)$ ), 
 - $z_1(t)$, an approximation of $\dot{z}_0(t)$ that exists purely in latent space and is never decoded. 
 
 A Latent Dynamics Surrogate (LDS), $f_\theta$, predicts the next state from both:
 
-$$z_0(t + \delta t) = z_0(t) + z_1(t) \delta t + f_\theta(z_0(t), z_1(t), \theta)\,\delta t^2/2,$$
+$$z_0(t + \delta t) = z_0(t) + z_1(t) \delta t + f_\theta(z_0(t), z_1(t), \theta) \delta t^2/2,$$
 
 with $\theta$ physical parameters (e.g. temperature). $z_1(t) \delta t$ is the first-order (linear) term; $f_\theta$ predicts the second-order (curvature) correction on top of it. 
 
@@ -55,7 +55,7 @@ $$x(t) \xrightarrow{E} z(t) \xrightarrow{f_\theta} z(t+\delta t) \xrightarrow{D}
 
 In fact, the encoding occurs only once at the beginning and the decoding once at the end (plus when plots are needed):
 
-$$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\theta} z(2 \delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(T).$$
+$$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\theta} z(2 \delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(t_\mathrm{end}).$$
 
 (Writing $z$ loosely for the full latent state $(z_0,\ z_1)$; see [./docs/neural_nets.md](docs/neural_nets.md) for the actual split-stream mechanics.)
 
@@ -107,19 +107,19 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\t
 .
 ├── cpp/               		# phase-field solver
 ├── datasets/
-│   ├── 64x64/
 │   ├── 128x128/
 │   └── 256x256/			# eventually
 ├── docs/
 │   ├── phase_field.md 		# C++ simulations (doc written by hand)
 │   ├── neural_nets.md 		# Python NN (doc written by hand)
+│   ├── NN-tools.md 		# CLI for useful tools (doc written by hand)
 │   └── NN-code_structure.md #written automatically by Claude
 ├── figures/				# figures selected for inclusion here
 ├── output/					# figures generated automatically
 │   └── datasets/			# statistics on phase-field runs
 │   └── stage<N>/
 ├── python/            		# neural network
-└── README.md 				# written by hand
+└── README.md 				# this (written by hand)
 ```
 
 For more details on the structure of the `python` directory, see [./docs/NN-code_structure.md](docs/NN-code_structure.md).
@@ -143,5 +143,4 @@ For more details on the structure of the `python` directory, see [./docs/NN-code
 - All five training stages are implemented and run end-to-end. The work currently underway is improving the accuracy of the surrogate, not making it run at all.
 - The initial development was carried out using 64×64 images (32×32 for testing the code end-to-end). They were serviceable but hit their limit, with finite-size artifacts eventually dominating the results. The focus is now on 128×128 microstructures.
 - There is a (physically plausible) difference of behavior above and below $T = 0.9 \times T_0$. Work is being done to smoothen out this wrinkle.
-- Predicting $t + \delta t$ gives sensible results, $t + 10 \delta t$ does not.
-- A set of attribution diagnostics has localized the remaining error to the latent dynamics rather than the autoencoder (stages 1 and 2), and identified that the learned second-order corrector ($f_\theta$) does not yet belong in the propagation path as trained. This may hint at the need for a redesign of stage 3 (training $f_\theta$ as a vector field under a multi-step objective) as the next step. 
+- Predicting $t + \delta t$ gives sensible results, $t + 10 \delta t$ did not. The introduction of `u = log10 t` helped.

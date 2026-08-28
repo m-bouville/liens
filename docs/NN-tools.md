@@ -3,7 +3,7 @@
 ## Tests
 `pytest -n 4 tests/ -q`, or `pytest -n 4 tests/ -q -m "not slow"` to skip the longer tests.
 
-Note: Two checkpoint binaries required for the test suite (32x32-stage2.pt, architecture_v1_golden_master.pt) are not distributed; contact the author.
+Note: Two checkpoint binaries required for the test suite (32x32-stage2.pt, architecture_v1_golden_master.pt) are not in the distribution.
 
 
 

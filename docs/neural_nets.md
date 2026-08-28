@@ -56,8 +56,8 @@ $$u = \log_{10} t, \qquad \Delta u = \log_{10}(t_\mathrm{end}/t_\mathrm{start}),
 and train $f_\theta$ to advance $z_0$ by $\Delta u$ rather than $\Delta t$. A fixed $\Delta u$ corresponds to a geometric step in physical time.
 
 Two first consequence is that the derivative rescales: since
-$\mathrm{d}z_0/\mathrm{d}u = \ln(10)\, t \, \mathrm{d}z_0/\mathrm{d}t$, 
-the stored derivative latent becomes $\tilde{z}_1 = \ln(10)\, t\, z_1$ (the dataset applies this at construction). 
+$\mathrm{d}z_0/\mathrm{d}u = \ln(10)  t   \mathrm{d}z_0/\mathrm{d}t$, 
+the stored derivative latent becomes $\tilde{z}_1 = \ln(10) t z_1$ (the dataset applies this at construction). 
 Second, the loss weighting must stay in physical time: $f_\theta$ steps in $\Delta u$, but $L_\mathrm{rollout}$ and its per-decade weights are computed against the physical $\Delta t$ ($\Delta u$ is nearly constant). 
 
 
@@ -256,8 +256,8 @@ Finally,
 
 $$z_0(t + \delta t) \approx z_0(t) + z_1(t) \delta t + f_\theta(z_0(t), z_1(t), \delta t)   \delta t.$$
 
-Under the `u`-scheme (above) the same $f_\theta$ steps in $u = \log_{10} t$: read $\Delta u$ for $\Delta t$, $\tilde{z}_1 = \ln(10)\,t\,z_1$ for $z_1$, and the integration $z_0(u+\Delta u) \approx z_0 + \tilde{z}_1\,\Delta u +
-f_\theta(\cdot)\,\Delta u$ is identical in form.
+Under the `u`-scheme (above) the same $f_\theta$ steps in $u = \log_{10} t$: read $\Delta u$ for $\Delta t$, $\tilde{z}_1 = \ln(10) t z_1$ for $z_1$, and the integration $z_0(u+\Delta u) \approx z_0 + \tilde{z}_1 \Delta u +
+f_\theta(\ldot) \Delta u$ is identical in form.
 
 
 ### One-step latent prediction loss
@@ -276,7 +276,11 @@ When starting from the snapshot at time $t_k$, the rollout loss is:
 
 $$L_\mathrm{rollout} = \sum_{i=1}^{N_r} \left\| \hat{z}_0(t_k + i \Delta t) - z_0(t_k + i \Delta t) \right\|_2^2,$$
 
-where $\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \Delta t) \Delta t + f_\theta(t_k + i \Delta t)   \delta t$. Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
+where 
+
+$$\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \Delta t) \Delta t + f_\theta(t_k + i \Delta t) \Delta t.$$
+
+Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
 
 ### Semi-implicit (predictor-corrector) velocity-Verlet
 Integration of the latent state $(z_0,  z_1)$ over one sub-step $dt$.
@@ -341,7 +345,7 @@ Blocks are labelled by index and channel transition. Under same-`dx` scaling, in
 | enc down_blocks[5] (512 →1024)| —      | —       | —      |23'600'128 |
 | **TOTAL encoder** |**490'664**|**1'976'488**|**7'897'256**|**31'535'272**|
 |-------------------------------|--------|---------|----------|---------|
-| enc bottleneck (1×1, per stream)|1'032|    2'056 |    4'104 |   8'200 |
+| enc bottleneck (1×1, per stream)|1'032 |   2'056 |    4'104 |   8'200 |
 | enc theta_conditioner (FiLM)  |  8'544 |  16'992 |   33'888 |  67'680 |
 | dec unbottleneck (1×1)        |  1'152 |   2'304 |    4'608 |   9'216 |
 |-------------------------------|--------|---------|----------|---------|
@@ -355,11 +359,11 @@ Blocks are labelled by index and channel transition. Under same-`dx` scaling, in
 |-------------------------------|--------|---------|----------|---------|
 | **TOTAL AE + stats**|**656'993**|**2'570'849**|**10'199'649**|**40'661'601**|
 |-------------------------------|--------|---------|----------|---------|
-| **VRAM: activations [MB/sample]**|**29** |**115** | **460** |**1'841**|
-| **VRAM: params + Adam [MB]**   |  **10** | **39** | **156** | **620** |
-| **Max batch (fp32, 8 GB card)**| **256** | **63** |  **15** |   **3** |
-| **Max batch (fp16 activations)**|**465** |**115** |  **28** |   **6** |
+| **VRAM: activations [MB/sample]**|**29**|**115** |  **460** |**1'841**|
+| **VRAM: params + Adam [MB]**   |  **10**| **39** |  **156** | **620** |
+| **Max batch (fp32, 8 GB card)**| **256**| **63** |   **15** |   **3** |
+| **Max batch (fp16 activations)**|**465**|**115** |   **28** |   **6** |
 |-------------------------------|--------|---------|----------|---------|
-|`tau_down` (millions)          |    0.6 |     2.5 |       10 |      35 |
+|`tau_down` (millions)          |    0.6 |     2.5 |       10 |      40 |
 
 `tau_down​` is the number of phase-field time steps needed for full coarsening. It is an indication of the length of C++ runs needed, and a potential limiting factor. (off-table: `tau_down​` = 80e3 at 32×32.)

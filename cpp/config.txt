@@ -1,19 +1,19 @@
 # Grid
-Nx      = 256
-Ny      = 256
+Nx      = 512
+Ny      = 512
 
 # Time integration
 dt      = 0.05
 
-steps   = 15000001		
+steps   = 60000001
 #  3e6 for   64 x  64, 
-#  6e6 for  128 x 128 ( 8 for extremes), 
-# 15e6 for  256 x 256 (20 for extremes), 
-# 80e6 for  512 x 512, 
+#  6e6 for  128 x 128 ( 8 at low temperature), 
+# 15e6 for  256 x 256 (20 at low temperature), 
+# 60e6 for  512 x 512 (80 at low temperature), 
 # ??   for 1024 x1024 (!)
 
 # Threads
-max_threads=  6		# 8 for 256x256, 3-4 for 512x512, 2 for 1024x1024
+max_threads=  2		# 8 for 256x256, 3-4 for 512x512, 2 for 1024x1024
 
 # Landau potential 
 a0      = 1.0			# quadratic term in Landau potential
@@ -26,11 +26,10 @@ M       = 0.05			# mobility
 
 
 # Parameter sweep
-temperatures= 0.725, 0.75, 0.775, 0.8, 0.825, 0.85, 0.875, 0.9, 0.925, 0.94, 0.95, 0.96, 0.97, 0.975, 0.98, 0.985, 0.988, 0.99, 0.992, 0.994, 0.995, 0.996, 0.997, 0.998, 0.999
-# temperatures= 0.55, 0.575, 0.6, 0.625, 0.65, 0.675, 0.7  # steps = 20e6 for 256x256
+temperatures= 0.825, 0.85, 0.875, 0.9, 0.925, 0.94, 0.95, 0.96, 0.97, 0.975, 0.98, 0.985, 0.988, 0.99, 0.992, 0.994, 0.995, 0.996, 0.997, 0.998
+# temperatures= 0.55, 0.575, 0.6, 0.625, 0.65, 0.675, 0.7, 0.725, 0.75, 0.775, 0.8  # steps = 20e6 for 256x256
 noises  = 0.003, 0.004, 0.005, 0.007, 0.01, 0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05
 seeds   = 79, 97, 123, 131, 191, 401, 599
-
 
 	
 
