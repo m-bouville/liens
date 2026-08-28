@@ -27,7 +27,7 @@ Everything else is about models at various stages.
 - add `--f-scale-sweep` to try f_theta × λ, with λ in [0, 0.25, 0.5, 1] ("λ-sweep"); 0 corresponds to stage 2 and 1 is stage 3.
 - add `--alpha-sweep` for the h→0 test.
 
-The combined `compare_f_theta` (no `--*-only` flag) still runs both.
+The combined `compare_f_theta` (no `--*-only` flag) still runs both: `python -m evaluation.compare_f_theta checkpoints/stage3a/128x128-stage3a.pt checkpoints/stage3b/128x128-stage3b.pt --n-stats 200 --n-samples 6 --steps 10 --seed 0 --trajectory`
 
 ### Stage 2 only 
 `python -m evaluation.compare_f_theta checkpoints/stage2/128x128-stage2-20260812_20h08.pt checkpoints/stage2/128x128-stage2-20260818_13h54.pt checkpoints/stage2/128x128-stage2-20260819_11h20.pt --stage2-compare --n-stats 200 --steps 10`
