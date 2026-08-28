@@ -96,12 +96,12 @@ Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` p
 ### Sweep over `min_stdev_phi`, `min_std_deriv` and `min_passing_steps`
 `python -m evaluation.sweep_min_stdev_phi --base-path ../datasets --size 128 --max-runs 1000`
 
-`python -m evaluation.sweep_min_std_deriv --base-path ../datasets --size 128 --min-step 1000 --min-passing-steps 12 --max-runs 1000 --output ../output/min_std_deriv_sweep.png`
+`python -m evaluation.sweep_min_std_deriv --base-path ../datasets --size 128 --min-step 1000 --min-passing-steps 12 --max-runs 1000`
 
 `python -m evaluation.sweep_min_passing_steps --base-path ../datasets --size 128 --max-runs 1000`
 
 Optional arguments:
 - `--sma 3` to average times (x-axis from t-1 to t+1) if the plot is too choppy (default 1, i.e. no moving average);
-- `--output` with path (default: `../output/datasets/128x128-min_std_deriv_sweep.png`);
-- `--min-bin-count 10` ignores steps with fewer than 10 windows (default: 10);
+- `--output` with path (default: `../output/datasets/128x128-min_XXX_sweep.png`);
+- `--min-bin-count 100` ignores steps with fewer than 100 windows (default: 10);
 - `--current-value​ 0.01` includes a curve for the value of the parameter currently used in the code, e.g. 0.01 (default: no curve).
