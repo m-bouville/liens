@@ -104,8 +104,42 @@ def _parse_stem(stem: str) -> tuple[str, str]:
 
 
 def _load_model(lds_checkpoint_path: Path, device) -> dict:
-    """One checkpoint -> its f_theta, its OWN AE, and its configs."""
+    """One checkpoint -> its f_theta, its OWN AE, and its configs.
+
+    A stage 4/5 JOINT checkpoint (E, D, f in one file, keys ae_state/
+    f_theta_state) is transparently split into the standalone lds-view this
+    function already knows how to read -- whose ae_checkpoint points at the
+    REFINED encoder, not the pre-refinement stage-2 ancestor. So `compare_f_theta
+    128x128-stage4.pt ...` just works, scoring stage 4's refined encoder against
+    whatever it is compared with (the f_theta is frozen through stage 4, so the
+    comparison isolates the encoder change)."""
     ck = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
+    if "f_theta_state" in ck and "ae_state" in ck:
+        # Stage 4/5 joint checkpoint (E, D, f in one file). Load via the SAME
+        # component path train_refinement uses to RESUME it, not the
+        # split->build_ae_from_checkpoint route: that route rebuilds the AE from
+        # config alone and drops the deriv RESIDUAL heads the refined encoder
+        # actually carries (cross_check reconciles stream NAMES, not head_kind),
+        # so it raises "Unexpected key(s) ...residual_heads.deriv". The component
+        # builder constructs the encoder that matches the saved weights, and the
+        # f_theta keeps its own time_coordinate (u-scheme stays u-scheme).
+        from training.checkpoint_components import load_joint_refinement_checkpoint
+        from training.model_assembly import build_models_from_components
+        components = load_joint_refinement_checkpoint(lds_checkpoint_path, device=device)
+        ae, _stats_head, f_theta, _frozen, _sc, _rsn = build_models_from_components(
+            components, device=device, freeze_decoder=True)
+        ae.eval()
+        f_theta.eval()
+        ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+        return {"path": lds_checkpoint_path, "ck": ck,
+                "config": ck.get("lds_config", ck.get("config")),
+                "ae": ae, "ae_encoder": ae_encoder,
+                "ae_config": components["encoder"].config,
+                "ae_path": lds_checkpoint_path,   # the REFINED encoder is in this file
+                "f_theta": f_theta,
+                "max_dt": (ck.get("data_config") or {}).get("max_dt"),
+                "prefix": _parse_stem(lds_checkpoint_path.stem)[0],
+                "label": _parse_stem(lds_checkpoint_path.stem)[1]}
     cfg = ck["config"]
     ae_path = Path(ck["ae_checkpoint"])
     ae, ae_encoder, ae_ck, _, _ = build_ae_from_checkpoint(ae_path, device)

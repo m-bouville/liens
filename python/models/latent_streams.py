@@ -5,7 +5,7 @@ separate from constants.py, which is for plain shared VALUES
 (LATENT_SPATIAL_SIZE); this is for the actual TYPES describing what a
 latent stream is and what it's allowed to be used for.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import re
 import warnings
@@ -332,38 +332,63 @@ def cross_check_stream_configs_against_state_dict(
             prefix = m.group(1)  # "encoder.bottlenecks." or "encoders.shared.bottlenecks."
             found_names.add(m.group(2))
 
-    if not found_names or found_names == set(stream_configs):
-        return stream_configs, recon_stream_name
-
-    missing = found_names - set(stream_configs)
-    if not missing:
-        return stream_configs, recon_stream_name
-
-    # Channel count is read directly from the actual weight tensor
-    # (out_channels of a 1x1 conv, shape[0]) -- a real value, not
-    # assumed. Spatial size can't be recovered the same way (1x1 convs
-    # don't encode it), so an inferred stream is assumed to share the
-    # recon stream's own spatial_size, matching this project's own
-    # decodable-streams-share-one-size design constraint (see
-    # build_stream_configs). Mode is assumed DECODER, not AUTOENCODER
-    # -- the safer default for a stream the metadata never claimed as
-    # the reconstruction target; at most one AUTOENCODER-mode stream
-    # is meaningful, and recon_stream_name already correctly identifies
-    # whichever one that is.
-    recon_stream = stream_configs[recon_stream_name]
     corrected = dict(stream_configs)
-    for name in sorted(missing):
-        weight_key = f"{prefix}{name}.weight"
-        channels = encoder_state_dict[weight_key].shape[0]
-        corrected[name] = LatentStreamConfig(
-            name=name, channels=channels, spatial_size=recon_stream.spatial_size,
-            mode=LatentStreamMode.DECODER,
+    _changed = False
+
+    # (1) missing STREAMS: names the weights have but the config omitted.
+    # Channel count is read directly from the actual weight tensor (out_channels
+    # of a 1x1 conv, shape[0]). Spatial size can't be recovered from a 1x1 conv,
+    # so an inferred stream shares the recon stream's spatial_size (this
+    # project's decodable-streams-share-one-size constraint); mode DECODER is the
+    # safe default for a stream never claimed as the reconstruction target.
+    missing = (found_names - set(stream_configs)) if found_names else set()
+    if missing:
+        _changed = True
+        recon_stream = stream_configs[recon_stream_name]
+        for name in sorted(missing):
+            weight_key = f"{prefix}{name}.weight"
+            channels = encoder_state_dict[weight_key].shape[0]
+            corrected[name] = LatentStreamConfig(
+                name=name, channels=channels, spatial_size=recon_stream.spatial_size,
+                mode=LatentStreamMode.DECODER,
+            )
+        warnings.warn(
+            f"checkpoint's saved config only described streams {sorted(stream_configs)}, but its "
+            f"encoder weights also contain {sorted(missing)} -- likely a checkpoint saved by an "
+            f"intermediate version of this codebase (weights correct, config metadata stale). "
+            f"Corrected automatically; consider retraining this checkpoint fresh when convenient "
+            f"so its saved config matches its weights without needing this correction."
         )
-    warnings.warn(
-        f"checkpoint's saved config only described streams {sorted(stream_configs)}, but its "
-        f"encoder weights also contain {sorted(missing)} -- likely a checkpoint saved by an "
-        f"intermediate version of this codebase (weights correct, config metadata stale). "
-        f"Corrected automatically; consider retraining this checkpoint fresh when convenient "
-        f"so its saved config matches its weights without needing this correction."
-    )
-    return corrected, recon_stream_name
+
+    # (2) missing HEAD_KIND: a stream whose weights include a residual head
+    # (residual_heads.<name>.0.weight) but whose config says head_kind != "residual"
+    # is the SAME stale-config failure -- weights valid, self-description incomplete.
+    # This is exactly the stage-4/5 joint save that serialized stream_configs
+    # WITHOUT head_kind/head_hidden, so a reload built a plain Encoder that could
+    # not accept the saved residual_heads.<name>.* weights. Read head_kind and
+    # head_hidden back from the actual weights. No-op for a correctly-saved
+    # checkpoint whose config already says "residual".
+    _RESIDUAL_KEY_RE = re.compile(r"residual_heads\.([^.]+)\.0\.weight$")
+    _residual_h: dict[str, int] = {}
+    for key, tensor in encoder_state_dict.items():
+        m = _RESIDUAL_KEY_RE.search(key)
+        if m:                                    # h = out_channels of the head's first conv
+            _residual_h.setdefault(m.group(1), tensor.shape[0])
+    _fixed = []
+    for name, h in _residual_h.items():
+        cfg = corrected.get(name)
+        if cfg is not None and getattr(cfg, "head_kind", "linear") != "residual":
+            corrected[name] = replace(cfg, head_kind="residual", head_hidden=int(h))
+            _fixed.append(name)
+            _changed = True
+    if _fixed:
+        warnings.warn(
+            f"checkpoint's saved config marked streams {sorted(_fixed)} as head_kind='linear' "
+            f"but its encoder weights contain a residual head for each -- a stage-4/5 joint "
+            f"checkpoint saved before stream_configs recorded head_kind/head_hidden. Corrected "
+            f"from the weights; re-save when convenient so the config matches."
+        )
+
+    # Preserve the no-op identity contract: return the ORIGINAL object untouched
+    # when nothing needed correcting (callers/tests rely on `result is input`).
+    return (corrected, recon_stream_name) if _changed else (stream_configs, recon_stream_name)

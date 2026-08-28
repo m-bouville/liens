@@ -792,7 +792,12 @@ def train_refinement(
                     **{k: v for k, v in components["encoder"].config.items() if k != "decoder_for_stream"},
                     "stream_configs": {
                         name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta}
+                               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,
+                               # head_kind/head_hidden MUST be recorded: a residual-head
+                               # stream's Encoder has real residual_heads.<name> weights, and
+                               # a reload rebuilds a plain Encoder without them (RuntimeError:
+                               # unexpected residual_heads.deriv.*) if the config omits these.
+                               "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
                         for name, cfg in stream_configs.items()
                     },
                     "recon_stream_name": recon_stream_name,

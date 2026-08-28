@@ -211,13 +211,13 @@ n_rollout_steps = same
 # adaptative sub-step: alpha always inherited 
 
 recon0_scale    =   same 	# was 0.15e-3
-stats0_scale    =   same 	# 0.03
+stats0_scale    =   0.1 	# 0.03
 
-rollout_scale   =   1. 	# 0.2
-rollout_weight_warmup_epochs= 20
-rollout_weight_warmup_start = 1e-3  # geometric warmup
+rollout_scale   =   0.2 	# 0.2
+rollout_weight_warmup_epochs= 10
+rollout_weight_warmup_start = 1e-2  # geometric warmup
 
-lr 			  =   5e-6  	# default: 1.e-3
+lr 			  =   2e-6  	# default: 1.e-3
 
 epochs 		  = 100
 patience 	  =  25 	# tends to shoot up: patience won't pay

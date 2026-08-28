@@ -398,3 +398,50 @@ def test_cross_check_no_bottleneck_keys_at_all_is_a_noop():
     )
     assert corrected is stream_configs
     assert recon_name == "state"
+
+
+def test_cross_check_reconciles_head_kind_from_residual_head_weights():
+    """A stage-4/5 joint checkpoint saved before head_kind was serialized has a
+    deriv stream whose config says head_kind='linear' but whose weights contain
+    a residual head. cross_check must read head_kind/head_hidden back from the
+    weights so the rebuilt Encoder creates the matching residual_heads.<name>."""
+    import torch
+    cfgs = {
+        "state": LatentStreamConfig(name="state", channels=8, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+        "deriv": LatentStreamConfig(name="deriv", channels=8, spatial_size=8,
+                                     mode=LatentStreamMode.DECODER),  # head_kind defaults linear
+    }
+    state = {
+        "encoders.shared.bottlenecks.state.weight": torch.zeros(8, 16, 1, 1),
+        "encoders.shared.bottlenecks.deriv.weight": torch.zeros(8, 16, 1, 1),
+        "encoders.shared.residual_heads.deriv.0.weight": torch.zeros(32, 16, 3, 3),  # h=32
+        "encoders.shared.residual_heads.deriv.2.weight": torch.zeros(8, 32, 3, 3),
+    }
+    with pytest.warns(UserWarning, match="head_kind"):
+        corrected, _ = cross_check_stream_configs_against_state_dict(cfgs, "state", state)
+    assert corrected["deriv"].head_kind == "residual"
+    assert corrected["deriv"].head_hidden == 32
+    assert corrected["state"].head_kind == "linear"   # untouched
+
+
+def test_cross_check_head_kind_is_a_noop_when_config_already_residual():
+    """A correctly-saved residual config must be returned UNCHANGED (identity),
+    not rebuilt -- the reconciliation only fires on the stale-config failure."""
+    import torch
+    cfgs = {
+        "state": LatentStreamConfig(name="state", channels=8, spatial_size=8,
+                                     mode=LatentStreamMode.AUTOENCODER),
+        "deriv": LatentStreamConfig(name="deriv", channels=8, spatial_size=8,
+                                     mode=LatentStreamMode.DECODER,
+                                     head_kind="residual", head_hidden=32),
+    }
+    state = {
+        "encoders.shared.bottlenecks.state.weight": torch.zeros(8, 16, 1, 1),
+        "encoders.shared.bottlenecks.deriv.weight": torch.zeros(8, 16, 1, 1),
+        "encoders.shared.residual_heads.deriv.0.weight": torch.zeros(32, 16, 3, 3),
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        corrected, _ = cross_check_stream_configs_against_state_dict(cfgs, "state", state)
+    assert corrected is cfgs
