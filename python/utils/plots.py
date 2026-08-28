@@ -321,6 +321,71 @@ def _proportional_limits(values: list[float], exponent: float = 0.15,
     return lo / pad, hi * pad
 
 
+def rollout_vs_1step_scatter(l_1step_val, l_rollout_val, output_path, title="",
+                             saved_epochs=None,
+                             l_1step_train=None, l_rollout_train=None):
+    """Stage-3b diagnostic: L_rollout vs L_1step at each SAVED epoch, on shared
+    log-log SQUARE axes, for BOTH training and validation (tab:blue / tab:orange,
+    same convention as loss_curve). Makes the rollout/per-step TRADEOFF visible:
+    a series buying multi-step stability at the cost of single-step accuracy
+    walks DOWN-and-RIGHT; one improving both heads to the lower-left. Comparing
+    train vs valid also shows GENERALIZATION -- e.g. val bending right while
+    train does not is the rollout equivalent of overfitting. Only saved epochs
+    are shown, so every point is a real, reloadable checkpoint. Fewer than 2
+    finite validation points -> returns None (a 1-step 3a where the two are
+    identical, or a run that never saved twice)."""
+    import numpy as np
+
+    def _clean(xs, ys):
+        xs = np.asarray(xs, dtype=float); ys = np.asarray(ys, dtype=float)
+        ok = np.isfinite(xs) & np.isfinite(ys) & (xs > 0) & (ys > 0)
+        return xs[ok], ys[ok], ok
+
+    xv, yv, okv = _clean(l_1step_val, l_rollout_val)
+    if len(xv) < 2:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    allx = list(xv); ally = list(yv)
+
+    def _series(x1, lr, color, name):
+        if x1 is None or lr is None:
+            return
+        x, y, _ = _clean(x1, lr)
+        if len(x) < 1:
+            return
+        allx.extend(x); ally.extend(y)
+        ax.plot(x, y, "-o", color=color, ms=4, lw=1, alpha=0.8, zorder=3, label=name)
+        ax.scatter(x[-1], y[-1], facecolors="none", edgecolors=color,
+                   s=140, lw=2, zorder=4)                 # latest saved (ring)
+        _b = int(np.argmin(y))
+        ax.scatter(x[_b], y[_b], marker="*", color=color, s=180, zorder=5)  # best L_rollout
+
+    _series(l_1step_train, l_rollout_train, "tab:blue", "train")
+    _series(l_1step_val, l_rollout_val, "tab:orange", "valid")
+
+    lo = min(allx + ally) * 0.7
+    hi = max(allx + ally) * 1.4
+    ax.plot([lo, hi], [lo, hi], "--", color="gray", lw=1, zorder=2,
+            label="L_rollout = L_1step")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal")
+    ax.set_xlabel("L_1step (saved epochs)")
+    ax.set_ylabel("L_rollout (saved epochs)")
+    ax.set_title(title or "L_rollout vs L_1step (saved checkpoints)")
+    # ring = latest saved, star = best L_rollout (per series)
+    ax.plot([], [], "o", mfc="none", mec="gray", label="latest saved")
+    ax.plot([], [], "*", color="gray", label="best L_rollout")
+    ax.legend(fontsize=8, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=100)
+    plt.close(fig)
+    return output_path
+
+
 def loss_component_scatter(
     epoch_history: list[int], component_histories: dict[str, dict[str, list[float]]],
     output_path: Path, title: str = "",

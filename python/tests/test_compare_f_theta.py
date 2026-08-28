@@ -1431,7 +1431,7 @@ def test_the_causal_baseline_is_the_second_row(monkeypatch, tmp_path):
     assert axes.shape == (5, 5)
     labels = [axes[r, 0].get_ylabel().replace("\n", " ") for r in range(5)]
     assert labels[0] == "real"
-    assert labels[1].startswith("causal")
+    assert labels[1].startswith("previous derivative")
     assert labels[2].startswith("stage 2"), labels
     assert labels[3] == "stage 3a" and labels[4] == "stage 3b"
     # and it carries its own loss/corr like the model rows
@@ -1644,7 +1644,7 @@ def test_the_causal_curve_is_on_all_six_stats_panels(monkeypatch, tmp_path):
         for c in range(3):
             legend = axes[r, c].get_legend()
             labels = [t.get_text() for t in legend.get_texts()]
-            assert any("causal" in t for t in labels), (
+            assert any("previous derivative" in t for t in labels), (
                 f"panel [{r},{c}] has no causal curve: {labels}"
             )
 
@@ -1673,7 +1673,7 @@ def test_the_causal_curve_is_absent_when_no_window_had_a_baseline(monkeypatch, t
     cf._stats_figure(stats, a, b, "T", tmp_path / "s.png")
     labels = [t.get_text()
               for t in captured["axes"][0, 2].get_legend().get_texts()]
-    assert not any("causal" in t for t in labels)
+    assert not any("previous derivative" in t for t in labels)
 
 
 def test_causal_vs_dt_uses_its_OWN_dt_array(monkeypatch, tmp_path):
@@ -1870,7 +1870,7 @@ def test_the_temperature_column_is_present_on_both_rows(monkeypatch, tmp_path):
     assert axes[0, 2].get_xlabel() == "temperature (SMA)"
     for r in (0, 1):
         labels = [t.get_text() for t in axes[r, 2].get_legend().get_texts()]
-        assert any("causal" in t for t in labels), (
+        assert any("previous derivative" in t for t in labels), (
             f"the causal baseline is missing from the vs-T panel [{r},2]"
         )
 
@@ -2177,8 +2177,8 @@ def test_the_stage2_row_sits_between_causal_and_the_models(monkeypatch, tmp_path
                            "cpu", False, "T", tmp_path / "t.png")
     axes = captured["axes"]
     labels = [axes[r, 0].get_ylabel().replace("\n", " ") for r in range(5)]
-    assert labels == ["real", "causal (backward dz0/dt)", "stage 2 (z0 + z1 dt)",
-                       "stage 3a", "stage 3b"], labels
+    assert labels == ["real", "previous derivative (linear extrapolation)",
+                       "stage 2 (z0 + z1 dt)", "stage 3a", "stage 3b"], labels
     # and it carries its own per-frame numbers
     assert "loss=" in axes[2, 1].get_title()
 
@@ -2224,7 +2224,7 @@ def test_stats_legends_are_ordered_like_the_trajectory_rows(monkeypatch, tmp_pat
     """
     stats, a, b = _stats_with_causal(monkeypatch, n=60)
     axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
-    expected = ["causal", "stage 2", "stage 3a", "stage 3b"]
+    expected = ["previous derivative", "stage 2", "stage 3a", "stage 3b"]
     for r in range(2):
         for c in range(4):
             labels = [t.get_text()

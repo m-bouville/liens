@@ -490,6 +490,12 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
                    output_path: Path, *, n_steps: int = 1) -> Path:
     """Four panels: loss and correlation, as distributions and against dt."""
     dt = np.array(stats["dt"], dtype=float)
+    # The stored "dt" is sum(dt_per_step) in the MODEL's time coordinate: a
+    # u-scheme (log10_t) model steps in Delta-u=log10(t_{i+1}/t_i), so the axis
+    # is du_total, not dt_total. Label it truthfully so the span is not misread
+    # as a narrow physical-dt range.
+    _dt_axis_label = ("du_total" if getattr(a["f_theta"], "time_coordinate", "t") == "log10_t"
+                      else "dt_total")
     fig, axes = plt.subplots(2, 5, figsize=(31, 9))
     colours = {"a": "tab:blue", "b": "tab:red", "causal": "tab:green",
                 "stage2": "tab:purple"}
@@ -511,7 +517,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     # are already in the suptitle, and the encoder tag made these overflow.
     # Drop the descriptor, keep the encoder provenance tag.
     labels = {"a": a["label"], "b": b["label"],
-              "causal": "causal" + _enc,
+              "causal": "previous derivative",
               "stage2": "stage 2" + _enc + (
                   "" if _stage2_comparable else "  [not comparable]")}
     linestyles = {"a": "-", "b": "-", "causal": "-",
@@ -587,7 +593,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
             dt_loss_medians.append(med)
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("dt_total (binned)")
+    ax.set_xlabel(_dt_axis_label + " (binned)")
     ax.set_ylabel("median loss (band: quartiles)")
     ax.set_title("loss vs dt")
     # loss-vs-dt is the REFERENCE range for the whole loss row: it is scaled
@@ -613,7 +619,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
             ax.plot(c, med, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
             ax.fill_between(c, lo, hi, color=colours[key], linestyle=linestyles[key], alpha=0.15)
     ax.set_xscale("log")
-    ax.set_xlabel("dt_total (binned)")
+    ax.set_xlabel(_dt_axis_label + " (binned)")
     ax.set_ylabel("median correlation (%) (band: quartiles)")
     ax.set_title("correlation vs dt")
     _corr_axis(ax)
@@ -1188,7 +1194,7 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     # the causal row could be present or absent.
     rows = [("real", real_frames, None)]
     if causal is not None:
-        rows.append(("causal\n(backward dz0/dt)", causal, "causal"))
+        rows.append(("previous derivative\n(linear extrapolation)", causal, "causal"))
     rows.append(("stage 2\n(z0 + z1 dt)", stage2, "stage2"))
     rows += [(a["label"], pred_a, "a"), (b["label"], pred_b, "b")]
 
@@ -1385,6 +1391,12 @@ def _default_figure_path(prefix, a, b, seed, n_steps_used, z1_resync,
     # filename should be reversible to its source, not a pretty display).
     sa = _sanitize(Path(a["path"]).stem)
     sb = _sanitize(Path(b["path"]).stem)
+    # Drop a shared leading "<prefix>-" (the size, e.g. "128x128-") from the
+    # SECOND name so it is not repeated: "128x128-stage3a_vs_stage3b", not
+    # "...stage3a_vs_128x128-stage3b". Still the raw stems, still reversible.
+    _shared = f"{prefix}-" if prefix else ""
+    if _shared and sb.startswith(_shared):
+        sb = sb[len(_shared):]
     name = f"{sa}_vs_{sb}"
     suffix = "" if fixed_windows else f"-seed{seed}"
     regime_tag = f"-{n_steps_used}step{'s' if n_steps_used != 1 else ''}"
@@ -1749,7 +1761,7 @@ def _stage2_rollout_figure(models, dt_totals, temps, n_steps, output_path):
                 warnings.simplefilter("ignore", RuntimeWarning)
                 _cmed = np.nanmedian(cdata, axis=0)
             ax.plot(steps_axis, _cmed, "--",
-                    color="grey", label="causal (frozen dz0/dt)")
+                    color="grey", label="previous derivative")
             meds.append(_cmed)
         if is_loss:
             ax.set_yscale("log")
@@ -1760,7 +1772,7 @@ def _stage2_rollout_figure(models, dt_totals, temps, n_steps, output_path):
     def _bundle(final_key, causal_key):
         b = [(m[final_key], m["label"], cmap(i % 10))
              for i, m in enumerate(models)]
-        b.append((models[0][causal_key], "causal (frozen dz0/dt)", "grey"))
+        b.append((models[0][causal_key], "previous derivative", "grey"))
         return b
 
     # TOP ROW: loss. Collect the MEDIAN curves so the y-range is set by them,
@@ -1878,7 +1890,7 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
         _cl = np.array([x for x in stats["loss_causal"] if np.isfinite(x)], dtype=float)
         _cc = np.array([c for c in stats["corr_causal"] if c is not None], dtype=float)
         if _cl.size:
-            print(f"  causal (frozen dz0/dt): median loss {np.median(_cl):.5g}, "
+            print(f"  previous derivative: median loss {np.median(_cl):.5g}, "
                   f"median corr {np.median(_cc):.1f}%")
         # Stage 2 (z0+z1*dt) RE-ENCODES the predicted state every step -- the
         # models never do -- so it is a fair, same-methodology baseline ONLY at

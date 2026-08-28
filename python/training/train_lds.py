@@ -41,7 +41,7 @@ from training.checkpoint_components import cross_check_ancestor_config
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss, compute_dt_decade_weights
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
-from utils.plots import loss_curve, write_loss_history, should_write_loss_figure
+from utils.plots import loss_curve, write_loss_history, should_write_loss_figure, rollout_vs_1step_scatter
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -778,6 +778,13 @@ def train_lds(
     best_so_far_history: list[float] = []
     train_1step_history: list[float] = []
     val_1step_history: list[float] = []
+    # (L_1step, L_rollout, epoch) at each SAVED epoch only -- for the
+    # rollout-vs-1step tradeoff scatter (stage 3b).
+    saved_1step_hist: list[float] = []
+    saved_rollout_hist: list[float] = []
+    saved_train_1step_hist: list[float] = []
+    saved_train_rollout_hist: list[float] = []
+    saved_epoch_hist: list[int] = []
 
     run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
@@ -1593,6 +1600,12 @@ def train_lds(
         if saved_this_epoch:
             _saved_this_run = True
             epochs_since_improvement = 0
+            if show_1step:            # L_rollout=*_loss, L_1step=*_1step
+                saved_1step_hist.append(val_1step)
+                saved_rollout_hist.append(val_loss)
+                saved_train_1step_hist.append(train_1step)
+                saved_train_rollout_hist.append(train_loss)
+                saved_epoch_hist.append(epoch)
             atomic_torch_save({
                 "model_state": f_theta.state_dict(),
                 "epoch": epoch,
@@ -1731,6 +1744,19 @@ def train_lds(
         secondary_label="1step",
     )
     write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
+
+    # Stage-3b only (show_1step): the L_rollout-vs-L_1step tradeoff at the
+    # SAVED checkpoints, log-log square. Skipped for 3a (n_rollout_steps=1,
+    # where the two are identical) and for runs with <2 saved epochs.
+    if show_1step:
+        rollout_vs_1step_scatter(
+            saved_1step_hist, saved_rollout_hist,
+            loss_curve_path.with_name(loss_curve_path.stem.replace("-loss_curve", "")
+                                      + "-rollout_vs_1step.png"),
+            title="Stage 3b: L_rollout vs L_1step (saved checkpoints)",
+            saved_epochs=saved_epoch_hist,
+            l_1step_train=saved_train_1step_hist,
+            l_rollout_train=saved_train_rollout_hist)
 
     if not checkpoint_path.exists():
         # A run that never saved is a FAILED run, and it must say so HERE.
