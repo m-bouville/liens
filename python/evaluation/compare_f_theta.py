@@ -507,10 +507,13 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     _enc_pretty = _pretty_label(Path(a.get("ae_path", "")).stem, include_year=False)
     _es = re.search(r"\((.*?)\)", _enc_pretty)   # pull just the "26/08 at 14:55"
     _enc = f"  [{_es.group(1)}]" if _es else ""
+    # Keep the legend short: the "(z0 + z1 dt)" / "(frozen dz0/dt)" descriptors
+    # are already in the suptitle, and the encoder tag made these overflow.
+    # Drop the descriptor, keep the encoder provenance tag.
     labels = {"a": a["label"], "b": b["label"],
-              "causal": "causal (frozen dz0/dt)" + _enc,
-              "stage2": "stage 2 (z0 + z1 dt)" + _enc + (
-                  "" if _stage2_comparable else "  [re-encodes -- not comparable]")}
+              "causal": "causal" + _enc,
+              "stage2": "stage 2" + _enc + (
+                  "" if _stage2_comparable else "  [not comparable]")}
     linestyles = {"a": "-", "b": "-", "causal": "-",
                   "stage2": "-" if _stage2_comparable else ":"}
     has_causal = bool(stats.get("step_loss_causal"))
@@ -1366,10 +1369,23 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
 
 def _default_figure_path(prefix, a, b, seed, n_steps_used, z1_resync,
                           fixed_windows):
-    sa = a["label"].replace(" ", "")
-    sb = b["label"].replace(" ", "")
-    name = f"{prefix}-{sa}_vs_{sb}" if prefix and " vs " not in prefix \
-        else f"{sa}_vs_{sb}"
+    # Build the FILENAME from the checkpoint stem, never from the (now
+    # prettified) legend label: the pretty label contains "/" and ":"
+    # (e.g. "stage 3a (27/08 at 22:44)"), which are a directory separator and
+    # an illegal-on-Windows char -- they crashed mkdir. The stem is filesystem-
+    # safe by construction. _sanitize is a final guard for any stray character.
+    def _sanitize(text):
+        for ch in ' /:()':
+            text = text.replace(ch, '')
+        return text
+    # The checkpoint stems are the source of truth and already carry the size
+    # prefix (e.g. "128x128-stage3a-..."); join them directly. Do NOT prepend
+    # `prefix` (it would duplicate the size -> "128x128-128x128-...") and do NOT
+    # build from the prettified label (its "/" and ":" crashed mkdir, and a
+    # filename should be reversible to its source, not a pretty display).
+    sa = _sanitize(Path(a["path"]).stem)
+    sb = _sanitize(Path(b["path"]).stem)
+    name = f"{sa}_vs_{sb}"
     suffix = "" if fixed_windows else f"-seed{seed}"
     regime_tag = f"-{n_steps_used}step{'s' if n_steps_used != 1 else ''}"
     regime_tag += "-resync" if z1_resync else "-propagated"

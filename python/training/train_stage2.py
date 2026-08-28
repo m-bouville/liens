@@ -1376,6 +1376,10 @@ def train_stage2(
         if _cuda_rng_state is not None:
             torch.cuda.set_rng_state(_cuda_rng_state)
 
+    _prev_val_seconds = None   # previous epoch's validation duration, added to
+    #                            the training bar's ETA so it reflects the WHOLE
+    #                            epoch, not just training (None until 1st epoch's
+    #                            validation has been timed -> shown as "+ validation")
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         # Linear ramp: 0 at epoch 0 (never reached, epochs are 1-indexed)
         # up to deriv_weight at epoch=deriv_weight_warmup_epochs and
@@ -1531,7 +1535,9 @@ def train_stage2(
         if epoch > 0:
             n_train = len(train_set)
             _n_train_batches = 0
-            _epoch_progress = EpochProgress(len(train_loader))
+            _epoch_progress = EpochProgress(
+                len(train_loader),
+                tail_label="validation", tail_seconds=_prev_val_seconds)
             for batch in train_loader:
                 _epoch_progress.tick()
                 bs = batch[0].size(0)
@@ -1591,6 +1597,7 @@ def train_stage2(
         # delay, so it only shows for a genuinely slow val pass, not every epoch.
         _val_prog = EpochProgress(len(val_loader), label="validation",
                                   unit="batches")
+        _val_t0 = time.monotonic()
         with torch.no_grad():
             for batch in val_loader:
                 _val_prog.tick()
@@ -1605,6 +1612,7 @@ def train_stage2(
                 val_deriv_sum += deriv * bs
                 val_interp_sum += interp_val * bs
         _val_prog.close()
+        _prev_val_seconds = time.monotonic() - _val_t0   # feeds next epoch's ETA
         val_total = (val_total_sum / n_val).item()
         val_recon = (val_recon_sum / n_val).item()
         val_stats = (val_stats_sum / n_val).item()

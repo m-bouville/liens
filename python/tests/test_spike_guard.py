@@ -1719,13 +1719,13 @@ def test_suppressed_skips_are_digested_not_discarded():
         assert r.epoch(ep, 0, None, 1, _marginal(), 13) == ""
     out = r.epoch(10, 0, None, 1, _marginal(), 13)
     assert "further batch(es) skipped" in out, out
-    assert "10 further" in out, f"digest lost some of the count: {out}"
+    assert "10/" in out, f"digest lost some of the count: {out}"
     assert "11.9x" in out
     # and the counter resets, so the next digest is not cumulative
     for ep in range(11, 20):
         r.epoch(ep, 0, None, 1, _marginal(), 13)
     out2 = r.epoch(20, 0, None, 1, _marginal(), 13)
-    assert "10 further" in out2, out2
+    assert "10/" in out2, out2
 
 
 def test_the_explanation_appears_on_the_first_NOTABLE_skip():

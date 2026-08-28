@@ -1385,7 +1385,7 @@ def main():
                               "check_stdev_phi_temperature, the early steps are what tau is "
                               "estimated from, so raising this further discards the signal this "
                               "diagnostic is built on")
-    parser.add_argument("--ref-fraction", type=float, default=0.5)
+    parser.add_argument("--ref-fraction", type=float, default=0.6)
     parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True,
                          help="--no-plot skips rendering the figure, which is ~99%% of the "
                               "runtime; the console tables are unaffected")

@@ -206,12 +206,20 @@ class EpochProgress:
     """
 
     def __init__(self, n_batches, delay_s: float = 20.0, every: int = 50,
-                 stream=None, label: str = "epoch progress: batch", unit: str = ""):
+                 stream=None, label: str = "epoch progress: batch", unit: str = "",
+                 tail_label: str | None = None, tail_seconds: float | None = None):
         self._n = n_batches
         self._delay = delay_s
         self._every = max(1, every)
         self._label = label            # what is being counted (default: the
         self._unit = unit              # epoch-batch wording, unchanged)
+        # Optional post-loop phase (e.g. validation) whose time this bar's ETA
+        # should also account for -- otherwise "~6m left" reads as "left in the
+        # epoch" when it's only "left in TRAINING". tail_label names the phase;
+        # tail_seconds is its estimated duration (None = not yet known, e.g.
+        # the first epoch, in which case the ETA is marked "+ <tail_label>").
+        self._tail_label = tail_label
+        self._tail_seconds = tail_seconds
         self._stream = stream if stream is not None else sys.stdout
         self._start = time.monotonic()
         self._i = 0
@@ -239,8 +247,19 @@ class EpochProgress:
             elapsed_since = now - self._activated_at
             if done_since > 0 and elapsed_since > 0:
                 rate = done_since / elapsed_since          # batches/sec
-                remaining = (self._n - self._i) / rate     # seconds
-                eta = f"~{_format_duration(remaining)} left"
+                remaining = (self._n - self._i) / rate     # seconds of THIS loop
+                if self._tail_label is None:
+                    eta = f"~{_format_duration(remaining)} left"
+                elif self._tail_seconds is None:
+                    # tail expected but its duration isn't known yet (first
+                    # epoch): don't hide it, flag the estimate as incomplete.
+                    eta = (f"~{_format_duration(remaining)} left "
+                           f"+ {self._tail_label}")
+                else:
+                    total = remaining + self._tail_seconds
+                    eta = (f"~{_format_duration(total)} left = "
+                           f"{_format_duration(remaining)} + "
+                           f"{_format_duration(self._tail_seconds)}")
             else:
                 eta = "estimating..."
             _u = f" {self._unit}" if self._unit else ""

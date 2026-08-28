@@ -51,7 +51,7 @@ augment       = False		# takes hours per epoch otherwise
 #   latent-space structure: z1 approximates d z0 / dt
 #############################################################
 
-resume_from = checkpoints/stage2/128x128-stage2-20260827_11h24.pt
+resume_from = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 
 ## Stage 2a (trains only z1 head, not z0: faster)
 # stage2a	  	= True
@@ -78,7 +78,7 @@ interp_weight   = 0.		# was 0.1
 val_ema_decay   = 0.7		# was 0.7 (default)
 
 n_frozen_stages =   0
-deriv_dt_weight_exponent = -0.5  # was -0.5; weight = dt^(−exponent)
+deriv_dt_weight_exponent = -0.5  # was -0.5, then -1. (no improvement); weight = dt^(−exponent)
 
 deriv_target_centered=True
 
@@ -93,7 +93,7 @@ grad_clip		= 1.0		# was by default 0.
 
 val_aug_averaging= True
 
-force 	      = True
+# force 	      = True
 
 
 
@@ -119,24 +119,26 @@ ae_stats_weight= 1.
 
 use_dt_decade_weights = False  # incompatible with `deriv_linear`
 
-epochs 		  = 4000	# improvements are barely noticeable after that
+epochs 		  = 6000	# improvements are barely noticeable after that
 patience 	  =  500
 
 num_workers	  =    4 	# was 4, then 0
 batches		  = 4096
-spike_skip_factor= 10
 
-lr 			  = 8.e-3  # was 5.e-3; default: 1.e-3
-z0_noise_scale=   0.1	# was 0.175
+spike_skip_factor= 10
+grad_clip		= 1.0		# was by default 0.
+
+lr 			  =  5.e-3  # was 5.e-3, then 8 (choppier); default: 1.e-3
+z0_noise_scale=   0.1
 
 derivative_source= previous_quotient   # INERT in 3a
 dt_cap		  = inf		# for second order
 max_dt        = inf   # possible with `deriv_linear`
 # max_dt        = 100000   # 100'000/0.05 = 2'000'000 time steps (last: 13'000'000 -> 15'000'000)
 
-# force 	      = True
+force 	      = True
 # resume_from   = checkpoints/stage3a/128x128-stage3a-20260825_02h51.pt
-# ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260827_11h24.pt
+ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 
 
 
@@ -160,7 +162,7 @@ memory_cost_a_bytes= 120787
 memory_cost_b_bytes= 18469
 memory_cost_p      = 0.79
 
-rollout_scale  = 0.25e-6			# was 1e-6
+rollout_scale  = 1.e-6			# was 1e-6, then 0.25e-6
 ae_stats_weight= same
 one_step_weight= 0.5 		# was 0.5
 
@@ -170,21 +172,20 @@ epochs 		  = 4000
 patience 	  =  500
 
 num_workers	  =    0
-batches		  = 3072
-# min_batch_size=  512 		# not implemented, TODO?
+batches		  = 4096
 spike_skip_factor= same
 # grad_spike_factor = 0        # disable the gradient guard; grad_clip does the bounding
 grad_clip		= 1.0		# TEST
 
-
-dynamics_mode=deriv_linear	# NEW
-time_coordinate = log10_t	# NEWER
+dynamics_mode=deriv_linear
+time_coordinate = log10_t
 derivative_source= previous_quotient   # NEW: the q-scheme (autonomous q-rollout)
 alpha            = None                # UNSET: deriv_linear forbids sub-stepping
 n_substeps       = 1                    # full-step
 
+lr 			  =   0.5e-3  	# was 0.2e-4, then 0.2e-3; default: 1.e-3
+lr_warmup_steps= 50			# was implicitly 20
 
-lr 			  =   0.2e-3  	# was 0.2e-4; default: 1.e-3
 z0_noise_scale= same
 
 dt_cap		  = same		# must be
@@ -192,7 +193,7 @@ max_dt        = inf 		# possible with `deriv_linear`
 
 
 force 	      = True
-ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_11h24.pt
+ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 ## resume_from = checkpoints/stage3b/128x128-stage3b-20260806_18h10.pt
 
 

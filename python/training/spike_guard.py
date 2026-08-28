@@ -370,6 +370,7 @@ class SkipReporter:
         self._explained = False
         self._quiet_epochs = 0
         self._quiet_batches = 0
+        self._quiet_total = 0
         self._quiet_worst = 0.0
         self._last_digest_epoch = 0
 
@@ -399,18 +400,21 @@ class SkipReporter:
             else:
                 self._quiet_epochs += 1
                 self._quiet_batches += total
+                self._quiet_total += n_batches
                 self._quiet_worst = max(self._quiet_worst, ratio)
 
         if (self.digest_every and self._quiet_epochs
                 and epoch - self._last_digest_epoch >= self.digest_every):
+            _pct = 100.0 * self._quiet_batches / self._quiet_total if self._quiet_total else 0.0
             lines.append(
-                f"  [epochs {self._last_digest_epoch + 1}-{epoch}: {self._quiet_batches} "
+                f"  [epochs {self._last_digest_epoch + 1}-{epoch}: {self._quiet_batches}"
+                f"/{self._quiet_total} ({_pct:.2g}%) "
                 f"further batch(es) skipped across {self._quiet_epochs} epoch(s), worst "
                 f"{self._quiet_worst:.3g}x its band median -- below the reporting bar "
                 f"({self.notable_ratio:g}x, or {100 * self.notable_fraction:g}% of an "
                 f"epoch's batches), i.e. the guard trimming a marginal tail]")
             self._last_digest_epoch = epoch
-            self._quiet_epochs = self._quiet_batches = 0
+            self._quiet_epochs = self._quiet_batches = self._quiet_total = 0
             self._quiet_worst = 0.0
         return "\n".join(x for x in lines if x)
 
