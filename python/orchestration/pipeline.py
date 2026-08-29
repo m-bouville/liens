@@ -651,8 +651,21 @@ def run_from_params_file(params_path: Path, default_base: Path,
             # does -- otherwise the log/registry name the rotating canonical
             # (128x128-stage3b.pt) the next run of that stage overwrites, and
             # the record of WHICH 3b this stage-4 was built on is lost.
-            ae_ancestor = _archive_ancestor(Path(stage2_checkpoint))
-            lds_ancestor = _archive_ancestor(Path(stage3_checkpoint))
+            # Resolve BOTH ancestors through the same helper run_lds_stage uses
+            # for its encoder: it POPS the key from kwargs (so a params-file
+            # ae_checkpoint_path / lds_checkpoint_path is not ALSO passed via
+            # **kwargs below, which is the "multiple values for keyword argument
+            # 'ae_checkpoint_path'" crash), and honours an explicit same-stage
+            # override. Not overridden -> pin the auto-chained ancestor to its
+            # timestamped identity, exactly as before.
+            kwargs, ae_ancestor, ae_overridden = _resolve_stage_specific_ancestor(
+                kwargs, stage2_checkpoint, f"Stage {stage_key}", key="ae_checkpoint_path")
+            if not ae_overridden:
+                ae_ancestor = _archive_ancestor(Path(ae_ancestor))
+            kwargs, lds_ancestor, lds_overridden = _resolve_stage_specific_ancestor(
+                kwargs, stage3_checkpoint, f"Stage {stage_key}", key="lds_checkpoint_path")
+            if not lds_overridden:
+                lds_ancestor = _archive_ancestor(Path(lds_ancestor))
             # Both ancestors recorded explicitly, same rationale as
             # run_lds_stage: full ancestry visible from this one
             # registry, without following stage2_checkpoint into ITS

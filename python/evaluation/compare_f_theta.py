@@ -2275,8 +2275,12 @@ def main() -> None:
         anc_mode = args.with_ancestors is not None
         if anc_mode and out is None:
             anchor = Path(args.checkpoints[0]).stem
-            out = (_PYTHON_ROOT.parent / "output"
-                   / _output_subdir(args.checkpoints[0])
+            # --with-ancestors spans several stages (2 -> 3a -> 3b -> ...), so it
+            # is NOT a single-stage comparison -- keying it off the anchor's
+            # stage would file a cross-stage figure under, e.g., stage3b/. It
+            # goes to the general rollout_check_png/ instead; only the two-model
+            # same-stage case (below) uses the per-stage subdir.
+            out = (_PYTHON_ROOT.parent / "output" / "rollout_check_png"
                    / f"{anchor}-ancestors-{args.steps}steps.png")
         compare_statistics(
             Path(lineage_paths[0]), Path(lineage_paths[1]),

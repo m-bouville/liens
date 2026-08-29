@@ -29,7 +29,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base-path", type=Path, default=_PYTHON_ROOT.parent / "datasets")
-    p.add_argument("--size", type=int, default=128)
+    p.add_argument("--size", type=int, required=True)
     p.add_argument("--window-length", type=int, default=2)
     p.add_argument("--min-step", type=int, default=0,
                    help="0 = include all steps (default). Raise to drop early steps")

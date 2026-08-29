@@ -26,6 +26,7 @@ one pass over ~2.6M parameters, ~10 ms, once per process.
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 from pathlib import Path
 
@@ -48,6 +49,44 @@ def encoder_fingerprint(encoder: torch.nn.Module) -> str:
         digest.update(str(contiguous.dtype).encode("utf-8"))
         digest.update(contiguous.numpy().tobytes())
     return digest.hexdigest()
+
+
+def write_cache_info(cache_root: Path, fingerprint: str, size: int | None,
+                     info: dict | None = None) -> None:
+    """Drop a human-readable `_cache_info.txt` in the fingerprint's subdir, so a
+    directory whose name is an opaque blake2b hash says WHAT produced it. The
+    fingerprint is a hash of the encoder's weights+buffers; `info` carries the
+    identifying context the hash itself can't be read back into (source
+    checkpoint, latent_channels, ...). Best-effort: the static block is written
+    once, the 'cache last accessed' timestamp is refreshed on every call, and
+    failure is swallowed (a missing note must never break caching)."""
+    directory = f"{size}x{size}-{fingerprint}" if size is not None else fingerprint
+    cache_dir = cache_root / directory
+    info_path = cache_dir / "_cache_info.txt"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "Latent cache directory. Name = <size>x<size>-<encoder fingerprint>.",
+            "The fingerprint is a blake2b hash of the encoder's weights AND",
+            "buffers (BatchNorm running stats included) -- nothing else. Same",
+            "encoder => same directory, independent of WHEN it was built. Files",
+            "here are latents from THAT encoder; a different encoder gets a",
+            "different dir.",
+            "",
+            f"fingerprint     = {fingerprint}",
+            f"size            = {size}",
+        ]
+        for k, v in (info or {}).items():
+            lines.append(f"{k:<15} = {v}")
+        # The access time DOES belong to the cache (not the hash): separated by
+        # a blank line so it reads as metadata about this directory, not as an
+        # input to the fingerprint.
+        lines.append("")
+        lines.append(f"cache last accessed = "
+                     f"{datetime.datetime.now().isoformat(timespec='seconds')}")
+        info_path.write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass
 
 
 def cache_path_for_run(cache_root: Path, fingerprint: str, run_dir: Path,

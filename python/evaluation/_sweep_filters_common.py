@@ -102,7 +102,7 @@ def render(name, values, starts_by_value, baseline_starts, current, scale,
     ax.set_ylabel("retention at each t  [%]  (windows here / baseline windows here)")
     sma_note = f", SMA={sma}" if sma > 1 else ""
     ax.set_title(f"which times does {name} discard?  ({100 * frac_runs:.0f}% of runs{sma_note})")
-    ax.legend(title=f"{name} (overall retained)", fontsize=7, ncol=2, loc="lower left")
+    ax.legend(title=f"{name} (overall retained)", fontsize=7, ncol=2, loc="lower center")
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
     plt.close(fig)

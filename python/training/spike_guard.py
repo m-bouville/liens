@@ -424,7 +424,9 @@ class SkipReporter:
         return "\n".join(x for x in lines if x)
 
 
-def early_stop_message(epoch: int, patience: int, saved_this_run: bool) -> str:
+def early_stop_message(epoch: int, patience: int, saved_this_run: bool,
+                       longest_gap: int | None = None,
+                       longest_gap_range: tuple[int, int] | None = None) -> str:
     """The line printed when patience runs out, honest about the two cases.
 
     "No improvement for N epochs" describes a run that climbed, plateaued and
@@ -435,13 +437,26 @@ def early_stop_message(epoch: int, patience: int, saved_this_run: bool) -> str:
     total paralysis. The distinction costs one boolean the trainers already
     track for the no-save guard.
 
+    longest_gap / longest_gap_range: the longest stretch of epochs WITHOUT a
+    save that the run recovered from before this final one, and the (first,
+    last) epochs it spanned -- the raw figure to judge whether stopping now was
+    expected (earlier gaps also near patience) or a one-off long draught (worth
+    a larger patience next time). Left uninterpreted: the number and range say
+    it.
+
     A pure function for the same reason deadlock_step_hint is one: inlined
     text can only be tested by matching source, and such tests break on
     correct changes while never checking what the message SAYS.
     """
     if saved_this_run:
+        tail = ""
+        if longest_gap is not None:
+            _rng = (f" ({longest_gap_range[0]} to {longest_gap_range[1]})"
+                    if longest_gap_range else "")
+            tail = (f"\n  longest period without saves before that: "
+                    f"{longest_gap} epochs{_rng}")
         return (f"Early stopping at epoch {epoch}: no improvement for "
-                f"{patience} epochs")
+                f"{patience} epochs{tail}")
     return (f"Early stopping at epoch {epoch}: NOTHING was ever saved -- this is "
             f"not a converged run, it is one that never improved on its starting "
             f"point (or never took a step at all; check the skip counts above). "

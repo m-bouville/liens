@@ -520,7 +520,7 @@ _LDS_PREAMBLE_PARAMS = (
     # they were measured from. Repeating them in the block below would make
     # it noisy enough to stop being read, which is how the old hand-rolled
     # preamble drifted in the first place.
-    "min_step", "min_stdev_phi", "min_passing_steps", "ae_stats_weight", "max_dt",
+    "min_step", "min_stdev_phi", "min_normalized_stdev_phi", "min_passing_steps", "ae_stats_weight", "max_dt",
     "n_rollout_steps", "one_step_weight", "grad_clip", "lr_warmup_steps",
     "z0_noise_scale", "lr", "seed", "epochs", "batch_size", "early_stopping_patience",
     "use_dt_decade_weights", "n_substeps",
@@ -536,6 +536,7 @@ def train_lds(
     hidden_dim: int = 256, n_hidden_layers: int = 2,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int = 1, min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_normalized_stdev_phi: float | None = None,
     min_passing_steps: int | None = None, max_dt: float | None = None,
     condition_on_theta: bool | None = None,
     encode_batch_size: int = 256, val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5,
@@ -736,7 +737,8 @@ def train_lds(
     if missing:
         raise ValueError(f"train_lds() requires {', '.join(missing)} to be given explicitly "
                           f"-- config.txt no longer provides ML training defaults.")
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps}  "
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  "
+          f"min_normalized_stdev_phi={min_normalized_stdev_phi}  min_passing_steps={min_passing_steps}  "
           f"ae_stats_weight={ae_stats_weight}")
     if max_dt is not None:
         # Motivation, from check_parameter_dependence.py's own oracle-z1
@@ -765,6 +767,11 @@ def train_lds(
               "backward quotient q=(z0(t)-z0(t-dt))/dt of the STATE stream "
               "instead (z1 is only the run-start fallback where no predecessor "
               "frame exists).\n")
+    # Human-readable identity for the (opaque, weight-hashed) latent-cache dir.
+    # The cache stores z0+z1 and is scheme-agnostic, so this names the ENCODER,
+    # not the derivative_source.
+    _cache_info = {"ae_checkpoint": str(ae_checkpoint_path),
+                   "latent_channels": ae_config.get("latent_channels")}
 
     if checkpoint_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
@@ -813,12 +820,13 @@ def train_lds(
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            min_normalized_stdev_phi=min_normalized_stdev_phi,
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
             time_coordinate=time_coordinate,
             return_phys_dt=(time_coordinate == "log10_t"),
-            derivative_source=derivative_source,
+            derivative_source=derivative_source, cache_info=_cache_info,
             split_label="validation",
         )
         # Defined on BOTH branches: the epochs=0 ablation builds no train
@@ -834,23 +842,25 @@ def train_lds(
         train_set = MicrostructureEvolutionDataset(
             train_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            min_normalized_stdev_phi=min_normalized_stdev_phi,
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
             time_coordinate=time_coordinate,
             return_phys_dt=(time_coordinate == "log10_t"),
-            derivative_source=derivative_source,
+            derivative_source=derivative_source, cache_info=_cache_info,
             split_label="training",
         )
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            min_normalized_stdev_phi=min_normalized_stdev_phi,
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
             time_coordinate=time_coordinate,
             return_phys_dt=(time_coordinate == "log10_t"),
-            derivative_source=derivative_source,
+            derivative_source=derivative_source, cache_info=_cache_info,
             split_label="validation",
         )
         print(f"{len(train_set)} train windows, {len(val_set)} val windows "
@@ -1195,8 +1205,18 @@ def train_lds(
     # None until the first adaptive epoch reports; see the drift note below.
     _last_substep_mean = None
     epochs_since_improvement = 0
+    longest_gap = 0            # longest no-save stretch this run RECOVERED from
+    longest_gap_range = None   # (first, last) epochs it spanned
 
     show_1step = n_rollout_steps > 1  # at n=1, L_1step == L_rollout always -- redundant to show
+
+    # The ceiling (ancestor's val_loss, when comparable) gates every save but was
+    # invisible on the loss curve -- so a resumed run showed no sign of the bar
+    # it had to clear. Draw it as a reference level (loss_curve already renders
+    # these as a dashed line). None when no ceiling is active (fresh run, or the
+    # grace-period 3a->3b handoff), in which case nothing is drawn.
+    _ref_levels = ([(tracker.reference_val_loss, "ancestor val_loss (beat to save)")]
+                   if tracker.reference_val_loss is not None else None)
 
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
@@ -1551,6 +1571,9 @@ def train_lds(
             _grace = grace_epochs_for_ema(val_ema_decay)
             _grace = clamp_grace_epochs(_grace, epochs - epoch + 1)
             tracker.reset_with_grace(_grace, reference_val_loss=float(_restored["val_loss"]))
+            if epochs_since_improvement > longest_gap:
+                longest_gap = epochs_since_improvement
+                longest_gap_range = (epoch - epochs_since_improvement, epoch)
             epochs_since_improvement = 0
             print(f"  [epoch {epoch}: ROLLED BACK to the best checkpoint "
                   f"(epoch {_restored['epoch']}, val_loss={_restored['val_loss']:.6f}) after "
@@ -1576,7 +1599,7 @@ def train_lds(
                 loss_curve_path, title="Stage 3 loss",
                 secondary_train=train_1step_history if show_1step else None,
                 secondary_val=val_1step_history if show_1step else None,
-                secondary_label="1step",
+                secondary_label="1step", reference_levels=_ref_levels,
             )
             write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
 
@@ -1608,6 +1631,9 @@ def train_lds(
 
         if saved_this_epoch:
             _saved_this_run = True
+            if epochs_since_improvement > longest_gap:
+                longest_gap = epochs_since_improvement
+                longest_gap_range = (epoch - epochs_since_improvement, epoch)
             epochs_since_improvement = 0
             if show_1step:            # L_rollout=*_loss, L_1step=*_1step
                 saved_1step_hist.append(val_1step)
@@ -1651,6 +1677,7 @@ def train_lds(
                 },
                 "data_config": {
                     "min_step": min_step, "min_stdev_phi": min_stdev_phi,
+                    "min_normalized_stdev_phi": min_normalized_stdev_phi,
                     "min_passing_steps": min_passing_steps, "max_dt": max_dt,
                     "window_length": window_length, "n_rollout_steps": n_rollout_steps,
                     "z0_noise_scale": z0_noise_scale,
@@ -1741,7 +1768,9 @@ def train_lds(
         # training has even stabilized.
         if (early_stopping_patience is not None and epoch > ema_warmup_epochs
                 and epochs_since_improvement >= early_stopping_patience):
-            print(early_stop_message(epoch, early_stopping_patience, _saved_this_run))
+            print(early_stop_message(epoch, early_stopping_patience, _saved_this_run,
+                                     longest_gap=longest_gap,
+                                     longest_gap_range=longest_gap_range))
             break
 
     # Unconditional final write: the in-loop calls are throttled (see
@@ -1755,7 +1784,7 @@ def train_lds(
         loss_curve_path, title="Stage 3 loss",
         secondary_train=train_1step_history if show_1step else None,
         secondary_val=val_1step_history if show_1step else None,
-        secondary_label="1step",
+        secondary_label="1step", reference_levels=_ref_levels,
     )
     write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
 
@@ -1843,6 +1872,7 @@ def main():
     parser.add_argument("--n-rollout-steps", type=int, default=1)
     parser.add_argument("--min-step", type=int, default=None)
     parser.add_argument("--min-stdev-phi", type=float, default=None)
+    parser.add_argument("--min-normalized-stdev-phi", type=float, default=None)
     parser.add_argument("--min-passing-steps", type=int, default=None,
                          help="exclude an entire run when fewer than this many of its steps clear "
                               "min-stdev-phi -- see build_good_steps' own docstring in "
@@ -1971,6 +2001,7 @@ def main():
         val_fraction=args.val_fraction, test_fraction=args.test_fraction,
         num_workers=args.num_workers, n_rollout_steps=args.n_rollout_steps,
         min_step=args.min_step, min_stdev_phi=args.min_stdev_phi,
+        min_normalized_stdev_phi=args.min_normalized_stdev_phi,
         min_passing_steps=args.min_passing_steps,
         condition_on_theta=args.condition_on_theta,
         encode_batch_size=args.encode_batch_size, val_ema_decay=args.val_ema_decay,

@@ -67,7 +67,7 @@ _REFINEMENT_PREAMBLE_PARAMS = (
     "freeze_decoder", "size", "rollout_weight_warmup_epochs", "rollout_weight_warmup_start",
     "max_dt", "rollout_weight", "recon0_weight", "stats0_weight", "rollout_scale",
     "recon0_scale", "stats0_scale", "epochs", "batch_size", "n_rollout_steps",
-    "min_step", "min_stdev_phi", "early_stopping_patience",
+    "min_step", "min_stdev_phi", "min_normalized_stdev_phi", "early_stopping_patience",
 )
 
 
@@ -83,6 +83,7 @@ def train_refinement(
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-4,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int | None = None, min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_normalized_stdev_phi: float | None = None,
     val_ema_decay: float = 0.7, ema_warmup_epochs: int = 0,
     early_stopping_patience: int | None = None, grad_clip: float = 1.0,
     spike_skip_factor: float = 10.0, grad_spike_factor: float = 10.0,
@@ -196,7 +197,8 @@ def train_refinement(
               f"against runs without a warmup.")
     print(f"rollout_weight={rollout_weight}  recon0_weight={recon0_weight}  "
           f"stats0_weight={stats0_weight}")
-    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  n_rollout_steps={n_rollout_steps}")
+    print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  "
+          f"min_normalized_stdev_phi={min_normalized_stdev_phi}  n_rollout_steps={n_rollout_steps}")
     print_run_parameters(train_refinement, locals(), _REFINEMENT_PREAMBLE_PARAMS)
     print()
 
@@ -265,6 +267,13 @@ def train_refinement(
     max_dt = max_dt if max_dt is not None else lds_data_config.get("max_dt")
     min_passing_steps = (min_passing_steps if min_passing_steps is not None
                           else lds_data_config.get("min_passing_steps"))
+    # Inherited alongside min_passing_steps: it is the filter that count is taken
+    # against (raw min_stdev_phi OR this normalized one), and the encoder must be
+    # refined on the SAME window population f_theta was trained on. Params may
+    # still override; the mismatch report below covers it like min_stdev_phi.
+    min_normalized_stdev_phi = (min_normalized_stdev_phi
+                                if min_normalized_stdev_phi is not None
+                                else lds_data_config.get("min_normalized_stdev_phi"))
     if max_dt is not None:
         print(f"max_dt={max_dt} inherited from f_theta's own training window "
               f"population (pass max_dt explicitly to override)")
@@ -275,7 +284,8 @@ def train_refinement(
     # But nothing checked them either, so a per-stage override would silently
     # refine the encoder against a different population than f_theta trained
     # on. Reported, not enforced.
-    for _field, _here in (("min_step", min_step), ("min_stdev_phi", min_stdev_phi)):
+    for _field, _here in (("min_step", min_step), ("min_stdev_phi", min_stdev_phi),
+                          ("min_normalized_stdev_phi", min_normalized_stdev_phi)):
         _there = lds_data_config.get(_field, "<absent>")
         if _there != "<absent>" and _there != _here:
             print(f"NOTE: {_field}={_here} differs from f_theta's own {_there}. Not an error "
@@ -293,6 +303,7 @@ def train_refinement(
             val_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
+            min_normalized_stdev_phi=min_normalized_stdev_phi,
             split_label="validation", return_frame_t=_needs_frame_t,
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
@@ -305,12 +316,14 @@ def train_refinement(
             train_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
+            min_normalized_stdev_phi=min_normalized_stdev_phi,
             split_label="training", return_frame_t=_needs_frame_t,
         )
         val_set = MicrostructureEvolutionDataset(
             val_dirs, encoder=None, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
+            min_normalized_stdev_phi=min_normalized_stdev_phi,
             split_label="validation", return_frame_t=_needs_frame_t,
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
@@ -450,6 +463,8 @@ def train_refinement(
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=ema_warmup_epochs,
                                           val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
+    longest_gap = 0            # longest no-save stretch this run RECOVERED from
+    longest_gap_range = None   # (first, last) epochs it spanned
 
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
@@ -776,6 +791,9 @@ def train_refinement(
 
         if saved_this_epoch:
             _saved_this_run = True
+            if epochs_since_improvement > longest_gap:
+                longest_gap = epochs_since_improvement
+                longest_gap_range = (epoch - epochs_since_improvement, epoch)
             epochs_since_improvement = 0
             atomic_torch_save({
                 "ae_state": ae.state_dict(),
@@ -838,7 +856,9 @@ def train_refinement(
             print(msg)
 
         if early_stopping_patience is not None and epochs_since_improvement >= early_stopping_patience:
-            print(early_stop_message(epoch, early_stopping_patience, _saved_this_run))
+            print(early_stop_message(epoch, early_stopping_patience, _saved_this_run,
+                                     longest_gap=longest_gap,
+                                     longest_gap_range=longest_gap_range))
             break
 
     # Unconditional final write: the in-loop calls are throttled (see

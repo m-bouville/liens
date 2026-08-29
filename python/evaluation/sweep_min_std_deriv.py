@@ -171,7 +171,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base-path", type=Path, default=_PYTHON_ROOT.parent / "datasets")
-    p.add_argument("--size", type=int, default=128)
+    p.add_argument("--size", type=int, required=True)
     p.add_argument("--window-length", type=int, default=2,
                    help="2 = full per-transition coverage (dataset characterisation, the "
                         "default). Set to n_rollout_steps+1 only to match a training population")

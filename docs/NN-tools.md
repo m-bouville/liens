@@ -63,7 +63,7 @@ Generates several plots: one for $\delta t$ and one for other parameters (temper
 
 
 ### z1_degeneracy (returns tables, not figures)
-`python -m evaluation.check_z1_degeneracy checkpoints/stage2/128x128-stage2.pt --size 128 --n-windows 515`
+`python -m evaluation.check_z1_degeneracy checkpoints/stage2/128x128-stage2.pt --size 128 --n-windows 500`
 
 
 ### z2_measurability (encoder diag, even when run on stage-3 checkpoint)
@@ -95,6 +95,7 @@ Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` p
 
 ### Sweep over `min_stdev_phi`, `min_std_deriv` and `min_passing_steps`
 `python -m evaluation.sweep_min_stdev_phi --base-path ../datasets --size 128 --max-runs 1000`
+Variant: `--normalized` for `min_normalized_stdev_phi`
 
 `python -m evaluation.sweep_min_std_deriv --base-path ../datasets --size 128 --min-step 1000 --min-passing-steps 12 --max-runs 1000`
 

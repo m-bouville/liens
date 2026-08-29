@@ -335,7 +335,8 @@ def split_run_dirs(run_dirs: list[Path], val_fraction: float, test_fraction: flo
 
 
 def _filtered_steps(metadata: "load.RunMetadata", bad_steps: set[int],
-                     min_step: int, min_stdev_phi: float | None, stats_df) -> list[int]:
+                     min_step: int, min_stdev_phi: float | None, stats_df,
+                     min_normalized_stdev_phi: float | None = None) -> list[int]:
     """
     Steps from metadata.save_steps passing the filters shared by every
     dataset in this module: not missing/corrupt (bad_steps), not earlier
@@ -343,7 +344,20 @@ def _filtered_steps(metadata: "load.RunMetadata", bad_steps: set[int],
     in statistics.csv's stdev_phi column. Factored out so
     MicrostructureSnapshotDataset and MicrostructureEvolutionDataset
     can't silently diverge in what counts as an excluded step.
+
+    min_normalized_stdev_phi: like min_stdev_phi, but thresholds stdev_phi
+    DIVIDED BY the theoretical equilibrium amplitude sqrt(-a(T)/b),
+    a(T)=a0*(T-T0) -- the same normalizer cspt.py uses to put every
+    temperature's plateau at 1.0. A raw stdev_phi threshold keeps a larger
+    FRACTION of a low-T run than a near-critical one (the ground-state
+    amplitude shrinks like sqrt(T0-T)), biasing the surviving sample by
+    temperature; normalizing removes that. Steps at T>=T0 (no equilibrium
+    amplitude to divide by) cannot satisfy it and are excluded.
     """
+    amplitude = None
+    if min_normalized_stdev_phi is not None:
+        a_T = metadata.a0 * (metadata.temperature - metadata.T0)
+        amplitude = math.sqrt(max(-a_T / metadata.b, 0.0))
     kept = []
     for step in metadata.save_steps:
         if step in bad_steps or step < min_step:
@@ -354,6 +368,12 @@ def _filtered_steps(metadata: "load.RunMetadata", bad_steps: set[int],
             stdev = stats_df.loc[step, "stdev_phi"]
             if math.isnan(stdev) or stdev < min_stdev_phi:
                 continue
+        if min_normalized_stdev_phi is not None:
+            if stats_df is None or step not in stats_df.index or not amplitude:
+                continue  # no stats, or T>=T0 (no equilibrium amplitude to normalize by)
+            stdev = stats_df.loc[step, "stdev_phi"]
+            if math.isnan(stdev) or stdev / amplitude < min_normalized_stdev_phi:
+                continue
         kept.append(step)
     return kept
 
@@ -362,6 +382,7 @@ def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
                       min_step: int = 0, min_stdev_phi: float | None = None,
                       min_passing_steps: int | None = None,
                       split_label: str = "",
+                      min_normalized_stdev_phi: float | None = None,
                       ) -> dict[Path, list[int]]:
     """
     Scan run_dirs ONCE and return a stable {run_dir: [kept_step, ...]}
@@ -417,9 +438,11 @@ def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
     model sees at train time vs. what it's graded on at test time, so
     it introduces no train/test inconsistency by construction.
     """
-    if min_passing_steps is not None and min_stdev_phi is None:
-        raise ValueError("min_passing_steps requires min_stdev_phi to also be set -- "
-                          "there's no 'passing' threshold to count against otherwise")
+    if min_passing_steps is not None and min_stdev_phi is None \
+            and min_normalized_stdev_phi is None:
+        raise ValueError("min_passing_steps requires min_stdev_phi or "
+                          "min_normalized_stdev_phi to also be set -- there's no "
+                          "'passing' threshold to count against otherwise")
     good_steps: dict[Path, list[int]] = {}
     n_runs_dropped_for_too_few_passing = 0
     for run_dir in run_dirs:
@@ -434,9 +457,12 @@ def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
                 f"({sorted(bad_steps)[:5]}...), and skip_bad=False"
             )
 
+        _need_stats = (min_stdev_phi is not None
+                       or min_normalized_stdev_phi is not None)
         stats_df = load.read_statistics_csv(run_dir / "statistics.csv") \
-            if min_stdev_phi is not None else None
-        kept_steps = _filtered_steps(metadata, bad_steps, min_step, min_stdev_phi, stats_df)
+            if _need_stats else None
+        kept_steps = _filtered_steps(metadata, bad_steps, min_step, min_stdev_phi,
+                                     stats_df, min_normalized_stdev_phi)
         if min_passing_steps is not None and len(kept_steps) < min_passing_steps:
             n_runs_dropped_for_too_few_passing += 1
             kept_steps = []
@@ -445,9 +471,15 @@ def build_good_steps(run_dirs: list[str | Path], skip_bad: bool = True,
     if min_passing_steps is not None and n_runs_dropped_for_too_few_passing:
         _what = f"{split_label} runs" if split_label else "runs"
         _pct = 100.0 * n_runs_dropped_for_too_few_passing / len(run_dirs) if run_dirs else 0.0
+        # Name whichever threshold actually ran -- under --normalized the
+        # criterion is min_normalized_stdev_phi, and printing "min_stdev_phi=None"
+        # there read as "no filter", the opposite of the truth.
+        _crit = (f"min_normalized_stdev_phi={min_normalized_stdev_phi}"
+                 if min_normalized_stdev_phi is not None
+                 else f"min_stdev_phi={min_stdev_phi}")
         print(f"build_good_steps: {n_runs_dropped_for_too_few_passing}/{len(run_dirs)} ({_pct:.1f}%) {_what} "
               f"dropped ENTIRELY -- fewer than min_passing_steps={min_passing_steps} steps "
-              f"cleared min_stdev_phi={min_stdev_phi}")
+              f"cleared {_crit}")
 
     return good_steps
 
@@ -516,7 +548,7 @@ class MicrostructureSnapshotDataset(Dataset):
                  min_stdev_phi: float | None = None, min_passing_steps: int | None = None,
                  include_stats: bool = False, stat_names: list[str] | None = None,
                  good_steps: dict[Path, list[int]] | None = None,
-                 split_label: str = ""):
+                 split_label: str = "", min_normalized_stdev_phi: float | None = None):
         """
         good_steps: a precomputed {run_dir: [kept_step, ...]} mapping
         from build_good_steps(), to skip re-scanning run_dirs when
@@ -580,7 +612,8 @@ class MicrostructureSnapshotDataset(Dataset):
         run_dirs = [Path(d) for d in run_dirs]
         if good_steps is None:
             good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi,
-                                          min_passing_steps, split_label=split_label)
+                                          min_passing_steps, split_label=split_label,
+                                          min_normalized_stdev_phi=min_normalized_stdev_phi)
 
         # Per-run stats + index build. For a large sweep this parses a
         # statistics.csv per run (1000+ files) silently, right after
@@ -915,6 +948,7 @@ class MicrostructureEvolutionDataset(Dataset):
                  device: str | torch.device = "cpu", window_length: int = 5,
                  skip_bad: bool = True, min_step: int = 0,
                  min_stdev_phi: float | None = None, min_passing_steps: int | None = None,
+                 min_normalized_stdev_phi: float | None = None,
                  encode_batch_size: int = 256,
                  good_steps: dict[Path, list[int]] | None = None,
                  stat_names: list[str] | None = None, augment: bool = False,
@@ -924,7 +958,8 @@ class MicrostructureEvolutionDataset(Dataset):
                  fixed_aug_indices: tuple[int, ...] | list[int] | None = None,
                  read_workers: int = 16, split_label: str = "",
                  time_coordinate: str = "t", return_phys_dt: bool = False,
-                 return_frame_t: bool = False, derivative_source: str = "z1"):
+                 return_frame_t: bool = False, derivative_source: str = "z1",
+                 cache_info: dict | None = None):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
@@ -1166,6 +1201,7 @@ class MicrostructureEvolutionDataset(Dataset):
         # about what the weights are, and a stale hit would train on latents
         # from a different encoder with no error anywhere.
         self._latent_cache_root = Path(latent_cache_dir) if latent_cache_dir else None
+        self._cache_info = cache_info or {}
         self._encoder_fingerprint = (
             latent_cache.encoder_fingerprint(encoder)
             if self._latent_cache_root is not None and encoder is not None else None)
@@ -1285,7 +1321,8 @@ class MicrostructureEvolutionDataset(Dataset):
         run_dirs = [Path(d) for d in run_dirs]
         if good_steps is None:
             good_steps = build_good_steps(run_dirs, skip_bad, min_step, min_stdev_phi,
-                                          min_passing_steps, split_label=split_label)
+                                          min_passing_steps, split_label=split_label,
+                                          min_normalized_stdev_phi=min_normalized_stdev_phi)
 
         if self.encoder_given:
             encoder = encoder.to(device).eval()
@@ -1529,6 +1566,13 @@ class MicrostructureEvolutionDataset(Dataset):
                 # window construction below depends on that ordering.
                 run_index = len(pending_meta)
                 if self._latent_cache_root is not None:
+                    latent_cache.write_cache_info(
+                        self._latent_cache_root, self._encoder_fingerprint,
+                        size=metadata.nx,
+                        info={"streams cached": ("z0 (state) + z1 (deriv)"
+                                                 if self.encode_both_streams
+                                                 else "z0 (state)"),
+                              **self._cache_info})
                     cached = latent_cache.load_cached(
                         latent_cache.cache_path_for_run(
                             self._latent_cache_root, self._encoder_fingerprint, run_dir,

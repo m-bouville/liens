@@ -1414,8 +1414,11 @@ def test_both_trainers_route_the_early_stop_through_the_function():
     their live save flag."""
     for fname in ("training/train_lds.py", "training/train_refinement.py"):
         src = source_without_comments(_ROOT / fname)
-        assert "early_stop_message(epoch, early_stopping_patience, _saved_this_run)" in src, (
+        assert "early_stop_message(epoch, early_stopping_patience, _saved_this_run" in src, (
             f"{fname} does not pass its save flag to early_stop_message"
+        )
+        assert "longest_gap=longest_gap" in src, (
+            f"{fname} does not pass the recovered-gap length to early_stop_message"
         )
 
 
