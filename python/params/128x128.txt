@@ -111,34 +111,34 @@ target_vram_gib = 6.5		# leave 1 GB as headroom for driver/context
 truncate_bptt 	=  32
 bucket_refresh_epochs=0
 
-dynamics_mode=deriv_linear	# NEW
+dynamics_mode	= deriv_linear	# NEW
 time_coordinate = log10_t	# NEWER
 
-rollout_scale = 0.05e-6
-ae_stats_weight= 1.
+rollout_scale 	= 0.05e-6
+ae_stats_weight	= 1.
 
 use_dt_decade_weights = False  # incompatible with `deriv_linear`
 
-epochs 		  = 6000	# improvements are barely noticeable after that
-patience 	  =  500
+epochs 		  	= 6000	# improvements are barely noticeable after that
+patience 	  	=  500
 
-num_workers	  =    4 	# was 4, then 0
-batches		  = 4096
+num_workers	  	=    4 	# was 4, then 0
+batches		  	= 4096
 
-spike_skip_factor= 10
-grad_clip		= 1.0		# was by default 0.
+spike_skip_factor=  10
+grad_clip		=    1.0		# was by default 0.
 
-lr 			  =  5.e-3  # was 5.e-3, then 8 (choppier); default: 1.e-3
-z0_noise_scale=   0.1
+lr 			  	=   5.e-3  # was 5.e-3, then 8 (choppier); default: 1.e-3
+z0_noise_scale	=    0.1
 
-derivative_source= previous_quotient   # INERT in 3a
-dt_cap		  = inf		# for second order
-max_dt        = inf   # possible with `deriv_linear`
+derivative_source= previous_quotient   # (was) INERT in 3a
+dt_cap		  	= inf		# for second order
+max_dt        	= inf   # possible with `deriv_linear`
 # max_dt        = 100000   # 100'000/0.05 = 2'000'000 time steps (last: 13'000'000 -> 15'000'000)
 
-# force 	      = True
-# resume_from   = checkpoints/stage3a/128x128-stage3a-20260825_02h51.pt
-ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260827_02h22.pt
+# force 	      	= True
+# ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260827_02h22.pt
+## resume_from   = checkpoints/stage3a/128x128-stage3a-20260829_14h39.pt
 
 
 
@@ -147,7 +147,7 @@ ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 #   latent dynamics surrogate (rollout)
 #############################################################
 
-n_rollout_steps=  5			# always > 1 for 3b
+n_rollout_steps=  2			# always > 1 for 3b
 z1_resync      = False		# always False for 3b
 
 # alpha			= 0.5		# adaptative sub-step; incompatible with `deriv_linear`
@@ -162,7 +162,7 @@ memory_cost_a_bytes= 120787
 memory_cost_b_bytes= 18469
 memory_cost_p      = 0.79
 
-rollout_scale  = 1.e-6			# was 1e-6, then 0.25e-6
+rollout_scale  = 1.e-4			# was 1e-6, then 0.25e-6
 ae_stats_weight= same
 one_step_weight= 0.5 		# was 0.5
 
@@ -175,7 +175,7 @@ num_workers	  =    0
 batches		  = 4096
 spike_skip_factor= same
 # grad_spike_factor = 0        # disable the gradient guard; grad_clip does the bounding
-grad_clip		= 1.0		# TEST
+grad_clip		= 10.		# was 1.
 
 dynamics_mode=deriv_linear
 time_coordinate = log10_t
@@ -192,7 +192,7 @@ dt_cap		  = same		# must be
 max_dt        = inf 		# possible with `deriv_linear`
 
 
-# force 	      = True
+force 	      = True
 ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 ## resume_from = checkpoints/stage3b/128x128-stage3b-20260806_18h10.pt
 
@@ -228,7 +228,7 @@ batches		  =  48		# was 64
 
 max_dt        = inf
 
-# force 	      = True
+force 	      = True
 ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 
 
@@ -259,4 +259,4 @@ max_dt         = same
 
 force 	       = True
 ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
-resume_from = checkpoints/stage5/128x128-stage5-20260829_10h01.pt
+# resume_from = checkpoints/stage5/128x128-stage5-20260829_10h01.pt

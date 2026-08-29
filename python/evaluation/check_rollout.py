@@ -200,7 +200,13 @@ def _correlation_pct(predicted, real) -> float | None:
     predicted_flat, real_flat = predicted.flatten(), real.flatten()
     if np.std(predicted_flat) < 1e-12 or np.std(real_flat) < 1e-12:
         return None
-    return float(np.corrcoef(predicted_flat, real_flat)[0, 1]) * 100
+    # A near-constant delta (float32) can pass the std guard yet leave
+    # corrcoef's internal c/=stddev at 0/0 -> nan and a RuntimeWarning. Silence
+    # the warning and treat a non-finite result as undefined (None), like a
+    # constant array -- the correlation genuinely isn't defined there.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.corrcoef(predicted_flat, real_flat)[0, 1]
+    return None if not np.isfinite(r) else float(r) * 100
 
 
 def _format_small(value: float, exponent: int = -3, precision: int = 1) -> str:

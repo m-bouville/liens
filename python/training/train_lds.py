@@ -759,6 +759,12 @@ def train_lds(
     encoder, ae_checkpoint, ae_config, ae_checkpoint_path = _load_frozen_encoder(
         ae_checkpoint_path, ae_latent_channels, ae_stats_weight, size, condition_on_theta, device,
     )
+    if derivative_source == "previous_quotient":
+        print("  derivative_source='previous_quotient': the encoder's z1 (deriv) "
+              "head is loaded but NOT used as the derivative -- f is fed the "
+              "backward quotient q=(z0(t)-z0(t-dt))/dt of the STATE stream "
+              "instead (z1 is only the run-start fallback where no predecessor "
+              "frame exists).\n")
 
     if checkpoint_path is None:
         name = lds_checkpoint_name(ae_config["size"], ae_config["latent_channels"],
@@ -812,6 +818,7 @@ def train_lds(
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
             time_coordinate=time_coordinate,
             return_phys_dt=(time_coordinate == "log10_t"),
+            derivative_source=derivative_source,
             split_label="validation",
         )
         # Defined on BOTH branches: the epochs=0 ablation builds no train
@@ -832,6 +839,7 @@ def train_lds(
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
             time_coordinate=time_coordinate,
             return_phys_dt=(time_coordinate == "log10_t"),
+            derivative_source=derivative_source,
             split_label="training",
         )
         val_set = MicrostructureEvolutionDataset(
@@ -842,6 +850,7 @@ def train_lds(
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
             time_coordinate=time_coordinate,
             return_phys_dt=(time_coordinate == "log10_t"),
+            derivative_source=derivative_source,
             split_label="validation",
         )
         print(f"{len(train_set)} train windows, {len(val_set)} val windows "

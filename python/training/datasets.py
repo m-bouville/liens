@@ -924,7 +924,7 @@ class MicrostructureEvolutionDataset(Dataset):
                  fixed_aug_indices: tuple[int, ...] | list[int] | None = None,
                  read_workers: int = 16, split_label: str = "",
                  time_coordinate: str = "t", return_phys_dt: bool = False,
-                 return_frame_t: bool = False):
+                 return_frame_t: bool = False, derivative_source: str = "z1"):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
@@ -1130,6 +1130,30 @@ class MicrostructureEvolutionDataset(Dataset):
         self.encode_both_streams = encode_both_streams
         self.stat_names = stat_names
         self.augment = augment
+        # derivative_source: "z1" (default) serves the encoder's deriv stream as
+        # window_deriv, exactly as before. "previous_quotient" instead serves the
+        # backward quotient of z0, q_k = (z0_k - z0_{k-1})/du_{k-1} (the "previous
+        # derivative" the causal baseline uses), so f trains on q, and the
+        # autonomous rollout's step-0 seed (z1_sequence[:,0]) becomes the real
+        # quotient rather than z1. Needs the deriv stream too (the run-start
+        # fallback, where no predecessor frame exists); augmentation is not yet
+        # handled for the quotient path.
+        if derivative_source not in ("z1", "previous_quotient"):
+            raise ValueError(
+                f"derivative_source must be 'z1' or 'previous_quotient', got "
+                f"{derivative_source!r}")
+        if derivative_source == "previous_quotient":
+            if not encode_both_streams:
+                raise ValueError(
+                    "derivative_source='previous_quotient' requires "
+                    "encode_both_streams=True (it reads the z0 stream to form the "
+                    "quotient and the z1 stream for the run-start fallback).")
+            if augment:
+                raise ValueError(
+                    "derivative_source='previous_quotient' does not support "
+                    "augment=True yet (the predecessor frame would need the same "
+                    "augmentation as the window).")
+        self.derivative_source = derivative_source
         self.min_std_deriv = min_std_deriv
         self.max_dt = max_dt
         self._split_label = split_label
@@ -1281,6 +1305,58 @@ class MicrostructureEvolutionDataset(Dataset):
             read_workers, encoder_accepts_theta,
         )
         self._build_window_index(pending_meta, run_data_list, run_data_deriv_list)
+        # q-scheme "compute before filter": give each run's FIRST kept frame a
+        # real backward-quotient predecessor from the full save_steps sequence,
+        # so q_0 there is the true previous derivative, not the z1 fallback. Done
+        # AFTER the window index (needs the finalised per-run order) and only for
+        # the quotient path with a real encoder.
+        self._run_pred_z0: list = [None] * len(self._run_steps)
+        self._run_pred_du: list = [None] * len(self._run_steps)
+        if self.derivative_source == "previous_quotient" and self.encoder_given:
+            self._encode_run_start_predecessors(encoder, device, encoder_accepts_theta)
+
+    def _encode_run_start_predecessors(self, encoder, device,
+                                       encoder_accepts_theta: bool) -> None:
+        """For each run, read+encode the ONE save_steps frame immediately before
+        its first kept frame -- the predecessor the filter dropped -- and store
+        its z0 (plus the coordinate step to the first kept frame). This is the
+        "compute the quotient on the full sequence, then filter" fix: the NaN
+        that q_0 would be at a run's ABSOLUTE first snapshot never surfaces
+        (min_step drops it), and every kept run's first frame gets a genuine
+        backward quotient instead of z1. Runs whose first kept frame IS the
+        first saved frame (no predecessor) keep None -> z1 fallback there only."""
+        for run_idx, run_dir in enumerate(self._run_dirs):
+            metadata = load.read_metadata(run_dir / "metadata.txt")
+            save_steps = list(metadata.save_steps)
+            first_kept = self._run_steps[run_idx][0]
+            try:
+                pos = save_steps.index(first_kept)
+            except ValueError:
+                continue
+            if pos == 0:
+                continue                       # first kept == first saved: no predecessor
+            pred_step = save_steps[pos - 1]
+            if pred_step == 0:
+                continue                       # predecessor is t=0 (the run's absolute
+                                               # first snapshot): log10 singular / dt=0
+                                               # -- the "not applicable at t=0" case; z1
+                                               # fallback for this run's first frame only
+            phi = load.read_phi_half(
+                run_dir / load.snapshot_filename(pred_step), metadata.nx, metadata.ny)
+            frame = torch.from_numpy(phi).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,ny,nx)
+            with torch.no_grad():
+                if encoder_accepts_theta:
+                    theta = torch.tensor(
+                        theta_coordinates(metadata.temperature, metadata.T0),
+                        dtype=torch.float32).unsqueeze(0).to(device)
+                    encoded = encoder(frame, theta=theta)
+                else:
+                    encoded = encoder(frame)
+            self._run_pred_z0[run_idx] = encoded[DEFAULT_STREAM_NAME].cpu()[0]  # (C,8,8)
+            self._run_pred_du[run_idx] = (
+                math.log10(first_kept / pred_step)
+                if self.time_coordinate == "log10_t"
+                else (first_kept - pred_step) * metadata.dt)
 
     def _read_and_encode_all_runs(
         self, run_dirs: list[Path], good_steps: dict, encoder: torch.nn.Module | None,
@@ -1556,11 +1632,12 @@ class MicrostructureEvolutionDataset(Dataset):
             # sharply once max_dt truncation is on -- 74/2466 to 1297/2594 on
             # the same sweep. Reading that as a filtering problem would send
             # someone to loosen min_stdev_phi for no reason.
+            _finite_cap = self.max_dt is not None and math.isfinite(self.max_dt)
             cause = (f"kept steps (after max_dt={self.max_dt} truncated each run to the "
-                     f"prefix its own transitions can reach)" if self.max_dt is not None
+                     f"prefix its own transitions can reach)" if _finite_cap
                      else "kept steps")
             advice = ("expected when max_dt is well below the sweep's later dt values"
-                      if self.max_dt is not None
+                      if _finite_cap
                       else "consider a shorter window_length or looser filtering if this "
                            "is a large fraction")
             _runs_word = f"{self._split_label} runs" if self._split_label else "runs"
@@ -1756,6 +1833,50 @@ class MicrostructureEvolutionDataset(Dataset):
         return np.array(out, dtype=np.float32)
 
 
+    def _du_slice(self, run_idx: int, lo: int, hi: int) -> torch.Tensor:
+        """Coordinate step per transition for frames [lo, hi): Delta-u =
+        log10(t_{i+1}/t_i) in log10_t mode, else physical Delta-t. This is the
+        SAME quantity dt_window holds, so dividing a z0 backward difference by it
+        yields dz0/du (or dz0/dt) -- the derivative in the model's own
+        coordinate, matching z̃1. Length hi-lo-1."""
+        if self.time_coordinate == "log10_t":
+            return torch.tensor(self._run_du[run_idx][lo:hi - 1], dtype=torch.float32)
+        steps = self._run_steps[run_idx]
+        dt_scale = self._run_dt_scale[run_idx]
+        return torch.tensor(
+            [(steps[i + 1] - steps[i]) * dt_scale for i in range(lo, hi - 1)],
+            dtype=torch.float32)
+
+    def _backward_quotient(self, run_idx: int, start: int, end: int,
+                           dt_window: torch.Tensor,
+                           z1_fallback: torch.Tensor) -> torch.Tensor:
+        """The 'previous quotient' derivative channel: q_k = (z0_k - z0_{k-1}) /
+        du_{k-1}, one per window frame, in the model's coordinate. Step 0 uses
+        the REAL predecessor frame (z0 at start-1) -- the value that makes the
+        autonomous rollout's step-0 seed a true backward quotient instead of z1.
+        At a run start (start==0) there is no predecessor, so step 0 falls back
+        to the encoder's z1 (the only derivative available there); the note in
+        the sweep log ('except t=0, not a great loss') is exactly this case.
+
+        Shapes: window has L=window_length frames; returns (L, C, 8, 8), aligned
+        with window_deriv so window_deriv[k] is the derivative AT frame k."""
+        z0 = self._run_data[run_idx]
+        if start > 0:
+            z0_ext = z0[start - 1:end]                       # (L+1, C, 8, 8)
+            du = self._du_slice(run_idx, start - 1, end)     # (L,)
+            return (z0_ext[1:] - z0_ext[:-1]) / du.view(-1, 1, 1, 1)
+        # start == 0: the window begins at the run's first kept frame. Its
+        # predecessor was filtered out, but we encoded it (pre-filter) into
+        # _run_pred_z0 -- use it so q_0 is a REAL backward quotient. Only when
+        # there is genuinely no predecessor (the run's absolute first saved
+        # frame, normally dropped by min_step) do we fall back to z1.
+        q_rest = (z0[start + 1:end] - z0[start:end - 1]) / dt_window.view(-1, 1, 1, 1)
+        pred = self._run_pred_z0[run_idx] if self._run_pred_z0 else None
+        if pred is not None:
+            q0 = ((z0[start] - pred) / self._run_pred_du[run_idx]).unsqueeze(0)
+            return torch.cat([q0, q_rest], dim=0)
+        return torch.cat([z1_fallback[:1], q_rest], dim=0)
+
     def __getitem__(self, idx: int):
         if self.augment:
             base_idx, aug_idx = divmod(idx, _N_AUGMENT_VARIANTS)
@@ -1810,6 +1931,9 @@ class MicrostructureEvolutionDataset(Dataset):
 
         if self.encode_both_streams:
             window_deriv = self._run_data_deriv[run_idx][start:end]
+            if self.derivative_source == "previous_quotient":
+                window_deriv = self._backward_quotient(
+                    run_idx, start, end, dt_window, window_deriv)
             if self.return_phys_dt:
                 # physical Delta-t = (step_{i+1}-step_i)*sim_dt, ALWAYS (== dt_window
                 # in t-mode). The loss weights by this; the model steps in dt_window.

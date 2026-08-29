@@ -47,7 +47,7 @@ import re
 import warnings
 import math
 import contextlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, ScalarFormatter
@@ -1146,6 +1146,39 @@ def compute_causal_trajectory(run_dir: Path, steps: list[int], ae,
     return out
 
 
+def _predecessor_quotient(run_dir: Path, steps: list[int], ae, ae_config: dict,
+                          device, time_coordinate: str):
+    """The backward quotient (z0(steps[0]) - z0(prev_saved))/du at the window
+    start, in the model's coordinate -- the SAME step-0 derivative the q-scheme
+    dataset seeds training with, and the causal baseline uses. Encodes the real
+    predecessor frame (the save_steps frame before steps[0]), so it is defined
+    even when that frame was filtered out of training. Returns (1, C, 8, 8), or
+    None when the window starts at the run's first saved frame (no predecessor)."""
+    metadata = load.read_metadata(run_dir / "metadata.txt")
+    saved = list(metadata.save_steps)
+    if steps[0] not in saved or saved.index(steps[0]) == 0:
+        return None
+    prev_step = saved[saved.index(steps[0]) - 1]
+    if time_coordinate == "log10_t":
+        if prev_step <= 0:
+            return None
+        dt_minus = math.log10(steps[0] / prev_step)
+    else:
+        dt_minus = (steps[0] - prev_step) * metadata.dt
+    if dt_minus <= 0:
+        return None
+    nx, ny = ae_config["size"], ae_config["size"]
+    theta_vec = theta_coordinates(metadata.temperature, metadata.T0)
+    _, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+    frames = [load.read_phi_half(run_dir / load.snapshot_filename(s), nx, ny)
+              for s in (prev_step, steps[0])]
+    x = torch.stack([torch.from_numpy(f) for f in frames]).unsqueeze(1).to(device)
+    theta_encode = torch.tensor(theta_vec, dtype=torch.float32, device=device).expand(2, -1)
+    encoded = ae_encoder(x, theta=theta_encode)[recon_stream_name]
+    return (encoded[1:2] - encoded[0:1]) / dt_minus       # (1, C, 8, 8)
+
+
 def compute_trajectory(run_dir: Path, steps: list[int], ae, f_theta,
                         ae_config: dict, device, z1_resync: bool = False):
     """Decoded state at EVERY frame: (real_frames, pred_frames, dt_per_step).
@@ -1191,6 +1224,23 @@ def compute_trajectory(run_dir: Path, steps: list[int], ae, f_theta,
             _sc = torch.tensor([math.log(10.0) * metadata.dt * s for s in steps],
                                device=device, dtype=z1_sequence.dtype)
             z1_sequence = z1_sequence * _sc[None, :, None, None, None]  # z1 -> z̃1
+        # q-scheme diagnostic: a model trained with derivative_source=
+        # previous_quotient consumed the BACKWARD QUOTIENT of z0 as its
+        # derivative channel, not the encoder z1. Build z1_sequence the same way
+        # here -- q_k=(z0_k - z0_{k-1})/du in the model's coordinate, with q_0
+        # from the real predecessor frame -- so plotting follows the SAME rule as
+        # training (in both z1_resync modes). Without this the figure evaluates
+        # the model outside its trained regime at step 0, and the step-1 number
+        # is an artefact of the two code paths disagreeing. Falls back to the
+        # encoder z1 at step 0 only when there is no predecessor (run start).
+        if getattr(f_theta, "derivative_source", "z1") == "previous_quotient":
+            _z0_seq = encoded[recon_stream_name]                          # (n, C, 8, 8)
+            _dts = torch.tensor(dt_per_step, device=device, dtype=_z0_seq.dtype)
+            _q_rest = (_z0_seq[1:] - _z0_seq[:-1]) / _dts[:, None, None, None]  # q_1..q_{n-1}
+            _q0 = _predecessor_quotient(run_dir, steps, ae, ae_config, device, _tc)
+            if _q0 is None:
+                _q0 = z1_sequence[0, 0:1]                                 # run-start fallback
+            z1_sequence = torch.cat([_q0, _q_rest], dim=0).unsqueeze(0)   # (1, n, C, 8, 8)
         dts = torch.tensor([dt_per_step], dtype=torch.float32, device=device)
         theta = torch.tensor([theta_vec], dtype=torch.float32, device=device)
 
@@ -1423,6 +1473,15 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
     return device, a, b, windows, window_strings, prefix, title, n_steps_used, z1_resync
 
 
+def _output_subdir(checkpoint_path) -> str:
+    """Where a figure comparing THIS checkpoint should land: its own stage dir
+    ('checkpoints/stage3a/x.pt' -> 'stage3a') so 3a comparisons sit in stage3a/,
+    3b in stage3b/, etc. Falls back to 'rollout_check_png' when the checkpoint
+    isn't under a recognisable stage<N> directory."""
+    parent = PurePosixPath(str(checkpoint_path).replace("\\", "/")).parent.name
+    return parent if re.fullmatch(r"stage\d+[ab]?", parent) else "rollout_check_png"
+
+
 def _default_figure_path(prefix, a, b, seed, n_steps_used, z1_resync,
                           fixed_windows):
     # Build the FILENAME from the checkpoint stem, never from the (now
@@ -1451,7 +1510,7 @@ def _default_figure_path(prefix, a, b, seed, n_steps_used, z1_resync,
     suffix = "" if fixed_windows else f"-seed{seed}"
     regime_tag = f"-{n_steps_used}step{'s' if n_steps_used != 1 else ''}"
     regime_tag += "-resync" if z1_resync else "-propagated"
-    out = (_PYTHON_ROOT.parent / "output" / "rollout_check_png"
+    out = (_PYTHON_ROOT.parent / "output" / _output_subdir(a["path"])
            / f"{name}{regime_tag}{suffix}.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     return out
@@ -2216,7 +2275,8 @@ def main() -> None:
         anc_mode = args.with_ancestors is not None
         if anc_mode and out is None:
             anchor = Path(args.checkpoints[0]).stem
-            out = (_PYTHON_ROOT.parent / "output" / "rollout_check_png"
+            out = (_PYTHON_ROOT.parent / "output"
+                   / _output_subdir(args.checkpoints[0])
                    / f"{anchor}-ancestors-{args.steps}steps.png")
         compare_statistics(
             Path(lineage_paths[0]), Path(lineage_paths[1]),

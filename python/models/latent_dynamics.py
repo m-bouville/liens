@@ -913,13 +913,16 @@ class LatentDynamics(nn.Module):
             # teacher-forced from z1_sequence. This is what lets deriv_linear
             # roll out without a z1-update equation: forward()'s f consumes a
             # derivative channel and is indifferent to whether it holds z1 or q.
-            # Step 0 is seeded from the real z1 (z1_sequence[:, 0]) -- the only
-            # real derivative available at the window start, and the value f saw
-            # at step 0 during Step-A training; every LATER step has no real
-            # frame to draw on and feeds its own quotient back in. (A q-trained
-            # model with a real predecessor frame would seed step 0 from a
-            # quotient too; that needs the dataset predecessor and is not this
-            # reuse path.)
+            # Step 0 is seeded from z1_sequence[:, 0] -- whatever the DATASET put
+            # in the derivative channel. Under the z1-reuse path that is the
+            # encoder's z1 (the only real derivative available at the window
+            # start, and the value f saw at step 0 during Step-A training). Under
+            # derivative_source='previous_quotient' the dataset instead serves the
+            # REAL backward quotient q_0 = (z0_0 - z0_{-1})/du here (from the
+            # predecessor frame), so this seed is the true previous derivative,
+            # not z1 -- which is the whole point of the q-trained path. Either
+            # way every LATER step has no real frame and feeds its own quotient
+            # back in.
             deriv = z1_sequence[:, 0]
             z0_prev = z0_cur
             for i in range(n_steps):
