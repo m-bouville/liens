@@ -625,6 +625,17 @@ def run_from_params_file(params_path: Path, default_base: Path,
                                             own_keys=renamed_keys(stages.get(stage_key, {})))
         kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
             kwargs, resume_from, f"Stage {stage_key}")
+        if resume_from is not None:
+            # A resume (stage 5 <- stage 4) is defined ENTIRELY by resume_from:
+            # the ae/lds ancestor paths don't apply and, if a shared params
+            # section supplied one, would trip train_refinement's
+            # exactly-one-of(ae+lds | resume_from) guard. Drop them so
+            # resume_from stays authoritative.
+            _stray = [k for k in ("ae_checkpoint_path", "lds_checkpoint_path")
+                      if kwargs.pop(k, None) is not None]
+            if _stray:
+                print(f"  Stage {stage_key}: ignoring {_stray} from params -- "
+                      f"this is a resume (resume_from is authoritative).")
         if resume_from is not None and not overridden:
             # Auto-chained ancestor (3a -> 3b, 3b -> 4): pin its timestamped
             # identity so the log and cache signature name the ACTUAL ancestor,

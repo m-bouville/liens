@@ -861,7 +861,8 @@ def test_every_model_panel_carries_its_own_loss_and_correlation(monkeypatch):
     for row in (1, 2):
         for col in range(5):
             t = axes[row, col].get_title()
-            assert "loss=" in t and "corr=" in t, f"panel [{row},{col}]: {t!r}"
+            assert "loss=" in t and "corr dx=" in t and "corr x=" in t, \
+                f"panel [{row},{col}]: {t!r}"
     # the real row keeps the time header, not metrics
     assert axes[0, 1].get_title() == "t = 250 (t0 + 250)"
 
@@ -869,13 +870,15 @@ def test_every_model_panel_carries_its_own_loss_and_correlation(monkeypatch):
 def test_the_metrics_show_the_collapse_frame(monkeypatch):
     """B is exact until frame 3 and noise after: its numbers must say so."""
     axes = _titles(monkeypatch, collapse_at=3)
-    b_corr = [axes[3, c].get_title().split("corr=")[1] for c in range(5)]
+    b_corr = [axes[3, c].get_title().split("corr dx=")[1].split(",")[0]
+              for c in range(5)]
     assert b_corr[1] == "100%" and b_corr[2] == "100%"
     assert b_corr[3] not in ("100%", "99%"), (
         f"frame 3 reports corr={b_corr[3]} for a collapsed prediction"
     )
     # stage 3a is row 2: real, stage 2, 3a, 3b
-    a_corr = [axes[2, c].get_title().split("corr=")[1] for c in range(5)]
+    a_corr = [axes[2, c].get_title().split("corr dx=")[1].split(",")[0]
+              for c in range(5)]
     assert a_corr[3] in ("99%", "100%"), "A is tracking and should say so"
 
 
@@ -915,7 +918,7 @@ def test_each_model_measures_its_delta_from_ITS_OWN_start(monkeypatch):
                            Path(tempfile.mkdtemp()) / "t.png")
     axes = captured["axes"]
     for col in (1, 2, 3):
-        assert axes[3, col].get_title().split("corr=")[1] == "100%", (
+        assert axes[3, col].get_title().split("corr dx=")[1].split(",")[0] == "100%", (
             f"frame {col}: B tracks the real trajectory exactly up to a "
             f"constant, so its correlation is only below 100% if the baseline "
             f"subtracted is not B's own start"
@@ -936,7 +939,7 @@ def test_frame_zero_reports_reconstruction_fidelity_not_na(monkeypatch):
     """
     axes = _titles(monkeypatch)
     for row in (1, 2):
-        corr = axes[row, 0].get_title().split("corr=")[1]
+        corr = axes[row, 0].get_title().split("corr x=")[1]
         assert corr != "n/a", f"frame 0 of row {row} still reports n/a"
         assert corr.endswith("%")
 
@@ -977,11 +980,11 @@ def test_a_constant_real_delta_still_reports_na(monkeypatch):
                            _model("128x128-stage3b"), "cpu", False, "T",
                            Path(tempfile.mkdtemp()) / "t.png")
     axes = captured["axes"]
-    assert axes[1, 1].get_title().endswith("corr=n/a"), (
+    assert "corr dx=n/a" in axes[1, 1].get_title(), (
         "an unchanged real state must give an undefined correlation, not a "
         "fabricated number"
     )
-    assert axes[2, 2].get_title().split("corr=")[1] != "n/a"
+    assert axes[2, 2].get_title().split("corr dx=")[1].split(",")[0] != "n/a"
 
 
 def test_stats_collect_per_step_series(monkeypatch):

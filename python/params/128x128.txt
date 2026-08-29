@@ -217,6 +217,8 @@ rollout_scale   =   0.2 	# 0.2
 rollout_weight_warmup_epochs= 10
 rollout_weight_warmup_start = 1e-2  # geometric warmup
 
+val_ema_decay   = 0.8		# was 0.7 (default)
+
 lr 			  =   2e-6  	# default: 1.e-3
 
 epochs 		  = 100
@@ -226,7 +228,8 @@ batches		  =  48		# was 64
 
 max_dt        = inf
 
-force 	      = True
+# force 	      = True
+ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 
 
 
@@ -234,20 +237,18 @@ force 	      = True
 #   end-to-end refinement
 #############################################################
 
-rollout_weight = 0.2        # now secondary -- see reasoning below
-recon0_weight   = 1  # was 1.0        # now primary, per the original design intent
+rollout_weight 	= 0.2        # now secondary -- see reasoning below
+recon0_weight   = 1  # was 1.0   # now primary, per the original design intent
 stats0_weight   = 0.25
 
-# resume_from = checkpoints/stage5/128x128-stage5-20260805_09h45.pt
-
-recon0_scale    =   0.4e-3
-stats0_scale    =   0.015
-rollout_scale   = 0.03
+recon0_scale    =   0.1e-3
+stats0_scale    =   0.003
+rollout_scale   =   0.005
 
 n_rollout_steps = same      # match stage 4's -- same reasoning as before
 # adaptative sub-step: alpha always inherited 
 
-lr 			  =   0.5e-4  	# default: 1.e-3
+lr 			  =   2.e-6  	# was 5.e-6; default: 1.e-3
 
 epochs         =  50
 patience       =  10
@@ -257,3 +258,5 @@ batches        =  48		# was 64
 max_dt         = same
 
 force 	       = True
+ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
+resume_from = checkpoints/stage5/128x128-stage5-20260829_10h01.pt

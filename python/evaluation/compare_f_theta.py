@@ -44,6 +44,7 @@ tool itself prints, for a repeatable rerun on later checkpoints.
 """
 import argparse
 import re
+import warnings
 import math
 import contextlib
 from pathlib import Path
@@ -52,6 +53,9 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, ScalarFormatter
 import numpy as np
 import torch
+
+from evaluation.lineage import (
+    resolve_lineage, _stage_label, _ancestor_pointers, _registry_resume_of)
 
 from evaluation._window_parsing import parse_fixed_window
 from evaluation.check_rollout import (
@@ -226,8 +230,10 @@ def _select_windows(model: dict, n_samples: int, n_steps: int, seed: int,
 
 
 def collect_stats(a: dict, b: dict, windows: list[tuple], device,
-                   z1_resync: bool) -> dict:
-    """Loss and correlation for BOTH models over every window in `windows`.
+                   z1_resync: bool, extra: list | None = None) -> dict:
+    """Loss and correlation for ALL models over every window in `windows` --
+    a, b, plus any `extra` models (keys "c", "d", ... in order), so
+    --with-ancestors extends this function instead of duplicating it.
 
     No images: the six-panel figure shows a handful of windows chosen to be
     looked at, which is the wrong basis for a verdict -- the seed-0 and seed-1
@@ -235,14 +241,16 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
     windows. This is the same quantities over hundreds.
     """
     recon_loss = ReconLoss()
-    out = {"loss_a": [], "loss_b": [], "corr_a": [], "corr_b": [],
-            "dt": [], "temperature": [], "n_corr_undefined": 0,
+    model_items = [("a", a), ("b", b)] + [
+        (chr(ord("c") + i), m) for i, m in enumerate(extra or [])]
+    model_keys = [k for k, _ in model_items]
+    out = {"dt": [], "temperature": [], "n_corr_undefined": 0,
             # PER-STEP: index k holds every window's value after k chained
             # applications. The collapse is counted in APPLICATIONS, not in
             # elapsed time -- two runs with different per-step dt broke at the
             # same frame index -- so this is the axis the failure lives on.
-            "step_loss_a": [], "step_loss_b": [],
-            "step_corr_a": [], "step_corr_b": [],
+            **{f"{kind}_{k}": [] for k in model_keys
+               for kind in ("loss", "corr", "step_loss", "step_corr")},
             # The frozen causal baseline, per step -- the same curve the
             # trajectory panels draw as their second row, over the whole
             # sample. Absent where the window has no pre-window frame, so it
@@ -271,7 +279,7 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
     for run_dir, steps in windows:
         row = {}
         real_frames = None
-        for key, m in (("a", a), ("b", b)):
+        for key, m in model_items:
             real_frames, pred_frames, dt_per_step = compute_trajectory(
                 run_dir, steps, m["ae"], m["f_theta"], m["ae_config"], device,
                 z1_resync=z1_resync)
@@ -311,13 +319,13 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
             out["temp_causal"].append(temperature)
         out["dt"].append(dt_total)
         out["temperature"].append(temperature)
-        for key in ("a", "b"):
+        for key in model_keys:
             out[f"loss_{key}"].append(row[key]["loss"])
             out[f"corr_{key}"].append(row[key]["corr"])
         # A window counts as undefined if EITHER model's correlation is --
         # dropping it for one model only would compare two populations, the
         # error this whole tool exists to avoid.
-        if row["a"]["corr"] is None or row["b"]["corr"] is None:
+        if any(row[k]["corr"] is None for k in model_keys):
             out["n_corr_undefined"] += 1
 
     # WHERE the undefined correlations sit, per step index. A step missing
@@ -330,7 +338,7 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
         key: [sum(1 for row in out[f"step_corr_{key}"]
                    if len(row) > k and row[k] is None)
               for k in range(n_frames)]
-        for key in ("a", "b")}
+        for key in model_keys}
     return out
 
 
@@ -521,7 +529,8 @@ def _ylim_from_medians(ax, medians) -> None:
 
 
 def _stats_figure(stats: dict, a: dict, b: dict, title: str,
-                   output_path: Path, *, n_steps: int = 1) -> Path:
+                   output_path: Path, *, n_steps: int = 1,
+                   extra: list | None = None, ancestors: bool = False) -> Path:
     """Four panels: loss and correlation, as distributions and against dt."""
     dt = np.array(stats["dt"], dtype=float)
     # The stored "dt" is sum(dt_per_step) in the MODEL's time coordinate: a
@@ -531,8 +540,15 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     _dt_axis_label = ("du_total" if getattr(a["f_theta"], "time_coordinate", "t") == "log10_t"
                       else "dt_total")
     fig, axes = plt.subplots(2, 5, figsize=(31, 9))
+    _model_items = [("a", a), ("b", b)] + [
+        (chr(ord("c") + i), m) for i, m in enumerate(extra or [])]
+    # extra-model colours avoid green/purple (the baselines)
+    _extra_palette = ["tab:orange", "tab:cyan", "deeppink", "black",
+                      "gold", "tab:brown"]
     colours = {"a": "tab:blue", "b": "tab:red", "causal": "tab:green",
-                "stage2": "tab:purple"}
+                "stage2": "tab:purple",
+                **{k: _extra_palette[i % len(_extra_palette)]
+                   for i, (k, _) in enumerate(_model_items[2:])}}
     # Stage 2 RE-ENCODES the predicted state each step (the models never do), so
     # its rollout is a same-methodology baseline only at 1 step. At multi-step it
     # uses information the models cannot; draw it DOTTED so "3a below stage 2"
@@ -546,15 +562,15 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     # style as every other label (via _pretty_label on its stem).
     _enc_pretty = _pretty_label(Path(a.get("ae_path", "")).stem, include_year=False)
     _es = re.search(r"\((.*?)\)", _enc_pretty)   # pull just the "26/08 at 14:55"
-    _enc = f"  [{_es.group(1)}]" if _es else ""
+    _enc = f"  ({_es.group(1)})" if _es else ""
     # Keep the legend short: the "(z0 + z1 dt)" / "(frozen dz0/dt)" descriptors
     # are already in the suptitle, and the encoder tag made these overflow.
     # Drop the descriptor, keep the encoder provenance tag.
-    labels = {"a": a["label"], "b": b["label"],
+    labels = {**{k: m["label"] for k, m in _model_items},
               "causal": "previous derivative",
-              "stage2": "stage 2" + _enc + (
+              "stage2": "stage 2" if ancestors else "stage 2" + _enc + (
                   "" if _stage2_comparable else "  [not comparable]")}
-    linestyles = {"a": "-", "b": "-", "causal": "-",
+    linestyles = {**{k: "-" for k, _ in _model_items}, "causal": "-",
                   "stage2": "-" if _stage2_comparable else ":"}
     has_causal = bool(stats.get("step_loss_causal"))
     has_stage2 = bool(stats.get("step_loss_stage2"))
@@ -568,7 +584,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
             out.append("causal")
         if has_stage2:
             out.append("stage2")
-        return tuple(out) + ("a", "b")
+        return tuple(out) + tuple(k for k, _ in _model_items)
 
     # LAYOUT: rows are the METRIC (loss, then correlation), columns the
     # VIEW (distribution, against dt, against number of steps). Transposed
@@ -793,12 +809,12 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     axes[0, 4].set_ylabel("ln[loss(n)/loss(0)] / n")
     axes[0, 4].set_title("loss log-growth rate per step")
     axes[0, 4].grid(alpha=0.3, which="both")
-    axes[0, 4].legend(fontsize=7)
+    axes[0, 4].legend()
     axes[1, 4].set_xlabel("chained steps applied")
     axes[1, 4].set_ylabel("(1 - corr(n)) / n  [% per step]")
     axes[1, 4].set_title("decorrelation rate per step")
     axes[1, 4].grid(alpha=0.3, which="both")
-    axes[1, 4].legend(fontsize=7)
+    axes[1, 4].legend()
     # (1-corr)/n is non-negative -- pin the floor to 0% (top stays auto).
     axes[1, 4].set_ylim(bottom=0.0)
     # Series start at n=1, but share the x range with the vs-steps column
@@ -1249,26 +1265,24 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
         for col in range(n_cols):
             loss = recon_loss(torch.from_numpy(frames[col])[None, None],
                                torch.from_numpy(real_frames[col])[None, None]).item()
+            # corr x: the FIELD itself vs the real field -- this is what the
+            # eye reads, and what moths (off-manifold speckle) wreck even when
+            # the interface still moves right. AE reconstruction fidelity at
+            # col 0.
+            corr_x = _correlation_pct(frames[col], real_frames[col])
             if col == 0:
-                # No delta exists yet, so correlate the STATES: at frame 0
-                # that is exactly the AE reconstruction fidelity, which is
-                # the meaningful number there and the baseline every later
-                # frame is measured against. Reporting n/a wasted the one
-                # column that says how good the starting point was.
-                corr = _correlation_pct(frames[0], real_frames[0])
+                # No delta from itself yet, so corr dx is undefined here; corr x
+                # already carries the meaningful col-0 number (AE fidelity).
+                corr_dx = None
             else:
-                # frames[0], not pred_a[0]: each model's delta is measured
-                # from ITS OWN starting reconstruction. Subtracting A's start
-                # from B's frames would fold the difference between the two
-                # AEs into B's correlation at every frame.
-                #
-                # This still returns n/a when the REAL delta is constant --
-                # snapshots are stored as float16, so at a short dt and a low
-                # temperature the state can be unchanged at storage
-                # precision. That n/a is a fact about the data, not a defect.
-                corr = _correlation_pct(frames[col] - frames[0],
-                                         real_frames[col] - real_frames[0])
-            per_frame.append((loss, corr))
+                # corr dx: the DELTA from the start (x - x_0), measured from
+                # each model's OWN start (frames[0], not pred_a[0], so the gap
+                # between the two AEs is not folded into B). This is the number
+                # the stats figure reports. n/a when the REAL delta is constant
+                # (float16 storage can leave a short-dt low-T state unchanged).
+                corr_dx = _correlation_pct(frames[col] - frames[0],
+                                            real_frames[col] - real_frames[0])
+            per_frame.append((loss, corr_dx, corr_x))
         metrics[key] = per_frame
 
     # ONE scale for the whole figure, taken from the REAL row: the states are
@@ -1306,10 +1320,12 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
             else:
                 # Model rows carry their own numbers per frame, so the frame
                 # at which each collapses can be read off rather than eyeballed.
-                loss, corr = metrics[metric_key][col]
-                corr_txt = "n/a" if corr is None else f"{corr:.0f}%"
-                ax.set_title(f"loss={_format_small(loss)}, corr={corr_txt}",
-                              fontsize=8)
+                loss, corr_dx, corr_x = metrics[metric_key][col]
+                _dx = "n/a" if corr_dx is None else f"{corr_dx:.0f}%"
+                _x = "n/a" if corr_x is None else f"{corr_x:.0f}%"
+                ax.set_title(
+                    f"loss={_format_small(loss)}, corr dx={_dx}, corr x={_x}",
+                    fontsize=7)
             if col == n_cols - 1 and row == len(rows) - 1:
                 fig.colorbar(im, ax=axes[:, n_cols - 1].tolist(), fraction=0.03)
         if col < len(dt_per_step):
@@ -1882,7 +1898,10 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
                         f_scale_sweep: bool = False, alpha_sweep: bool = False,
                         trajectory: bool = False,
                         output_path: Path | None = None,
-                        device: str | None = None) -> tuple[Path, list[str]]:
+                        device: str | None = None,
+                        extra_paths: list | None = None,
+                        ancestors_mode: bool = False,
+                        n_traj: int = 0) -> tuple[Path, list[str]]:
     """The STATISTICS side: loss/correlation over n_stats windows (the 2x4
     figure), plus the optional f-scale and alpha sweeps, which share that
     same window set and the same loaded models. No per-window images. This
@@ -1892,32 +1911,62 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
     combined function, no panel window is drawn to define it, so n_samples
     has no meaning here."""
     (device, a, b, windows, window_strings, prefix, title,
-     n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device, 0, n_steps,
+     n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device, n_traj, n_steps,
                                          seed, None, max_dt, z1_resync, t0_range=t0_range)
+    # --with-ancestors path: FURTHER models flow through the same machinery as
+    # a and b (keys "c", "d", ...) rather than a parallel implementation.
+    extras = [_load_model(Path(pth), device) for pth in (extra_paths or [])]
+    if extras:  # prettify like _setup_comparison does for a/b (stage 4/5 joint
+                # checkpoints arrive here with raw 'stage 4-20260828_20h05' labels)
+        _ex_year = _labels_need_year([m["label"] for m in extras])
+        for m in extras:
+            m["label"] = _pretty_label(m["label"], _ex_year)
+    if not z1_resync and any(getattr(m["f_theta"], "resync_z1", False)
+                             for m in extras):
+        print("  an ancestor model resynchronises z1; forcing z1_resync=True "
+              "for ALL models so the comparison runs one regime.")
+        z1_resync = True
+    model_items = [("a", a), ("b", b)] + [
+        (chr(ord("c") + i), m) for i, m in enumerate(extras)]
+    if ancestors_mode:
+        from evaluation.lineage import _stage_label
+        _mods = [m for _, m in model_items]        # pretty-labelled, oldest -> newest
+        _anchor, _anc = _mods[-1], _mods[:-1]      # newest is the input checkpoint
+        _s2_label = _parse_stem(Path(a["ae_path"]).stem)[1]     # 'stage 2-2026...'
+        _s2_pretty = _pretty_label(_s2_label, _labels_need_year([_s2_label]))
+        _line1 = (f"{prefix}: {_anchor['label']} and its ancestors: "
+                  f"{', '.join(m['label'] for m in _anc)}; "
+                  f"{_s2_pretty} is not comparable")
+        _parts = title.split("\n", 1)             # keep the "N chained steps..." line
+        title = _line1 + (("\n" + _parts[1]) if len(_parts) > 1 else "")
+        # NB: labels stay FULL (with timestamps) through the console table below;
+        # they are simplified to bare stage names only for the figure legend
+        # (just before the figure), since the title already carries full names.
     if n_stats:
         stat_windows = _select_windows(a, n_stats, n_steps, seed, max_dt, device,
                                         t0_range=t0_range)
         print(f"\ncollecting statistics over {len(stat_windows)} windows "
-              f"(both models, same windows)...")
-        stats = collect_stats(a, b, stat_windows, device, z1_resync)
+              f"({len(model_items)} models, same windows)...")
+        stats = collect_stats(a, b, stat_windows, device, z1_resync,
+                              extra=extras)
     else:
         stats = None  # trajectory-only: no stats figure, just the traj plots
     if alpha_sweep and stats is not None:
-        for key, m in (("a", a), ("b", b)):
+        for key, m in model_items:
             print(f"\nalpha sweep -- {m['label']} (smaller alpha == "
                   f"smaller substeps, h -> 0):")
             sweep_alpha(m, stat_windows, device, z1_resync)
     if f_scale_sweep and stats is not None:
-        for key, m in (("a", a), ("b", b)):
+        for key, m in model_items:
             print(f"\nf_theta scale sweep -- {m['label']} "
                   f"(scale 0 == stage 2):")
             sweep_f_theta_scale(m, stat_windows, device, z1_resync)
-    for key, m in ((("a", a), ("b", b)) if stats is not None else ()):
+    for key, m in (model_items if stats is not None else ()):
         losses_k = np.array(stats[f"loss_{key}"], dtype=float)
         corrs_k = np.array([c for c in stats[f"corr_{key}"]
                              if c is not None], dtype=float)
         print(f"  {m['label']}: median loss {np.median(losses_k):.5g}, "
-              f"median corr {np.median(corrs_k):.1f}%")
+              f"median corr dx {np.median(corrs_k):.1f}%")
     if stats is not None:
         # Causal (frozen dz0/dt extrapolation) never re-encodes -- same rollout
         # methodology as the models -- so it is comparable at every step count.
@@ -1925,7 +1974,7 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
         _cc = np.array([c for c in stats["corr_causal"] if c is not None], dtype=float)
         if _cl.size:
             print(f"  previous derivative: median loss {np.median(_cl):.5g}, "
-                  f"median corr {np.median(_cc):.1f}%")
+                  f"median corr dx {np.median(_cc):.1f}%")
         # Stage 2 (z0+z1*dt) RE-ENCODES the predicted state every step -- the
         # models never do -- so it is a fair, same-methodology baseline ONLY at
         # 1 step (no re-encode yet). At multi-step it uses information the models
@@ -1936,12 +1985,12 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
         _sc = np.array([c for c in stats["corr_stage2"] if c is not None], dtype=float)
         if _sl.size and n_steps == 1:
             print(f"  stage 2 (z0+z1*dt): median loss {np.median(_sl):.5g}, "
-                  f"median corr {np.median(_sc):.1f}%  [comparable: 1 step]")
+                  f"median corr dx {np.median(_sc):.1f}%  [comparable: 1 step]")
         elif _sl.size:
-            print(f"  stage 2 (z0+z1*dt): median corr {np.median(_sc):.1f}% "
+            print(f"  stage 2 (z0+z1*dt): median corr dx {np.median(_sc):.1f}% "
                   f"-- NOT comparable at {n_steps} steps (re-encodes each step; "
                   f"dotted in the figure), reference only")
-    for key, m in ((("a", a), ("b", b)) if stats is not None else ()):
+    for key, m in (model_items if stats is not None else ()):
         per_step = stats["n_corr_undefined_per_step"][key]
         flagged = [k for k, n in enumerate(per_step)
                     if k > 0 and n == len(stats["dt"])]
@@ -1951,6 +2000,10 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
                   f"explains that -- the predicted delta is constant there "
                   f"(pred[k] == pred[0]) or the real frames are identical. "
                   f"Those steps are absent from the correlation panel.")
+    if ancestors_mode:                            # figure legend: bare stage names
+        from evaluation.lineage import _stage_label
+        for _, m in model_items:
+            m["label"] = _stage_label(Path(m["path"]).stem) or m["label"]
     if output_path is None:
         output_path = _default_figure_path(prefix, a, b, seed, n_steps_used,
                                             z1_resync, None)
@@ -1963,12 +2016,17 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
             run_dir = Path(run_dir)
             traj_path = output_path.with_name(
                 f"{output_path.stem.rsplit('-seed', 1)[0]}-{run_dir.name}.png")
-            _trajectory_figure(run_dir, steps, a, b, device, z1_resync,
+            # the two NEWEST models, OLDEST-first (older on top, newer below) so
+            # the rows read as a progression and match the stats legend order.
+            _tj_a, _tj_b = (extras[-2], extras[-1]) if len(extras) >= 2 else \
+                           (b, extras[-1]) if extras else (a, b)
+            _trajectory_figure(run_dir, steps, _tj_a, _tj_b, device, z1_resync,
                                 title, traj_path)
             print(f"saved {traj_path}")
     if stats is not None:
         stats_path = output_path.with_name(output_path.stem + "-stats.png")
-        _stats_figure(stats, a, b, title, output_path=stats_path, n_steps=n_steps)
+        _stats_figure(stats, a, b, title, output_path=stats_path,
+                      n_steps=n_steps, extra=extras, ancestors=ancestors_mode)
         print(f"saved {stats_path}")
     # Return the BASE path (not the -stats one): callers derive both the
     # stats and trajectory names from this stem, as the panel tool's return
@@ -2108,9 +2166,67 @@ def main() -> None:
                               "(compare_statistics): the 2x4 figure and the "
                               "sweeps, no per-window panels. --n-stats "
                               "defaults to 200 here if left at 0.")
+    parser.add_argument("--with-ancestors", nargs="*", default=None, metavar="STAGE",
+                         help="expand a SINGLE checkpoint into its lineage and "
+                              "compare all of them (stats-only). No value = all "
+                              "ancestors; a list (e.g. 2 3b) selects stages. "
+                              "Uses resolve_lineage; --registry adds the 3b->3a link.")
+    parser.add_argument("--registry", type=Path, default=None,
+                         help="registry CSV, for --with-ancestors to resolve the "
+                              "3b->3a link the checkpoint file does not store.")
     args = parser.parse_args()
     if args.panels_only and args.stats_only:
         parser.error("--panels-only and --stats-only are mutually exclusive")
+
+    # --with-ancestors: expand ONE checkpoint into its lineage, then run the
+    # N-model stats path. >2 explicit checkpoints also route here. Exactly-two
+    # (and the trajectory/panels modes) keep the untouched 2-model path.
+    lineage_paths = None
+    if args.with_ancestors is not None:
+        if len(args.checkpoints) != 1:
+            parser.error("--with-ancestors expands ONE checkpoint into its "
+                         "lineage; pass a single checkpoint (or list the "
+                         "checkpoints explicitly without --with-ancestors).")
+        # ALWAYS pass a registry_resume callback: _registry_resume_of falls
+        # back to the registry sitting next to each checkpoint
+        # (checkpoints/stage<N>/registry-stage<N>.csv) when args.registry is
+        # None, so the 3b->3a link resolves with no explicit --registry.
+        reg = lambda pth: _registry_resume_of(pth, args.registry)
+        lineage = resolve_lineage(args.checkpoints[0],
+                                  select=(args.with_ancestors or None),
+                                  registry_resume=reg)
+        print("lineage: " + " -> ".join(lbl for lbl, _ in lineage))
+        # stage 1/2 have no f_theta and cannot roll out -- they are the encoder
+        # root (the stage-2 baseline), NOT a compared model. Keep only the
+        # f_theta-bearing stages (3a/3b/4/5) as the rollout models.
+        _NO_FTHETA = {"stage 1", "stage 1a", "stage 2"}
+        lineage_paths = [str(pth) for lbl, pth in lineage if lbl not in _NO_FTHETA]
+        if len(lineage_paths) < len(lineage):
+            print(f"  (excluding {len(lineage) - len(lineage_paths)} encoder-only "
+                  f"stage(s) with no f_theta from the rollout comparison)")
+    elif len(args.checkpoints) > 2 and args.stats_only:
+        lineage_paths = list(args.checkpoints)
+
+    if lineage_paths is not None:
+        if len(lineage_paths) < 2:
+            parser.error("need at least two checkpoints to compare; the lineage "
+                         "resolved to fewer (missing ancestors? try --registry, "
+                         "or check the paths resolve on this machine).")
+        out = args.output
+        anc_mode = args.with_ancestors is not None
+        if anc_mode and out is None:
+            anchor = Path(args.checkpoints[0]).stem
+            out = (_PYTHON_ROOT.parent / "output" / "rollout_check_png"
+                   / f"{anchor}-ancestors-{args.steps}steps.png")
+        compare_statistics(
+            Path(lineage_paths[0]), Path(lineage_paths[1]),
+            extra_paths=lineage_paths[2:], ancestors_mode=anc_mode,
+            n_stats=args.n_stats or 200, n_steps=args.steps,
+            seed=args.seed, max_dt=args.max_dt, z1_resync=args.z1_resync,
+            t0_range=tuple(args.t0_range) if args.t0_range else None,
+            trajectory=args.trajectory, output_path=out, device=args.device,
+            n_traj=args.n_samples)
+        return
 
     if args.stage2_compare:
         compare_stage2_rollouts(

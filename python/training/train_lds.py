@@ -1612,6 +1612,11 @@ def train_lds(
                 "val_loss": val_loss,
                 "val_loss_ema": tracker.val_ema,
                 "ae_checkpoint": str(Path(ae_checkpoint_path).resolve()),
+                # The resume ancestor (3b -> 3a), stored so lineage is walkable
+                # from the checkpoint alone -- same as stage 4/5's joint save.
+                # Without it the 3b -> 3a link is registry-only (asymmetric).
+                **({"resumed_from": str(Path(resume_from).resolve())}
+                   if resume_from is not None else {}),
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {
                     "latent_channels": ae_config["latent_channels"], "n_theta": N_THETA,
