@@ -1596,7 +1596,7 @@ def train_lds(
         if show_1step:
             train_1step_history.append(train_1step)
             val_1step_history.append(val_1step)
-        if should_write_loss_figure(epoch, log_every_epoch):
+        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
             loss_curve(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                 loss_curve_path, title="Stage 3 loss",

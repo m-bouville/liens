@@ -307,8 +307,28 @@ def skip_report(epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst
         return f"{n}/{n_batches} ({100 * n / n_batches:.1f}%)" if n_batches else str(n)
 
     if verbose:
+        # The two skip kinds share a long boilerplate tail ("optimizer step NOT
+        # taken, BatchNorm restored, model untouched"). When BOTH fire in an
+        # epoch, printing two near-identical five-line blocks is mostly repeated
+        # boilerplate -- so merge into one: both worst-clauses, the shared tail
+        # once. Single-kind epochs are unchanged.
+        def _worst_clause(kind: str, worst) -> str:
+            if worst is None:
+                return kind
+            return (f"{kind} (worst: {worst[0]:.4g} vs median "
+                    f"{_SpikeGuard.median_display(worst[1])}, {dt_label}={worst[2]:.4g}, "
+                    f"mean theta[0]={worst[3]:.4g})")
+        _tail = ("The optimizer step was NOT taken, and the BatchNorm running "
+                 "statistics its forward pass moved were restored, so the model "
+                 "is untouched.")
         parts = []
-        if grad_new:
+        if grad_new and loss_new:
+            parts.append(
+                f"  [epoch {epoch}: skipped {_count(grad_new)} batch(es) whose "
+                f"{_worst_clause('gradient norm', grad_worst)} and {_count(loss_new)} "
+                f"batch(es) whose {_worst_clause('loss', loss_worst)} were catastrophic "
+                f"outliers. {_tail}]")
+        elif grad_new:
             parts.append(
                 f"  [epoch {epoch}: skipped {_count(grad_new)} batch(es) whose GRADIENT NORM was a "
                 f"catastrophic outlier, despite an ordinary loss. This is the case the loss "
@@ -318,11 +338,10 @@ def skip_report(epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst
                    f"{_SpikeGuard.median_display(grad_worst[1])}, {dt_label}={grad_worst[2]:.4g}, "
                    f"mean theta[0]={grad_worst[3]:.4g}")
                 + "]")
-        if loss_new:
+        elif loss_new:
             parts.append(
                 f"  [epoch {epoch}: skipped {_count(loss_new)} batch(es) whose loss was a catastrophic "
-                f"outlier. The optimizer step was NOT taken, and the BatchNorm running "
-                f"statistics its forward pass moved were restored, so the model is untouched."
+                f"outlier. {_tail}"
                 + ("" if loss_worst is None else
                    f" worst: loss {loss_worst[0]:.4g} vs median "
                    f"{_SpikeGuard.median_display(loss_worst[1])}, {dt_label}={loss_worst[2]:.4g}, "

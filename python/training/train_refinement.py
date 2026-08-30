@@ -674,7 +674,7 @@ def train_refinement(
         train_loss_history.append(train_loss)
         val_loss_history.append(val_loss)
         best_so_far_history.append(tracker.best_val_loss)
-        if should_write_loss_figure(epoch, log_every_epoch):
+        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
             loss_curve(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                 loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
@@ -697,7 +697,7 @@ def train_refinement(
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
             component_histories[name]["best_so_far"].append(best_components[name])
-        if should_write_loss_figure(epoch, log_every_epoch):
+        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
             loss_component_scatter(
                 epoch_history, component_histories, loss_components_path,
                 title=f"Stage {'4' if freeze_decoder else '5'} loss components",

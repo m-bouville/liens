@@ -1591,10 +1591,32 @@ def test_the_first_skip_explains_itself_and_later_ones_do_not():
     worst = (4.6e8, 4.8e6, 1250.0, -0.10)
     first = skip_report(9, 1, worst, 3, worst, 13, verbose=True)
     later = skip_report(10, 1, worst, 3, worst, 13, verbose=False)
-    assert "loss guard cannot see" in first
-    assert "loss guard cannot see" not in later
+    # First time spells out the full boilerplate (once, even when both guards
+    # fire and the two reports are merged); later epochs collapse to one compact
+    # line without it. That contrast is the point -- six boilerplate lines every
+    # epoch is what made the loss curve unreadable.
+    assert "The optimizer step was NOT taken" in first
+    assert "The optimizer step was NOT taken" not in later
     assert len(later.splitlines()) == 1, later
     assert len(first.splitlines()) > len(later.splitlines())
+
+
+def test_both_guards_firing_merge_into_one_verbose_block():
+    """When BOTH the loss and gradient guards fire in an epoch, the verbose
+    report is a SINGLE block -- both worst-clauses, the shared 'optimizer step
+    NOT taken / BatchNorm restored' tail exactly once -- not two near-identical
+    five-line messages. Grad-only and loss-only epochs keep their own wording."""
+    from training.spike_guard import skip_report
+    gw = (6.0e6, 29.4, 2.5e4, -0.15)
+    lw = (1.1e5, 0.63, 2.5e4, -0.09)
+    both = skip_report(2, 4, lw, 5, gw, 48, verbose=True)
+    body = both.splitlines()[0]                      # the merged line (before the note)
+    assert body.count("optimizer step was NOT taken") == 1, "boilerplate must appear once"
+    assert "gradient norm" in body and "loss" in body     # both kinds named
+    assert "6e+06" in body and "1.1e+05" in body          # both worst values kept
+    # single-kind epochs unchanged
+    assert "despite an ordinary loss" in skip_report(3, 0, None, 5, gw, 48, verbose=True)
+    assert "whose loss was a catastrophic" in skip_report(3, 5, lw, 0, None, 48, verbose=True)
 
 
 def test_the_compact_line_carries_what_varies():

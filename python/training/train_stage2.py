@@ -1660,7 +1660,7 @@ def train_stage2(
         train_loss_history.append(train_total)
         val_loss_history.append(val_total)
         best_so_far_history.append(tracker.best_val_loss)
-        if should_write_loss_figure(epoch, log_every_epoch):
+        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
             loss_curve(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                 loss_curve_path, title="Stage 2 loss", event_epochs=loss_curve_events,
@@ -1683,7 +1683,7 @@ def train_stage2(
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
             component_histories[name]["best_so_far"].append(best_components[name])
-        if should_write_loss_figure(epoch, log_every_epoch) and not stage2a:
+        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)) and not stage2a:
             # In stage 2a only the deriv stream trains -- recon0 and stats0 are
             # frozen and dead-flat, so a stacked-component scatter is two flat
             # bands plus deriv: visual noise. The single moving term is already

@@ -618,7 +618,7 @@ def train_autoencoder(
         train_loss_history.append(train_total)
         val_loss_history.append(val_total)
         best_so_far_history.append(tracker.best_val_loss)
-        if should_write_loss_figure(epoch, log_every_epoch):
+        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
             loss_curve(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                 loss_curve_path, title="Stage 1 loss",
@@ -636,7 +636,7 @@ def train_autoencoder(
             component_histories["stats0"]["train"].append(stats0_weight * train_stats0 / stats0_scale)
             component_histories["stats0"]["val"].append(current_val_components["stats0"])
             component_histories["stats0"]["best_so_far"].append(best_components["stats0"])
-            if should_write_loss_figure(epoch, log_every_epoch):
+            if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
                 loss_component_scatter(
                     epoch_history, component_histories, loss_components_path,
                     title="Stage 1 loss components",

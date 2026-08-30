@@ -30,9 +30,9 @@ The latent representation is split into two streams:
 
 A Latent Dynamics Surrogate (LDS), $f_\theta$, predicts the next state from both:
 
-$$z_0(t + \delta t) = z_0(t) + z_1(t) \delta t + f_\theta(z_0(t), z_1(t), \theta) \delta t^2/2,$$
+$$z_0(t + \delta t) = z_0(t) + [z_1(t) + f_\theta(z_0(t), z_1(t), \theta, \delta t)] \delta t,$$
 
-with $\theta$ physical parameters (e.g. temperature). $z_1(t) \delta t$ is the first-order (linear) term; $f_\theta$ predicts the second-order (curvature) correction on top of it. 
+with $\theta$ physical parameters (e.g. temperature). $z_1(t) \delta t$ is the first-order (linear) term; $f_\theta$ is a correction on top of it and can include second-order terms (curvature).
 
 As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\delta t$ a multiple of the phase-field time step) — in practice the second-order term is capped for large $\delta t$, to avoid a blow-up.
 
@@ -55,7 +55,7 @@ $$x(t) \xrightarrow{E} z(t) \xrightarrow{f_\theta} z(t+\delta t) \xrightarrow{D}
 
 In fact, the encoding occurs only once at the beginning and the decoding once at the end (plus when plots are needed):
 
-$$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\theta} z(2 \delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(T) \xrightarrow{D} x(t_\mathrm{end}).$$
+$$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\theta} z(2 \delta t) \xrightarrow{f_\theta} \ldots \xrightarrow{f_\theta} z(t_\mathrm{end}) \xrightarrow{D} x(t_\mathrm{end}).$$
 
 (Writing $z$ loosely for the full latent state $(z_0,\ z_1)$; see [./docs/neural_nets.md](docs/neural_nets.md) for the actual split-stream mechanics.)
 
@@ -94,7 +94,7 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\t
 ## Workflow
 0.	Generate several thousands of  phase-field simulations. 
 1.	Train a CNN autoencoder on individual microstructures (no time evolution yet) to learn a latent representation that is reconstructive and physically descriptive.
-2.  Train a second latent stream, $z_1$, to represent $\dot{z}_0$ via a derivative loss (see [./docs/neural_nets.md](docs/neural_nets.md) for more details).
+2.  Train a second latent stream, $z_1$, to represent $\dot{z}_0$ via a derivative loss.
 3.	Freeze the encoder and train the Latent Dynamics Surrogate (LDS) to predict future microstructures in latent space. (Two sub-steps: 3a and 3b.)
 4.	Fine-tune the encoder and the LDS for prediction, including a small input from reconstruction.
 5.	Fine-tune the latent representation and the LDS to both predict future microstructures and reconstruct the original microstructure.
