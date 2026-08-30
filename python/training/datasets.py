@@ -1202,6 +1202,7 @@ class MicrostructureEvolutionDataset(Dataset):
         # from a different encoder with no error anywhere.
         self._latent_cache_root = Path(latent_cache_dir) if latent_cache_dir else None
         self._cache_info = cache_info or {}
+        self._cache_info_written: set = set()
         self._encoder_fingerprint = (
             latent_cache.encoder_fingerprint(encoder)
             if self._latent_cache_root is not None and encoder is not None else None)
@@ -1349,6 +1350,7 @@ class MicrostructureEvolutionDataset(Dataset):
         # the quotient path with a real encoder.
         self._run_pred_z0: list = [None] * len(self._run_steps)
         self._run_pred_du: list = [None] * len(self._run_steps)
+        self._quotient_precomputed = False
         if self.derivative_source == "previous_quotient" and self.encoder_given:
             self._encode_run_start_predecessors(encoder, device, encoder_accepts_theta)
 
@@ -1361,7 +1363,16 @@ class MicrostructureEvolutionDataset(Dataset):
         that q_0 would be at a run's ABSOLUTE first snapshot never surfaces
         (min_step drops it), and every kept run's first frame gets a genuine
         backward quotient instead of z1. Runs whose first kept frame IS the
-        first saved frame (no predecessor) keep None -> z1 fallback there only."""
+        first saved frame (no predecessor) keep None -> z1 fallback there only.
+
+        Encodes are BATCHED (one frame per run, gathered into chunks) rather
+        than 2750 sequential batch-1 forwards, and afterwards the per-run
+        quotient is PRECOMPUTED once and swapped in place of the deriv stream
+        (whose only remaining role -- the run-start fallback -- is baked into
+        frame 0). __getitem__ then serves the quotient as a plain slice, the
+        same cost as the z1 path, instead of rebuilding a du tensor from a
+        Python list per window (~100k times per epoch on num_workers=0)."""
+        pending: list[tuple[int, torch.Tensor, torch.Tensor | None, float]] = []
         for run_idx, run_dir in enumerate(self._run_dirs):
             metadata = load.read_metadata(run_dir / "metadata.txt")
             save_steps = list(metadata.save_steps)
@@ -1380,20 +1391,46 @@ class MicrostructureEvolutionDataset(Dataset):
                                                # fallback for this run's first frame only
             phi = load.read_phi_half(
                 run_dir / load.snapshot_filename(pred_step), metadata.nx, metadata.ny)
-            frame = torch.from_numpy(phi).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,ny,nx)
+            frame = torch.from_numpy(phi).unsqueeze(0)          # (1, ny, nx)
+            theta = (torch.tensor(theta_coordinates(metadata.temperature, metadata.T0),
+                                  dtype=torch.float32)
+                     if encoder_accepts_theta else None)
+            du_pred = (math.log10(first_kept / pred_step)
+                       if self.time_coordinate == "log10_t"
+                       else (first_kept - pred_step) * metadata.dt)
+            pending.append((run_idx, frame, theta, du_pred))
+
+        chunk = 256
+        for lo in range(0, len(pending), chunk):
+            part = pending[lo:lo + chunk]
+            batch = torch.stack([f for _, f, _, _ in part]).to(device)   # (B,1,ny,nx)
             with torch.no_grad():
                 if encoder_accepts_theta:
-                    theta = torch.tensor(
-                        theta_coordinates(metadata.temperature, metadata.T0),
-                        dtype=torch.float32).unsqueeze(0).to(device)
-                    encoded = encoder(frame, theta=theta)
+                    thetas = torch.stack([t for _, _, t, _ in part]).to(device)
+                    encoded = encoder(batch, theta=thetas)
                 else:
-                    encoded = encoder(frame)
-            self._run_pred_z0[run_idx] = encoded[DEFAULT_STREAM_NAME].cpu()[0]  # (C,8,8)
-            self._run_pred_du[run_idx] = (
-                math.log10(first_kept / pred_step)
-                if self.time_coordinate == "log10_t"
-                else (first_kept - pred_step) * metadata.dt)
+                    encoded = encoder(batch)
+            z0 = encoded[DEFAULT_STREAM_NAME].cpu()
+            for k, (run_idx, _, _, du_pred) in enumerate(part):
+                self._run_pred_z0[run_idx] = z0[k]                        # (C, 8, 8)
+                self._run_pred_du[run_idx] = du_pred
+
+        # Precompute the per-run quotient ONCE and swap it in for the deriv
+        # stream: q_k = (z0_k - z0_{k-1})/du_{k-1}, frame 0 from the predecessor
+        # (or the old z1 where there is none). Same memory (replaces z1), and
+        # __getitem__'s existing plain slice now serves the quotient directly.
+        for run_idx in range(len(self._run_data)):
+            z0 = self._run_data[run_idx]
+            du = self._du_slice(run_idx, 0, z0.shape[0])                  # (n-1,)
+            q = torch.empty_like(z0)
+            q[1:] = (z0[1:] - z0[:-1]) / du.view(-1, 1, 1, 1)
+            pred = self._run_pred_z0[run_idx]
+            if pred is not None:
+                q[0] = (z0[0] - pred) / self._run_pred_du[run_idx]
+            else:
+                q[0] = self._run_data_deriv[run_idx][0]                   # z1 fallback
+            self._run_data_deriv[run_idx] = q
+        self._quotient_precomputed = True
 
     def _read_and_encode_all_runs(
         self, run_dirs: list[Path], good_steps: dict, encoder: torch.nn.Module | None,
@@ -1566,13 +1603,21 @@ class MicrostructureEvolutionDataset(Dataset):
                 # window construction below depends on that ordering.
                 run_index = len(pending_meta)
                 if self._latent_cache_root is not None:
-                    latent_cache.write_cache_info(
-                        self._latent_cache_root, self._encoder_fingerprint,
-                        size=metadata.nx,
-                        info={"streams cached": ("z0 (state) + z1 (deriv)"
-                                                 if self.encode_both_streams
-                                                 else "z0 (state)"),
-                              **self._cache_info})
+                    # Once per (size, fingerprint) per BUILD -- not per run: the
+                    # content is identical across a build's ~3000 runs, and the
+                    # per-run version rewrote the same small file ~3000 times.
+                    # "cache last accessed" therefore refreshes per build, which
+                    # is the meaningful unit of access.
+                    _ck = (metadata.nx, self._encoder_fingerprint)
+                    if _ck not in self._cache_info_written:
+                        self._cache_info_written.add(_ck)
+                        latent_cache.write_cache_info(
+                            self._latent_cache_root, self._encoder_fingerprint,
+                            size=metadata.nx,
+                            info={"streams cached": ("z0 (state) + z1 (deriv)"
+                                                     if self.encode_both_streams
+                                                     else "z0 (state)"),
+                                  **self._cache_info})
                     cached = latent_cache.load_cached(
                         latent_cache.cache_path_for_run(
                             self._latent_cache_root, self._encoder_fingerprint, run_dir,
@@ -1975,7 +2020,11 @@ class MicrostructureEvolutionDataset(Dataset):
 
         if self.encode_both_streams:
             window_deriv = self._run_data_deriv[run_idx][start:end]
-            if self.derivative_source == "previous_quotient":
+            if (self.derivative_source == "previous_quotient"
+                    and not getattr(self, "_quotient_precomputed", False)):
+                # Fallback path only (precompute normally replaces the deriv
+                # stream with the quotient at build time, so the slice above
+                # already IS the quotient).
                 window_deriv = self._backward_quotient(
                     run_idx, start, end, dt_window, window_deriv)
             if self.return_phys_dt:

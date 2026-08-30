@@ -1902,3 +1902,30 @@ def test_report_label_is_du_max_in_u_mode_dt_max_otherwise():
     assert "du_max=0.07918" in u_line and "dt_max=" not in u_line, u_line
     t_line = skip_report(120, 1, worst, 0, None, 13, verbose=False)  # default
     assert "dt_max=0.07918" in t_line, t_line
+
+
+def test_early_stop_message_reports_longest_recovered_gap():
+    """The exit line answers 'one-off draught or chronic near-stops?': it names
+    the longest no-save stretch the run RECOVERED from and the epochs it
+    spanned -- number and range only, no editorialising."""
+    from training.spike_guard import early_stop_message
+    msg = early_stop_message(500, 500, saved_this_run=True,
+                             longest_gap=120, longest_gap_range=(250, 370))
+    assert "no improvement for 500 epochs" in msg
+    assert "longest period without saves before that: 120 epochs (250 to 370)" in msg
+    assert "->" not in msg                       # interpretation line removed by request
+    assert "%" not in msg                        # no percentage by request
+
+
+def test_early_stop_message_without_gap_info_is_the_plain_line():
+    from training.spike_guard import early_stop_message
+    assert early_stop_message(2618, 500, saved_this_run=True) == \
+        "Early stopping at epoch 2618: no improvement for 500 epochs"
+
+
+def test_early_stop_message_never_saved_case_unchanged_by_gap_args():
+    from training.spike_guard import early_stop_message
+    msg = early_stop_message(200, 200, saved_this_run=False,
+                             longest_gap=50, longest_gap_range=(10, 60))
+    assert "NOTHING was ever saved" in msg
+    assert "longest period" not in msg           # gap clause is a saved-run detail

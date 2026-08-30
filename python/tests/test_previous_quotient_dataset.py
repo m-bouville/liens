@@ -153,3 +153,34 @@ def test_absolute_first_snapshot_falls_back_to_z1(tmp_run_dir):
         encode_both_streams=True, time_coordinate="t",
         derivative_source="previous_quotient")
     assert ds._run_pred_z0[0] is None, "step-0 predecessor should be skipped, not encoded"
+
+
+def test_run_start_predecessor_log10_t(tmp_run_dir):
+    """log10_t is the production coordinate: the predecessor's du must be
+    log10(first_kept/pred_step), and q_0 the z0 difference over THAT du. This is
+    the path the t-mode test cannot exercise (du = physical dt there)."""
+    run_dir, _ = tmp_run_dir
+    enc = _TwoStreamEncoder()
+    # min_step=2000 keeps [2000,3000,4000]; predecessor 1000 (nonzero -> valid in log10_t)
+    ds = MicrostructureEvolutionDataset(
+        [run_dir], encoder=enc, window_length=3, min_step=2000, min_stdev_phi=None,
+        encode_both_streams=True, time_coordinate="log10_t",
+        derivative_source="previous_quotient")
+    assert ds._run_pred_z0[0] is not None
+    du_pred = ds._run_pred_du[0]
+    assert abs(du_pred - math.log10(2000 / 1000)) < 1e-9, \
+        "predecessor du must be log10(t_first/t_pred) in log10_t mode"
+    window, window_deriv, du_window, _ = ds[0]
+    expected = (window[0] - ds._run_pred_z0[0]) / du_pred
+    assert torch.allclose(window_deriv[0], expected, atol=1e-5)
+
+
+def test_log10_t_step0_predecessor_guarded(tmp_run_dir):
+    """min_step=1 keeps [1000,...]; predecessor would be step 0 -> log10 singular
+    -> guarded to None, z1 fallback for that run's first frame only."""
+    run_dir, _ = tmp_run_dir
+    ds = MicrostructureEvolutionDataset(
+        [run_dir], encoder=_TwoStreamEncoder(), window_length=3, min_step=1,
+        min_stdev_phi=None, encode_both_streams=True, time_coordinate="log10_t",
+        derivative_source="previous_quotient")
+    assert ds._run_pred_z0[0] is None

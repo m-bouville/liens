@@ -1213,10 +1213,13 @@ def train_lds(
     # The ceiling (ancestor's val_loss, when comparable) gates every save but was
     # invisible on the loss curve -- so a resumed run showed no sign of the bar
     # it had to clear. Draw it as a reference level (loss_curve already renders
-    # these as a dashed line). None when no ceiling is active (fresh run, or the
-    # grace-period 3a->3b handoff), in which case nothing is drawn.
-    _ref_levels = ([(tracker.reference_val_loss, "ancestor val_loss (beat to save)")]
-                   if tracker.reference_val_loss is not None else None)
+    # these as a dashed line). Computed AT PLOT TIME, not once up front: a spike
+    # rollback resets the tracker WITH A NEW reference (reset_with_grace), and a
+    # precomputed list would keep drawing the stale one. None when no ceiling is
+    # active (fresh run, or the grace-period 3a->3b handoff): nothing is drawn.
+    def _ref_levels():
+        return ([(tracker.reference_val_loss, "ancestor val_loss (beat to save)")]
+                if tracker.reference_val_loss is not None else None)
 
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
@@ -1599,7 +1602,7 @@ def train_lds(
                 loss_curve_path, title="Stage 3 loss",
                 secondary_train=train_1step_history if show_1step else None,
                 secondary_val=val_1step_history if show_1step else None,
-                secondary_label="1step", reference_levels=_ref_levels,
+                secondary_label="1step", reference_levels=_ref_levels(),
             )
             write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
 
@@ -1784,7 +1787,7 @@ def train_lds(
         loss_curve_path, title="Stage 3 loss",
         secondary_train=train_1step_history if show_1step else None,
         secondary_val=val_1step_history if show_1step else None,
-        secondary_label="1step", reference_levels=_ref_levels,
+        secondary_label="1step", reference_levels=_ref_levels(),
     )
     write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
 

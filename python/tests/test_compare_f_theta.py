@@ -2675,3 +2675,45 @@ def test_stage2_dx_column_uses_its_own_scale_not_the_shared_one(monkeypatch, tmp
     assert stage2_clim[1] > real_clim[1] * 100, (
         "stage-2 dx column is not on its own scale -- a diverged z1 should give "
         "it a far wider range than real dx, not the shared one")
+
+
+def test_correlation_pct_silent_and_none_on_degenerate():
+    """A near-constant float32 delta used to slip past the std guard and hit
+    corrcoef's internal 0/0 -> RuntimeWarning. Now: silent, and non-finite
+    results are None (correlation genuinely undefined), while real data is
+    untouched."""
+    import warnings
+    import numpy as np
+    from evaluation.check_rollout import _correlation_pct
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")               # any warning -> failure
+        a = np.full(64, 0.5, dtype=np.float32); a[0] = 0.5000001
+        assert _correlation_pct(a, np.full(64, 0.5, dtype=np.float32)) is None
+        assert abs(_correlation_pct(np.arange(9.0), np.arange(9.0) * 2) - 100.0) < 1e-6
+        assert _correlation_pct(np.zeros(16), np.arange(16.0)) is None   # constant
+
+
+def test_output_subdir_routes_by_stage_directory():
+    """Two-model comparisons file under the input checkpoint's own stage dir;
+    anything not under a stage<N>[ab] dir falls back to rollout_check_png.
+    Windows separators must route identically."""
+    from evaluation.compare_f_theta import _output_subdir
+    assert _output_subdir("checkpoints/stage3a/x.pt") == "stage3a"
+    assert _output_subdir("checkpoints/stage3b/128x128-stage3b-20260829_21h48.pt") == "stage3b"
+    assert _output_subdir("checkpoints/stage4/x.pt") == "stage4"
+    assert _output_subdir(r"D:\work\NN\phase_field\python\checkpoints\stage3a\x.pt") == "stage3a"
+    assert _output_subdir("checkpoints/misc/x.pt") == "rollout_check_png"
+    assert _output_subdir("x.pt") == "rollout_check_png"
+
+
+def test_ancestors_figure_goes_to_general_dir_not_anchor_stage():
+    """--with-ancestors spans stages (2 -> 3a -> 3b -> ...), so its default
+    output is the general rollout_check_png/, NOT the anchor's stage dir --
+    source-level check of the default-path branch."""
+    import inspect
+    import evaluation.compare_f_theta as cf
+    src = inspect.getsource(cf)
+    i = src.index("anc_mode and out is None")
+    block = src[i:i + 600]
+    assert '"rollout_check_png"' in block
+    assert "_output_subdir(args.checkpoints[0])" not in block
