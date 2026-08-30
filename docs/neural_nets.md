@@ -81,11 +81,9 @@ Currently, the first type works more reliably than the other.
 |---|-----------------|------------|-----------|----------------------------|
 | 1 | autoencoder ($z_0$)| $x_0$ | $z_0$ | $D[z_0(t)] \approx x_0(t)$ |
 | 2 | derivative ($z_1$) | $x_0$ | $z_1$ | $z_0(t) + z_1(t) \delta t \approx z_0(t+\delta t)$, i.e. $z_1(t) \approx \dot{z}_0(t)$; while maintaining $D[z_0(t)] \approx x_0(t)$ |
-| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ and $g_\theta{}^\ast$ | $z_0(t) + z_1(t) \Delta t + f_\theta(z_0(t), z_1(t), \Delta t)   \Delta t \approx z_0(t+\Delta t)$ |
-| 3b | LDS, rollout   |        "        | "    |  as 3a, chained, + $z_1(t) + f_\theta(z_0(t), z_1(t)) \delta t + g_\theta(z_0(t), z_1(t))  (\delta t^2/2) \approx z_1(t+\delta t)$ |
+| 3a | LDS, one step  | $z_0$, $z_1$| $f_\theta$ | $z_0(t) + z_1(t) \Delta t + f_\theta(z_0(t), z_1(t), \Delta t) \Delta t \approx z_0(t+\Delta t)$ |
+| 3b | LDS, rollout   |        "        | "    |  as 3a, chained |
 
-Note:
-${}^\ast$: not yet implemented.
 
 
 
@@ -254,7 +252,7 @@ $$[z_0(t + \Delta t) - z_0(t) - z_1(t) \Delta t] / \Delta t,$$
 with $\theta$ (currently just the temperature: in the form of $T-T_0$, and $\ln(T_0-T)$ to handle $T$ close to $T_0$) as further input.
 Finally,
 
-$$z_0(t + \delta t) \approx z_0(t) + z_1(t) \delta t + f_\theta(z_0(t), z_1(t), \delta t)   \delta t.$$
+$$z_0(t + \delta t) \approx z_0(t) + z_1(t) \delta t + f_\theta(z_0(t), z_1(t), \delta t) \delta t.$$
 
 Under the `u`-scheme (above) the same $f_\theta$ steps in $u = \log_{10} t$: read $\Delta u$ for $\Delta t$, $\tilde{z}_1 = \ln(10) t z_1$ for $z_1$, and the integration $z_0(u+\Delta u) \approx z_0 + \tilde{z}_1 \Delta u +
 f_\theta(\ldot) \Delta u$ is identical in form.
@@ -263,7 +261,7 @@ f_\theta(\ldot) \Delta u$ is identical in form.
 ### One-step latent prediction loss
 Compare the prediction to the ground truth in latent space:
 
-$$L_\mathrm{1step} = \left\| z_0(t+\Delta t) - [z_0(t) + z_1(t)  \Delta t] \right\|_2^2.$$
+$$L_\mathrm{1step} = \left\| z_0(t+\Delta t) - [z_0(t) + z_1(t) \Delta t + f_\theta(z_0(t), z_1(t), \Delta t) \Delta t] \right\|_2^2.$$
 
 Doing so in latent space avoids reliance on the decoder, cleanly separating decoder loss and prediction loss.
 
@@ -283,6 +281,8 @@ $$\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \D
 Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
 
 ### Semi-implicit (predictor-corrector) velocity-Verlet
+This section and the next pertain to the obsolete `dynamics_mode=z1_taylor` mode.
+
 Integration of the latent state $(z_0,  z_1)$ over one sub-step $dt$.
 
 $f_\theta(z_0, z_1, \theta)$ approximates $\dot z_1 = \ddot z_0$.
@@ -303,11 +303,13 @@ $$f_{n+1} = f_\theta\left(z_0^{(n+1)},  \tilde z_1,  \theta\right).$$
 
 corrector (trapezoidal):
 
-$$  z_1^{(n+1)} = z_1^{(n)} + \frac{f_n + f_{n+1}}{2} \delta t.$$
+$$z_1^{(n+1)} = z_1^{(n)} + \frac{f_n + f_{n+1}}{2} \delta t.$$
 
 Stage 3a uses only one step, `L_1step`, whereas stage 3b involves several consecutive steps (`L_rollout`)​.
 
 ### `check_alpha.py` — calibrating the Taylor-validity ratio
+This section and the previous one pertain to the obsolete `dynamics_mode=z1_taylor` mode.
+
 The training (stage 3b) initially used steps $\delta t = \Delta t / n_\mathrm{substeps}$:
 - we ensure that we land on known time steps,
 - we rely on $\Delta t$ to scale sensibly with $t$.

@@ -32,9 +32,9 @@ A Latent Dynamics Surrogate (LDS), $f_\theta$, predicts the next state from both
 
 $$z_0(t + \delta t) = z_0(t) + [z_1(t) + f_\theta(z_0(t), z_1(t), \theta, \delta t)] \delta t,$$
 
-with $\theta$ physical parameters (e.g. temperature). $z_1(t) \delta t$ is the first-order (linear) term; $f_\theta$ is a correction on top of it and can include second-order terms (curvature).
+with $\theta$ physical parameters (e.g. temperature). $z_1(t) \delta t$ is the first-order (linear) term; $f_\theta$ is a correction on top of it. Since it takes $\delta t$ as input, it can account for second-order terms (curvature).
 
-As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\delta t$ a multiple of the phase-field time step) — in practice the second-order term is capped for large $\delta t$, to avoid a blow-up.
+As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\delta t$ a multiple of the phase-field time step).
 
 Representing the microstructure in latent space rather than real space has two advantages:
 - it can be much smaller (even a smallish 256×256 image has 65'000 degrees of freedom),
@@ -142,5 +142,5 @@ For more details on the structure of the `python` directory, see [./docs/NN-code
 ### For those who prefer text
 - All five training stages are implemented and run end-to-end. The work currently underway is improving the accuracy of the surrogate, not making it run at all.
 - The initial development was carried out using 64×64 images (32×32 for testing the code end-to-end). They were serviceable but hit their limit, with finite-size artifacts eventually dominating the results. The focus is now on 128×128 microstructures.
-- There is a (physically plausible) difference of behavior above and below $T = 0.9 \times T_0$. Work is being done to smoothen out this wrinkle.
+- There is a (physically plausible) difference of behavior above and below $T \approx 0.9 \times T_0$. Microstructures are now filtered with `min_normalized_stdev_phi` instead of `min_stdev_phi` (i.e. using the temperature-dependent ground-state value for `phi` as threshold, rather than a constant) to avoid a bias at `$T \approx T_0$.
 - Predicting $t + \delta t$ gives sensible results, $t + 10 \delta t$ did not. The introduction of `u = log10 t` helped.

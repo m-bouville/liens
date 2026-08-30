@@ -1,9 +1,9 @@
 # Diagnostic tools for the LIENS neural network
 
 ## Tests
-`pytest -n 4 tests/ -q`, or `pytest -n 4 tests/ -q -m "not slow"` to skip the longer tests.
+`pytest -n 4 tests/ -q`. Variant: `pytest -n 4 tests/ -q -m "not slow"` to skip the longer tests.
 
-Note: Two checkpoint binaries required for the test suite (32x32-stage2.pt, architecture_v1_golden_master.pt) are not in the distribution.
+Note: Checkpoint binaries required for the test suite may not be in the distribution.
 
 
 
@@ -95,7 +95,7 @@ Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` p
 
 ### Sweep over `min_stdev_phi`, `min_std_deriv` and `min_passing_steps`
 `python -m evaluation.sweep_min_stdev_phi --base-path ../datasets --size 128 --max-runs 1000`
-Variant: `--normalized` for `min_normalized_stdev_phi`
+Variant: `--normalized` for `min_normalized_stdev_phi`, i.e. as fraction of temperature-dependent ground-state value for `phi`.
 
 `python -m evaluation.sweep_min_std_deriv --base-path ../datasets --size 128 --min-step 1000 --min-passing-steps 12 --max-runs 1000`
 
