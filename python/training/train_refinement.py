@@ -18,7 +18,7 @@ from training.checkpoint_components import cross_check_ancestor_config
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
 from training.spike_guard import (
     _SpikeGuard, _record_spike, difficulty_band, early_stop_message, end_epoch_pair,
-    restore_running_stats, snapshot_running_stats,
+    restore_running_stats, snapshot_running_stats, SkipReporter,
 )
 from utils.logging_utils import print_run_parameters, EpochProgress
 from training.checkpoint_criterion import (
@@ -477,6 +477,11 @@ def train_refinement(
     grad_guard = _SpikeGuard(grad_spike_factor)
     _spikes_reported = 0
     _grad_spikes_reported = 0
+    _nonfinite_reported = 0
+    # Same digesting reporter stages 3 uses, so stage 4/5 gets the SAME merged
+    # single-block message when BOTH guards fire in an epoch (was two separate
+    # near-identical blocks) and the compact one-line digest for routine skips.
+    _skip_reporter = SkipReporter()
     _n_train_batches = 0
 
     _prev_val_seconds = None   # previous epoch's validation duration, added to
@@ -643,18 +648,25 @@ def train_refinement(
         # BOTH counts captured before either reset -- see end_epoch_pair's own
         # docstring for the ordering bug this replaces.
         _deadlocked = end_epoch_pair(spike_guard, grad_guard, _n_train_batches)
-        for _g, _seen, _what in ((grad_guard, _grad_spikes_reported, "GRADIENT NORM"),
-                                  (spike_guard, _spikes_reported, "loss")):
-            if _g.n_skipped != _seen:
-                _w = _g.last_worst
-                _d = ("" if _w is None else
-                       f" worst: {_w[0]:.4g} vs median {_SpikeGuard.median_display(_w[1])}, "
-                       f"dt_max={_w[2]:.4g}, mean theta[0]={_w[3]:.4g}")
-                print(f"  [epoch {epoch}: skipped {_g.n_skipped - _seen} batch(es) whose "
-                      f"{_what} was a catastrophic outlier. The optimizer step was NOT "
-                      f"taken, and the BatchNorm running statistics its forward pass "
-                      f"moved were restored, so the model is untouched.{_d}]")
-        _grad_spikes_reported, _spikes_reported = grad_guard.n_skipped, spike_guard.n_skipped
+        # ONE merged report via the shared reporter: when both guards fire in an
+        # epoch it is a single block (both worst-clauses, boilerplate once), not
+        # two near-identical ones; routine skips digest to a compact line. This
+        # is the SAME path stage 3 uses -- stages 4/5 used to hand-roll two
+        # separate blocks here.
+        _newg = grad_guard.n_skipped - _grad_spikes_reported
+        _new = spike_guard.n_skipped - _spikes_reported
+        _grad_spikes_reported = grad_guard.n_skipped
+        _spikes_reported = spike_guard.n_skipped
+        _all_nonfinite = spike_guard.n_nonfinite + grad_guard.n_nonfinite
+        _new_nonfinite = _all_nonfinite - _nonfinite_reported
+        _nonfinite_reported = _all_nonfinite
+        _line = _skip_reporter.epoch(
+            epoch, _new, spike_guard.last_worst, _newg, grad_guard.last_worst,
+            _n_train_batches, n_nonfinite_new=_new_nonfinite,
+            dt_label=("du_max" if getattr(f_theta, "time_coordinate", "t") == "log10_t"
+                      else "dt_max"))
+        if _line:
+            print(_line)
         if _deadlocked and spike_guard.consecutive_total_skip_epochs >= 5:
             # STOP, keeping the best checkpoint -- the stage-3 lesson. No
             # rollback here: at ~135 batches per epoch an all-skipped epoch

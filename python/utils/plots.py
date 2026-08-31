@@ -385,7 +385,6 @@ def rollout_vs_1step_scatter(l_1step_val, l_rollout_val, output_path, title="",
         # step contributed one independent 1-step error (linear accumulation).
         # Points BELOW it accumulate sub-linearly (the rollout is better than n
         # independent steps); on log-log it is the diagonal shifted up by n.
-        _yhi = hi
         ax.plot([lo, hi], [n_rollout_steps * lo, n_rollout_steps * hi], ":",
                 color="gray", lw=1, zorder=2,
                 label=f"L_rollout = {n_rollout_steps} x L_1step")

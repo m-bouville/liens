@@ -2751,12 +2751,68 @@ def test_panel_subsamples_columns_beyond_ten_steps(monkeypatch, tmp_path):
             captured.setdefault("axes", axes)
             return fig, axes
 
+        captured_suptitle = {}
+        import matplotlib.figure as _mfig
+        orig_supt = _mfig.Figure.suptitle
+
+        def supt_spy(self, text, *a, **k):
+            captured_suptitle.setdefault("text", text)
+            return orig_supt(self, text, *a, **k)
+
         monkeypatch.setattr(plt, "subplots", spy)
+        monkeypatch.setattr(_mfig.Figure, "suptitle", supt_spy)
+        # a realistic regime title, so the note's ATTACHMENT to the step-count
+        # phrase (rather than the title end) is actually exercised
+        regime_title = (f"stage 3a vs. stage 3b\n{n_steps} chained step"
+                        f"{'s' if n_steps != 1 else ''}, derivative not resynced")
         cf._trajectory_figure(Path("T625_n050_s599"), steps,
                                _model("128x128-stage3a"), _model("128x128-stage3b"),
-                               "cpu", False, "T", tmp_path / f"tr{n_steps}.png")
-        return captured["axes"].shape[1]
+                               "cpu", False, regime_title, tmp_path / f"tr{n_steps}.png")
+        return captured["axes"].shape[1], captured_suptitle.get("text", "")
 
-    assert _run(10) == 11          # <=10 steps: every column
-    assert _run(20) == 11          # 21 cols -> every other = 0,2,..,20 = 11 cols
-    assert _run(11) == 7           # 12 cols -> 0,2,..,10 + last(11) = 7 cols
+    cols10, supt10 = _run(10)
+    cols20, supt20 = _run(20)
+    cols11, supt11 = _run(11)
+    assert cols10 == 11            # <=10 steps: every column
+    assert cols20 == 11            # 21 cols -> every other = 0,2,..,20 = 11 cols
+    assert cols11 == 7             # 12 cols -> 0,2,..,10 + last(11) = 7 cols
+
+    # <=10 steps: no subsampling note at all
+    assert "displayed" not in supt10
+    # >10 steps: the note names which steps are shown AND attaches to the
+    # step-count phrase, not the title end -- so it is NOT split from the count
+    # by the ", derivative ..." clause that follows in the regime.
+    assert "(steps 2, 4, ... displayed)" in supt20
+    assert "20 chained steps (steps 2, 4, ... displayed)" in supt20
+    assert "displayed), derivative" in supt20  # note BEFORE the resync clause
+
+
+def test_select_windows_threads_the_normalized_filter_and_passing_steps():
+    """The eval population must match TRAINING: a model trained with
+    min_normalized_stdev_phi (and min_stdev_phi=None) was being evaluated on the
+    UNFILTERED pool, which includes the near-critical low-stdev windows that
+    dominate the re-encode stage-2 reference and make it swing with the sample.
+    _select_windows must pull BOTH filters from the anchor's data_config."""
+    import inspect
+    src = inspect.getsource(cf._select_windows)
+    assert 'min_normalized_stdev_phi=data_config.get("min_normalized_stdev_phi")' in src, (
+        "_select_windows does not thread min_normalized_stdev_phi, so the eval "
+        "population differs from training for normalized-filter models"
+    )
+    assert 'min_passing_steps=data_config.get("min_passing_steps")' in src, (
+        "_select_windows does not thread min_passing_steps"
+    )
+
+
+def test_select_windows_stamps_the_cache_with_the_encoder_source():
+    """An eval-created latent cache must be identifiable, not an anonymous
+    'streams cached = z0 (state)'. _select_windows records the ENCODER SOURCE
+    (ae_path -- the refined file for stage 4/5, the stage-2 ae for stage-3) so
+    the cache dir's _cache_info.txt says which encoder produced it, the same way
+    training does."""
+    import inspect
+    src = inspect.getsource(cf._select_windows)
+    assert "cache_info=" in src, "_select_windows passes no cache_info -> anonymous cache"
+    assert 'ae_checkpoint' in src and 'ae_path' in src, (
+        "the cache_info must carry the encoder source (ae_path) as ae_checkpoint"
+    )

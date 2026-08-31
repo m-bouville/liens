@@ -855,11 +855,16 @@ def test_stage45_reports_skips_and_stops_on_deadlock():
     into a permanent one.
     """
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    # Scoped to the CONDITION, not the file: the message string survives in
-    # the f-string even with the `if` disabled, so a file-level check passed
-    # against that mutation -- verified.
-    assert "if _g.n_skipped != _seen:" in src, "skips are computed but never reported"
-    assert "catastrophic outlier" in src
+    # Skips are reported through the SAME shared digesting reporter stage 3
+    # uses -- so stage 4/5 gets the merged single-block message when BOTH guards
+    # fire (was two separate near-identical blocks) and the compact digest for
+    # routine skips. The message strings themselves live in skip_report, tested
+    # separately; here we assert stage 4/5 actually routes through it.
+    assert "SkipReporter()" in src, "stage 4/5 does not instantiate the shared reporter"
+    assert "_skip_reporter.epoch(" in src, "skips are computed but never reported"
+    assert "spike_guard.n_skipped - _spikes_reported" in src, (
+        "the per-epoch NEW skip delta is not computed for the reporter"
+    )
     assert "end_epoch_pair(spike_guard" in src
     assert "consecutive_total_skip_epochs >= 5" in src
     assert "STOPPING at epoch" in src
@@ -1379,13 +1384,19 @@ def test_an_empty_history_renders_as_words_not_nan():
 
 
 def test_the_reports_use_the_display_not_raw_formatting():
-    """All three skip-report sites must render the median through
-    median_display, or the nan reappears at whichever site was missed."""
-    for fname in ("training/spike_guard.py", "training/train_refinement.py"):
+    """The skip-report formatting lives in ONE place now -- spike_guard.skip_report,
+    which BOTH trainers route through -- and it must render the median through
+    median_display, or the nan reappears. The trainers must not raw-format a
+    median themselves (they used to, inline; now they delegate)."""
+    shared = source_without_comments(_ROOT / "training/spike_guard.py")
+    assert ("median {_SpikeGuard.median_display" in shared
+            or "median_display(grad_worst" in shared
+            or "median_display(loss_worst" in shared), (
+        "spike_guard.skip_report does not route the median through median_display"
+    )
+    for fname in ("training/spike_guard.py", "training/train_refinement.py",
+                  "training/train_lds.py"):
         src = source_without_comments(_ROOT / fname)
-        assert "median {_SpikeGuard.median_display" in src or \
-               "median_display(grad_worst" in src or \
-               "median_display(_w" in src or "median_display(_wg" in src, fname
         assert "vs median {_w[1]:.4g}" not in src, f"{fname} still raw-formats a median"
         assert "vs median {_wg[1]:.4g}" not in src, f"{fname} still raw-formats a median"
 
@@ -1407,6 +1418,29 @@ def test_early_stop_distinguishes_never_saved_from_plateaued():
     assert "previous run" in paralyzed
     assert "skip counts" in paralyzed
     assert "no improvement for 200 epochs" not in paralyzed
+
+
+def test_both_trainers_route_skips_through_the_shared_reporter():
+    """The merged skip message -- one block when BOTH guards fire, a compact
+    digest for routine skips -- must reach stage 4/5 too, not just stage 3.
+    Stage 4/5 used to hand-roll two separate blocks here, so a both-guards
+    epoch printed two near-identical paragraphs (the bug this locks). Both
+    trainers must instantiate SkipReporter and print its per-epoch line."""
+    for fname in ("training/train_lds.py", "training/train_refinement.py"):
+        src = source_without_comments(_ROOT / fname)
+        assert "SkipReporter()" in src, (
+            f"{fname} does not use the shared digesting skip reporter"
+        )
+        assert "_skip_reporter.epoch(" in src, (
+            f"{fname} never calls the reporter -- skips go unreported or "
+            f"un-merged"
+        )
+    # and stage 4/5 must NOT still carry the old hand-rolled two-block loop
+    src45 = source_without_comments(_ROOT / "training/train_refinement.py")
+    assert "if _g.n_skipped != _seen:" not in src45, (
+        "the old per-guard two-block printing is still present -- both guards "
+        "firing will print two separate blocks instead of one merged one"
+    )
 
 
 def test_both_trainers_route_the_early_stop_through_the_function():

@@ -738,3 +738,53 @@ def test_rollout_vs_1step_needs_two_points(tmp_path):
     import math
     assert rollout_vs_1step_scatter(
         [1.0, math.inf, -1.0], [2.0, 3.0, 4.0], tmp_path / "nf.png") is None
+
+
+def test_rollout_vs_1step_new_features_ring_nline_ratio_panel(tmp_path):
+    """Guards the four edits made to this plot so a regression is caught:
+      - the ring marks the INITIAL saved checkpoint (x[0]), not the latest;
+      - an 'L_rollout = n x L_1step' reference line is drawn when n>1;
+      - a SECOND panel plots the L_rollout/L_1step ratio vs epoch;
+      - the scatter legend sits lower-right (the empty sub-diagonal corner)."""
+    import inspect
+    from utils import plots
+    src = inspect.getsource(plots.rollout_vs_1step_scatter)
+
+    # (1) ring = INITIAL, not last
+    assert "x[0], y[0]" in src and "INITIAL saved" in src
+    assert 'label="initial saved"' in src
+    assert "x[-1], y[-1]" not in src, "ring still marks the LATEST point, not initial"
+
+    # (2) the n x L_1step reference line, gated on n_rollout_steps
+    assert "n_rollout_steps" in inspect.signature(
+        plots.rollout_vs_1step_scatter).parameters
+    assert "n_rollout_steps * lo" in src and "n_rollout_steps * hi" in src
+    assert "x L_1step" in src
+
+    # (3) the second (ratio) panel
+    assert "plt.subplots(1, 2" in src, "no second panel -- ratio-vs-epoch missing"
+    assert "L_rollout / L_1step" in src
+    assert "ax2" in src
+
+    # (4) legend lower-right
+    assert 'loc="lower right"' in src
+
+    # and it still renders end to end with the new panel
+    n = 5
+    out = rollout_vs_1step_scatter(
+        [0.5 + 0.02 * i for i in range(n)],
+        [15.0 / (i + 1) for i in range(n)],
+        tmp_path / "feat.png", title="s",
+        saved_epochs=[10 * (i + 1) for i in range(n)], n_rollout_steps=6,
+        l_1step_train=[0.48 + 0.02 * i for i in range(n)],
+        l_rollout_train=[14.0 / (i + 1) for i in range(n)])
+    assert out is not None and Path(out).exists()
+
+
+def test_rollout_vs_1step_ratio_panel_tolerates_no_epochs_and_nline_off(tmp_path):
+    """saved_epochs=None -> ratio panel falls back to a point index (no crash);
+    n_rollout_steps=None -> no n-line drawn, still renders."""
+    out = rollout_vs_1step_scatter(
+        [0.5, 0.52, 0.54], [9.0, 5.0, 3.0], tmp_path / "noep.png",
+        saved_epochs=None)          # no epochs, no n_rollout_steps
+    assert out is not None and Path(out).exists()

@@ -1418,11 +1418,18 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
 
     # When columns were subsampled (>10 steps), say which are shown, so the
     # header times aren't mistaken for consecutive steps: "steps 2, 4, ...".
-    _sub_note = ""
+    # The note attaches to the STEP-COUNT phrase ("16 chained steps (steps 2,
+    # 4, ... displayed)"), not the end of the title, so it isn't split from the
+    # step count by the ", derivative ..." clause that follows in the regime.
+    title_with_note = title
     if n_plot_cols < n_cols:
-        _sub_note = (f"  (steps {col_indices[1]}, {col_indices[2]}, ... displayed)"
-                     if len(col_indices) >= 3 else "  (subsampled)")
-    fig.suptitle(f"{title}{_sub_note}\n{run_dir.name}:{steps[0]}\u2192{steps[-1]}  "
+        _note = (f" (steps {col_indices[1]}, {col_indices[2]}, ... displayed)"
+                 if len(col_indices) >= 3 else " (subsampled)")
+        n_steps_used = n_cols - 1
+        _phrase = f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}"
+        title_with_note = (title.replace(_phrase, _phrase + _note, 1)
+                           if _phrase in title else title + _note)
+    fig.suptitle(f"{title_with_note}\n{run_dir.name}:{steps[0]}\u2192{steps[-1]}  "
                   f"(column 0 of the model rows is the AE reconstruction of "
                   f"the start, which is where the model actually begins)",
                   fontsize=11)
