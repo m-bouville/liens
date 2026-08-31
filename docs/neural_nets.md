@@ -90,30 +90,31 @@ Currently, the first type works more reliably than the other.
 ### Stages, losses and checkpoints
 
 There are six losses, which can be mixed and matched at the different stages:
-- reconstruction loss: $L_\mathrm{recon}$,
-- statistics loss: $L_\mathrm{stats}$,
+- reconstruction loss: $L_\mathrm{recon0}$,
+- statistics loss: $L_\mathrm{stats0}$,
 - derivative loss: $L_\mathrm{deriv}$,
-- interpolation loss: $L_\mathrm{interp}$,
 - one-step latent prediction loss: $L_\mathrm{1step}$,
-- multi-step rollout loss: $L_\mathrm{rollout}$.
+- multi-step rollout loss (latent space): $L_\mathrm{rollout}$,
+- reconstruction after multi-step rollout (real): $L_\mathrm{recon predict}$.
 
 For each loss `XX`:
 - `XX_scale` normalize the loss for it to be around 1 (objective),
 - `XX_weight` is the importance given to a certain loss at a certain stage (a choice).
 What is concretely used in the loss function: `XX_weight * L_XX / XX_scale`.
 
+Interpolation loss, $L_\mathrm{interp}$, is no longer used in loss function.
+
 
 | \#| Stage             | Trained | Frozen | Unused | Space | Snapshots | Loss                            |
 |---|-------------------|--------------|------|------|-------|-------|---------------------------------|
 | 1 a| autoencoder ($z_0$)|E, D, SH|   | f    | real  | 1    | `L_recon0 + λ L_stats0`           |
-| 2 | derivative ($z_1$) |E*, D*| SH | f | both | 3 | `L_recon0 + λ L_stats0 + λ₁ L_deriv + ε L_interp` |
+| 2 | derivative ($z_1$) |E*, D*| SH | f | both | 3 | `L_recon0 + λ L_stats0 + λ₁ L_deriv` |
 | 3a| LDS               | f       | E, SH | D | latent| 2    | `L_1step + λ₁ L_deriv`           |
 | 3b| LDS               | f       | E, SH | D | latent| $n+1$  | `L_rollout + ε L_1step + λ₁ L_deriv` |
-| 4 | encoder refinement| E, f  | D, SH|  | latent†|$n+1$|`L_rollout + λ L_stats0 + ε L_recon0 + λ₁ L_deriv` |
-| 5 | end-to-end        | E, f, D | SH  |      | real  | $n+1$ | `L_recon + λ L_stats + λ₂ L_rollout + λ₁ L_deriv` |
+| 4 | encoder refinement| E, f  | D, SH|  | latent†|$n+1$|`L_rollout + ε L_stats0 + ε₁ L_recon0` |
+| 5 | end-to-end        | E, f, D | SH  |      | real  | $n+1$ | `L_recon_predict + ε L_recon0 + ε₁ L_stats0 + ε₂ L_rollout` |
 
 Notes:
-- `L_interp` requires three consecutive snapshots: adding it to stage 1 would double the computational cost (3 E + 1D instead of 1 E + 1 D);
 - SH: `stats_head`, $n$: `n_rollout_steps`;
 - ${}^\ast$: outter layers frozen;
 - ${}^\dagger$: mostly.
@@ -319,9 +320,12 @@ Every sub-step of the latent integrator advances the state by a linear term and 
 
 
 ## Stages 4 and 5: encoder refinement and end-to-end
-In stage 1 the autoencoder was trained for reconstruction and stats-accuracy of the state. Stage 2 focus on the relationship between $z_1$ and $z_0$ in latent space. Stage 3 trained `f` to predict dynamics, with E and D frozen. Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). 
+In stage 1 the autoencoder was trained for reconstruction and stats-accuracy of the state. Stage 2 focus on the relationship between $z_1$ and $z_0$ in latent space. Stage 3 trained `f` to predict dynamics, with E and D frozen. 
 
-D is frozen, even though `L_recon` is in the loss function: this is what distinguishes stage 4 from stage 5. D is a tether keeping E's output compatible with the existing decoder. (Since the encoder is no longer frozen, the latent representation of each sample cannot be cached, unlike in stage 3.)
+Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). D is frozen (even though `L_recon0` is in the loss function), this is one difference between stages 4 and 5. D is a tether keeping E's output compatible with the existing decoder. (Since the encoder is no longer frozen, the latent representation of each sample cannot be cached, unlike in stage 3.)
+
+Stage 5 focuses on `L_recon_predict`, the reconstruction at $t_0 + n \Delta t$. `L_recon0` and `L_stats0` (both applied to time $t_0$) and `L_rollout` (in latent space) are maintained, but with a lower weight. 
+
 
 
 ## Miscellaneous
