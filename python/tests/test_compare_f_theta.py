@@ -407,8 +407,8 @@ def test_the_stats_figure_has_eight_panels_and_reports_the_window_count(monkeypa
               for r in range(2) for c in range(5)]
     assert any("loss distribution" in t for t in titles)
     assert any("correlation distribution" in t for t in titles)
-    assert any("loss vs dt" in t for t in titles)
-    assert any("correlation vs dt" in t for t in titles)
+    assert any("loss vs t_init" in t for t in titles)
+    assert any("correlation vs t_init" in t for t in titles)
     assert any("loss vs temperature" in t for t in titles)
     assert any("correlation vs temperature" in t for t in titles)
 
@@ -991,7 +991,7 @@ def test_stats_collect_per_step_series(monkeypatch):
     """Index k holds every window's value after k chained applications --
     the axis the collapse actually lives on."""
     _traj_stub_collapsing(monkeypatch, collapse_at=3)
-    windows = [(f"run{i}", list(range(6))) for i in range(8)]
+    windows = [(f"run{i}", list(range(10 * (i + 1), 10 * (i + 1) + 6))) for i in range(8)]
     stats = cf.collect_stats(_model("128x128-stage3a"), _model("128x128-stage3b"),
                               windows, "cpu", False)
     for key in ("a", "b"):
@@ -1022,7 +1022,7 @@ def test_the_stats_figure_has_a_steps_column(monkeypatch, tmp_path):
     import matplotlib.pyplot as plt
     _traj_stub_collapsing(monkeypatch)
     a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
-    windows = [(f"run{i}", list(range(5))) for i in range(10)]
+    windows = [(f"run{i}", list(range(10 * (i + 1), 10 * (i + 1) + 5))) for i in range(10)]
     _stub_metadata(monkeypatch)
     stats = cf.collect_stats(a, b, windows, "cpu", False)
     captured = {}
@@ -1180,12 +1180,18 @@ def _stats_for_figure(monkeypatch, blow_up_every=10, max_dt_a=2000.0,
         i = zlib.crc32(str(run_dir).encode()) % 997
         rng = np.random.default_rng(i)
         real = [rng.normal(size=(8, 8)) * (1 + 0.05 * k) for k in range(n)]
-        # dt comes from i % 8 and the blow-up from i // 8, so the two are
-        # INDEPENDENT. Deriving both from i % 3 and i % 8 correlated them,
-        # and whole dt bins came out entirely diverged -- the medians then
-        # legitimately reached 1e30 and the fixture no longer isolated
-        # "median small, upper quartile huge".
-        blow = blow_up_every and ((i // 8) % blow_up_every == 0)
+        # The blow-up is keyed to the WINDOW INDEX (parsed from the "_s{idx}"
+        # suffix), not the crc32 hash, so it is spread EVENLY: exactly every
+        # blow_up_every-th window diverges. t_init is monotonic in the window
+        # index, so a t_init bin is a contiguous index range and gets a flat
+        # ~1/blow_up_every fraction diverged -- never a >=50% bin, which would
+        # blow a MEDIAN and defeat the median-scaling test. dt stays keyed to
+        # i % 8 (coprime with the blow period, so still independent of it).
+        try:
+            widx = int(str(run_dir).split("_s")[-1])
+        except (ValueError, IndexError):
+            widx = i // 8
+        blow = blow_up_every and (widx % blow_up_every == 0)
         pred = [real[k] + (1e15 if (blow and k > 2) else 0.02 * k)
                 for k in range(n)]
         return real, pred, [250.0 * (1 + i % 8)] * (n - 1)
@@ -1212,7 +1218,16 @@ def _stats_for_figure(monkeypatch, blow_up_every=10, max_dt_a=2000.0,
     # puts the MEDIAN safely below it and the UPPER QUARTILE safely above.
     # With 40 windows the bins held ~7 each and sampling noise pushed some
     # bins past half diverged, making the medians themselves 1e30.
-    windows = [(f"T{500 + i}_n020_s{i}", list(range(9))) for i in range(160)]
+    # Varied START steps so t_init (steps[0]*dt) spans a log range for the
+    # loss/correlation-vs-t_init panels; dt_total variety still comes from
+    # fake's per-window dt_per_step. Geometric (all-distinct) starts so the
+    # log bins are even and no small bin can hit 50% blown (which would
+    # blow a MEDIAN, defeating the median-scaling test).
+    def _start(i):
+        return int(round(100 * 1.02 ** i))
+    windows = [(f"T{500 + i}_n020_s{i}",
+                list(range(_start(i), _start(i) + 9)))
+               for i in range(160)]
     return cf.collect_stats(a, b, windows, "cpu", False), a, b
 def _figure_axes(monkeypatch, stats, a, b, tmp_path):
     import matplotlib.pyplot as plt
@@ -1378,7 +1393,7 @@ def test_the_layout_is_metric_by_row_and_view_by_column(monkeypatch, tmp_path):
     assert "correlation" in axes[1, 1].get_title()
     # each column shares an x axis, top row over bottom
     assert (axes[0, 1].get_xlabel() == axes[1, 1].get_xlabel()
-            == "dt_total (binned)")
+            == "window start time t (binned)")
     assert (axes[0, 2].get_xlabel() == axes[1, 2].get_xlabel()
             == "temperature (SMA)")
     assert (axes[0, 3].get_xlabel() == axes[1, 3].get_xlabel()
@@ -1614,7 +1629,12 @@ def _stats_with_causal(monkeypatch, n=40):
     monkeypatch.setattr(cf, "compute_causal_trajectory", caus)
     monkeypatch.setattr(cf, "compute_stage2_trajectory", _flat_stage2)
     a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
-    windows = [(f"T{500 + i}_n020_s{i}", list(range(9))) for i in range(n)]
+    # Varied START steps -> t_init spans a log range for the vs-t_init panels
+    # (geometric so bins are even, same rationale as _stats_for_figure).
+    windows = [(f"T{500 + i}_n020_s{i}",
+                list(range(int(round(100 * 1.02 ** i)),
+                           int(round(100 * 1.02 ** i)) + 9)))
+               for i in range(n)]
     _stub_metadata(monkeypatch)
     return cf.collect_stats(a, b, windows, "cpu", False), a, b
 
@@ -1660,7 +1680,7 @@ def test_the_causal_curve_is_absent_when_no_window_had_a_baseline(monkeypatch, t
     monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
     monkeypatch.setattr(cf, "compute_stage2_trajectory", _flat_stage2)
     a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
-    windows = [(f"run{i}", list(range(5))) for i in range(10)]
+    windows = [(f"run{i}", list(range(10 * (i + 1), 10 * (i + 1) + 5))) for i in range(10)]
     _stub_metadata(monkeypatch)
     stats = cf.collect_stats(a, b, windows, "cpu", False)
     assert stats["step_loss_causal"] == []
@@ -1710,7 +1730,7 @@ def test_causal_vs_dt_uses_its_OWN_dt_array(monkeypatch, tmp_path):
     monkeypatch.setattr(cf, "compute_causal_trajectory", caus)
     monkeypatch.setattr(cf, "compute_stage2_trajectory", _flat_stage2)
     a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
-    windows = [(f"T500_n020_s{i}", list(range(9))) for i in range(20)]
+    windows = [(f"T500_n020_s{i}", list(range(10 * (i + 1), 10 * (i + 1) + 9))) for i in range(20)]
     _stub_metadata(monkeypatch)
     stats = cf.collect_stats(a, b, windows, "cpu", False)
 
@@ -1787,7 +1807,7 @@ def test_the_whole_correlation_row_shares_one_y_range(monkeypatch, tmp_path):
     monkeypatch.setattr(cf, "compute_stage2_trajectory", _flat_stage2)
     _stub_metadata(monkeypatch)
     a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
-    windows = [(f"T{550 + i * 5}_n020_s{i}", list(range(9))) for i in range(60)]
+    windows = [(f"T{550 + i * 5}_n020_s{i}", list(range(10 * (i + 1), 10 * (i + 1) + 9))) for i in range(60)]
     stats = cf.collect_stats(a, b, windows, "cpu", False)
     axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
     ranges = [axes[1, c].get_ylim() for c in range(4)]
@@ -1827,7 +1847,7 @@ def test_a_negative_correlation_min_reaches_the_cdf_panel(monkeypatch, tmp_path)
     monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
     monkeypatch.setattr(cf, "compute_stage2_trajectory", _flat_stage2)
     a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
-    windows = [(f"T500_n020_s{i}", list(range(9))) for i in range(60)]
+    windows = [(f"T500_n020_s{i}", list(range(10 * (i + 1), 10 * (i + 1) + 9))) for i in range(60)]
     _stub_metadata(monkeypatch)
     stats = cf.collect_stats(a, b, windows, "cpu", False)
     axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
@@ -2286,7 +2306,7 @@ def test_the_shared_correlation_floor_is_also_clamped(monkeypatch, tmp_path):
     monkeypatch.setattr(cf, "compute_stage2_trajectory", _flat_stage2)
     _stub_metadata(monkeypatch)
     a, b = _model("128x128-stage3a"), _model("128x128-stage3b")
-    windows = [(f"T{550 + i * 5}_n020_s{i}", list(range(9))) for i in range(60)]
+    windows = [(f"T{550 + i * 5}_n020_s{i}", list(range(10 * (i + 1), 10 * (i + 1) + 9))) for i in range(60)]
     stats = cf.collect_stats(a, b, windows, "cpu", False)
     axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
     for c in range(4):
@@ -2782,8 +2802,8 @@ def test_panel_subsamples_columns_beyond_ten_steps(monkeypatch, tmp_path):
     # >10 steps: the note names which steps are shown AND attaches to the
     # step-count phrase, not the title end -- so it is NOT split from the count
     # by the ", derivative ..." clause that follows in the regime.
-    assert "(steps 2, 4, ... displayed)" in supt20
-    assert "20 chained steps (steps 2, 4, ... displayed)" in supt20
+    assert "(steps 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20 displayed)" in supt20
+    assert "20 chained steps (steps 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20 displayed)" in supt20
     assert "displayed), derivative" in supt20  # note BEFORE the resync clause
 
 
@@ -2816,3 +2836,41 @@ def test_select_windows_stamps_the_cache_with_the_encoder_source():
     assert 'ae_checkpoint' in src and 'ae_path' in src, (
         "the cache_info must carry the encoder source (ae_path) as ae_checkpoint"
     )
+
+
+def test_degenerate_t_init_gives_a_readable_note_not_a_bare_legend(monkeypatch, tmp_path):
+    """When every window shares one start time (t_init has no spread -- e.g. a
+    fixed-window set, or windows starting at step 0 which the dt>0 bin guard
+    drops), the two vs-t_init panels have nothing to plot. They must show a
+    note rather than call legend() on an empty axis (a UserWarning) and leave
+    two silently blank panels."""
+    import warnings
+    stats, a, b = _stats_with_causal(monkeypatch, n=40)
+    # collapse t_init to the value the dt>0 bin guard drops -- every window
+    # starting at step 0 (t_init = 0), which is what the fixed-start mock
+    # windows produced and what a min_step=0 run would produce.
+    stats["t_init"] = [0.0] * len(stats["t_init"])
+    stats["t_init_causal"] = [0.0] * len(stats["t_init_causal"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)   # a bare legend would raise here
+        axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
+    for panel in (axes[0, 1], axes[1, 1]):
+        assert panel.get_legend() is None, "degenerate panel should not draw a legend"
+        note = " ".join(t.get_text() for t in panel.texts)
+        assert "no spread in t_init" in note, f"missing the explanatory note: {note!r}"
+
+
+def test_stage2_is_drawn_but_excluded_from_the_loss_row_y_range(monkeypatch, tmp_path):
+    """Stage 2 skyrockets near T0 and at long times; its median must NOT set the
+    shared loss-row scale (which would flatten the decades where the real models
+    differ), but its curve is still drawn -- running off the top."""
+    stats, a, b = _stats_with_causal(monkeypatch, n=60)
+    # make stage 2's loss enormous everywhere, tiny for the real models
+    stats["loss_stage2"] = [1e12] * len(stats["loss_stage2"])
+    axes = _figure_axes(monkeypatch, stats, a, b, tmp_path)
+    # the loss-vs-t_init panel's top stays well below stage 2's 1e12 median
+    top = axes[0, 1].get_ylim()[1]
+    assert top < 1e6, f"stage 2 set the y-range: top={top:.3g}"
+    # ...yet stage 2 IS on the panel
+    labels = [t.get_text() for t in axes[0, 1].get_legend().get_texts()]
+    assert any("stage 2" in t for t in labels), f"stage 2 not drawn: {labels}"

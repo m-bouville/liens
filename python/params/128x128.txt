@@ -10,7 +10,7 @@ min_step 	  = 2000       	# skip snapshots earlier than this step
 # min_stdev_phi = 5e-3      	# was 1e-3; skip snapshots whose stdev_phi is below this
 min_normalized_stdev_phi = 0.02      	# was min_stdev_phi; skip snapshots whose normalized_stdev_phi (stdev_phi / sqrt(...)) is below this
 min_std_deriv = 1.e-7		# was 1.5e-4, then 1.e-6; TARGET: 1.e-8; skip time derivatives (w.r.t. t, not its log) whose stdev is below this (for: late, converged microstructures)
-min_passing_steps= 12		# any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
+min_passing_steps= None		# was 12 (causing too much trouble). any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
 recon0_scale  = 0.07e-3		# was 0.17e-3 then 0.1e-3
 stats0_scale  = 0.3 		# was 0.018   then 0.18
@@ -30,6 +30,8 @@ condition_on_theta= True
 
 latent_spatial_size= 8
 latent_channels = 8  		# 8 * 8x8 = 512 DoF  [64x64 = 4096]
+
+min_passing_steps = None	# irrelevant: stage 1 handles microstructures individually
 
 # resume_from	  = checkpoints/stage1/128x128-stage2-as-stage1.pt
 
@@ -214,12 +216,11 @@ stats0_weight   = 0.2
 n_rollout_steps = 3
 # adaptative sub-step: alpha always inherited 
 
-recon0_scale    =   0.06e-3 	# was 0.15e-3, then 0.07e-3
+recon0_scale    =   0.04e-3 	# was 0.15e-3, then 0.07e-3
 stats0_scale    =   0.15 	# 0.03
 
-rollout_scale   =   0.2 	# was 0.2, then 1.e5
+rollout_scale   =   0.25 	# was 0.2, then 1.e5
 rollout_weight_warmup_epochs= 10
-rollout_weight_warmup_start = 1e-2  # geometric warmup
 
 val_ema_decay   = 0.8		# was 0.7 (default)
 
@@ -232,8 +233,9 @@ batches		  =  48		# was 64
 
 max_dt        = inf
 
-force 	      = True
+# force 	      = True
 ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
+# resume_from = checkpoints/stage4/128x128-stage4-20260831_10h40.pt
 
 
 
@@ -241,13 +243,18 @@ ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 #   end-to-end refinement
 #############################################################
 
-rollout_weight 	= 0.2        # now secondary -- see reasoning below
-recon0_weight   = 1  # was 1.0   # now primary, per the original design intent
-stats0_weight   = 0.25
+recon_predict_weight=1	# now primary, per the original design intent
+recon_predict_scale	= 0.01		# CHANGE
+recon_predict_weight_warmup_epochs= 5
 
-recon0_scale    =   0.1e-3
-stats0_scale    =   0.003
-rollout_scale   =   0.005
+# now secondary
+rollout_weight 	= 0.2        
+recon0_weight   = 0.2  		# was 1.0
+stats0_weight   = 0.05
+
+recon0_scale    = 0.2e-3 	# was 0.1e-3, then 0.04e-3
+stats0_scale    = 0.15		# was 0.003
+rollout_scale   = 0.25 		# was 0.005
 
 n_rollout_steps = same      # match stage 4's -- same reasoning as before
 # adaptative sub-step: alpha always inherited 
@@ -262,5 +269,4 @@ batches        =  48		# was 64
 max_dt         = same
 
 force 	       = True
-ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 # resume_from = checkpoints/stage5/128x128-stage5-20260829_10h01.pt

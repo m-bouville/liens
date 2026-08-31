@@ -697,7 +697,7 @@ class MicrostructureEvolutionDataset(Dataset):
                  read_workers: int = 16, split_label: str = "",
                  time_coordinate: str = "t", return_phys_dt: bool = False,
                  return_frame_t: bool = False, derivative_source: str = "z1",
-                 cache_info: dict | None = None):
+                 cache_info: dict | None = None, require_consecutive: bool = True):
         """
         encoder: pass a frozen encoder for the cached-latent mode (stage
         3), or None for the raw-pixel mode (stage 4/5, E trainable) --
@@ -929,6 +929,7 @@ class MicrostructureEvolutionDataset(Dataset):
         self.derivative_source = derivative_source
         self.min_std_deriv = min_std_deriv
         self.max_dt = max_dt
+        self.require_consecutive = require_consecutive
         self._split_label = split_label
         # Latent cache. Only meaningful with a FROZEN encoder, which is what
         # stage 3 has by construction -- 3a and 3b load the same stage-2
@@ -1501,6 +1502,7 @@ class MicrostructureEvolutionDataset(Dataset):
         """
         n_degenerate_deriv_windows = 0
         n_max_dt_windows = 0
+        n_nonconsecutive_windows = 0
         n_candidate_windows = 0
 
         for (run_dir, metadata, kept_steps), run_data, run_data_deriv in zip(
@@ -1546,8 +1548,32 @@ class MicrostructureEvolutionDataset(Dataset):
                               dtype=torch.float32)
             )
 
+            # Consecutive-in-the-SAVE-SCHEDULE guard. A window is n+1 CONSECUTIVE
+            # kept steps, but "consecutive kept" is not the same as "consecutive
+            # SAVED": when a step-level filter (min_normalized_stdev_phi etc.)
+            # drops a quiet frame, the two kept frames on either side become
+            # adjacent in kept_steps while a real saved frame sits between them
+            # in the simulation. A window spanning that seam is NOT n+1
+            # consecutive frames of the trajectory -- it silently jumps over the
+            # gap, manufacturing a large-dt transition (the du_total>=~2 tail and
+            # the du_max=2.5e4 grad-spike windows are exactly these).
+            # require_consecutive rejects any window whose kept steps are not a
+            # contiguous run of the original save_steps. _adj[j] is True iff
+            # kept_steps[j+1] is the IMMEDIATE successor of kept_steps[j] in the
+            # save schedule (nothing filtered between them).
+            _adj = None
+            if self.require_consecutive:
+                _save_pos = {s: i for i, s in enumerate(metadata.save_steps)}
+                _kpos = [_save_pos[s] for s in kept_steps]
+                _adj = [(_kpos[j + 1] == _kpos[j] + 1)
+                        for j in range(len(kept_steps) - 1)]
+
             for start in range(len(kept_steps) - self.window_length + 1):
                 n_candidate_windows += 1
+                if self.require_consecutive and not all(
+                        _adj[start + i] for i in range(self.window_length - 1)):
+                    n_nonconsecutive_windows += 1
+                    continue
                 if self.stat_names is not None:
                     start_step = kept_steps[start + self.stats_frame_index]
                     stats_df = self._stats_by_run[run_dir]
@@ -1575,6 +1601,16 @@ class MicrostructureEvolutionDataset(Dataset):
                 self._index.append((run_idx, start))
 
         _split_suffix = f" in {self._split_label} runs" if self._split_label else ""
+        if n_nonconsecutive_windows:
+            _pct = 100.0 * n_nonconsecutive_windows / n_candidate_windows if n_candidate_windows else 0.0
+            print(f"MicrostructureEvolutionDataset: {n_nonconsecutive_windows}/{n_candidate_windows} "
+                  f"({_pct:.1f}%) candidate window(s){_split_suffix} skipped for NOT being "
+                  f"{self.window_length} CONSECUTIVE saved steps -- a step-level filter dropped a "
+                  f"frame inside the window, so its kept steps jump over a real saved frame and it "
+                  f"is not {self.window_length} adjacent frames of the trajectory. Such a window "
+                  f"silently carries a large-dt transition across the gap; require_consecutive "
+                  f"excludes it at the definition of a window rather than clipping its dt tail.")
+
         if n_max_dt_windows:
             _pct = 100.0 * n_max_dt_windows / n_candidate_windows if n_candidate_windows else 0.0
             print(f"MicrostructureEvolutionDataset: {n_max_dt_windows}/{n_candidate_windows} "

@@ -34,9 +34,9 @@ from utils.plots import loss_component_scatter, loss_curve, write_loss_history, 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
 
 
-def geometric_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int,
-                             start_fraction: float) -> float:
-    """`full_weight` ramped GEOMETRICALLY from start_fraction to 1 over warmup_epochs.
+def linear_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int,
+                          start_fraction: float) -> float:
+    """`full_weight` ramped LINEARLY from start_fraction to 1 over warmup_epochs.
 
     A module-level function rather than an expression inline in the epoch
     loop, so a test can exercise the ACTUAL formula. An inline version forced
@@ -44,14 +44,16 @@ def geometric_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int,
     copy then left every endpoint assertion green -- the test was checking its
     own arithmetic.
 
-    Geometric, not linear (which is what stage 2 uses for deriv_weight),
-    because the quantity being ramped behaves differently. L_deriv is O(1)
-    throughout; L_rollout collapses ~6e9 over the first ten epochs
-    (1.76e9 -> 0.29, measured). A linear ramp at epoch 1 gives
-    0.10 * 1.76e9 = 1.76e8 -- eight decades above the converged contribution,
-    so it barely softens the transient it exists to absorb. Geometric holds
-    weight*L_rollout roughly flat instead, which is the gradient scale the
-    optimiser actually sees.
+    Linear, not geometric. This USED to be geometric, on the argument that
+    L_rollout collapsed ~6e9 over the first ten epochs (1.76e9 -> 0.29,
+    measured) so a linear weight ramp left epoch 1 eight decades above the
+    converged contribution. That collapse was itself an artefact of the
+    filter-manufactured large-dt windows (du_max=2.5e4): require_consecutive
+    now excludes those at the window definition, and with the scales
+    recalibrated L_rollout sits at O(1-10) from epoch 1, not O(1e9). Nothing
+    left to hold flat -- so the ramp is a plain linear introduction of the
+    term, and the same function serves any warmed-in weight (rollout,
+    recon_predict) rather than encoding one term's obsolete transient.
 
     epoch is 1-based: epoch 1 gives exactly start_fraction*full_weight, epoch
     warmup_epochs and beyond give exactly full_weight.
@@ -59,14 +61,16 @@ def geometric_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int,
     if warmup_epochs <= 0 or epoch >= warmup_epochs:
         return full_weight
     frac = (epoch - 1) / max(1, warmup_epochs - 1)
-    return full_weight * (start_fraction ** (1.0 - frac))
+    return full_weight * (start_fraction + (1.0 - start_fraction) * frac)
 
 
 _REFINEMENT_PREAMBLE_PARAMS = (
     # See _LDS_PREAMBLE_PARAMS for why these are excluded rather than repeated.
     "freeze_decoder", "size", "rollout_weight_warmup_epochs", "rollout_weight_warmup_start",
-    "max_dt", "rollout_weight", "recon0_weight", "stats0_weight", "rollout_scale",
-    "recon0_scale", "stats0_scale", "epochs", "batch_size", "n_rollout_steps",
+    "recon_predict_weight_warmup_epochs", "recon_predict_weight_warmup_start",
+    "max_dt", "rollout_weight", "recon0_weight", "stats0_weight", "recon_predict_weight",
+    "rollout_scale", "recon0_scale", "stats0_scale", "recon_predict_scale",
+    "epochs", "batch_size", "n_rollout_steps",
     "min_step", "min_stdev_phi", "min_normalized_stdev_phi", "early_stopping_patience",
 )
 
@@ -75,11 +79,15 @@ def train_refinement(
     base_path: Path, freeze_decoder: bool, size: int | None = None,
     rollout_weight_warmup_epochs: int = 0,
     rollout_weight_warmup_start: float = 1e-6,
+    recon_predict_weight_warmup_epochs: int = 0,
+    recon_predict_weight_warmup_start: float = 1e-6,
     max_dt: float | None = None, min_passing_steps: int | None = None,
     ae_checkpoint_path: Path | None = None, lds_checkpoint_path: Path | None = None,
     resume_from: Path | None = None,
     rollout_weight: float = 1.0, recon0_weight: float = 0.0, stats0_weight: float = 0.0,
+    recon_predict_weight: float = 0.0,
     rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
+    recon_predict_scale: float = 1.0,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-4,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int | None = None, min_step: int | None = None, min_stdev_phi: float | None = None,
@@ -184,19 +192,26 @@ def train_refinement(
     print(f"size={size}, latent_channels={components['encoder'].config['latent_channels']}, "
           f"freeze_decoder={freeze_decoder}")
     if rollout_weight_warmup_epochs > 0:
-        print(f"rollout_weight ramped GEOMETRICALLY from {rollout_weight_warmup_start:g}x to 1x "
-              f"over {rollout_weight_warmup_epochs} epoch(s) -- geometric, not linear, because "
-              f"L_rollout itself collapses by orders of magnitude over those epochs (measured "
-              f"1.76e9 -> 0.29 across ten), so a linear ramp still leaves epoch 1 eight decades "
-              f"above the converged contribution. The geometric ramp holds the CONTRIBUTION "
-              f"roughly flat instead. "
-              f"f_theta is FROZEN and the encoder starts on exactly the "
-              f"distribution it was fitted to, so a full-strength rollout gradient at epoch 1 "
-              f"drives the encoder off that distribution faster than recon0/stats0 can anchor "
-              f"it. VAL is never ramped, so val_loss stays comparable across epochs and "
-              f"against runs without a warmup.")
+        print(f"rollout_weight ramped LINEARLY from {rollout_weight_warmup_start:g}x to 1x "
+              f"over {rollout_weight_warmup_epochs} epoch(s). This was geometric while L_rollout "
+              f"collapsed ~6e9 over the first epochs (a linear ramp then left epoch 1 eight "
+              f"decades hot); require_consecutive removed the large-dt windows that caused that "
+              f"collapse, so L_rollout is O(1-10) from epoch 1 and a plain linear introduction "
+              f"suffices. The warmup still exists because f_theta is FROZEN and the encoder "
+              f"starts on exactly the distribution it was fitted to, so a full-strength rollout "
+              f"gradient at epoch 1 drives the encoder off that distribution faster than "
+              f"recon0/stats0 can anchor it. VAL is never ramped, so val_loss stays comparable "
+              f"across epochs and against runs without a warmup.")
+    if recon_predict_weight_warmup_epochs > 0:
+        print(f"recon_predict_weight ramped LINEARLY from "
+              f"{recon_predict_weight_warmup_start:g}x to 1x over "
+              f"{recon_predict_weight_warmup_epochs} epoch(s). recon_predict decodes the "
+              f"rolled-out endpoint and backprops a full-weight pixel loss through the rollout "
+              f"into a decoder that (resuming from stage 4) only ever saw frame-0 latents; the "
+              f"ramp lets the decoder settle on frame-0 reconstruction before being pulled "
+              f"toward rendering the drifted endpoint. VAL is never ramped.")
     print(f"rollout_weight={rollout_weight}  recon0_weight={recon0_weight}  "
-          f"stats0_weight={stats0_weight}")
+          f"stats0_weight={stats0_weight}  recon_predict_weight={recon_predict_weight}")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  "
           f"min_normalized_stdev_phi={min_normalized_stdev_phi}  n_rollout_steps={n_rollout_steps}")
     print_run_parameters(train_refinement, locals(), _REFINEMENT_PREAMBLE_PARAMS)
@@ -365,7 +380,8 @@ def train_refinement(
     # are all always active in this stage (no conditional gating like
     # stage 1's include_stats or stage 2's active_terms).
     component_histories: dict[str, dict[str, list[float]]] = {
-        name: {"train": [], "val": [], "best_so_far": []} for name in ("rollout", "recon0", "stats0")
+        name: {"train": [], "val": [], "best_so_far": []}
+        for name in ("rollout", "recon0", "stats0", "recon_predict")
     }
     component_best_tracker = ComponentBestTracker()
 
@@ -382,7 +398,8 @@ def train_refinement(
         x_window, dt_window, theta = batch
         return x_window.to(device), dt_window.to(device), theta.to(device), None, None
 
-    def step(batch, train: bool, effective_rollout_weight: float | None = None):
+    def step(batch, train: bool, effective_rollout_weight: float | None = None,
+             effective_recon_predict_weight: float | None = None):
         x_window, dt_window, theta, true_stats, t_window = unpack(batch)
         # BEFORE the forward, because the forward is what moves the buffers.
         # A skipped batch must leave the model exactly as it found it, and
@@ -395,7 +412,11 @@ def train_refinement(
             rollout_weight=(rollout_weight if effective_rollout_weight is None
                              else effective_rollout_weight),
             recon0_weight=recon0_weight, stats0_weight=stats0_weight,
+            recon_predict_weight=(recon_predict_weight
+                                   if effective_recon_predict_weight is None
+                                   else effective_recon_predict_weight),
             rollout_scale=rollout_scale, recon0_scale=recon0_scale, stats0_scale=stats0_scale,
+            recon_predict_scale=recon_predict_scale,
             stats_loss_fn=stats_loss_fn, true_stats=true_stats,
             recon_stream_name=recon_stream_name, return_components=True,
             z1_resync=lds_z1_resync, t_window=t_window,
@@ -453,7 +474,8 @@ def train_refinement(
         # train_stage2.py's own step() -- see any of those functions'
         # own identical comment.
         return (loss.detach(), components["rollout"].detach(),
-                components["recon0"].detach(), components["stats0"].detach())
+                components["recon0"].detach(), components["stats0"].detach(),
+                components["recon_predict"].detach())
 
     # Whether THIS run has written the checkpoint at least once -- train_lds
     # tracks the same thing for its no-save guard; here it feeds
@@ -470,7 +492,8 @@ def train_refinement(
           f"{early_stopping_patience}, batches of {batch_size})...")
     print(f"/{epochs:3d} train = {rollout_weight}*rollout/{rollout_scale} "
           f"+{recon0_weight}*recon0/{recon0_scale} "
-          f"+{stats0_weight}*stats0/{stats0_scale} | valid = ...  | ema")
+          f"+{stats0_weight}*stats0/{stats0_scale} "
+          f"+{recon_predict_weight}*recon_predict/{recon_predict_scale} | valid = ...  | ema")
 
     spike_guard = _SpikeGuard(spike_skip_factor)
     # Separate history: gradient norms and losses live on different scales.
@@ -532,14 +555,23 @@ def train_refinement(
         # converged contribution, so it barely softens the transient it exists
         # to absorb.
         #
-        # Geometric from rollout_weight_warmup_start to 1 over the window
+        # Linear from rollout_weight_warmup_start to 1 over the window
         # tracks the collapse instead: 1e-6 * 1.76e9 = 1.8e3 at epoch 1, then
         # ~0.34 at epochs 2 and 5, then 0.29 at epoch 10. The CONTRIBUTION is
         # roughly flat across the ramp, which is the actual goal -- a constant
         # gradient scale while the encoder settles, rather than a constant
         # weight applied to a wildly varying loss.
-        effective_rollout_weight = geometric_warmup_weight(
+        effective_rollout_weight = linear_warmup_weight(
             epoch, rollout_weight, rollout_weight_warmup_epochs, rollout_weight_warmup_start)
+        # Same linear ramp for recon_predict: it backprops a full-weight pixel
+        # loss through the rollout into a decoder that (resuming from stage 4)
+        # only ever saw frame-0 latents, so it warms in to let the decoder
+        # settle on frame-0 reconstruction before being pulled toward rendering
+        # the drifted endpoint. Default off (0 warmup epochs) -> full weight
+        # from epoch 1, the weights as specified.
+        effective_recon_predict_weight = linear_warmup_weight(
+            epoch, recon_predict_weight, recon_predict_weight_warmup_epochs,
+            recon_predict_weight_warmup_start)
 
         # THE END OF THE RAMP RESETS THE SAVE CRITERION.
         #
@@ -562,8 +594,9 @@ def train_refinement(
         # when deriv_target_centered switches, because "val_loss computed under
         # the OLD target isn't a fair bar for the NEW target's own val_loss to
         # clear". A weight ramp is the same change spread over several epochs.
-        if (rollout_weight_warmup_epochs > 0
-                and epoch == rollout_weight_warmup_epochs):
+        if (max(rollout_weight_warmup_epochs, recon_predict_weight_warmup_epochs) > 0
+                and epoch == max(rollout_weight_warmup_epochs,
+                                 recon_predict_weight_warmup_epochs)):
             # max(2, ...) not max(1, ...): a single-epoch grace is
             # mathematically identical to no grace at all, since best_val_loss
             # then ends up as that one epoch's own raw value, lucky or not.
@@ -586,6 +619,7 @@ def train_refinement(
         train_rollout_sum = torch.zeros((), device=device)
         train_recon0_sum = torch.zeros((), device=device)
         train_stats0_sum = torch.zeros((), device=device)
+        train_recon_predict_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
             _n_train_batches = 0
@@ -596,22 +630,26 @@ def train_refinement(
                 _epoch_progress.tick()
                 _n_train_batches += 1
                 bs = batch[0].size(0)
-                loss, rollout, recon0, stats0 = step(
-                    batch, train=True, effective_rollout_weight=effective_rollout_weight)
+                loss, rollout, recon0, stats0, recon_predict = step(
+                    batch, train=True, effective_rollout_weight=effective_rollout_weight,
+                    effective_recon_predict_weight=effective_recon_predict_weight)
                 train_loss_sum += loss * bs
                 train_rollout_sum += rollout * bs
                 train_recon0_sum += recon0 * bs
                 train_stats0_sum += stats0 * bs
+                train_recon_predict_sum += recon_predict * bs
             _epoch_progress.close()
             train_loss = (train_loss_sum / n_train).item()
             train_rollout = (train_rollout_sum / n_train).item()
             train_recon0 = (train_recon0_sum / n_train).item()
             train_stats0 = (train_stats0_sum / n_train).item()
+            train_recon_predict = (train_recon_predict_sum / n_train).item()
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
             # "epoch", rather than a misleading 0.0.
             train_loss = train_rollout = train_recon0 = train_stats0 = float("nan")
+            train_recon_predict = float("nan")
 
         ae.eval()
         f_theta.eval()
@@ -619,6 +657,7 @@ def train_refinement(
         val_rollout_sum = torch.zeros((), device=device)
         val_recon0_sum = torch.zeros((), device=device)
         val_stats0_sum = torch.zeros((), device=device)
+        val_recon_predict_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         # Stage 4's validation runs a full val_loader pass after training with
         # no output -- looks hung on a large sweep. Bar it (self-gating delay)
@@ -630,17 +669,19 @@ def train_refinement(
             for batch in val_loader:
                 _val_prog.tick()
                 bs = batch[0].size(0)
-                loss, rollout, recon0, stats0 = step(batch, train=False)
+                loss, rollout, recon0, stats0, recon_predict = step(batch, train=False)
                 val_loss_sum += loss * bs
                 val_rollout_sum += rollout * bs
                 val_recon0_sum += recon0 * bs
                 val_stats0_sum += stats0 * bs
+                val_recon_predict_sum += recon_predict * bs
         _val_prog.close()
         _prev_val_seconds = time.monotonic() - _val_t0   # feeds next epoch's ETA
         val_loss = (val_loss_sum / n_val).item()
         val_rollout = (val_rollout_sum / n_val).item()
         val_recon0 = (val_recon0_sum / n_val).item()
         val_stats0 = (val_stats0_sum / n_val).item()
+        val_recon_predict = (val_recon_predict_sum / n_val).item()
 
         # SKIPPED BATCHES ARE NEVER SILENT -- a guard that quietly drops data
         # would be worse than the crash it prevents, since the run would look
@@ -698,12 +739,14 @@ def train_refinement(
             "rollout": rollout_weight * val_rollout / rollout_scale,
             "recon0": recon0_weight * val_recon0 / recon0_scale,
             "stats0": stats0_weight * val_stats0 / stats0_scale,
+            "recon_predict": recon_predict_weight * val_recon_predict / recon_predict_scale,
         }
         best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
         current_train_components = {
             "rollout": rollout_weight * train_rollout / rollout_scale,
             "recon0": recon0_weight * train_recon0 / recon0_scale,
             "stats0": stats0_weight * train_stats0 / stats0_scale,
+            "recon_predict": recon_predict_weight * train_recon_predict / recon_predict_scale,
         }
         for name in component_histories:
             component_histories[name]["train"].append(current_train_components[name])
@@ -723,10 +766,12 @@ def train_refinement(
                # beside them and the discrepancy reads as a bug.
                f"{train_loss:7.4f} ={effective_rollout_weight*train_rollout/rollout_scale:7.4f} "
                f"+{recon0_weight*train_recon0/recon0_scale:7.4f} "
-               f"+{stats0_weight*train_stats0/stats0_scale:7.4f} |"
+               f"+{stats0_weight*train_stats0/stats0_scale:7.4f} "
+               f"+{effective_recon_predict_weight*train_recon_predict/recon_predict_scale:7.4f} |"
                f"{val_loss:7.4f} ={rollout_weight*val_rollout/rollout_scale:7.4f} "
                f"+{recon0_weight*val_recon0/recon0_scale:7.4f} "
-               f"+{stats0_weight*val_stats0/stats0_scale:7.4f} |"
+               f"+{stats0_weight*val_stats0/stats0_scale:7.4f} "
+               f"+{recon_predict_weight*val_recon_predict/recon_predict_scale:7.4f} |"
                f"{ema_str:>10}"
                + (f"  [rollout_weight {effective_rollout_weight:.3g}/{rollout_weight:g}]"
                   if effective_rollout_weight < rollout_weight else ""))
@@ -755,13 +800,15 @@ def train_refinement(
                 "rollout": rollout_weight * val_rollout / rollout_scale,
                 "recon0": recon0_weight * val_recon0 / recon0_scale,
                 "stats0": stats0_weight * val_stats0 / stats0_scale,
+                "recon_predict": recon_predict_weight * val_recon_predict / recon_predict_scale,
             }
             total = sum(abs(v) for v in contributions.values())
-            raw = {"rollout": val_rollout, "recon0": val_recon0, "stats0": val_stats0}
+            raw = {"rollout": val_rollout, "recon0": val_recon0, "stats0": val_stats0,
+                   "recon_predict": val_recon_predict}
             weights = {"rollout": rollout_weight, "recon0": recon0_weight,
-                        "stats0": stats0_weight}
+                        "stats0": stats0_weight, "recon_predict": recon_predict_weight}
             scales = {"rollout": rollout_scale, "recon0": recon0_scale,
-                       "stats0": stats0_scale}
+                       "stats0": stats0_scale, "recon_predict": recon_predict_scale}
             if total > 0:
                 shares = {k: abs(v) / total for k, v in contributions.items()}
                 _raw_str = ", ".join(f"{k}={raw[k]:.3e}" for k in shares)

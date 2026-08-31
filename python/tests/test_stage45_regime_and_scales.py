@@ -149,23 +149,21 @@ def test_stage45_has_a_rollout_weight_warmup():
     )
 
 
-def test_the_ramp_is_GEOMETRIC_not_linear():
+def test_the_ramp_is_LINEAR_not_geometric():
     """
-    Linear is what stage 2 uses for deriv_weight, and it is wrong here: the
-    quantities behave completely differently. L_deriv is O(1) throughout;
-    L_rollout collapses ~6e9 over ten epochs (1.76e9 -> 0.29, measured). A
-    linear ramp at epoch 1 gives 0.10 * 1.76e9 = 1.76e8 -- eight orders of
-    magnitude above the converged contribution, so it barely softens the
-    transient it exists to absorb.
+    This USED to be geometric, on the argument that L_rollout collapsed ~6e9
+    over the first epochs so a linear weight ramp left epoch 1 eight decades
+    hot. That collapse was an artefact of the filter-manufactured large-dt
+    windows (du_max=2.5e4); require_consecutive now excludes them at the window
+    definition, and with the scales recalibrated L_rollout is O(1-10) from
+    epoch 1 -- nothing left to hold flat, so a plain linear introduction is the
+    right ramp, and the same helper serves recon_predict.
     """
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "start_fraction ** (1.0 - frac)" in src, "the ramp must be geometric"
-    assert "min(1.0, epoch / rollout_weight_warmup_epochs)" not in src, (
-        "the linear ramp is back"
+    assert "start_fraction + (1.0 - start_fraction) * frac" in src, (
+        "the ramp must be linear"
     )
-    # The no-op branch lives in the extracted helper now, under its own
-    # parameter name -- checked behaviourally rather than by matching the
-    # caller's variable name, which is what the earlier version did.
+    assert "start_fraction ** (1.0 - frac)" not in src, "the geometric ramp is back"
     assert "warmup_epochs <= 0" in src
     assert _ramp(1, 0) == 1.0 and _ramp(99, 0) == 1.0
 
@@ -178,8 +176,8 @@ def _ramp(epoch, warmup_epochs, start=1e-6, weight=1.0):
     tests were checking their own arithmetic. That is why the ramp is a
     module-level function rather than an expression inline in the epoch loop.
     """
-    from training.train_refinement import geometric_warmup_weight
-    return geometric_warmup_weight(epoch, weight, warmup_epochs, start)
+    from training.train_refinement import linear_warmup_weight
+    return linear_warmup_weight(epoch, weight, warmup_epochs, start)
 
 
 def test_the_ramp_endpoints_are_exact():
@@ -192,18 +190,17 @@ def test_the_ramp_endpoints_are_exact():
     assert _ramp(1, 0) == 1.0, "warmup disabled must be an exact no-op at every epoch"
 
 
-def test_the_ramp_flattens_the_CONTRIBUTION_not_the_weight():
-    """
-    The point of geometric: weight * raw should be roughly constant across the
-    ramp, because that is the gradient scale the optimiser actually sees. With
-    the measured raw values a linear ramp spans ~9 decades of contribution and
-    the geometric one spans ~1 (after epoch 1).
-    """
-    raw = {2: 7.3859e4, 3: 8.2262e3, 5: 7.3873e2, 10: 2.93e-1}
-    geo = [_ramp(e, 10) * v for e, v in raw.items()]
-    lin = [min(1.0, e / 10) * v for e, v in raw.items()]
-    assert max(geo) / min(geo) < 100, f"geometric contributions span too much: {geo}"
-    assert max(lin) / min(lin) > 1000, f"expected linear to span far more: {lin}"
+def test_the_ramp_is_linear_in_the_WEIGHT():
+    """Linear now: the midpoint epoch is exactly half-way in WEIGHT (a geometric
+    ramp would be the geometric mean, ~0.001 for a 1e-6 start), and equal epoch
+    spacings give equal weight increments."""
+    # start_fraction 0 makes the midpoint check clean: epoch 6 of an 11-epoch
+    # ramp (frac=0.5) must be 0.5, not sqrt(anything).
+    assert _ramp(6, 11, start=0.0) == pytest.approx(0.5)
+    # equal steps -> equal increments (the signature of linear)
+    d1 = _ramp(4, 11, start=0.0) - _ramp(3, 11, start=0.0)
+    d2 = _ramp(8, 11, start=0.0) - _ramp(7, 11, start=0.0)
+    assert d1 == pytest.approx(d2), "linear ramp must have constant slope"
 
 
 def test_the_start_value_is_configurable():
@@ -272,8 +269,12 @@ def test_the_criterion_is_reset_when_the_ramp_completes():
     """
     src = source_without_comments(_ROOT / "training/train_refinement.py")
     assert "tracker.reset_with_grace(grace)" in src
-    assert "epoch == rollout_weight_warmup_epochs" in src, (
-        "the reset must happen exactly when the ramp completes"
+    # the reset fires when the LAST of the two ramps completes -- epoch equals
+    # max(rollout, recon_predict) warmup epochs (whitespace-insensitive check)
+    _cond = " ".join(src.split())
+    assert "epoch == max(rollout_weight_warmup_epochs, "\
+           "recon_predict_weight_warmup_epochs)" in _cond, (
+        "the reset must happen exactly when the LAST ramp completes"
     )
 
 
@@ -314,9 +315,9 @@ def test_no_reset_when_there_is_no_warmup():
     """GUARDS resetting unconditionally, which would discard a perfectly good
     criterion history for every existing run."""
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    guard = src[src.index("if (rollout_weight_warmup_epochs > 0"):]
+    guard = src[src.index("if (max(rollout_weight_warmup_epochs,"):]
     guard = guard[:guard.index("tracker.reset_with_grace")]
-    assert "rollout_weight_warmup_epochs > 0" in guard
+    assert "> 0" in guard and "rollout_weight_warmup_epochs" in guard
 
 
 def test_the_dominance_warning_waits_for_the_ramp():

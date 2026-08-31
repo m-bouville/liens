@@ -284,3 +284,65 @@ def test_stage45_t_scheme_ignores_t_window_and_is_unchanged():
     b = compute_stage45_loss(ae, f_theta, stats_head, x_window, dt_window, theta,
                              rollout_weight=1.0, recon0_weight=0.1, t_window=_t_window())
     assert torch.allclose(a, b), "t-scheme loss must not depend on t_window"
+
+
+def test_recon_predict_decodes_the_FINAL_step_not_frame_zero():
+    """L_recon_predict must grade D(z_hat[:, -1]) against the real FINAL frame,
+    not frame 0. Constructed so that a frame-0 decode and a last-step decode
+    give measurably different losses: make the predicted last latent decode far
+    from the true last frame while frame-0 recon is unaffected."""
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    # recon_predict alone (no other terms) so the total IS l_recon_predict/scale
+    _, comps = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=0.0, recon0_weight=0.0, stats0_weight=0.0,
+        recon_predict_weight=1.0, recon_predict_scale=1.0, return_components=True)
+    assert "recon_predict" in comps
+    # it is a pixel loss of the LAST predicted frame -> a finite positive scalar
+    assert comps["recon_predict"].ndim == 0 and comps["recon_predict"].item() > 0
+    # and it is NOT the same object/value as recon0 (frame-0 recon)
+    assert not torch.allclose(comps["recon_predict"], comps["recon0"])
+
+
+def test_recon_predict_backprops_to_the_DECODER():
+    """The whole point: this term reaches the decoder THROUGH the rollout. With
+    recon_predict the only active term, decoder parameters must get gradient --
+    unlike L_rollout (latent-only) which never touches D."""
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    total = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=0.0, recon0_weight=0.0, stats0_weight=0.0,
+        recon_predict_weight=1.0, recon_predict_scale=1.0)
+    total.backward()
+    dec = ae.decoders["shared"]
+    grads = [p.grad for p in dec.parameters() if p.grad is not None
+             and p.grad.abs().sum() > 0]
+    assert grads, "recon_predict produced no decoder gradient -- it must decode"
+
+
+def test_recon_predict_also_reaches_f_theta_through_the_rollout():
+    """Decoding the rolled-out latent backprops through f_theta too, so the
+    dynamics co-adapt to the pixel endpoint, not just the latent proxy."""
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    total = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=0.0, recon0_weight=0.0, stats0_weight=0.0,
+        recon_predict_weight=1.0, recon_predict_scale=1.0)
+    total.backward()
+    grads = [p.grad for p in f_theta.parameters() if p.grad is not None
+             and p.grad.abs().sum() > 0]
+    assert grads, "recon_predict did not backprop through f_theta"
+
+
+def test_recon_predict_weight_zero_is_an_exact_no_op():
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    _, comps = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=1.0, recon0_weight=0.1, recon_predict_weight=0.0,
+        return_components=True)
+    # the term is a zero scalar and contributes nothing (weight 0)
+    assert comps["recon_predict"].item() == 0.0

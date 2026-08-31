@@ -74,7 +74,7 @@ from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
-from utils.logging_utils import format_progress_count
+from utils.logging_utils import format_progress_count, EpochProgress
 import sys
 import time
 
@@ -262,7 +262,7 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
     model_items = [("a", a), ("b", b)] + [
         (chr(ord("c") + i), m) for i, m in enumerate(extra or [])]
     model_keys = [k for k, _ in model_items]
-    out = {"dt": [], "temperature": [], "n_corr_undefined": 0,
+    out = {"dt": [], "temperature": [], "t_init": [], "n_corr_undefined": 0,
             # PER-STEP: index k holds every window's value after k chained
             # applications. The collapse is counted in APPLICATIONS, not in
             # elapsed time -- two runs with different per-step dt broke at the
@@ -276,7 +276,7 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
             # the a/b ones, which cover every window.
             "step_loss_causal": [], "step_corr_causal": [],
             "loss_causal": [], "corr_causal": [], "dt_causal": [],
-            "temp_causal": [],
+            "temp_causal": [], "t_init_causal": [],
             # Stage 2 alone (z0 + z1*dt, no f_theta) -- present for every
             # window, unlike causal, so it needs no separate dt/T arrays.
             "step_loss_stage2": [], "step_corr_stage2": [],
@@ -294,7 +294,9 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
                                        real_frames[k] - real_frames[0]))
         return losses_k, corrs_k
 
+    _prog = EpochProgress(len(windows), label="  window", unit="windows")
     for run_dir, steps in windows:
+        _prog.tick()
         row = {}
         real_frames = None
         for key, m in model_items:
@@ -313,6 +315,12 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
         # same file the trajectory paths came from), used by the vs-T panels.
         meta = load.read_metadata(Path(run_dir) / "metadata.txt")
         temperature = meta.temperature
+        # Physical START time of the window, t_init = steps[0] * sim_dt. Unlike
+        # du_total (which is ~constant now that windows are consecutive, and in
+        # u-mode is ~constant BY CONSTRUCTION since Delta-u is designed flat),
+        # t_init resolves WHERE in the trajectory a window sits -- the actually
+        # diagnostic axis, and physical (so meaningful) in both t- and u-mode.
+        t_init = steps[0] * meta.dt
 
         _tc = getattr(a["f_theta"], "time_coordinate", "t")
         stage2 = compute_stage2_trajectory(run_dir, steps, a["ae"],
@@ -335,8 +343,10 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
             out["corr_causal"].append(c_corr[-1])
             out["dt_causal"].append(dt_total)
             out["temp_causal"].append(temperature)
+            out["t_init_causal"].append(t_init)
         out["dt"].append(dt_total)
         out["temperature"].append(temperature)
+        out["t_init"].append(t_init)
         for key in model_keys:
             out[f"loss_{key}"].append(row[key]["loss"])
             out[f"corr_{key}"].append(row[key]["corr"])
@@ -351,6 +361,7 @@ def collect_stats(a: dict, b: dict, windows: list[tuple], device,
     # there, for both models -- which no property of any single window
     # explains, and which points at a CONSTANT delta (pred[k] == pred[0], or
     # identical real frames) rather than at a quiet window.
+    _prog.close()
     n_frames = max((len(r) for r in out["step_corr_a"]), default=0)
     out["n_corr_undefined_per_step"] = {
         key: [sum(1 for row in out[f"step_corr_{key}"]
@@ -551,12 +562,15 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
                    extra: list | None = None, ancestors: bool = False) -> Path:
     """Four panels: loss and correlation, as distributions and against dt."""
     dt = np.array(stats["dt"], dtype=float)
+    # Diagnostic x-axis for the two "vs time" panels: the window's physical
+    # START time. du_total is nearly constant (windows are consecutive now, and
+    # in u-mode Delta-u is flat by construction), so it can't resolve anything;
+    # t_init resolves WHERE in the trajectory a window sits, in both t/u modes.
+    t_init_arr = np.array(stats["t_init"], dtype=float)
     # The stored "dt" is sum(dt_per_step) in the MODEL's time coordinate: a
     # u-scheme (log10_t) model steps in Delta-u=log10(t_{i+1}/t_i), so the axis
     # is du_total, not dt_total. Label it truthfully so the span is not misread
     # as a narrow physical-dt range.
-    _dt_axis_label = ("du_total" if getattr(a["f_theta"], "time_coordinate", "t") == "log10_t"
-                      else "dt_total")
     fig, axes = plt.subplots(2, 5, figsize=(31, 9))
     _model_items = [("a", a), ("b", b)] + [
         (chr(ord("c") + i), m) for i, m in enumerate(extra or [])]
@@ -647,23 +661,31 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     ax.grid(alpha=0.3)
     ax.legend()
 
-    # (0,1) loss against dt
+    # (0,1) loss against window start time t
     ax = axes[0, 1]
     dt_loss_medians = []
+    _loss_t_drew = False
     for key in _keys():
-        key_dt = dt if key != "causal" else np.array(stats["dt_causal"],
-                                                       dtype=float)
-        c, med, lo, hi = _binned(key_dt, np.array(stats[f"loss_{key}"],
-                                                   dtype=float))
+        key_t = (t_init_arr if key != "causal"
+                 else np.array(stats["t_init_causal"], dtype=float))
+        c, med, lo, hi = _binned(key_t, np.array(stats[f"loss_{key}"],
+                                                  dtype=float))
         if c.size:
             ax.plot(c, med, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
             ax.fill_between(c, lo, hi, color=colours[key], linestyle=linestyles[key], alpha=0.15)
-            dt_loss_medians.append(med)
+            _loss_t_drew = True
+            # Stage 2 is DRAWN but excluded from the y-range: as a re-encoding
+            # reference (no propagation) its loss skyrockets near T0 and at long
+            # times, and letting its median set the shared loss-row scale
+            # flattens the decades where the real models differ. It runs off the
+            # top instead, visible but not scale-setting.
+            if key != "stage2":
+                dt_loss_medians.append(med)
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel(_dt_axis_label + " (binned)")
+    ax.set_xlabel("window start time t (binned)")
     ax.set_ylabel("median loss (band: quartiles)")
-    ax.set_title("loss vs dt")
+    ax.set_title("loss vs t_init")
     # loss-vs-dt is the REFERENCE range for the whole loss row: it is scaled
     # to its medians (via the shared _ylim call at the end of the row), so
     # the decades where the curves actually differ stay legible instead of
@@ -673,27 +695,43 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     axes[0, 1].set_yscale("log")
     _label_dt_axis(ax)
     ax.grid(alpha=0.3, which="both")
-    ax.legend()
+    if _loss_t_drew:
+        ax.legend()
+    else:
+        # No window has a positive, varied start time (e.g. every window starts
+        # at step 0, or a fixed-window set pins them all to one t). Nothing to
+        # bin against t_init -- say so rather than emit a bare-legend warning
+        # and leave the panel silently blank.
+        ax.text(0.5, 0.5, "no spread in t_init\n(all windows share one start time)",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=9, color="gray")
 
-    # (1,1) correlation against dt
+    # (1,1) correlation against window start time t
     ax = axes[1, 1]
+    _corr_t_drew = False
     for key in _keys():
         corr = np.array([np.nan if c is None else c
                           for c in stats[f"corr_{key}"]], dtype=float)
-        key_dt = dt if key != "causal" else np.array(stats["dt_causal"],
-                                                       dtype=float)
-        c, med, lo, hi = _binned(key_dt, corr)
+        key_t = (t_init_arr if key != "causal"
+                 else np.array(stats["t_init_causal"], dtype=float))
+        c, med, lo, hi = _binned(key_t, corr)
         if c.size:
             ax.plot(c, med, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
             ax.fill_between(c, lo, hi, color=colours[key], linestyle=linestyles[key], alpha=0.15)
+            _corr_t_drew = True
     ax.set_xscale("log")
-    ax.set_xlabel(_dt_axis_label + " (binned)")
+    ax.set_xlabel("window start time t (binned)")
     ax.set_ylabel("median correlation (%) (band: quartiles)")
-    ax.set_title("correlation vs dt")
+    ax.set_title("correlation vs t_init")
     _corr_axis(ax)
     _label_dt_axis(ax)
     ax.grid(alpha=0.3, which="both")
-    ax.legend()
+    if _corr_t_drew:
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, "no spread in t_init\n(all windows share one start time)",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=9, color="gray")
 
     # (0,2) and (1,2): the SAME endpoints against TEMPERATURE. dt and T are
     # collinear in this sweep (later frames are both larger dt and, through
@@ -1416,15 +1454,15 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
             if plot_col == n_plot_cols - 1 and row == len(rows) - 1:
                 fig.colorbar(im, ax=axes[:, n_plot_cols - 1].tolist(), fraction=0.03)
 
-    # When columns were subsampled (>10 steps), say which are shown, so the
-    # header times aren't mistaken for consecutive steps: "steps 2, 4, ...".
-    # The note attaches to the STEP-COUNT phrase ("16 chained steps (steps 2,
-    # 4, ... displayed)"), not the end of the title, so it isn't split from the
-    # step count by the ", derivative ..." clause that follows in the regime.
+    # When columns were subsampled (>10 steps), say EXACTLY which steps are
+    # shown, so the header times aren't mistaken for consecutive steps. The list
+    # is the real col_indices, e.g. "(steps 0, 2, 4, 6, 8, 10, 12, 14, 16
+    # displayed)". It attaches to the STEP-COUNT phrase ("16 chained steps (...
+    # displayed)"), not the end of the title, so it isn't split from the step
+    # count by the ", derivative ..." clause that follows in the regime.
     title_with_note = title
     if n_plot_cols < n_cols:
-        _note = (f" (steps {col_indices[1]}, {col_indices[2]}, ... displayed)"
-                 if len(col_indices) >= 3 else " (subsampled)")
+        _note = f" (steps {', '.join(str(c) for c in col_indices)} displayed)"
         n_steps_used = n_cols - 1
         _phrase = f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}"
         title_with_note = (title.replace(_phrase, _phrase + _note, 1)

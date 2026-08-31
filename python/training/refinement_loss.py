@@ -28,7 +28,9 @@ def compute_stage45_loss(
     ae, f_theta, stats_head, x_window: torch.Tensor, dt_window: torch.Tensor,
     theta: torch.Tensor, rollout_weight: float = 1.0, recon0_weight: float = 0.0,
     stats0_weight: float = 0.0,
+    recon_predict_weight: float = 0.0,
     rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
+    recon_predict_scale: float = 1.0,
     stats_loss_fn: StatsLoss | None = None,
     true_stats: torch.Tensor | None = None, return_components: bool = False,
     recon_stream_name: str = DEFAULT_STREAM_NAME, deriv_stream_name: str = "deriv",
@@ -179,12 +181,32 @@ def compute_stage45_loss(
     else:
         l_stats0 = torch.zeros((), device=x_window.device, dtype=x_window.dtype)
 
+    # L_recon_predict: decode the FINAL rolled-out latent and grade it against
+    # the real final frame IN PIXELS. This is the only term that closes the loop
+    # on what is actually rendered at inference -- D(f_theta^n(E(x0))) vs the
+    # true image at step n. L_rollout checks f_theta^n(E(x0)) only in LATENT
+    # space (a proxy), and L_recon0 trains the decoder only on frame-0 latents;
+    # neither asks the decoder to render a PREDICTED latent. Solely the last
+    # step (not every step): it is the endpoint that gets decoded, it is the
+    # most-drifted latent -- the one least protected by L_recon0's frame-0
+    # training -- and one decode is cheaper than n. The decoder backprops
+    # THROUGH the rollout here (z_hat carries grad), so this is also the term
+    # that co-adapts encoder, f_theta and decoder toward the pixel endpoint.
+    if recon_predict_weight != 0.0:
+        x_pred_n = recon_pathway.decoder(z_hat[:, -1]) * torch.exp(
+            recon_pathway.log_output_scale)
+        l_recon_predict = ReconLoss()(x_pred_n, x_future[:, -1])
+    else:
+        l_recon_predict = torch.zeros((), device=x_window.device, dtype=x_window.dtype)
+
     total = (rollout_weight * l_rollout / rollout_scale + recon0_weight * l_recon0 / recon0_scale
-             + stats0_weight * l_stats0 / stats0_scale)
+             + stats0_weight * l_stats0 / stats0_scale
+             + recon_predict_weight * l_recon_predict / recon_predict_scale)
 
     if return_components:
         components = {
             "rollout": l_rollout, "recon0": l_recon0, "stats0": l_stats0,
+            "recon_predict": l_recon_predict,
             "z0": z0, "z_true": z_true,
         }
         return total, components
