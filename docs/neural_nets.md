@@ -281,7 +281,7 @@ $$\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \D
 Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
 
 ### Semi-implicit (predictor-corrector) velocity-Verlet
-This section and the next pertain to the obsolete `dynamics_mode=z1_taylor` mode.
+This section and the next pertain to the `dynamics_mode=z1_taylor` mode. It is no longer used, because it is less stable for long times.
 
 Integration of the latent state $(z_0,  z_1)$ over one sub-step $dt$.
 
@@ -308,7 +308,7 @@ $$z_1^{(n+1)} = z_1^{(n)} + \frac{f_n + f_{n+1}}{2} \delta t.$$
 Stage 3a uses only one step, `L_1step`, whereas stage 3b involves several consecutive steps (`L_rollout`)​.
 
 ### `check_alpha.py` — calibrating the Taylor-validity ratio
-This section and the previous one pertain to the obsolete `dynamics_mode=z1_taylor` mode.
+This section and the previous one pertain to the `dynamics_mode=z1_taylor` mode. It is no longer used, because it is less stable for long times.
 
 The training (stage 3b) initially used steps $\delta t = \Delta t / n_\mathrm{substeps}$:
 - we ensure that we land on known time steps,

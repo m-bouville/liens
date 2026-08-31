@@ -386,3 +386,25 @@ def test_the_other_conversions_still_hold():
     assert _convert_value("1.5") == 1.5
     assert math.isinf(_convert_value("inf"))
     assert _convert_value("some/path.pt") == "some/path.pt"
+
+
+def test_convert_value_strips_matching_surrounding_quotes():
+    """A quoted string value yields the bare string, so `key = 'initial'` and
+    `key = initial` are equivalent. Without this, quotes survive into the value
+    ('initial' -> the 9-char "'initial'") and fail every downstream `== "..."`
+    check -- e.g. LatentDynamics' derivative_time/derivative_source validation."""
+    from orchestration.stage_params import _convert_value
+    assert _convert_value("'initial'") == "initial"
+    assert _convert_value('"initial"') == "initial"
+    assert _convert_value("initial") == "initial"           # bare, unchanged
+    assert _convert_value("previous_quotient") == "previous_quotient"
+
+
+def test_convert_value_quote_stripping_does_not_touch_non_strings_or_inner_quotes():
+    from orchestration.stage_params import _convert_value
+    assert _convert_value("42") == 42                        # numbers first
+    assert _convert_value("3.14") == 3.14
+    assert _convert_value("None") is None
+    assert _convert_value("true") is True
+    assert _convert_value("'it's'") == "it's"                # only OUTER pair removed
+    assert _convert_value("'mismatched\"") == "'mismatched\""  # non-matching: left as-is

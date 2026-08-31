@@ -6,8 +6,8 @@ files directly, without going through the solver's PNG export.
 import math
 from pathlib import Path
 
-import matplotlib.animation as animation
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import matplotlib.ticker as mticker
 import numpy as np
 
@@ -333,10 +333,116 @@ def _proportional_limits(values: list[float], exponent: float = 0.15,
     return lo / pad, hi * pad
 
 
+def rollout_vs_1step_scatter(l_1step_val, l_rollout_val, output_path, title="",
+                             saved_epochs=None, n_rollout_steps=None,
+                             l_1step_train=None, l_rollout_train=None):
+    """Stage-3b diagnostic: L_rollout vs L_1step at each SAVED epoch, on shared
+    log-log SQUARE axes, for BOTH training and validation (tab:blue / tab:orange,
+    same convention as loss_curve). Makes the rollout/per-step TRADEOFF visible:
+    a series buying multi-step stability at the cost of single-step accuracy
+    walks DOWN-and-RIGHT; one improving both heads to the lower-left. Comparing
+    train vs valid also shows GENERALIZATION -- e.g. val bending right while
+    train does not is the rollout equivalent of overfitting. Only saved epochs
+    are shown, so every point is a real, reloadable checkpoint. Fewer than 2
+    finite validation points -> returns None (a 1-step 3a where the two are
+    identical, or a run that never saved twice)."""
+    import numpy as np
+
+    def _clean(xs, ys):
+        xs = np.asarray(xs, dtype=float); ys = np.asarray(ys, dtype=float)
+        ok = np.isfinite(xs) & np.isfinite(ys) & (xs > 0) & (ys > 0)
+        return xs[ok], ys[ok], ok
+
+    xv, yv, okv = _clean(l_1step_val, l_rollout_val)
+    if len(xv) < 2:
+        return None
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+    allx = list(xv); ally = list(yv)
+
+    def _series(x1, lr, color, name):
+        if x1 is None or lr is None:
+            return
+        x, y, _ = _clean(x1, lr)
+        if len(x) < 1:
+            return
+        allx.extend(x); ally.extend(y)
+        ax.plot(x, y, "-o", color=color, ms=4, lw=1, alpha=0.8, zorder=3, label=name)
+        ax.scatter(x[0], y[0], facecolors="none", edgecolors=color,
+                   s=140, lw=2, zorder=4)                 # INITIAL saved (ring)
+        _b = int(np.argmin(y))
+        ax.scatter(x[_b], y[_b], marker="*", color=color, s=180, zorder=5)  # best L_rollout
+
+    _series(l_1step_train, l_rollout_train, "tab:blue", "train")
+    _series(l_1step_val, l_rollout_val, "tab:orange", "valid")
+
+    lo = min(allx + ally) * 0.7
+    hi = max(allx + ally) * 1.4
+    ax.plot([lo, hi], [lo, hi], "--", color="gray", lw=1, zorder=2,
+            label="L_rollout = L_1step")
+    if n_rollout_steps and n_rollout_steps > 1:
+        # L_rollout = n * L_1step: what an n-step rollout would cost if every
+        # step contributed one independent 1-step error (linear accumulation).
+        # Points BELOW it accumulate sub-linearly (the rollout is better than n
+        # independent steps); on log-log it is the diagonal shifted up by n.
+        _yhi = hi
+        ax.plot([lo, hi], [n_rollout_steps * lo, n_rollout_steps * hi], ":",
+                color="gray", lw=1, zorder=2,
+                label=f"L_rollout = {n_rollout_steps} x L_1step")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal")
+    ax.set_xlabel("L_1step")
+    ax.set_ylabel("L_rollout")
+    ax.set_title(title or "L_rollout vs L_1step (saved checkpoints)")
+    # ring = INITIAL saved, star = best L_rollout (per series)
+    ax.plot([], [], "o", mfc="none", mec="gray", label="initial saved")
+    ax.plot([], [], "*", color="gray", label="best L_rollout")
+    ax.legend(fontsize=8, loc="lower right")
+
+    # Second panel: the L_rollout/L_1step RATIO over training. The scatter shows
+    # WHERE each checkpoint sits; this shows HOW the ratio moved epoch to epoch.
+    # 1.0 = rollout as cheap as one 1-step (nothing accumulated); n = linear
+    # accumulation (each step one independent error). A ratio falling over
+    # training means f is learning to suppress accumulation; rising means the
+    # rollout is degrading relative to the single step (the tradeoff turning bad).
+    def _ratio_series(x1, lr, color, name):
+        if x1 is None or lr is None:
+            return
+        x1 = np.asarray(x1, dtype=float); lr = np.asarray(lr, dtype=float)
+        ok = np.isfinite(x1) & np.isfinite(lr) & (x1 > 0) & (lr > 0)
+        if ok.sum() < 1:
+            return
+        e = (np.asarray(saved_epochs, dtype=float)[ok]
+             if saved_epochs is not None and len(saved_epochs) == len(ok)
+             else np.arange(len(ok))[ok])
+        ax2.plot(e, lr[ok] / x1[ok], "-o", color=color, ms=3, lw=1,
+                 alpha=0.8, zorder=3, label=name)
+    _ratio_series(l_1step_train, l_rollout_train, "tab:blue", "train")
+    _ratio_series(l_1step_val, l_rollout_val, "tab:orange", "valid")
+    ax2.axhline(1.0, ls="--", color="gray", lw=1, zorder=2,
+                label="L_rollout = L_1step")
+    if n_rollout_steps and n_rollout_steps > 1:
+        ax2.axhline(n_rollout_steps, ls=":", color="gray", lw=1, zorder=2,
+                    label=f"L_rollout = {n_rollout_steps} x L_1step")
+    ax2.set_xlabel("epoch")
+    ax2.set_ylabel("L_rollout / L_1step")
+    ax2.set_title("rollout/1step ratio over training")
+    ax2.set_ylim(bottom=0)
+    ax2.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=100)
+    plt.close(fig)
+    return output_path
+
+
 def loss_component_scatter(
     epoch_history: list[int], component_histories: dict[str, dict[str, list[float]]],
     output_path: Path, title: str = "",
     ref_components: dict[str, float] | None = None,
+    ref_label: str = "ref (pre-run)",
 ) -> Path | None:
     """
     Companion to loss_curve(): for a COMPOSITE loss (total = sum of
@@ -487,9 +593,9 @@ def loss_component_scatter(
             if (rx is not None and ry is not None
                     and math.isfinite(rx) and math.isfinite(ry)
                     and rx > 0 and ry > 0):
-                ax.scatter([rx], [ry], s=110, marker="o", facecolors="none",
+                ax.scatter([rx], [ry], s=70, marker="o", facecolors="none",
                            edgecolors="tab:purple", linewidths=2.0, zorder=6,
-                           label="ref (pre-run)")
+                           label=ref_label)
 
         # FINITE values only, everywhere below. An epochs=0 ablation never
         # iterates the train set, so every train component is NaN -- and while
@@ -579,10 +685,27 @@ def loss_component_scatter(
         else:
             ax.tick_params(labelleft=False)
         # Minor-tick text off on log axes: majors (decades) stay labelled.
+        # BUT only when there is at least one major (decade) tick IN VIEW to
+        # carry the labelling -- a sub-decade range (e.g. 0.4..0.5, common on a
+        # converged run) crosses no power of ten, so LogLocator places no major
+        # ticks at all, and blanking the minors too would leave the axis with
+        # NO numbers whatsoever. In that case keep the minor labels (and give
+        # them a readable scalar format) so the axis is still legible.
+        def _has_major_in_view(axis, lo, hi):
+            ticks = axis.get_majorticklocs()
+            return any(lo <= t <= hi for t in ticks)
         if ax.get_xscale() == "log":
-            ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+            _lo, _hi = ax.get_xlim()
+            if _has_major_in_view(ax.xaxis, _lo, _hi):
+                ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+            else:
+                ax.xaxis.set_minor_formatter(mticker.ScalarFormatter())
         if ax.get_yscale() == "log":
-            ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+            _lo, _hi = ax.get_ylim()
+            if _has_major_in_view(ax.yaxis, _lo, _hi):
+                ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+            else:
+                ax.yaxis.set_minor_formatter(mticker.ScalarFormatter())
         if (row, col) == (0, 0):
             # "best", not a fixed corner. These trajectories head toward the
             # origin, so they occupy the LOWER-LEFT... except early in a run,
@@ -678,3 +801,67 @@ def show_snapshot(path: str | Path, nx: int, ny: int,
     return ax
 
 
+# NOTE: called nowhere in the codebase, but kept for direct use from the
+# command line / an interactive session: do not remove. (Reported not
+# working as of 2026-08; works in isolation on synthetic data, failure
+# mode not yet pinned down -- see session notes.)
+def make_video(run_dir: str | Path, metadata: "load.RunMetadata", output_path: str | Path,
+                fps: int = 10, cmap: str = "RdBu", vmin: float | None = None,
+                vmax: float | None = None):
+    """
+    Build a video from a run's saved snapshots, in step order.
+    Skips steps whose file is missing rather than failing outright --
+    check_snapshots_saved should be used beforehand for a real completeness check.
+
+    output_path must end in .mp4 (needs ffmpeg on PATH) or .gif (works
+    everywhere via Pillow, no extra dependency).
+
+    vmin/vmax default to None, which auto-scales symmetrically around 0
+    using the actual range across ALL frames in this video (not
+    per-frame, which would make amplitude changes over time invisible --
+    the whole point of a growing-microstructure video is to see the
+    field's amplitude and structure develop, so the scale must stay
+    fixed across frames while still reflecting the real data range).
+    """
+    run_dir = Path(run_dir)
+    output_path = Path(output_path)
+
+    if output_path.suffix not in (".mp4", ".gif"):
+        raise ValueError(
+            f"output_path '{output_path}' must end in .mp4 or .gif "
+            f"(got suffix '{output_path.suffix}')"
+        )
+
+    frames = []
+    for step in metadata.save_steps:
+        f = run_dir / load.snapshot_filename(step)
+        if f.exists():
+            frames.append((step, load.read_phi_half(f, metadata.nx, metadata.ny)))
+
+    if not frames:
+        raise ValueError(f"{run_dir}: no snapshot files found to build a video from")
+
+    if vmin is None or vmax is None:
+        scale = max(max(abs(phi.min()), abs(phi.max())) for _, phi in frames)
+        scale = max(scale, 1e-6)
+        vmin, vmax = -scale, scale
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    im = ax.imshow(frames[0][1], cmap=cmap, vmin=vmin, vmax=vmax, origin="upper")
+    title = ax.set_title(f"step {frames[0][0]}")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    def update(i):
+        step, phi = frames[i]
+        im.set_data(phi)
+        title.set_text(f"step {step}")
+        return im, title
+
+    anim = animation.FuncAnimation(fig, update, frames=len(frames), blit=False)
+
+    writer = "ffmpeg" if output_path.suffix == ".mp4" else "pillow"
+    anim.save(output_path, writer=writer, fps=fps)
+    plt.close(fig)
+
+    return output_path

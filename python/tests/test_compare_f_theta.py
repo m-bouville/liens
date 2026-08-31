@@ -215,7 +215,7 @@ def test_title_and_filename_use_the_parsed_names(monkeypatch, tmp_path):
                                  fixed_windows=["r:1:2"], device="cpu")
     # "r:1:2" is a 2-element window = ONE transition, hence the singular
     assert titles == ["128x128: stage 3a vs. stage 3b\n"
-                       "1 chained step, z1 not resynchronized"]
+                       "1 chained step, derivative not resynced"]
     # NO seed in the name for --fixed-windows (check_rollout's convention):
     # the seed played no part in selecting them, and a stamped seed would
     # suggest a rerun with another seed changes the windows.
@@ -486,7 +486,7 @@ def test_the_stats_figure_is_titled_with_the_model_names(monkeypatch, tmp_path):
     assert len(titles) == 2, "expected one title per figure"
     for t in titles:
         assert t.startswith("128x128: stage 3a vs. stage 3b\n"
-                             "2 chained steps, z1 not resynchronized"), (
+                             "2 chained steps, derivative not resynced"), (
             f"figure titled {t!r} -- a panel caption has leaked into it"
         )
 
@@ -522,12 +522,12 @@ def test_the_regime_is_in_the_title_and_the_filename(monkeypatch, tmp_path):
 
     two, _ = cf.compare_f_theta("128x128-stage3a", "128x128-stage3b",
                                  fixed_windows=["r:1:2:3"], device="cpu")
-    assert "2 chained steps, z1 not resynchronized" in titles[-1]
+    assert "2 chained steps, derivative not resynced" in titles[-1]
 
     four, _ = cf.compare_f_theta("128x128-stage3a", "128x128-stage3b",
                                   fixed_windows=["r:1:2:3:4:5"],
                                   z1_resync=True, device="cpu")
-    assert "4 chained steps, z1 resynced at each real frame" in titles[-1]
+    assert "4 chained steps, derivative resynced at each real frame" in titles[-1]
 
     assert two.name != four.name, (
         "two different experiments write to the same file; one overwrites "
@@ -861,7 +861,7 @@ def test_every_model_panel_carries_its_own_loss_and_correlation(monkeypatch):
     for row in (1, 2):
         for col in range(5):
             t = axes[row, col].get_title()
-            assert "loss=" in t and "corr dx=" in t and "corr x=" in t, \
+            assert "loss=" in t and "corr dx=" in t and "(x:" in t, \
                 f"panel [{row},{col}]: {t!r}"
     # the real row keeps the time header, not metrics
     assert axes[0, 1].get_title() == "t = 250 (t0 + 250)"
@@ -870,14 +870,14 @@ def test_every_model_panel_carries_its_own_loss_and_correlation(monkeypatch):
 def test_the_metrics_show_the_collapse_frame(monkeypatch):
     """B is exact until frame 3 and noise after: its numbers must say so."""
     axes = _titles(monkeypatch, collapse_at=3)
-    b_corr = [axes[3, c].get_title().split("corr dx=")[1].split(",")[0]
+    b_corr = [axes[3, c].get_title().split("corr dx=")[1].split(" (")[0]
               for c in range(5)]
     assert b_corr[1] == "100%" and b_corr[2] == "100%"
     assert b_corr[3] not in ("100%", "99%"), (
         f"frame 3 reports corr={b_corr[3]} for a collapsed prediction"
     )
     # stage 3a is row 2: real, stage 2, 3a, 3b
-    a_corr = [axes[2, c].get_title().split("corr dx=")[1].split(",")[0]
+    a_corr = [axes[2, c].get_title().split("corr dx=")[1].split(" (")[0]
               for c in range(5)]
     assert a_corr[3] in ("99%", "100%"), "A is tracking and should say so"
 
@@ -918,7 +918,7 @@ def test_each_model_measures_its_delta_from_ITS_OWN_start(monkeypatch):
                            Path(tempfile.mkdtemp()) / "t.png")
     axes = captured["axes"]
     for col in (1, 2, 3):
-        assert axes[3, col].get_title().split("corr dx=")[1].split(",")[0] == "100%", (
+        assert axes[3, col].get_title().split("corr dx=")[1].split(" (")[0] == "100%", (
             f"frame {col}: B tracks the real trajectory exactly up to a "
             f"constant, so its correlation is only below 100% if the baseline "
             f"subtracted is not B's own start"
@@ -939,7 +939,7 @@ def test_frame_zero_reports_reconstruction_fidelity_not_na(monkeypatch):
     """
     axes = _titles(monkeypatch)
     for row in (1, 2):
-        corr = axes[row, 0].get_title().split("corr x=")[1]
+        corr = axes[row, 0].get_title().split("(x: ")[1].rstrip(")")
         assert corr != "n/a", f"frame 0 of row {row} still reports n/a"
         assert corr.endswith("%")
 
@@ -984,7 +984,7 @@ def test_a_constant_real_delta_still_reports_na(monkeypatch):
         "an unchanged real state must give an undefined correlation, not a "
         "fabricated number"
     )
-    assert axes[2, 2].get_title().split("corr dx=")[1].split(",")[0] != "n/a"
+    assert axes[2, 2].get_title().split("corr dx=")[1].split(" (")[0] != "n/a"
 
 
 def test_stats_collect_per_step_series(monkeypatch):
@@ -1935,17 +1935,20 @@ def test_the_moving_window_reports_the_MEDIAN_inside_its_quartile_band():
 
 def test_the_header_carries_ABSOLUTE_time_not_only_the_offset(monkeypatch, tmp_path):
     """
-    "t = 650 (t0)" then "t = 750 (t0 + 100)". The bare offset gave no way to
-    place a frame in the run without going back to the title's step numbers.
+    "t = 650 (t0)" then "t = 750 (t0 * 1.15)". The header carries ABSOLUTE
+    physical time, with the MULTIPLICATIVE ratio to t0 in brackets -- the ratio
+    is steps[col]/steps[0], the log-time story told as a time rather than a
+    u-offset. (The bare additive offset used to add a Delta-u to a physical t0
+    for log10_t models, which was meaningless.)
 
-    Uses a window that does NOT start at step 0 -- with t0 = 0 the absolute
-    and offset numbers coincide and dropping the absolute term is invisible.
+    Uses a window that does NOT start at step 0 -- with t0 = 0 there is no
+    multiplicative ratio and the header falls back to an additive offset.
     """
     import matplotlib.pyplot as plt
     from pathlib import Path
 
     steps = [13000, 15000, 17500, 20000]
-    sim_dt = 0.05                       # -> t0 = 650, offsets 0/100/225/350
+    sim_dt = 0.05                       # -> t0 = 650, ratios 1 / 1.1538 / 1.3462 / 1.5385
 
     def traj(run_dir, s, ae, f_theta, ae_config, device, z1_resync):
         rng = np.random.default_rng(0)
@@ -1969,9 +1972,12 @@ def test_the_header_carries_ABSOLUTE_time_not_only_the_offset(monkeypatch, tmp_p
                            _model("128x128-stage3a"), _model("128x128-stage3b"),
                            "cpu", False, "T", tmp_path / "tr.png")
     axes = captured["axes"]
-    assert [axes[0, c].get_title() for c in range(4)] == [
-        "t = 650 (t0)", "t = 750 (t0 + 100)", "t = 875 (t0 + 225)",
-        "t = 1000 (t0 + 350)"]
+    titles = [axes[0, c].get_title() for c in range(4)]
+    assert titles[0] == "t = 650 (t0)"
+    # absolute physical time is carried in every header
+    assert titles[1].startswith("t = 750 (t0 * ") and "1.15" in titles[1]
+    assert titles[2].startswith("t = 875 (t0 * ") and "1.34" in titles[2]
+    assert titles[3].startswith("t = 1000 (t0 * ") and "1.53" in titles[3]
 
 
 def test_sim_dt_is_recovered_from_the_step_spacing(monkeypatch, tmp_path):
@@ -2180,8 +2186,8 @@ def test_the_stage2_row_sits_between_causal_and_the_models(monkeypatch, tmp_path
                            "cpu", False, "T", tmp_path / "t.png")
     axes = captured["axes"]
     labels = [axes[r, 0].get_ylabel().replace("\n", " ") for r in range(5)]
-    assert labels == ["real", "previous derivative (linear extrapolation)",
-                       "stage 2 (z0 + z1 dt)", "stage 3a", "stage 3b"], labels
+    assert labels == ["real", "previous derivative (no future info)",
+                       "stage 2 (z0 + z1 dt) (uses future info)", "stage 3a", "stage 3b"], labels
     # and it carries its own per-frame numbers
     assert "loss=" in axes[2, 1].get_title()
 
@@ -2717,3 +2723,40 @@ def test_ancestors_figure_goes_to_general_dir_not_anchor_stage():
     block = src[i:i + 600]
     assert '"rollout_check_png"' in block
     assert "_output_subdir(args.checkpoints[0])" not in block
+
+
+def test_panel_subsamples_columns_beyond_ten_steps(monkeypatch, tmp_path):
+    """>10 steps makes the panel unreadably wide, so it plots every OTHER column,
+    always keeping the first and the last frame. <=10 steps shows every column."""
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    def _run(n_steps):
+        steps = list(range(2000, 2000 + (n_steps + 1) * 1000, 1000))
+
+        def traj(run_dir, s, ae, f_theta, ae_config, device, z1_resync):
+            rng = np.random.default_rng(0)
+            real = [rng.normal(size=(8, 8)) for _ in range(len(s))]
+            return (real, [f + 0.01 for f in real],
+                    [(s[i + 1] - s[i]) * 0.05 for i in range(len(s) - 1)])
+
+        monkeypatch.setattr(cf, "compute_trajectory", traj)
+        monkeypatch.setattr(cf, "compute_causal_trajectory", lambda *a, **k: None)
+        monkeypatch.setattr(cf, "compute_stage2_trajectory", _flat_stage2)
+        captured = {}
+        original = plt.subplots
+
+        def spy(*args, **kwargs):
+            fig, axes = original(*args, **kwargs)
+            captured.setdefault("axes", axes)
+            return fig, axes
+
+        monkeypatch.setattr(plt, "subplots", spy)
+        cf._trajectory_figure(Path("T625_n050_s599"), steps,
+                               _model("128x128-stage3a"), _model("128x128-stage3b"),
+                               "cpu", False, "T", tmp_path / f"tr{n_steps}.png")
+        return captured["axes"].shape[1]
+
+    assert _run(10) == 11          # <=10 steps: every column
+    assert _run(20) == 11          # 21 cols -> every other = 0,2,..,20 = 11 cols
+    assert _run(11) == 7           # 12 cols -> 0,2,..,10 + last(11) = 7 cols

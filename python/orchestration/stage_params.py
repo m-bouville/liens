@@ -115,6 +115,16 @@ def _convert_value(value: str):
         return float(value)
     except ValueError:
         pass
+    # A string value: strip ONE pair of matching surrounding quotes, so
+    # `key = 'initial'` and `key = initial` both yield the string initial.
+    # Without this a quoted value keeps its quotes -- 'initial' becomes the
+    # 9-char "'initial'", which then fails every downstream `== "initial"`
+    # check (LatentDynamics' derivative_time/source validation, dynamics_mode,
+    # etc.), either silently or as a confusing "got \"'initial'\"" error.
+    # Bare values (the file's own convention, e.g. previous_quotient) are
+    # unaffected; inner quotes/apostrophes in a path are left alone.
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
     return value
 
 

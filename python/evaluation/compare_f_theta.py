@@ -187,6 +187,24 @@ def _select_windows(model: dict, n_samples: int, n_steps: int, seed: int,
         max_dt=max_dt if max_dt is not None else data_config.get("max_dt"),
         min_step=data_config.get("min_step", 0),
         min_stdev_phi=data_config.get("min_stdev_phi"),
+        # Apply the SAME window filters the anchor model trained under, so the
+        # eval population matches training. Without threading the normalized
+        # filter, a model trained with min_normalized_stdev_phi (and thus
+        # min_stdev_phi=None) was evaluated on the UNFILTERED pool -- which
+        # includes the near-critical low-stdev windows that training dropped and
+        # that dominate the re-encode reference, making "stage 2" swing wildly
+        # with the sample. min_passing_steps likewise defines run eligibility.
+        min_normalized_stdev_phi=data_config.get("min_normalized_stdev_phi"),
+        min_passing_steps=data_config.get("min_passing_steps"),
+        # Identify the cache the SAME way training does, so an eval-created cache
+        # dir isn't an anonymous "streams cached = z0 (state)" that can't be told
+        # from any other. ae_path is the checkpoint the ENCODER came from (the
+        # refined file itself for stage 4/5, the stage-2 ae for stage-3), i.e.
+        # exactly what the fingerprint hashes.
+        cache_info={
+            "ae_checkpoint": str(model.get("ae_path", model["path"])),
+            "latent_channels": (model.get("ae_config") or {}).get("latent_channels"),
+        },
         # Share the trainers' latent cache (keyed on encoder fingerprint + run +
         # step list), so a repeated diagnostic re-uses its own encodings instead
         # of re-encoding all runs every invocation. Omitting this disables the
@@ -1294,8 +1312,8 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     # the causal row could be present or absent.
     rows = [("real", real_frames, None)]
     if causal is not None:
-        rows.append(("previous derivative\n(linear extrapolation)", causal, "causal"))
-    rows.append(("stage 2\n(z0 + z1 dt)", stage2, "stage2"))
+        rows.append(("previous derivative\n(no future info)", causal, "causal"))
+    rows.append(("stage 2 (z0 + z1 dt)\n(uses future info)", stage2, "stage2"))
     rows += [(a["label"], pred_a, "a"), (b["label"], pred_b, "b")]
 
     # Per-frame loss and correlation, against the SAME real frame the panel
@@ -1341,31 +1359,50 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     lo, hi = _padded_bounds(np.concatenate([f.ravel() for f in real_frames]),
                              1.0, symmetric=True)
 
+    # When there are more than 10 steps the panel gets unreadably wide, so plot
+    # every OTHER column (always keeping the first and the last frame, since the
+    # start and the final state are the two a reader most needs). At <=10 steps
+    # every column is shown.
+    if n_cols > 11:
+        col_indices = list(range(0, n_cols, 2))
+        if col_indices[-1] != n_cols - 1:
+            col_indices.append(n_cols - 1)
+    else:
+        col_indices = list(range(n_cols))
+    n_plot_cols = len(col_indices)
+
     # A little taller than 3 x 3.1: every model panel now carries a caption.
-    fig, axes = plt.subplots(len(rows), n_cols,
-                              figsize=(3.1 * n_cols, 3.4 * len(rows)),
+    fig, axes = plt.subplots(len(rows), n_plot_cols,
+                              figsize=(3.1 * n_plot_cols, 3.4 * len(rows)),
                               squeeze=False)
-    # ABSOLUTE time in the header, with the offset in brackets: "t = 650 (t0)"
-    # then "t = 750 (t0 + 100)". The bare "t + 100" gave no way to place a
-    # frame in the run without going back to the title's step numbers.
-    # metadata.dt is recovered from the data already in hand -- dt_per_step[i]
-    # is (steps[i+1] - steps[i]) * metadata.dt -- rather than re-reading the
-    # metadata file.
+    # ABSOLUTE physical time in the header, with the MULTIPLICATIVE ratio to t0
+    # in brackets: "t = 0.408 (t0)" then "t = 0.523 (t0 * 1.28)". sim_dt (physical
+    # seconds per simulation step) is recovered from dt_per_step[0] already in
+    # hand. The time is steps[col]*sim_dt directly -- NOT an accumulated offset,
+    # which for a log10_t model would wrongly add Delta-u (a log-time offset) to
+    # a physical t0. The ratio t/t0 = steps[col]/steps[0] is the log-time story
+    # in a form that reads as time, not as u.
     sim_dt = (dt_per_step[0] / (steps[1] - steps[0])
               if len(steps) > 1 and steps[1] != steps[0] else 0.0)
     t0 = steps[0] * sim_dt
-    elapsed = 0.0
-    for col in range(n_cols):
+    for plot_col, col in enumerate(col_indices):
         for row, (label, frames, metric_key) in enumerate(rows):
-            ax = axes[row, col]
+            ax = axes[row, plot_col]
             im = ax.imshow(frames[col], cmap="RdBu_r", vmin=lo, vmax=hi)
             ax.set_xticks([])
             ax.set_yticks([])
-            if col == 0:
+            if plot_col == 0:
                 ax.set_ylabel(label, fontsize=10)
             if metric_key is None:
-                offset = "t0" if col == 0 else f"t0 + {elapsed:g}"
-                head = f"t = {t0 + elapsed:g} ({offset})"
+                t_col = steps[col] * sim_dt
+                if col == 0:
+                    head = f"t = {t0:g} (t0)"
+                elif t0 > 0:
+                    head = f"t = {t_col:g} (t0 * {t_col / t0:g})"
+                else:
+                    # window starts at t=0: no multiplicative ratio -- the offset
+                    # IS the elapsed time, so show it additively.
+                    head = f"t = {t_col:g} (t0 + {t_col:g})"
                 ax.set_title(head, fontsize=9)
             else:
                 # Model rows carry their own numbers per frame, so the frame
@@ -1374,14 +1411,18 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
                 _dx = "n/a" if corr_dx is None else f"{corr_dx:.0f}%"
                 _x = "n/a" if corr_x is None else f"{corr_x:.0f}%"
                 ax.set_title(
-                    f"loss={_format_small(loss)}, corr dx={_dx}, corr x={_x}",
+                    f"loss={_format_small(loss)}, corr dx={_dx} (x: {_x})",
                     fontsize=7)
-            if col == n_cols - 1 and row == len(rows) - 1:
-                fig.colorbar(im, ax=axes[:, n_cols - 1].tolist(), fraction=0.03)
-        if col < len(dt_per_step):
-            elapsed += dt_per_step[col]
+            if plot_col == n_plot_cols - 1 and row == len(rows) - 1:
+                fig.colorbar(im, ax=axes[:, n_plot_cols - 1].tolist(), fraction=0.03)
 
-    fig.suptitle(f"{title}\n{run_dir.name}:{steps[0]}\u2192{steps[-1]}  "
+    # When columns were subsampled (>10 steps), say which are shown, so the
+    # header times aren't mistaken for consecutive steps: "steps 2, 4, ...".
+    _sub_note = ""
+    if n_plot_cols < n_cols:
+        _sub_note = (f"  (steps {col_indices[1]}, {col_indices[2]}, ... displayed)"
+                     if len(col_indices) >= 3 else "  (subsampled)")
+    fig.suptitle(f"{title}{_sub_note}\n{run_dir.name}:{steps[0]}\u2192{steps[-1]}  "
                   f"(column 0 of the model rows is the AE reconstruction of "
                   f"the start, which is where the model actually begins)",
                   fontsize=11)
@@ -1461,12 +1502,17 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
     # dt axis is dt_total (the sum over the horizon), which reaches ~n_steps
     # times higher under the geometric schedule.
     resolved_max_dt = max_dt if max_dt is not None else a.get("max_dt")
-    regime = (f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}, "
-              f"z1 {'resynced at each real frame' if z1_resync else 'not resynchronized'}, "
-              f"max_dt={resolved_max_dt:g}/transition"
-              if resolved_max_dt is not None else
-              f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}, "
-              f"z1 {'resynced at each real frame' if z1_resync else 'not resynchronized'}")
+    # The resync flag is named z1_resync historically, but it governs the
+    # DERIVATIVE regardless of source (z1 or the backward quotient), so it is
+    # described without "z1": resynced = re-derived from each real frame
+    # (teacher-forced), not resynced = propagated/frozen. Both states are worth
+    # stating. max_dt is shown only when it's a real (finite) cap, not inf.
+    _regime = [f"{n_steps_used} chained step{'s' if n_steps_used != 1 else ''}"]
+    _regime.append("derivative resynced at each real frame" if z1_resync
+                   else "derivative not resynced")
+    if resolved_max_dt is not None and math.isfinite(resolved_max_dt):
+        _regime.append(f"max_dt={resolved_max_dt:g}/transition")
+    regime = ", ".join(_regime)
     title = (f"{prefix}: {a['label']} vs. {b['label']}" if prefix
               else f"{a['label']} vs. {b['label']}")
     title = f"{title}\n{regime}"

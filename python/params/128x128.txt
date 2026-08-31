@@ -7,7 +7,8 @@ Ny			  = 128
 val_fraction  =  0.25
 
 min_step 	  = 2000       	# skip snapshots earlier than this step
-min_stdev_phi = 5e-3      	# was 1e-3; skip snapshots whose stdev_phi is below this
+# min_stdev_phi = 5e-3      	# was 1e-3; skip snapshots whose stdev_phi is below this
+min_normalized_stdev_phi = 0.02      	# was min_stdev_phi; skip snapshots whose normalized_stdev_phi (stdev_phi / sqrt(...)) is below this
 min_std_deriv = 1.e-7		# was 1.5e-4, then 1.e-6; TARGET: 1.e-8; skip time derivatives (w.r.t. t, not its log) whose stdev is below this (for: late, converged microstructures)
 min_passing_steps= 12		# any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
@@ -101,8 +102,8 @@ val_aug_averaging= True
 #   latent dynamics surrogate (1step)
 #############################################################
 
-n_rollout_steps	= 1			# always 1 for 3a
-z1_resync       = True		# always True for 3a
+n_rollout_steps	= 2			# always 1 for 3a
+z1_resync       = False		# always True for 3a
 
 # alpha			=  0.5		# adaptative sub-step (higher: more lenient); incompatible with `deriv_linear`
 # max_substeps    = 512		# default: 256
@@ -114,8 +115,9 @@ bucket_refresh_epochs=0
 dynamics_mode	= deriv_linear	# NEW
 time_coordinate = log10_t	# NEWER
 
-rollout_scale 	= 0.05e-6
+rollout_scale 	= 0.1e-6	# 0.05e-6 * n_rollout_steps
 ae_stats_weight	= 1.
+one_step_weight= 0.5 		# was implicitly 0.
 
 use_dt_decade_weights = False  # incompatible with `deriv_linear`
 
@@ -131,13 +133,14 @@ grad_clip		=    1.0		# was by default 0.
 lr 			  	=   5.e-3  # was 5.e-3, then 8 (choppier); default: 1.e-3
 z0_noise_scale	=    0.1
 
-derivative_source= previous_quotient   # (was) INERT in 3a
+derivative_source= previous_quotient
+derivative_time	= initial	# NEW
 dt_cap		  	= inf		# for second order
 max_dt        	= inf   # possible with `deriv_linear`
 # max_dt        = 100000   # 100'000/0.05 = 2'000'000 time steps (last: 13'000'000 -> 15'000'000)
 
 # force 	      	= True
-# ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260827_02h22.pt
+ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 ## resume_from   = checkpoints/stage3a/128x128-stage3a-20260829_14h39.pt
 
 
@@ -147,7 +150,7 @@ max_dt        	= inf   # possible with `deriv_linear`
 #   latent dynamics surrogate (rollout)
 #############################################################
 
-n_rollout_steps=  2			# always > 1 for 3b
+n_rollout_steps= 6			# always > 1 for 3b
 z1_resync      = False		# always False for 3b
 
 # alpha			= 0.5		# adaptative sub-step; incompatible with `deriv_linear`
@@ -162,29 +165,30 @@ memory_cost_a_bytes= 120787
 memory_cost_b_bytes= 18469
 memory_cost_p      = 0.79
 
-rollout_scale  = 1.e-4			# was 1e-6, then 0.25e-6
+rollout_scale  = 0.3e-6	# 0.05e-6 * n_rollout_steps; was 1e-6, then 0.25e-6
 ae_stats_weight= same
 one_step_weight= 0.5 		# was 0.5
 
 use_dt_decade_weights = False 	# incompatible with `deriv_linear`
 
-epochs 		  = 4000
+epochs 		  = 6000
 patience 	  =  500
 
-num_workers	  =    0
+num_workers	  =    4
 batches		  = 4096
 spike_skip_factor= same
 # grad_spike_factor = 0        # disable the gradient guard; grad_clip does the bounding
-grad_clip		= 10.		# was 1.
+grad_clip		= 1.		# was 1.
 
 dynamics_mode=deriv_linear
 time_coordinate = log10_t
 derivative_source= previous_quotient   # NEW: the q-scheme (autonomous q-rollout)
+derivative_time	= initial	# NEW
 alpha            = None                # UNSET: deriv_linear forbids sub-stepping
 n_substeps       = 1                    # full-step
 
-lr 			  =   0.5e-3  	# was 0.2e-4, then 0.2e-3; default: 1.e-3
-lr_warmup_steps= 50			# was implicitly 20
+lr 			  =   1.e-3  	# was 0.5e-3; default: 1.e-3
+lr_warmup_steps= 20			# default: 20
 
 z0_noise_scale= same
 
@@ -192,9 +196,9 @@ dt_cap		  = same		# must be
 max_dt        = inf 		# possible with `deriv_linear`
 
 
-force 	      = True
+# force 	      = True
 ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
-## resume_from = checkpoints/stage3b/128x128-stage3b-20260806_18h10.pt
+# resume_from = checkpoints/stage3b/128x128-stage3b-20260829_22h39.pt
 
 
 
@@ -207,19 +211,19 @@ rollout_weight = 1.0        # primary term for stage 4 (matches the default, but
 recon0_weight   = 0.2  # was 0.5       # small but > 0 anchor
 stats0_weight   = 0.2
 
-n_rollout_steps = same
+n_rollout_steps = 3
 # adaptative sub-step: alpha always inherited 
 
-recon0_scale    =   same 	# was 0.15e-3
-stats0_scale    =   0.1 	# 0.03
+recon0_scale    =   0.06e-3 	# was 0.15e-3, then 0.07e-3
+stats0_scale    =   0.15 	# 0.03
 
-rollout_scale   =   0.2 	# 0.2
+rollout_scale   =   0.2 	# was 0.2, then 1.e5
 rollout_weight_warmup_epochs= 10
 rollout_weight_warmup_start = 1e-2  # geometric warmup
 
 val_ema_decay   = 0.8		# was 0.7 (default)
 
-lr 			  =   2e-6  	# default: 1.e-3
+lr 			  =   0.2e-6  	# default: 1.e-3
 
 epochs 		  = 100
 patience 	  =  25 	# tends to shoot up: patience won't pay

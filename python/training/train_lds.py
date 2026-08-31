@@ -387,8 +387,10 @@ def _resume_f_theta_from_checkpoint(
                 f"it is not convertible by loading (retrain instead): "
                 + ", ".join(f"{k}={old} (checkpoint) vs {new} (requested)"
                             for k, old, new in meaning_mismatch)
-                + ". (derivative_source is intentionally exempt: z1 -> "
-                "previous_quotient is the q-reuse path.)")
+                + ". (derivative_source and derivative_time are intentionally "
+                "exempt: reusing f's weights under a different scheme -- z1 -> "
+                "previous_quotient, or previous -> initial -- is a deliberate "
+                "training path, not a mismatch.)")
         from models.encoder import zero_pad_theta_columns
         f_theta.load_state_dict(
             zero_pad_theta_columns(prev_lds["model_state"], f_theta))
@@ -556,6 +558,7 @@ def train_lds(
     z0_noise_scale: float = 0.0,
     dt_cap: float = float("inf"), n_substeps: int = 1, alpha: float | None = None,
     dynamics_mode: str = "z1_taylor", derivative_source: str = "z1",
+    derivative_time: str = "previous",
     time_coordinate: str = "t",
     max_substeps: int = 256, truncate_bptt: int | None = None,
     target_vram_gib: float | None = None,
@@ -799,6 +802,23 @@ def train_lds(
     saved_train_rollout_hist: list[float] = []
     saved_epoch_hist: list[int] = []
 
+    def _write_rollout_scatter() -> None:
+        # The L_rollout-vs-L_1step tradeoff at the SAVED checkpoints. Written
+        # here AND in the final block (below), on the same cadence as the loss
+        # curve, so a still-running or early-stopped n_rollout_steps>1 run shows
+        # it too -- it used to be final-only, so mid-run you saw the 1step/
+        # rollout curves but never this scatter. No-op until >=2 saved epochs
+        # exist (rollout_vs_1step_scatter's own guard), and only for
+        # n_rollout_steps>1 (its caller checks show_1step).
+        rollout_vs_1step_scatter(
+            saved_1step_hist, saved_rollout_hist,
+            loss_curve_path.with_name(loss_curve_path.stem.replace("-loss_curve", "")
+                                      + "-rollout_vs_1step.png"),
+            title="L_rollout vs L_1step (saved checkpoints)",
+            saved_epochs=saved_epoch_hist, n_rollout_steps=n_rollout_steps,
+            l_1step_train=saved_train_1step_hist,
+            l_rollout_train=saved_train_rollout_hist)
+
     run_dirs = complete_run_dirs(base_path, size, size)
     if not run_dirs:
         raise ValueError(f"No complete runs found under {base_path}/{size}x{size} -- "
@@ -900,6 +920,7 @@ def train_lds(
                               dt_cap=dt_cap, n_substeps=n_substeps, alpha=alpha,
                               max_substeps=max_substeps, dynamics_mode=dynamics_mode,
                               derivative_source=derivative_source,
+                              derivative_time=derivative_time,
                               time_coordinate=time_coordinate,
                               truncate_bptt=truncate_bptt).to(device)
 
@@ -1605,6 +1626,8 @@ def train_lds(
                 secondary_label="1step", reference_levels=_ref_levels(),
             )
             write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
+            if show_1step:
+                _write_rollout_scatter()
 
         # SKIPPED BATCHES ARE NEVER SILENT. A guard that quietly drops data
         # would be worse than the crash it prevents: the run would look
@@ -1669,6 +1692,7 @@ def train_lds(
                     "alpha": alpha,
                     "dynamics_mode": dynamics_mode,
                     "derivative_source": derivative_source,
+                    "derivative_time": derivative_time,
                     "time_coordinate": time_coordinate,
                     # Recorded for provenance only. Deliberately NOT in
                     # _MEANING_FIELDS: truncation changes how the gradient was
@@ -1791,18 +1815,13 @@ def train_lds(
     )
     write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
 
-    # Stage-3b only (show_1step): the L_rollout-vs-L_1step tradeoff at the
-    # SAVED checkpoints, log-log square. Skipped for 3a (n_rollout_steps=1,
-    # where the two are identical) and for runs with <2 saved epochs.
+    # The L_rollout-vs-L_1step tradeoff at the SAVED checkpoints, log-log
+    # square. Same call written periodically above; repeated here so the FINAL
+    # state is always current even between periodic writes. Skipped for 3a
+    # (n_rollout_steps=1, where the two are identical) and for runs with <2
+    # saved epochs (the scatter's own guard).
     if show_1step:
-        rollout_vs_1step_scatter(
-            saved_1step_hist, saved_rollout_hist,
-            loss_curve_path.with_name(loss_curve_path.stem.replace("-loss_curve", "")
-                                      + "-rollout_vs_1step.png"),
-            title="Stage 3b: L_rollout vs L_1step (saved checkpoints)",
-            saved_epochs=saved_epoch_hist,
-            l_1step_train=saved_train_1step_hist,
-            l_rollout_train=saved_train_rollout_hist)
+        _write_rollout_scatter()
 
     if not checkpoint_path.exists():
         # A run that never saved is a FAILED run, and it must say so HERE.

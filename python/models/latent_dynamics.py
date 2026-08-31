@@ -45,6 +45,17 @@ _MEANING_FIELDS = {
                                    # the model's OWN trajectory -- the q-scheme,
                                    # Step B). Changes what rollout computes with
                                    # the SAME weights, so it round-trips too.
+    "derivative_time": "previous", # WHEN the derivative fed to forward() is
+                                   # evaluated, in the AUTONOMOUS rollout: "previous"
+                                   # (recomputed each step from the state at the
+                                   # prior step -- live quotient for the q-scheme,
+                                   # teacher-forced z1 under z1_resync) or "initial"
+                                   # (FROZEN at the seed value z1_sequence[:,0] for
+                                   # every step; f then corrects that anchor's
+                                   # growing staleness, with NO feedback). Changes
+                                   # what rollout computes with the SAME weights,
+                                   # so it round-trips; absent (old checkpoints)
+                                   # => "previous", the historical behaviour.
     "time_coordinate": "t",        # the TIME VARIABLE the derivative and step
                                    # size are expressed in: "t" (physical time,
                                    # h = dt, D = dz0/dt -- historical) or
@@ -180,6 +191,7 @@ class LatentDynamics(nn.Module):
                  max_substeps: int = 256, truncate_bptt: int | None = None,
                  dynamics_mode: str = "z1_taylor",
                  derivative_source: str = "z1",
+                 derivative_time: str = "previous",
                  time_coordinate: str = "t"):
         super().__init__()
         self.latent_channels = latent_channels
@@ -270,6 +282,11 @@ class LatentDynamics(nn.Module):
                 "defined for dynamics_mode='deriv_linear'; z1_taylor propagates z1 "
                 f"by its own update, got dynamics_mode={dynamics_mode!r}.")
         self.derivative_source = derivative_source
+        if derivative_time not in ("previous", "initial"):
+            raise ValueError(
+                f"derivative_time must be 'previous' or 'initial', got "
+                f"{derivative_time!r}")
+        self.derivative_time = derivative_time
         if time_coordinate not in ("t", "log10_t"):
             raise ValueError(
                 f"time_coordinate must be 't' or 'log10_t', got {time_coordinate!r}")
@@ -903,6 +920,27 @@ class LatentDynamics(nn.Module):
         n_steps = dts.shape[1]
         z0_hats = [z0]
         z0_cur = z0
+
+        if not z1_resync and self.derivative_time == "initial" and n_steps >= 1:
+            # FROZEN-ANCHOR rollout (derivative_time='initial'). The derivative
+            # fed to f is held at its seed value z1_sequence[:, 0] for EVERY
+            # step, never recomputed. That seed is whatever the dataset put in
+            # the derivative channel: the encoder's z1(t_0) under
+            # derivative_source='z1' (option 1), or the REAL backward quotient
+            # q_0=(z0_0 - z0_{-1})/du from the predecessor frame under
+            # 'previous_quotient' (option 3 -- the best-anchored, feedback-free
+            # scheme). f's job is to correct the anchor's GROWING staleness as
+            # the true derivative drifts away from the frozen one; unlike the
+            # 'previous' quotient branch below, the model's own predictions
+            # never re-enter the derivative channel, so there is no
+            # 1/du-amplified feedback loop. Works for BOTH sources precisely
+            # because forward()'s f is indifferent to whether its derivative
+            # argument holds z1 or q -- the seed's meaning is fixed upstream.
+            deriv = z1_sequence[:, 0]
+            for i in range(n_steps):
+                z0_cur = self.forward(z0_cur, deriv, dts[:, i], theta)
+                z0_hats.append(z0_cur)
+            return torch.stack(z0_hats, dim=1)
 
         if (self.dynamics_mode == "deriv_linear"
                 and self.derivative_source == "previous_quotient"

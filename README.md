@@ -45,7 +45,6 @@ The underlying hypothesis is two-fold. Phase-field evolution occurs on a smooth 
 
 For phase-field systems, the latent variables are expected to behave similarly to coordinates on a reduced thermodynamic manifold, dynamics should approximate gradient flow.
 
-See [./docs/neural_nets.md](docs/neural_nets.md) for the full derivation, including the Taylor expansions.
 
 
 ## Process
