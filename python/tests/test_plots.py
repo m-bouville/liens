@@ -288,7 +288,11 @@ def test_the_switch_records_an_event_between_the_two_epochs():
     assert "event_epochs=loss_curve_events" in src
 
     src45 = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert 'loss_curve_events.append((epoch - 0.5, "rollout ramp complete"))' in src45
+    # The label is built from which ramp(s) actually completed at this epoch
+    # (rollout and/or recon_predict), not the old hardcoded "rollout ramp
+    # complete" -- a recon_predict-only warmup was mislabelled as rollout.
+    assert 'loss_curve_events.append((epoch - 0.5, f"{_ramp_names} ramp complete"))' in src45
+    assert '"ramp complete"' not in src45, "the label must not be hardcoded to one ramp"
     assert "event_epochs=loss_curve_events" in src45
 
 

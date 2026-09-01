@@ -34,15 +34,29 @@ from utils.plots import loss_component_scatter, loss_curve, write_loss_history, 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
 
 
-def linear_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int,
-                          start_fraction: float) -> float:
-    """`full_weight` ramped LINEARLY from start_fraction to 1 over warmup_epochs.
+def linear_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int) -> float:
+    """`full_weight` ramped LINEARLY as epoch/warmup_epochs over the warmup.
 
     A module-level function rather than an expression inline in the epoch
     loop, so a test can exercise the ACTUAL formula. An inline version forced
     the test to re-implement it, and an off-by-one mutation in the production
     copy then left every endpoint assertion green -- the test was checking its
     own arithmetic.
+
+    epoch/warmup_epochs, NOT (epoch-1)/(warmup_epochs-1). The latter pinned
+    epoch 1 to exactly zero -- a wasted first epoch where the warmed-in term
+    did nothing at all -- and only reached full at epoch warmup_epochs by
+    spending one of its levels on zero. epoch/warmup_epochs starts the
+    introduction immediately at 1/warmup_epochs (20% for a 5-epoch warmup) and
+    still reaches full AT epoch warmup_epochs, so the grace-on-completion timing
+    (epoch == max(1, warmup_epochs)) is unchanged. This is ALSO the convention
+    stage 2's deriv_weight warmup already uses (deriv_weight * min(1, epoch/N)),
+    so warmup_epochs=N now means the same ramp in every trainer.
+
+    No start_fraction: it was a holdover from the geometric era (a multiplicative
+    ramp cannot start at 0), and with two independent warmups in stage 4 plus one
+    in stage 5 the knob proliferated meaninglessly. epoch/warmup_epochs needs no
+    floor -- it starts at a real 1/warmup_epochs.
 
     Linear, not geometric. This USED to be geometric, on the argument that
     L_rollout collapsed ~6e9 over the first ten epochs (1.76e9 -> 0.29,
@@ -55,19 +69,18 @@ def linear_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int,
     term, and the same function serves any warmed-in weight (rollout,
     recon_predict) rather than encoding one term's obsolete transient.
 
-    epoch is 1-based: epoch 1 gives exactly start_fraction*full_weight, epoch
+    epoch is 1-based: epoch 1 gives full_weight/warmup_epochs, epoch
     warmup_epochs and beyond give exactly full_weight.
     """
     if warmup_epochs <= 0 or epoch >= warmup_epochs:
         return full_weight
-    frac = (epoch - 1) / max(1, warmup_epochs - 1)
-    return full_weight * (start_fraction + (1.0 - start_fraction) * frac)
+    return full_weight * (epoch / warmup_epochs)
 
 
 _REFINEMENT_PREAMBLE_PARAMS = (
     # See _LDS_PREAMBLE_PARAMS for why these are excluded rather than repeated.
-    "freeze_decoder", "size", "rollout_weight_warmup_epochs", "rollout_weight_warmup_start",
-    "recon_predict_weight_warmup_epochs", "recon_predict_weight_warmup_start",
+    "freeze_decoder", "size", "rollout_weight_warmup_epochs",
+    "recon_predict_weight_warmup_epochs",
     "max_dt", "rollout_weight", "recon0_weight", "stats0_weight", "recon_predict_weight",
     "rollout_scale", "recon0_scale", "stats0_scale", "recon_predict_scale",
     "epochs", "batch_size", "n_rollout_steps",
@@ -78,9 +91,7 @@ _REFINEMENT_PREAMBLE_PARAMS = (
 def train_refinement(
     base_path: Path, freeze_decoder: bool, size: int | None = None,
     rollout_weight_warmup_epochs: int = 0,
-    rollout_weight_warmup_start: float = 1e-6,
     recon_predict_weight_warmup_epochs: int = 0,
-    recon_predict_weight_warmup_start: float = 1e-6,
     max_dt: float | None = None, min_passing_steps: int | None = None,
     ae_checkpoint_path: Path | None = None, lds_checkpoint_path: Path | None = None,
     resume_from: Path | None = None,
@@ -192,8 +203,9 @@ def train_refinement(
     print(f"size={size}, latent_channels={components['encoder'].config['latent_channels']}, "
           f"freeze_decoder={freeze_decoder}")
     if rollout_weight_warmup_epochs > 0:
-        print(f"rollout_weight ramped LINEARLY from {rollout_weight_warmup_start:g}x to 1x "
-              f"over {rollout_weight_warmup_epochs} epoch(s). This was geometric while L_rollout "
+        print(f"rollout_weight ramped LINEARLY as epoch/warmup over "
+              f"{rollout_weight_warmup_epochs} epoch(s) (1/{rollout_weight_warmup_epochs} at "
+              f"epoch 1, full at epoch {rollout_weight_warmup_epochs}). This was geometric while L_rollout "
               f"collapsed ~6e9 over the first epochs (a linear ramp then left epoch 1 eight "
               f"decades hot); require_consecutive removed the large-dt windows that caused that "
               f"collapse, so L_rollout is O(1-10) from epoch 1 and a plain linear introduction "
@@ -203,9 +215,9 @@ def train_refinement(
               f"recon0/stats0 can anchor it. VAL is never ramped, so val_loss stays comparable "
               f"across epochs and against runs without a warmup.")
     if recon_predict_weight_warmup_epochs > 0:
-        print(f"recon_predict_weight ramped LINEARLY from "
-              f"{recon_predict_weight_warmup_start:g}x to 1x over "
-              f"{recon_predict_weight_warmup_epochs} epoch(s). recon_predict decodes the "
+        print(f"recon_predict_weight ramped LINEARLY as epoch/warmup over "
+              f"{recon_predict_weight_warmup_epochs} epoch(s) (1/{recon_predict_weight_warmup_epochs} "
+              f"at epoch 1, full at epoch {recon_predict_weight_warmup_epochs}). recon_predict decodes the "
               f"rolled-out endpoint and backprops a full-weight pixel loss through the rollout "
               f"into a decoder that (resuming from stage 4) only ever saw frame-0 latents; the "
               f"ramp lets the decoder settle on frame-0 reconstruction before being pulled "
@@ -490,10 +502,18 @@ def train_refinement(
 
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
+    # recon_predict is a stage-5 term; a stage-4 run leaves its weight 0, so
+    # drop the dead "+0.0*recon_predict/..." from the header and every loss line
+    # rather than carry a column that is always +0.0000. The conditional is
+    # INLINE in the print call (not hoisted to a variable): the preamble
+    # invariant (test_run_parameter_logging) walks print() calls for parameter
+    # names, and hoisting moved recon_predict_scale out of every print.
     print(f"/{epochs:3d} train = {rollout_weight}*rollout/{rollout_scale} "
           f"+{recon0_weight}*recon0/{recon0_scale} "
-          f"+{stats0_weight}*stats0/{stats0_scale} "
-          f"+{recon_predict_weight}*recon_predict/{recon_predict_scale} | valid = ...  | ema")
+          f"+{stats0_weight}*stats0/{stats0_scale}"
+          + (f" +{recon_predict_weight}*recon_predict/{recon_predict_scale}"
+             if recon_predict_weight != 0.0 else "")
+          + " | valid = ...  | ema")
 
     spike_guard = _SpikeGuard(spike_skip_factor)
     # Separate history: gradient norms and losses live on different scales.
@@ -555,14 +575,14 @@ def train_refinement(
         # converged contribution, so it barely softens the transient it exists
         # to absorb.
         #
-        # Linear from rollout_weight_warmup_start to 1 over the window
+        # Linear epoch/warmup_epochs over the window (starts at 1/N, not 0)
         # tracks the collapse instead: 1e-6 * 1.76e9 = 1.8e3 at epoch 1, then
         # ~0.34 at epochs 2 and 5, then 0.29 at epoch 10. The CONTRIBUTION is
         # roughly flat across the ramp, which is the actual goal -- a constant
         # gradient scale while the encoder settles, rather than a constant
         # weight applied to a wildly varying loss.
         effective_rollout_weight = linear_warmup_weight(
-            epoch, rollout_weight, rollout_weight_warmup_epochs, rollout_weight_warmup_start)
+            epoch, rollout_weight, rollout_weight_warmup_epochs)
         # Same linear ramp for recon_predict: it backprops a full-weight pixel
         # loss through the rollout into a decoder that (resuming from stage 4)
         # only ever saw frame-0 latents, so it warms in to let the decoder
@@ -570,8 +590,7 @@ def train_refinement(
         # the drifted endpoint. Default off (0 warmup epochs) -> full weight
         # from epoch 1, the weights as specified.
         effective_recon_predict_weight = linear_warmup_weight(
-            epoch, recon_predict_weight, recon_predict_weight_warmup_epochs,
-            recon_predict_weight_warmup_start)
+            epoch, recon_predict_weight, recon_predict_weight_warmup_epochs)
 
         # THE END OF THE RAMP RESETS THE SAVE CRITERION.
         #
@@ -604,15 +623,25 @@ def train_refinement(
             # window.
             grace = grace_epochs_for_ema(val_ema_decay)
             grace = clamp_grace_epochs(grace, epochs - epoch + 1)
+            # Which ramp(s) actually complete at THIS epoch (== max of the two
+            # warmups): the grace fires when the LAST one finishes, but the
+            # label must name the one that did, not always "rollout" -- a
+            # recon_predict-only warmup completing was mislabelled "rollout".
+            _done = [n for n, w in (("rollout_weight", rollout_weight_warmup_epochs),
+                                    ("recon_predict_weight", recon_predict_weight_warmup_epochs))
+                     if w == epoch]
+            _which = " and ".join(_done)
+            _verb = "have" if len(_done) > 1 else "has"
             if grace > 0:
-                print(f"  [epoch {epoch}: rollout_weight has reached full strength -- giving "
+                print(f"  [epoch {epoch}: {_which} {_verb} reached full strength -- giving "
                       f"the tracker a {grace}-epoch grace period before comparing again, since "
                       f"val_loss recorded DURING the ramp described a model trained on a "
                       f"different objective and is not a fair bar for the full one to clear]")
             # Same marking as stage 2's target switch: the criterion reset
             # makes "best EMA so far" jump discontinuously, and the ramp
             # completing changes what the TRAIN column measures.
-            loss_curve_events.append((epoch - 0.5, "rollout ramp complete"))
+            _ramp_names = " + ".join(n.replace("_weight", "") for n in _done)
+            loss_curve_events.append((epoch - 0.5, f"{_ramp_names} ramp complete"))
             tracker.reset_with_grace(grace)
 
         train_loss_sum = torch.zeros((), device=device)
@@ -766,15 +795,24 @@ def train_refinement(
                # beside them and the discrepancy reads as a bug.
                f"{train_loss:7.4f} ={effective_rollout_weight*train_rollout/rollout_scale:7.4f} "
                f"+{recon0_weight*train_recon0/recon0_scale:7.4f} "
-               f"+{stats0_weight*train_stats0/stats0_scale:7.4f} "
-               f"+{effective_recon_predict_weight*train_recon_predict/recon_predict_scale:7.4f} |"
+               f"+{stats0_weight*train_stats0/stats0_scale:7.4f}"
+               + (f" +{effective_recon_predict_weight*train_recon_predict/recon_predict_scale:7.4f}"
+                  if recon_predict_weight != 0.0 else "")
+               + f" |"
                f"{val_loss:7.4f} ={rollout_weight*val_rollout/rollout_scale:7.4f} "
                f"+{recon0_weight*val_recon0/recon0_scale:7.4f} "
-               f"+{stats0_weight*val_stats0/stats0_scale:7.4f} "
-               f"+{recon_predict_weight*val_recon_predict/recon_predict_scale:7.4f} |"
+               f"+{stats0_weight*val_stats0/stats0_scale:7.4f}"
+               + (f" +{recon_predict_weight*val_recon_predict/recon_predict_scale:7.4f}"
+                  if recon_predict_weight != 0.0 else "")
+               + f" |"
                f"{ema_str:>10}"
-               + (f"  [rollout_weight {effective_rollout_weight:.3g}/{rollout_weight:g}]"
-                  if effective_rollout_weight < rollout_weight else ""))
+               + "".join(
+                   f"  [{name} {eff:.3g}/{full:g}]"
+                   for name, eff, full in (
+                       ("rollout_weight", effective_rollout_weight, rollout_weight),
+                       ("recon_predict_weight", effective_recon_predict_weight,
+                        recon_predict_weight))
+                   if eff < full))
 
         # AFTER the ramp, not at epoch 1. During a warmup the imbalance is
         # deliberate -- the whole point is that rollout contributes almost
@@ -895,6 +933,13 @@ def train_refinement(
                 "stage45_config": {
                     "freeze_decoder": freeze_decoder, "rollout_weight": rollout_weight,
                     "recon0_weight": recon0_weight, "stats0_weight": stats0_weight,
+                    # recon_predict is the term that DEFINES a stage-5 objective
+                    # (weight 1, leading); a checkpoint that omits it reads as a
+                    # stage-4 config. Scales recorded too: the weighted objective
+                    # is weight*raw/scale, so the weights alone do not reproduce it.
+                    "recon_predict_weight": recon_predict_weight,
+                    "rollout_scale": rollout_scale, "recon0_scale": recon0_scale,
+                    "stats0_scale": stats0_scale, "recon_predict_scale": recon_predict_scale,
                     "n_rollout_steps": n_rollout_steps,
                 },
             }, checkpoint_path)

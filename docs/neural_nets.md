@@ -111,7 +111,7 @@ Interpolation loss, $L_\mathrm{interp}$, is no longer used in loss function.
 | 2 | derivative ($z_1$) |E*, D*| SH | f | both | 3 | `L_recon0 + λ L_stats0 + λ₁ L_deriv` |
 | 3a| LDS               | f       | E, SH | D | latent| 2    | `L_1step + λ₁ L_deriv`           |
 | 3b| LDS               | f       | E, SH | D | latent| $n+1$  | `L_rollout + ε L_1step + λ₁ L_deriv` |
-| 4 | encoder refinement| E, f  | D, SH|  | latent†|$n+1$|`L_rollout + ε L_stats0 + ε₁ L_recon0` |
+| 4 | encoder refinement| E, f  | D, SH|  | latent†|$n+1$|`L_rollout + ε L_stats0 + ε₁ L_recon0 + ε₂ L_recon_predict` |
 | 5 | end-to-end        | E, f, D | SH  |      | real  | $n+1$ | `L_recon_predict + ε L_recon0 + ε₁ L_stats0 + ε₂ L_rollout` |
 
 Notes:
@@ -320,11 +320,11 @@ Every sub-step of the latent integrator advances the state by a linear term and 
 
 
 ## Stages 4 and 5: encoder refinement and end-to-end
-In stage 1 the autoencoder was trained for reconstruction and stats-accuracy of the state. Stage 2 focus on the relationship between $z_1$ and $z_0$ in latent space. Stage 3 trained `f` to predict dynamics, with E and D frozen. 
+In stage 1 the autoencoder was trained for reconstruction and stats-accuracy of the state. Stage 2 focus on the relationship between $z_1$ and $z_0$ in latent space. Stage 3 trained `f` to predict dynamics, with E and D frozen. Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). (Since the encoder is no longer frozen, the latent representation of each sample cannot be cached, unlike in stage 3.)
 
-Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). D is frozen (even though `L_recon0` is in the loss function), this is one difference between stages 4 and 5. D is a tether keeping E's output compatible with the existing decoder. (Since the encoder is no longer frozen, the latent representation of each sample cannot be cached, unlike in stage 3.)
-
-Stage 5 focuses on `L_recon_predict`, the reconstruction at $t_0 + n \Delta t$. `L_recon0` and `L_stats0` (both applied to time $t_0$) and `L_rollout` (in latent space) are maintained, but with a lower weight. 
+Stages 4 and 5 are similar in structure, but:
+- D is frozen in stage 4 (even though `L_recon0` is in the loss function).
+- Stage 5 focuses on `L_recon_predict`, the reconstruction at $t_0 + n \Delta t$; `L_recon0` and `L_stats0` (both applied to time $t_0$) and `L_rollout` (in latent space) are maintained, but with a lower weight. Stage 4 handles E and $f_\theta$ separately, with a small weight to `L_recon_predict` to reduce the risk of drift.
 
 
 

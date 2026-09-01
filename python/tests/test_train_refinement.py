@@ -195,6 +195,67 @@ def test_train_refinement_stage5_trainable_decoder(tmp_path, isolated_project_ro
     assert saved["stage45_config"]["freeze_decoder"] is False
 
 
+def test_stage5_recon_predict_threads_through_and_is_recorded(tmp_path, isolated_project_root):
+    """End-to-end guard for the stage-5 recon_predict term. The loss math is
+    covered in test_refinement_loss and the ramp math in
+    test_stage45_regime_and_scales, but nothing checked that
+    train_refinement(recon_predict_weight=..., recon_predict_weight_warmup_epochs=...)
+    actually wires those through -- the 5-tuple step return, the component
+    histories, and the SAVED provenance. A revert of the threading or of the
+    stage45_config additions would otherwise pass every test."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_checkpoint_path = tmp_path / "fake-stage2.pt"
+    lds_checkpoint_path = tmp_path / "fake-stage3.pt"
+    _build_ae_checkpoint(ae_checkpoint_path, include_stats_head=True)
+    _build_lds_checkpoint(lds_checkpoint_path)
+
+    checkpoint_path = tmp_path / "stage5_rp.pt"
+    train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
+        lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=False,
+        rollout_weight=0.2, recon0_weight=0.2, stats0_weight=0.05,
+        recon_predict_weight=1.0, recon_predict_scale=0.05,
+        recon_predict_weight_warmup_epochs=2,
+        rollout_scale=0.15, recon0_scale=5e-4, stats0_scale=0.15,
+        epochs=2, batch_size=4, n_rollout_steps=2,
+        min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+        checkpoint_path=checkpoint_path, device="cpu",
+    )
+
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    cfg = saved["stage45_config"]
+    # provenance: the term that DEFINES a stage-5 objective, and every scale
+    # (weight*raw/scale is not reproducible from weights alone) must be recorded.
+    assert cfg["recon_predict_weight"] == 1.0
+    for k in ("rollout_scale", "recon0_scale", "stats0_scale", "recon_predict_scale"):
+        assert k in cfg, f"stage45_config must record {k} to reproduce the objective"
+    assert cfg["recon_predict_scale"] == 0.05
+
+
+def test_stage4_omits_recon_predict_from_the_saved_config_value_but_records_the_key(
+        tmp_path, isolated_project_root):
+    """A stage-4 run (recon_predict_weight defaults to 0) still RECORDS the key,
+    so a reader can tell "recon_predict was off" apart from "this checkpoint
+    predates the field". The value is 0.0, not absent."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_checkpoint_path = tmp_path / "fake-stage2.pt"
+    lds_checkpoint_path = tmp_path / "fake-stage3.pt"
+    _build_ae_checkpoint(ae_checkpoint_path, include_stats_head=True)
+    _build_lds_checkpoint(lds_checkpoint_path)
+
+    checkpoint_path = tmp_path / "stage4_out.pt"
+    train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
+        lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=True,
+        rollout_weight=1.0, recon0_weight=0.2, stats0_weight=0.05,
+        epochs=1, batch_size=4, n_rollout_steps=2,
+        min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+        checkpoint_path=checkpoint_path, device="cpu",
+    )
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert saved["stage45_config"]["recon_predict_weight"] == 0.0
+
+
 @pytest.mark.slow
 def test_train_refinement_without_ancestor_stats_head_warns_and_skips(tmp_path, capsys, isolated_project_root):
     """If the ancestor AE has no stats_head at all, asking for

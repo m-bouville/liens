@@ -160,15 +160,18 @@ def test_the_ramp_is_LINEAR_not_geometric():
     right ramp, and the same helper serves recon_predict.
     """
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "start_fraction + (1.0 - start_fraction) * frac" in src, (
-        "the ramp must be linear"
+    assert "full_weight * (epoch / warmup_epochs)" in src, (
+        "the ramp must be linear as epoch/warmup_epochs"
     )
     assert "start_fraction ** (1.0 - frac)" not in src, "the geometric ramp is back"
+    assert "(epoch - 1) / max(1, warmup_epochs - 1)" not in src, (
+        "the (epoch-1)/(N-1) form wasted epoch 1 at zero -- replaced by epoch/N"
+    )
     assert "warmup_epochs <= 0" in src
     assert _ramp(1, 0) == 1.0 and _ramp(99, 0) == 1.0
 
 
-def _ramp(epoch, warmup_epochs, start=1e-6, weight=1.0):
+def _ramp(epoch, warmup_epochs, weight=1.0):
     """The PRODUCTION formula, imported -- not a re-implementation.
 
     An earlier version of this file reimplemented it, so an off-by-one
@@ -177,37 +180,40 @@ def _ramp(epoch, warmup_epochs, start=1e-6, weight=1.0):
     module-level function rather than an expression inline in the epoch loop.
     """
     from training.train_refinement import linear_warmup_weight
-    return linear_warmup_weight(epoch, weight, warmup_epochs, start)
+    return linear_warmup_weight(epoch, weight, warmup_epochs)
 
 
 def test_the_ramp_endpoints_are_exact():
-    """Epoch 1 must be the start value and the last warmup epoch exactly the
-    full weight -- an off-by-one here either skips the protection entirely or
-    never reaches full strength."""
-    assert _ramp(1, 10) == pytest.approx(1e-6)
+    """Epoch 1 is 1/warmup_epochs (the introduction starts immediately, not at
+    zero), and the last warmup epoch is exactly full weight. An off-by-one here
+    either wastes epoch 1 at zero or never reaches full strength."""
+    assert _ramp(1, 10) == pytest.approx(0.1)
     assert _ramp(10, 10) == 1.0
     assert _ramp(11, 10) == 1.0
     assert _ramp(1, 0) == 1.0, "warmup disabled must be an exact no-op at every epoch"
 
 
 def test_the_ramp_is_linear_in_the_WEIGHT():
-    """Linear now: the midpoint epoch is exactly half-way in WEIGHT (a geometric
-    ramp would be the geometric mean, ~0.001 for a 1e-6 start), and equal epoch
-    spacings give equal weight increments."""
-    # start_fraction 0 makes the midpoint check clean: epoch 6 of an 11-epoch
-    # ramp (frac=0.5) must be 0.5, not sqrt(anything).
-    assert _ramp(6, 11, start=0.0) == pytest.approx(0.5)
+    """epoch/warmup_epochs: epoch k of an N-epoch ramp is exactly k/N (a
+    geometric ramp would be the geometric mean), and equal epoch spacings give
+    equal weight increments."""
+    assert _ramp(5, 10) == pytest.approx(0.5)   # 5/10
+    assert _ramp(2, 5) == pytest.approx(0.4)    # the user-expected 0.2,0.4,...
     # equal steps -> equal increments (the signature of linear)
-    d1 = _ramp(4, 11, start=0.0) - _ramp(3, 11, start=0.0)
-    d2 = _ramp(8, 11, start=0.0) - _ramp(7, 11, start=0.0)
+    d1 = _ramp(4, 11) - _ramp(3, 11)
+    d2 = _ramp(8, 11) - _ramp(7, 11)
     assert d1 == pytest.approx(d2), "linear ramp must have constant slope"
 
 
-def test_the_start_value_is_configurable():
+def test_start_fraction_is_gone():
+    """start_fraction was a geometric-era holdover (a multiplicative ramp cannot
+    start at 0); epoch/warmup_epochs starts at a real 1/N and needs no floor, so
+    the knob -- which proliferated across stage 4's two warmups and stage 5's one
+    -- was removed."""
     from training.train_refinement import train_refinement
     params = inspect.signature(train_refinement).parameters
-    assert "rollout_weight_warmup_start" in params
-    assert params["rollout_weight_warmup_start"].default == 1e-6
+    assert "rollout_weight_warmup_start" not in params
+    assert "recon_predict_weight_warmup_start" not in params
 
 
 def test_only_the_TRAIN_step_is_ramped():

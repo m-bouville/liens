@@ -37,7 +37,8 @@ from training.datasets import VAL_DECORRELATED_AUG_INDICES, MicrostructureEvolut
 from training.losses import (ReconLoss, StatsLoss, InterpLoss, centered_deriv_target,
                               dt_weighted_deriv_loss)
 from training.stats_head import StatsHead
-from training.spike_guard import _SpikeGuard, _record_spike, difficulty_band
+from training.spike_guard import (_SpikeGuard, _record_spike, difficulty_band,
+                                   snapshot_running_stats, restore_running_stats)
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
 from utils.plots import loss_component_scatter, loss_curve, write_loss_history, should_write_loss_figure
@@ -935,16 +936,13 @@ def train_stage2(
     # default (factor 0.0 -> no guard), matching prior stage-2 behavior; a
     # trunk-moving run should set it (10.0 is train_lds's default).
     #
-    # CAVEAT specific to stage 2 (not present in the stage-3 caller): when the
-    # trunk trains (2b), its BatchNorm running buffers ADVANCE on a skipped
-    # batch, because the forward pass has already run by the time the loss --
-    # the skip signal -- is known (see spike_guard.snapshot_running_stats' own
-    # docstring). No optimizer STEP is taken, but the buffers drift by one
-    # batch's momentum. For occasional spikes (1-2 batches/epoch, the design
-    # case) this is second-order versus the spike it prevents. If skipping
-    # becomes frequent it compounds -- and frequent skipping itself signals lr
-    # too high; lower lr rather than relying on the guard as a crutch. (Stage 3
-    # is immune: its encoder is frozen and LatentDynamics has no BatchNorm.)
+    # Stage-2-specific note: in 2b the trunk's BatchNorm running buffers would
+    # ADVANCE on a skipped batch (the forward runs before the loss -- the skip
+    # signal -- is known), since no optimizer STEP is taken but the buffers
+    # drift by one batch's momentum. step() now snapshots those buffers before
+    # the forward and restores them when a batch is skipped, so a skip leaves
+    # the model bit-identical (matching train_refinement). (Stage 3 never needed
+    # this: its encoder is frozen and LatentDynamics has no BatchNorm.)
     spike_guard = _SpikeGuard(spike_skip_factor) if spike_skip_factor > 0 else None
 
     def step(batch, train: bool, deriv_weight_used: float, use_centered: bool = False):
@@ -953,6 +951,14 @@ def train_stage2(
         dt_window = dt_window.to(device, non_blocking=True)
         theta = theta.to(device, non_blocking=True)
         true_stats = true_stats.to(device, non_blocking=True)
+
+        # Snapshot BN running buffers BEFORE the forward: in 2b the trunk
+        # trains, and its BatchNorm running_mean/var ADVANCE during the forward
+        # pass, which happens below before the loss (the skip signal) is known.
+        # A skipped batch must leave the model exactly as it found it -- restore
+        # below. Only when training (val runs under no_grad in eval mode, buffers
+        # frozen). Mirrors train_refinement's identical guard.
+        _bn_snapshot = snapshot_running_stats(ae) if train else None
 
         if deriv_target_centered and use_centered:
             # window_length=3: (t-dt_minus, t, t+dt_plus). z1 -- and
@@ -1158,6 +1164,7 @@ def train_stage2(
                 if spike_guard.should_skip(float(total.detach()), band=_band):
                     _record_spike(spike_guard, total, dt_window, theta)
                     optimizer.zero_grad()
+                    restore_running_stats(_bn_snapshot)   # undo the forward's BN drift
                     return (total.detach(), recon.detach(),
                             stats_loss_val.detach(), stats1_loss_val.detach(),
                             deriv_loss.detach(), interp.detach())
@@ -1619,6 +1626,59 @@ def train_stage2(
         val_stats1 = (val_stats1_sum / n_val).item()
         val_deriv = (val_deriv_sum / n_val).item()
         val_interp = (val_interp_sum / n_val).item()
+
+        # Scale-balance check, ported from train_refinement. Fires ONCE, at the
+        # first FULL-weight epoch (max(1, deriv_weight_warmup_epochs)) -- after
+        # deriv's ramp, so it reads the converged balance, not the transient.
+        # Uses the FULL weights (not the ramped effective ones): val is never
+        # ramped, and the question is whether the *_scale values put each term
+        # where its weight says it should be. recon0 is the implicit-weight-1
+        # anchor; stats0/stats1/interp default to weight 0 and are excluded from
+        # "starved" by the nonzero-weight guard, so a term the user deliberately
+        # left off is never flagged. The valuable case for stage 2 is the mirror
+        # of stage 4's: L_deriv (the term 2b exists to add) scaled out of an
+        # objective that stays ~100% recon0.
+        if epoch == max(1, deriv_weight_warmup_epochs):
+            contributions = {
+                "recon0": val_recon / recon0_scale,
+                "stats0": stats0_weight * val_stats / stats0_scale,
+                "stats1": stats1_weight * val_stats1 / stats1_scale,
+                "deriv": deriv_weight * val_deriv / deriv_scale,
+                "interp": interp_weight * val_interp / interp_scale,
+            }
+            _total = sum(abs(v) for v in contributions.values())
+            _raw = {"recon0": val_recon, "stats0": val_stats, "stats1": val_stats1,
+                    "deriv": val_deriv, "interp": val_interp}
+            _wts = {"recon0": 1.0, "stats0": stats0_weight, "stats1": stats1_weight,
+                    "deriv": deriv_weight, "interp": interp_weight}
+            _scl = {"recon0": recon0_scale, "stats0": stats0_scale, "stats1": stats1_scale,
+                    "deriv": deriv_scale, "interp": interp_scale}
+            if _total > 0:
+                _shares = {k: abs(v) / _total for k, v in contributions.items()}
+                _raw_str = ", ".join(f"{k}={_raw[k]:.3e}" for k in _shares)
+                _suggest = ", ".join(
+                    f"{k}_scale~{_raw[k]:.3g}" for k in _shares if _raw[k] > 0)
+                _dominant = [k for k, sh in _shares.items() if sh > 0.99]
+                _starved = [k for k, sh in _shares.items()
+                            if sh < 0.01 and _wts.get(k, 0.0) != 0.0]
+                if _dominant:
+                    k = _dominant[0]
+                    _others = ", ".join(f"{n} {100 * _shares[n]:.4f}%"
+                                        for n in _shares if n != k)
+                    print(f"\n  WARNING: '{k}' is {100 * _shares[k]:.4f}% of the validation "
+                          f"loss ({_others}). The *_scale values are calibrated for a "
+                          f"different stage -- each scale should be the RAW magnitude of its "
+                          f"own component here, so the weights beside them mean what they say. "
+                          f"Raw values this epoch: {_raw_str}. Suggested: {_suggest}\n")
+                elif _starved:
+                    _detail = ", ".join(
+                        f"'{k}' {100 * _shares[k]:.4f}% (weight {_wts[k]:g}, "
+                        f"scale {_scl[k]:g})" for k in _starved)
+                    print(f"\n  WARNING: {_detail} of the validation loss, despite a nonzero "
+                          f"weight -- that term is effectively OUT of the objective, so this "
+                          f"stage is not balancing what it exists to balance. Its scale is far "
+                          f"above its own raw magnitude. Raw values this epoch: {_raw_str}. "
+                          f"Suggested: {_suggest}\n")
 
         # Captured BEFORE update(), which decrements the grace counter and
         # flips in_grace_period to False on the FINAL grace epoch -- an epoch

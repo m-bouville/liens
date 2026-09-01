@@ -1341,3 +1341,118 @@ def test_spike_skip_factor_zero_leaves_guard_off(tmp_path, isolated_project_root
         log_every_epoch=False, loss_curve_path=tmp_path / "curve_noguard.png",
     )
     assert n["calls"] == 0, "guard consulted when spike_skip_factor=0 (should be off)"
+
+
+def test_a_skipped_stage2_batch_restores_the_batchnorm_buffers():
+    """In 2b the trunk trains, so its BatchNorm running_mean/var advance during
+    the forward pass -- which runs BEFORE the loss (the skip signal) is known.
+    A skipped batch takes no optimizer step, but without restoring the buffers
+    it would still leave them drifted by one batch's momentum. step() must
+    snapshot before the forward and restore in the skip branch, so a skip is a
+    true no-op on the model (the fix that already exists in train_refinement;
+    the snapshot/restore helpers' own correctness is covered in
+    test_spike_guard). Source-level check because step() is a closure inside
+    train_stage2 and cannot be exercised in isolation."""
+    from conftest import source_without_comments
+    import training.train_stage2 as mod
+
+    src = source_without_comments(mod)
+    # snapshot taken (train-only) before the forward
+    assert "snapshot_running_stats(ae) if train else None" in src, (
+        "step() must snapshot the BN buffers before the forward pass"
+    )
+    # restored in the skip branch, before the early return
+    skip_branch = src[src.index("should_skip"):src.index("total.backward()")]
+    assert "restore_running_stats(" in skip_branch, (
+        "a skipped batch must restore the BN buffers it moved -- the caveat "
+        "comment that used to accept this drift is now a fix"
+    )
+    # and the obsolete "accept the drift" caveat must be gone
+    assert "second-order versus the spike it prevents" not in src, (
+        "the accept-the-drift caveat is stale now that the drift is fixed"
+    )
+
+
+# --------------------------------------------------------------------
+# scale-balance warning (ported from train_refinement)
+# --------------------------------------------------------------------
+
+def _balance_warning_src():
+    from conftest import source_without_comments
+    import training.train_stage2 as mod
+    src = source_without_comments(mod)
+    # comments are stripped, so anchor on CODE: the block runs from its epoch
+    # guard to the tracker.update that follows it.
+    start = src.index("epoch == max(1, deriv_weight_warmup_epochs)")
+    return src[start:src.index("was_in_grace_period", start)]
+
+
+def test_balance_warning_fires_once_after_the_deriv_ramp():
+    """Like refinement's, it must read the CONVERGED balance, not the transient:
+    fired at the first FULL-weight epoch, max(1, deriv_weight_warmup_epochs),
+    not epoch 1 unconditionally -- during the ramp L_deriv is legitimately small
+    and would false-fire as 'starved'."""
+    w = _balance_warning_src()
+    assert w.startswith("epoch == max(1, deriv_weight_warmup_epochs)"), (
+        "the check must fire at the first full-weight epoch, after deriv's ramp"
+    )
+
+
+def test_balance_warning_is_two_sided_and_names_the_raws():
+    w = _balance_warning_src()
+    assert "sh > 0.99" in w, "must catch a term DOMINATING"
+    assert "sh < 0.01" in w, "must catch a term STARVED"
+    assert "_raw_str" in w and "_suggest" in w, (
+        "the report must name the raw magnitudes and the scale they imply"
+    )
+
+
+def test_starved_is_guarded_on_a_nonzero_weight():
+    """stats0/stats1/interp default to weight 0. A term the user deliberately
+    switched off must NEVER be reported as 'effectively OUT' -- that guard is
+    what makes the warning trustworthy rather than noise on every default run."""
+    w = _balance_warning_src()
+    assert '_wts.get(k, 0.0) != 0.0' in w, (
+        "the starved branch must exclude zero-weight (deliberately-off) terms"
+    )
+
+
+def test_recon0_is_the_implicit_weight_one_anchor_in_the_check():
+    """recon0 has no recon0_weight parameter -- it is the fixed anchor (coef 1
+    in the total). The check must weight it 1.0, not omit it, or a run that is
+    ~100% recon0 (deriv starved) would not register recon0's dominance."""
+    w = _balance_warning_src()
+    assert '"recon0": 1.0' in w, "recon0 must enter the check at implicit weight 1"
+    assert '"recon0": val_recon / recon0_scale' in w
+
+
+@pytest.mark.slow
+def test_a_starved_deriv_actually_prints_the_warning(tmp_path, capsys, isolated_project_root):
+    """Behavioral end-to-end: with deriv_scale enormous, L_deriv is driven out
+    of the objective (recon0 ~100%), so the warning MUST print and name a
+    suggested deriv_scale. deriv_weight_warmup_epochs=1 makes the first full
+    epoch epoch 1, so a 1-epoch run reaches it. Robust to fixture randomness:
+    a scale of 1e8 guarantees the imbalance regardless of the raw magnitudes."""
+    base_path, stage1_path = cached_stage1_ancestor(
+        tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),
+        size=32, epochs=1, batch_size=4, base_channels=4, latent_channels=4,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0, augment=False,
+        min_step=0, min_stdev_phi=None, stats0_weight=0.01, stat_names=["avg_phi"],
+        device="cpu", seed=0, log_every_epoch=False,
+    )
+    train_stage2(
+        base_path=base_path, resume_from=stage1_path,
+        deriv_weight=1.0, deriv_scale=1e8, deriv_weight_warmup_epochs=1,
+        stats0_weight=0.0, stats1_weight=0.0, interp_weight=0.0,
+        epochs=1, batch_size=4, num_workers=0,
+        min_step=0, min_stdev_phi=None,
+        checkpoint_path=tmp_path / "stage2_starved.pt", device="cpu",
+        log_every_epoch=False, loss_curve_path=tmp_path / "curve_starved.png",
+    )
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "deriv" in out, out[-600:]
+    assert "Suggested" in out and "deriv_scale~" in out, (
+        "the warning must name a concrete suggested deriv_scale")
+    # the zero-weight terms must NOT be blamed
+    assert "'stats0'" not in out and "'interp'" not in out, (
+        "a deliberately-off term was reported as starved -- the weight guard failed")

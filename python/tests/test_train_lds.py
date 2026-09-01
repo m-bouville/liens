@@ -716,12 +716,6 @@ def test_the_grace_and_the_ceiling_are_the_same_verdict(tmp_path, isolated_proje
     capsys.readouterr()
 
     _train_3b(tmp_path, base_path, stage2_path, stage3a_path,
-              epochs=8,  # several post-grace epochs: with the default 4 and a
-              # grace of 3, exactly ONE epoch could save, and whether its EMA
-              # beat the grace-end best was a training-trajectory coin flip
-              # that landed differently across torch versions/platforms (fine
-              # on Linux, no-save RuntimeError on Windows). This test asserts
-              # the grace/ceiling MESSAGES, not the save -- decouple them.
               checkpoint_path=tmp_path / "stage3b-diff.pt")
     out = capsys.readouterr().out
     assert ("grace period" in out) != ("reference ceiling" in out), (
@@ -786,3 +780,39 @@ def test_a_STALLED_run_reports_but_a_healthy_one_does_not():
     assert "epoch % 10 == 0" not in src, (
         "a fixed epoch grid would print a thousand lines on a 10000-epoch run"
     )
+
+
+def test_early_stopping_actually_terminates_before_the_epoch_budget(tmp_path, capsys,
+                                                                     isolated_project_root):
+    """The one loop behavior that 'it produced a checkpoint' does NOT prove:
+    that patience actually STOPS a run early. Load-bearing for the Tier-2
+    epoch-loop extraction -- whichever module ends up owning patience must
+    still terminate a plateaued run. Made deterministic with a near-zero lr:
+    the weights barely move, so val_loss plateaus from epoch 1, every later
+    epoch is a non-improvement, and patience fires predictably rather than
+    depending on fixture noise. The loss-history CSV has one row per epoch
+    trained, so fewer rows than `epochs` is the observable proof of an early
+    stop (not just that patience was passed as a parameter)."""
+    base_path, stage2_path = _cached_stage2_ancestor(tmp_path, stats0_weight=0.01)
+    curve = tmp_path / "curve_earlystop.png"
+    train_lds(
+        size=32, base_path=base_path, ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
+        epochs=25, early_stopping_patience=2, ema_warmup_epochs=0,
+        lr=1e-12,                      # plateau: val barely changes -> non-improvement is deterministic
+        batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        val_fraction=0.34, test_fraction=0.17, num_workers=0,
+        n_rollout_steps=1, min_step=0, min_stdev_phi=None,
+        encode_batch_size=4,
+        checkpoint_path=tmp_path / "stage3_earlystop.pt", device="cpu", seed=0,
+        log_every_epoch=False, loss_curve_path=curve,
+    )
+    out = capsys.readouterr().out
+    csv_path = curve.with_suffix(".csv")
+    assert csv_path.exists(), "loss-history CSV was never written"
+    n_rows = sum(1 for _ in csv_path.read_text().splitlines()) - 1  # minus header
+    assert n_rows < 25, (
+        f"run trained all {n_rows} epochs -- early stopping did NOT terminate it "
+        f"despite a plateaued val_loss and patience=2")
+    # and it must be the ORDINARY early stop (patience), not a deadlock/crash exit
+    assert "Early stop" in out or "early stop" in out or "no longer improv" in out.lower(), (
+        f"terminated early but not via the patience message; tail:\n{out[-500:]}")
