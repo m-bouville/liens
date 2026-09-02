@@ -5,6 +5,7 @@
 
 Note: Checkpoint binaries required for the test suite may not be in the distribution.
 
+`python tests/_import_graph.py` maps the project's internal imports, as two dictionaries `dict_key_imports_values` and `dict_key_imported_by_values`, saved in `tests/data/`.
 
 
 ## datasets (not models)

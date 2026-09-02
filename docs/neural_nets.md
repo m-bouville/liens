@@ -89,18 +89,20 @@ Currently, the first type works more reliably than the other.
 
 ### Stages, losses and checkpoints
 
-There are six losses, which can be mixed and matched at the different stages:
-- reconstruction loss: $L_\mathrm{recon0}$,
-- statistics loss: $L_\mathrm{stats0}$,
-- derivative loss: $L_\mathrm{deriv}$,
-- one-step latent prediction loss: $L_\mathrm{1step}$,
-- multi-step rollout loss (latent space): $L_\mathrm{rollout}$,
-- reconstruction after multi-step rollout (real): $L_\mathrm{recon predict}$.
+There are seven losses, which can be mixed and matched at the different stages:
+- reconstruction loss: `L_recon0`,
+- statistics loss: `L_stats0`,
+- derivative loss: `L_deriv`,
+- one-step latent prediction loss: `L_1step`,
+- multi-step rollout loss (latent space): `L_rollout`,
+- reconstruction after multi-step rollout: `L_recon_predict` (state, real space) and `L_grad_predict` (gradient, real).
 
 For each loss `XX`:
 - `XX_scale` normalize the loss for it to be around 1 (objective),
 - `XX_weight` is the importance given to a certain loss at a certain stage (a choice).
 What is concretely used in the loss function: `XX_weight * L_XX / XX_scale`.
+
+For simplicity, the ratios of the weights `L_stats0 / L_recon0` and `L_grad_predict / L_recon_predict` tend to be conserved between stages.
 
 Interpolation loss, $L_\mathrm{interp}$, is no longer used in loss function.
 
@@ -111,8 +113,8 @@ Interpolation loss, $L_\mathrm{interp}$, is no longer used in loss function.
 | 2 | derivative ($z_1$) |E*, D*| SH | f | both | 3 | `L_recon0 + λ L_stats0 + λ₁ L_deriv` |
 | 3a| LDS               | f       | E, SH | D | latent| 2    | `L_1step + λ₁ L_deriv`           |
 | 3b| LDS               | f       | E, SH | D | latent| $n+1$  | `L_rollout + ε L_1step + λ₁ L_deriv` |
-| 4 | encoder refinement| E, f  | D, SH|  | latent†|$n+1$|`L_rollout + ε L_stats0 + ε₁ L_recon0 + ε₂ L_recon_predict` |
-| 5 | end-to-end        | E, f, D | SH  |      | real  | $n+1$ | `L_recon_predict + ε L_recon0 + ε₁ L_stats0 + ε₂ L_rollout` |
+| 4 | encoder refinement| E, f  | D, SH|  | latent†|$n+1$|`L_rollout + ε L_stats0 + ε₁ L_recon0 + ε₂ L_recon_predict + ε₃ L_grad_predict` |
+| 5 | end-to-end        | E, f, D | SH  |      | real  | $n+1$ | `L_recon_predict + λ L_grad_predict + ε L_recon0 + ε₁ L_stats0 + ε₂ L_rollout` |
 
 Notes:
 - SH: `stats_head`, $n$: `n_rollout_steps`;
@@ -322,9 +324,14 @@ Every sub-step of the latent integrator advances the state by a linear term and 
 ## Stages 4 and 5: encoder refinement and end-to-end
 In stage 1 the autoencoder was trained for reconstruction and stats-accuracy of the state. Stage 2 focus on the relationship between $z_1$ and $z_0$ in latent space. Stage 3 trained `f` to predict dynamics, with E and D frozen. Stage 4 is the first time the encoder must seek a latent representation balancing reconstruction (with the decoder) and dynamics prediction (along with LDS). (Since the encoder is no longer frozen, the latent representation of each sample cannot be cached, unlike in stage 3.)
 
-Stages 4 and 5 are similar in structure, but:
+Stages 4 and 5 are similar in structure and use the same losses:
+- `L_recon0` and `L_stats0` (both applied to time $t_0$);
+- `L_recon_predict` (state) and `L_grad_predict` (gradient), based on the real-space reconstruction at $t_0 + N \Delta t$;
+- `L_rollout` (in latent space at $t_0 + N \Delta t$).
+
+The two differences are:
 - D is frozen in stage 4 (even though `L_recon0` is in the loss function).
-- Stage 5 focuses on `L_recon_predict`, the reconstruction at $t_0 + n \Delta t$; `L_recon0` and `L_stats0` (both applied to time $t_0$) and `L_rollout` (in latent space) are maintained, but with a lower weight. Stage 4 handles E and $f_\theta$ separately, with a small weight to `L_recon_predict` to reduce the risk of drift.
+- Stage 5 focuses on `L_recon_predict` and `L_grad_predict`; `L_recon0`, `L_stats0` and `L_rollout` are maintained, but with a lower weight. Stage 4 handles E and $f_\theta$ separately, with a small weight to `L_recon_predict` and `L_grad_predict` to reduce the risk of drift.
 
 
 
