@@ -390,7 +390,7 @@ def test_stage1_warmup_is_clamped_so_a_short_run_can_still_save():
     file rather than a worse one, and every downstream consumer fails far from
     the cause. clamp_grace_epochs exists for this and stage 1 must use it.
     """
-    from training.checkpoint_criterion import clamp_grace_epochs
+    from training._checkpoint_criterion import clamp_grace_epochs
     assert "clamp_grace_epochs(ema_warmup_epochs, epochs)" in inspect.getsource(train_autoencoder)
     assert clamp_grace_epochs(5, 3) == 2      # always leaves one epoch able to save
     assert clamp_grace_epochs(5, 1) == 0

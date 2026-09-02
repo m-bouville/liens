@@ -14,7 +14,7 @@ from .constants import LATENT_SPATIAL_SIZE
 
 # The single AUTOENCODER-mode stream's conventional name, when there's
 # only one -- e.g. Autoencoder's own internal single-stream config, and
-# any code (like refinement_loss.py, pre-C0/C1-redesign) that still
+# any code (like _refinement_loss.py, pre-C0/C1-redesign) that still
 # only knows about one stream and needs to unwrap Encoder's dict return
 # to get at it. A NAMED, SHARED constant specifically so this doesn't
 # become yet another independently-hardcoded magic string duplicated

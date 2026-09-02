@@ -25,7 +25,7 @@ from test_train_stage2_l_deriv import _build_sweep
 from test_train_refinement import (
     _build_ae_checkpoint, _build_lds_checkpoint, _build_sweep as _build_sweep_refinement,
 )
-from training.checkpoint_criterion import ComponentBestTracker
+from training._checkpoint_criterion import ComponentBestTracker
 from training.train_stage1 import train_autoencoder
 from training.train_refinement import train_refinement
 
@@ -35,7 +35,7 @@ def _png_size(path: Path) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------
-# ComponentBestTracker -- isolated unit tests (see checkpoint_criterion.py
+# ComponentBestTracker -- isolated unit tests (see _checkpoint_criterion.py
 # for the class's own docstring on why "each component's own independent
 # running minimum" is the WRONG semantics, and this instead freezes the
 # co-occurring values at the epoch a checkpoint was actually saved).

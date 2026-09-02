@@ -139,3 +139,83 @@ def test_entry_script_edges_are_captured():
     for the entry-script scan."""
     imports = compute_imports(_ROOT)
     assert "orchestration/pipeline.py" in imports.get("main.py", set())
+
+
+def test_ast_detector_agrees_with_an_independent_regex_scan():
+    """Cross-check: the AST import detector (compute_imports) must find every
+    project-module reference that an INDEPENDENT lexical scan finds. Two methods
+    that can't both be wrong the same way -- if the AST logic silently drops a
+    form (as it did three times: from-package, relative, and entry-script
+    imports), the lexical scan still sees it and this test flags the difference.
+
+    The independent scan blanks STRING and COMMENT tokens (via tokenize, purely
+    lexical -- it shares none of _imports_of's import-node logic) so prose that
+    reads like an import ('from evaluation._plot_helpers.fmt_corr which takes...'
+    in a docstring) can't create a false hit, then regex-matches real import
+    syntax on what remains. Any project-module import it finds that the AST
+    missed is a genuine gap."""
+    import io
+    import re
+    import tokenize
+    from _import_graph import _module_map, compute_imports
+
+    modpaths, dotted = _module_map(_ROOT)
+    ast_imports = compute_imports(_ROOT)
+
+    def code_only(text: str) -> str:
+        """Source with string and comment token content blanked (structure kept)."""
+        out = []
+        try:
+            toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
+        except tokenize.TokenError:
+            return text
+        for tok in toks:
+            if tok.type in (tokenize.STRING, tokenize.COMMENT):
+                out.append((tok.start, tok.end, ""))
+        # rebuild line-by-line, dropping blanked spans is fiddly; simpler: keep
+        # only NAME/OP/NL structure by re-emitting non-string/comment tokens.
+        kept = [t.string for t in toks
+                if t.type not in (tokenize.STRING, tokenize.COMMENT, tokenize.NL,
+                                  tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT)]
+        return " ".join(kept)
+
+    missed = []
+    for key, p in modpaths.items():
+        own = key.rsplit("/", 1)[0]
+        code = code_only(p.read_text(encoding="utf-8", errors="ignore"))
+        hits = set()
+        # import a.b.c [as z] , d.e
+        for m in re.finditer(r"\bimport\s+([\w.]+(?:\s*,\s*[\w.]+)*)", code):
+            for name in re.split(r"\s*,\s*", m.group(1)):
+                name = name.split()[0]
+                if name in dotted:
+                    hits.add(dotted[name])
+        # from X import ...  (X absolute or a package)
+        for m in re.finditer(r"\bfrom\s+([\w.]+)\s+import\s+([\w.,*\s]+)", code):
+            mod = m.group(1)
+            if mod in dotted:
+                hits.add(dotted[mod])
+            else:
+                for name in re.findall(r"\w+", m.group(2)):
+                    if f"{mod}.{name}" in dotted:
+                        hits.add(dotted[f"{mod}.{name}"])
+        # from .x import ... / from . import x   (level 1, this dir)
+        for m in re.finditer(r"\bfrom\s+\.(\w+)\s+import", code):
+            if f"{own}/{m.group(1)}.py" in modpaths:
+                hits.add(f"{own}/{m.group(1)}.py")
+        for m in re.finditer(r"\bfrom\s+\.\s+import\s+([\w,\s]+)", code):
+            for name in re.findall(r"\w+", m.group(1)):
+                if f"{own}/{name}.py" in modpaths:
+                    hits.add(f"{own}/{name}.py")
+        # dynamic (the string arg survives code_only as a NAME-less STRING was
+        # blanked -- so scan the RAW text for these, they are unambiguous calls)
+        raw = p.read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(r'(?:import_module|__import__)\(\s*["\']([\w.]+)["\']', raw):
+            if m.group(1) in dotted:
+                hits.add(dotted[m.group(1)])
+        gap = hits - ast_imports[key]
+        if gap:
+            missed.append(f"  {key}: AST missed {sorted(gap)}")
+    assert not missed, (
+        "the AST import detector missed edges an independent lexical scan found "
+        "-- a new import form it does not handle:\n" + "\n".join(missed))

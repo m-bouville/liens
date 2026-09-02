@@ -1,5 +1,5 @@
 """
-Tests for training/checkpoint_criterion.py -- pure arithmetic, no
+Tests for training/_checkpoint_criterion.py -- pure arithmetic, no
 torch/model/dataset dependency, so these run instantly and exercise the
 exact state machine train_autoencoder()/train_stage2()/train_lds() all
 now share.
@@ -9,7 +9,7 @@ Run from python/ (imports rely on that root being on sys.path):
 """
 import pytest
 
-from training.checkpoint_criterion import CheckpointCriterionTracker, clamp_grace_epochs
+from training._checkpoint_criterion import CheckpointCriterionTracker, clamp_grace_epochs
 
 
 def test_no_warmup_first_epoch_always_saves():
@@ -378,7 +378,7 @@ def test_the_grace_window_tracks_the_ema_decay():
     window, so a slower EMA gets proportionally longer to settle. Not a free
     parameter -- deriving it is what keeps it consistent with the decay.
     """
-    from training.checkpoint_criterion import grace_epochs_for_ema
+    from training._checkpoint_criterion import grace_epochs_for_ema
     assert grace_epochs_for_ema(0.9) > grace_epochs_for_ema(0.7)
     assert grace_epochs_for_ema(0.99) > grace_epochs_for_ema(0.9)
     assert grace_epochs_for_ema(0.7) == 3
@@ -418,7 +418,7 @@ def test_low_raw_val_with_worse_ema_does_not_save_or_move_the_raw_bar():
 # inline copies). Tested here against its OUTPUT rather than by asserting
 # the source string in either trainer.
 # --------------------------------------------------------------------
-from training.checkpoint_criterion import scale_balance_report
+from training._checkpoint_criterion import scale_balance_report
 
 
 def _report(contribs, raw, weights, scales):
@@ -491,7 +491,7 @@ def test_all_zero_contributions_returns_None():
     assert _report({"a": 0.0, "b": 0.0}, {"a": 0, "b": 0}, {"a": 1, "b": 1}, {"a": 1, "b": 1}) is None
 
 
-from training.checkpoint_criterion import ramp_completion_grace
+from training._checkpoint_criterion import ramp_completion_grace
 
 
 class _FakeTracker:
@@ -537,7 +537,7 @@ def test_ramp_grace_is_clamped_to_leave_a_saveable_epoch():
     assert grace <= 20 - 19  # at most the remaining epochs, so >=1 stays saveable
 
 
-from training.checkpoint_criterion import save_checkpoint
+from training._checkpoint_criterion import save_checkpoint
 
 
 def test_save_checkpoint_guarantees_the_common_fields(tmp_path):

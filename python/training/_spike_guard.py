@@ -514,29 +514,29 @@ def early_stop_message(epoch: int, patience: int, saved_this_run: bool,
             f"The checkpoint on disk, if any, belongs to a previous run.")
 
 
-def end_epoch_pair(spike_guard: _SpikeGuard, grad_guard: _SpikeGuard,
+def end_epoch_pair(_spike_guard: _SpikeGuard, grad_guard: _SpikeGuard,
                     n_batches: int) -> bool:
     """Close BOTH guards' epochs, each seeing the other's skips.
 
     Extracted from the two trainers for the same reason the rest of this
     module was (a second caller), but also because the inline version had an
     ordering bug both sites shared: calling
-    ``grad_guard.end_epoch(n, extra_skipped=spike_guard.n_skipped_this_epoch)``
-    AFTER ``spike_guard.end_epoch(...)`` always passed 0, since end_epoch
+    ``grad_guard.end_epoch(n, extra_skipped=_spike_guard.n_skipped_this_epoch)``
+    AFTER ``_spike_guard.end_epoch(...)`` always passed 0, since end_epoch
     zeroes the per-epoch counter as it returns. The deadlock check happened to
-    read only spike_guard's counter (which got the combined total first), so
+    read only _spike_guard's counter (which got the combined total first), so
     nothing visible broke -- but grad_guard.consecutive_total_skip_epochs
     silently undercounted, a trap for anyone who later reads it and trusts it.
     Capturing both counts BEFORE either reset is the entire fix.
 
-    Returns spike_guard's own all-skipped verdict -- the one both trainers'
+    Returns _spike_guard's own all-skipped verdict -- the one both trainers'
     deadlock checks actually use. The two verdicts are equal by construction
     (each guard judges the same combined total against the same n_batches),
     so returning one of them loses nothing.
     """
-    spike_skips = spike_guard.n_skipped_this_epoch
+    spike_skips = _spike_guard.n_skipped_this_epoch
     grad_skips = grad_guard.n_skipped_this_epoch
-    deadlocked = spike_guard.end_epoch(n_batches, extra_skipped=grad_skips)
+    deadlocked = _spike_guard.end_epoch(n_batches, extra_skipped=grad_skips)
     grad_guard.end_epoch(n_batches, extra_skipped=spike_skips)
     return deadlocked
 

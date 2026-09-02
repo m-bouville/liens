@@ -1,5 +1,5 @@
 """
-Tests for training/refinement_loss.py. Uses small, REAL model instances
+Tests for training/_refinement_loss.py. Uses small, REAL model instances
 (same pattern as test_model_assembly.py) so gradient-flow tests are
 genuine, not simulated.
 
@@ -16,7 +16,7 @@ from models.latent_streams import DEFAULT_STREAM_NAME, LatentStreamConfig, Laten
 from models.latent_dynamics import LatentDynamics
 from training.stats_head import StatsHead
 from training.losses import StatsLoss
-from training.refinement_loss import compute_stage45_loss
+from training._refinement_loss import compute_stage45_loss
 
 
 LATENT_CHANNELS = 4

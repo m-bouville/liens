@@ -5,7 +5,7 @@ import pytest
 from utils import load_datasets as load
 from training.train_stage1 import train_autoencoder
 from training.train_stage2 import train_stage2
-from training.checkpoint_criterion import grace_epochs_for_ema
+from training._checkpoint_criterion import grace_epochs_for_ema
 from training.train_lds import train_lds
 
 

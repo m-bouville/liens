@@ -133,7 +133,7 @@ def compute_stage45_loss(
     # frames, matching inference -- and applying such an f_theta teacher-forced
     # is the same "NOT equivalent" direction that n_substeps N -> 1 is. Both
     # are inherited from the LDS checkpoint; this one was missed because the
-    # rollout call sits in refinement_loss.py rather than beside the model
+    # rollout call sits in _refinement_loss.py rather than beside the model
     # construction in model_assembly.py.
     # u-scheme: a log10_t f_theta steps in Delta-u and consumes z̃1=dz0/du,
     # NOT physical dt and z1=dz0/dt. Convert both here, sourced from the

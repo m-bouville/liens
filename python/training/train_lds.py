@@ -33,7 +33,7 @@ from models.latent_streams import (
     LatentStreamMode, cross_check_stream_configs_against_state_dict,
     resolve_stream_configs_from_checkpoint_config,
 )
-from training.checkpoint_criterion import (
+from training._checkpoint_criterion import (
     CheckpointCriterionTracker, save_checkpoint, clamp_grace_epochs, grace_epochs_for_ema,
 )
 from training.checkpoint_components import cross_check_ancestor_config
@@ -286,7 +286,7 @@ def _load_frozen_encoder(
     return encoder, ae_checkpoint, ae_config, ae_checkpoint_path
 
 
-# Re-exported: the definitions moved to training/spike_guard.py when stages
+# Re-exported: the definitions moved to training/_spike_guard.py when stages
 # 4 and 5 became a second caller. Kept importable from here so existing
 # callers and tests (tests/test_spike_guard.py) are unaffected.
 from training.dt_bucketing import (  # noqa: E402
@@ -294,7 +294,7 @@ from training.dt_bucketing import (  # noqa: E402
     PeakMemoryTracker, budget_report,
     estimate_window_costs,
 )
-from training.spike_guard import (  # noqa: E402,F401
+from training._spike_guard import (  # noqa: E402,F401
     _SpikeGuard, _record_spike, difficulty_band, early_stop_message, end_epoch_pair,
     SkipReporter,
 )
@@ -1107,8 +1107,8 @@ def train_lds(
             # batches as a block -- 14-19 of ~37 every epoch on the first
             # max_dt=1000 run, restoring the max_dt=500 population by stealth.
             _band = difficulty_band(float(dt_window.detach().max()))
-            if spike_guard.should_skip(float(total.detach()), band=_band):
-                _record_spike(spike_guard, total, dt_window, theta)
+            if _spike_guard.should_skip(float(total.detach()), band=_band):
+                _record_spike(_spike_guard, total, dt_window, theta)
                 optimizer.zero_grad()
             else:
                 optimizer.zero_grad()
@@ -1245,7 +1245,7 @@ def train_lds(
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
 
-    spike_guard = _SpikeGuard(spike_skip_factor)
+    _spike_guard = _SpikeGuard(spike_skip_factor)
     # Separate history: gradient norms and losses live on different scales, so
     # one shared median would be meaningless for both.
     grad_guard = _SpikeGuard(grad_spike_factor)
@@ -1497,8 +1497,8 @@ def train_lds(
         # to a known-good state and lets it continue.
         # BOTH counts captured before either reset -- see end_epoch_pair's own
         # docstring for the ordering bug this replaces.
-        _deadlocked = end_epoch_pair(spike_guard, grad_guard, _n_train_batches)
-        if _deadlocked and spike_guard.consecutive_total_skip_epochs >= spike_deadlock_epochs:
+        _deadlocked = end_epoch_pair(_spike_guard, grad_guard, _n_train_batches)
+        if _deadlocked and _spike_guard.consecutive_total_skip_epochs >= spike_deadlock_epochs:
             # THIS RUN's own save, not merely a file at the path.
             #
             # Observed: a 3b run at max_dt=2000 diverged from epoch 1, saved
@@ -1529,7 +1529,7 @@ def train_lds(
                 if _have_checkpoint:
                     _best = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
                     print(f"\nSTOPPING at epoch {epoch}: every batch has been skipped for "
-                          f"{spike_guard.consecutive_total_skip_epochs} consecutive epochs and "
+                          f"{_spike_guard.consecutive_total_skip_epochs} consecutive epochs and "
                           f"{_n_rollbacks} rollback(s) have not held, so training cannot "
                           f"continue. Keeping the best checkpoint (epoch {_best['epoch']}, "
                           f"val_loss={_best['val_loss']:.6f}), which is what an ordinary early "
@@ -1541,7 +1541,7 @@ def train_lds(
                     break
                 raise RuntimeError(
                     f"stage 3: every batch has been skipped for "
-                    f"{spike_guard.consecutive_total_skip_epochs} consecutive epochs, so no "
+                    f"{_spike_guard.consecutive_total_skip_epochs} consecutive epochs, so no "
                     f"gradient step is being taken and the weights cannot recover, and "
                     + ("this run has SAVED NOTHING, so there is no checkpoint of its own to "
                        "roll back to or to keep -- any file at the checkpoint path belongs "
@@ -1572,7 +1572,7 @@ def train_lds(
                 lr_scheduler = torch.optim.lr_scheduler.LinearLR(
                     optimizer, start_factor=0.01, total_iters=lr_warmup_steps,
                 )
-            spike_guard.forget_history()
+            _spike_guard.forget_history()
             grad_guard.forget_history()
             # THE CRITERION MUST BE RESET TOO. Restoring the weights is only
             # half of it: the diverged epochs pushed val_ema to ~1e5, and from
@@ -1626,7 +1626,7 @@ def train_lds(
         # stage 4/5 uses -- non-finite is always notable (an inf gradient turns
         # the whole parameter vector to nan in a single step if it gets through).
         _line = _skip_reporter.report_epoch(
-            epoch, spike_guard, grad_guard, _n_train_batches,
+            epoch, _spike_guard, grad_guard, _n_train_batches,
             dt_label=("du_max" if time_coordinate == "log10_t" else "dt_max"))
         if _line:
             print(_line)

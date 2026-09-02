@@ -27,7 +27,7 @@ from models.latent_streams import (
     LatentStreamConfig, cross_check_stream_configs_against_state_dict,
     resolve_stream_configs_from_checkpoint_config,
 )
-from training.checkpoint_criterion import atomic_torch_save
+from training._checkpoint_criterion import atomic_torch_save
 
 
 @dataclass
@@ -591,8 +591,13 @@ def build_ae_from_checkpoint(
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders=decoders,
                                      stream_configs=stream_configs,
                                      decoder_for_stream=decoder_for_stream).to(device)
-    # Old (pre-2-feature-theta) checkpoints upgrade here: zero-pad the new
-    # theta input column so the loaded model is bit-identical in function.
+    # Upgrade a pre-2-feature-theta checkpoint before loading: an old checkpoint
+    # carries n_theta=1 theta-conditioner weights, the model here is built at
+    # n_theta=N_THETA. zero_pad_theta_columns widens the theta columns with zeros
+    # (a no-op on a current checkpoint). The other production loaders
+    # (train_stage1/2, train_lds) all do this; build_ae_from_checkpoint must too,
+    # or an old checkpoint fails to load with a theta_conditioners.deriv shape
+    # mismatch.
     from models.encoder import zero_pad_theta_columns
     ae.load_state_dict(zero_pad_theta_columns(checkpoint["model_state"], ae))
     ae.eval()

@@ -31,12 +31,12 @@ def test_stage45_rollout_takes_z1_resync():
     An f_theta trained at z1_resync=False expects z1 to be PROPAGATED, not
     reset at each real frame -- the same "NOT equivalent" direction that
     n_substeps N -> 1 is, and n_substeps IS inherited. Missed because the
-    rollout call lives in refinement_loss.py rather than beside the model
+    rollout call lives in _refinement_loss.py rather than beside the model
     construction in model_assembly.py.
     """
-    from training.refinement_loss import compute_stage45_loss
+    from training._refinement_loss import compute_stage45_loss
     assert "z1_resync" in inspect.signature(compute_stage45_loss).parameters
-    src = source_without_comments(_ROOT / "training/refinement_loss.py")
+    src = source_without_comments(_ROOT / "training/_refinement_loss.py")
     assert "z1_resync=z1_resync" in src, "the parameter must reach rollout()"
 
 
@@ -81,7 +81,7 @@ def test_stage45_wires_in_the_shared_scale_balance_report():
     OUTPUT in test_checkpoint_criterion; here we pin only that train_refinement
     WIRES it in -- calls the shared function with all four components. The two
     trainers had byte-identical inline copies of this logic; it now lives once
-    in checkpoint_criterion.py."""
+    in _checkpoint_criterion.py."""
     src = source_without_comments(_ROOT / "training/train_refinement.py")
     assert "scale_balance_report(" in src, "the balance check is not wired in"
     for comp in ("rollout", "recon0", "stats0", "recon_predict"):
@@ -260,7 +260,7 @@ def test_the_criterion_is_reset_when_the_ramp_completes():
     deriv_target_centered switches.
     """
     # The fire-on-the-LAST-ramp timing and the reset itself now live in
-    # checkpoint_criterion.ramp_completion_grace (behaviour covered by
+    # _checkpoint_criterion.ramp_completion_grace (behaviour covered by
     # test_ramp_grace_fires_on_the_LAST_ramp_not_each and, end-to-end, by
     # test_train_refinement's EMA-rebaseline test). Here: the trainer delegates
     # to it, passing BOTH warmups so "the last ramp" is computed correctly.
@@ -284,7 +284,7 @@ def test_the_reset_grace_is_at_least_two_epochs():
     extraction while saying nothing about the property -- and would have
     passed a max(1, ...) written any other way.
     """
-    from training.checkpoint_criterion import grace_epochs_for_ema
+    from training._checkpoint_criterion import grace_epochs_for_ema
     assert grace_epochs_for_ema(0.0) == 2, "no smoothing at all still needs the floor"
     assert grace_epochs_for_ema(0.5) == 2
     assert grace_epochs_for_ema(1.0) == 2, "an infinite window has no derived length"

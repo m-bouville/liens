@@ -26,7 +26,7 @@ from models.decoder import Decoder
 from models.encoder import Encoder
 from models.latent_streams import cross_check_stream_configs_against_state_dict, \
                                    resolve_stream_configs_from_checkpoint_config
-from training.checkpoint_criterion import (
+from training._checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, save_checkpoint, clamp_grace_epochs,
     grace_epochs_for_ema, scale_balance_report,
 )
@@ -37,10 +37,10 @@ from training.datasets import VAL_DECORRELATED_AUG_INDICES, MicrostructureEvolut
 from training.losses import (ReconLoss, StatsLoss, InterpLoss, centered_deriv_target,
                               dt_weighted_deriv_loss)
 from training.stats_head import StatsHead
-from training.spike_guard import (_SpikeGuard, _record_spike, difficulty_band,
+from training._spike_guard import (_SpikeGuard, _record_spike, difficulty_band,
                                    snapshot_running_stats, restore_running_stats)
 from training._training_loop import accumulate_epoch, write_epoch_figures
-from training.train_ae_common import freeze_outer_layers, compute_weight_drift
+from training._train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
 from utils.plots import loss_component_scatter
 from evaluation.check_interpolation import check_interpolation
@@ -944,7 +944,7 @@ def train_stage2(
     # the forward and restores them when a batch is skipped, so a skip leaves
     # the model bit-identical (matching train_refinement). (Stage 3 never needed
     # this: its encoder is frozen and LatentDynamics has no BatchNorm.)
-    spike_guard = _SpikeGuard(spike_skip_factor) if spike_skip_factor > 0 else None
+    _spike_guard = _SpikeGuard(spike_skip_factor) if spike_skip_factor > 0 else None
 
     def step(batch, train: bool, deriv_weight_used: float, use_centered: bool = False):
         window, dt_window, theta, true_stats = batch
@@ -1159,11 +1159,11 @@ def train_stage2(
             # loss must never reach backward()/optimizer.step(). Banded by the
             # batch's own dt_max so hard long-dt batches are judged against
             # their own population, not skipped as a block (see train_lds and
-            # difficulty_band). Off entirely when spike_guard is None.
-            if spike_guard is not None:
+            # difficulty_band). Off entirely when _spike_guard is None.
+            if _spike_guard is not None:
                 _band = difficulty_band(float(dt_window.detach().max()))
-                if spike_guard.should_skip(float(total.detach()), band=_band):
-                    _record_spike(spike_guard, total, dt_window, theta)
+                if _spike_guard.should_skip(float(total.detach()), band=_band):
+                    _record_spike(_spike_guard, total, dt_window, theta)
                     optimizer.zero_grad()
                     restore_running_stats(_bn_snapshot)   # undo the forward's BN drift
                     return {"total": total.detach(), "recon": recon.detach(),
@@ -1562,10 +1562,10 @@ def train_stage2(
             # report_epoch would therefore CHANGE stage 2's log format and gating
             # -- a deliberate unification decision, not the faithful extraction the
             # rest of this refactor is, so it is left as an explicit opt-in.
-            if spike_guard is not None:
-                _n_skipped = spike_guard.n_skipped_this_epoch
-                _worst = spike_guard.worst
-                _deadlocked = spike_guard.end_epoch(_n_train_batches)
+            if _spike_guard is not None:
+                _n_skipped = _spike_guard.n_skipped_this_epoch
+                _worst = _spike_guard.worst
+                _deadlocked = _spike_guard.end_epoch(_n_train_batches)
                 if _n_skipped:
                     _w = (f" worst loss {_SpikeGuard.median_display(_worst[0])} "
                           f"(band median {_SpikeGuard.median_display(_worst[1])}, "

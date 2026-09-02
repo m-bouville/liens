@@ -52,38 +52,63 @@ def _module_map(root: pathlib.Path):
 def _imports_of(key: str, path: pathlib.Path, dotted: dict[str, str]) -> set[str]:
     """The project modules that the module at `path` (graph key `key`) imports.
 
-    Handles absolute (`import training.x`, `from training.x import y`,
-    `from training import x`) AND relative (`from .blocks import y`,
-    `from . import blocks`) forms. Relative imports resolve against the module's
-    own package -- e.g. `from .blocks` in models/encoder.py means models.blocks.
-    The packages here are one level deep, so only level-1 relatives target a
-    project module; deeper levels resolve above the package root and are ignored.
+    Handles every form that can create an edge to a project module:
+      - absolute:  import training.x [as z] / from training.x import y
+      - from-pkg:  from training import x   (module imported from its package)
+      - relative:  from .x import y / from . import x   (any level; resolved
+                   against the module's own package)
+      - dynamic:   importlib.import_module("training.x") / __import__("training.x")
+                   with a STRING-CONSTANT argument (a runtime load is a real
+                   dependency, invisible to the import-statement node forms).
+    A dynamic import built from a non-constant expression cannot be resolved
+    statically and is not recorded -- if the project ever does that, the
+    cross-check test (regex vs AST) is where it would surface.
     """
     own_pkg = key.rsplit("/", 1)[0] if "/" in key else ""
+    own_parts = own_pkg.split("/") if own_pkg else []
     found: set[str] = set()
     for n in ast.walk(ast.parse(path.read_text(encoding="utf-8", errors="ignore"))):
         if isinstance(n, ast.ImportFrom):
-            if n.level and n.level == 1 and own_pkg:
-                if n.module:                             # from .blocks import y
-                    cand = f"{own_pkg}.{n.module}"
+            if n.level:
+                # relative: drop (level-1) trailing components of own package.
+                # This tree's packages are one level deep, so level 1 -> own
+                # package and deeper levels resolve above any package (no project
+                # module), but the arithmetic is general so a nested package would
+                # resolve correctly too.
+                base_parts = own_parts[: len(own_parts) - (n.level - 1)]
+                base = ".".join(base_parts)
+                if not base:
+                    continue
+                if n.module:                              # from .sub import y
+                    cand = f"{base}.{n.module}"
                     if cand in dotted:
                         found.add(dotted[cand])
-                else:                                     # from . import blocks
+                else:                                      # from . import sub
                     for a in n.names:
-                        cand = f"{own_pkg}.{a.name}"
+                        cand = f"{base}.{a.name}"
                         if cand in dotted:
                             found.add(dotted[cand])
             elif n.module in dotted:                      # from training.x import y
                 found.add(dotted[n.module])
-            elif n.module and not n.level:                # from training import x
+            elif n.module:                                # from training import x
                 for a in n.names:
                     cand = f"{n.module}.{a.name}"
                     if cand in dotted:
                         found.add(dotted[cand])
-        elif isinstance(n, ast.Import):                   # import training.x
+        elif isinstance(n, ast.Import):                   # import training.x [as z]
             for a in n.names:
                 if a.name in dotted:
                     found.add(dotted[a.name])
+        elif isinstance(n, ast.Call):
+            # dynamic imports: importlib.import_module("training.x") or
+            # __import__("training.x"). Invisible to the statement forms above --
+            # a real gap if any module loads another by name at runtime.
+            fn = n.func
+            is_dyn = ((isinstance(fn, ast.Attribute) and fn.attr in ("import_module",))
+                      or (isinstance(fn, ast.Name) and fn.id == "__import__"))
+            if is_dyn and n.args and isinstance(n.args[0], ast.Constant) \
+                    and isinstance(n.args[0].value, str) and n.args[0].value in dotted:
+                found.add(dotted[n.args[0].value])
     return found
 
 

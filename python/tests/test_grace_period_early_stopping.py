@@ -24,7 +24,7 @@ and is reproduced here exactly.
 """
 import pytest
 
-from training.checkpoint_criterion import CheckpointCriterionTracker
+from training._checkpoint_criterion import CheckpointCriterionTracker
 
 # early_stopping_patience=4 is what the 32x32 and 64x64 params files use;
 # grace=5 is what val_ema_decay=0.8 produces at the deriv_target_centered

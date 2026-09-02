@@ -1,5 +1,5 @@
 """
-Tests for training/train_ae_common.py's weight-drift diagnostic.
+Tests for training/_train_ae_common.py's weight-drift diagnostic.
 
 Found by an audit: `freeze_outer_layers` is well covered (a stage-2 test
 asserts both that a frozen block's weights are unchanged and that an unfrozen
@@ -19,7 +19,7 @@ blocks, and NON-zero for changed ones.
 import pytest
 import torch
 
-from training.train_ae_common import _drift_by_block, _param_group, compute_weight_drift
+from training._train_ae_common import _drift_by_block, _param_group, compute_weight_drift
 
 
 def _state(**values):

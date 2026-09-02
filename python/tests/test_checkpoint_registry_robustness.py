@@ -35,7 +35,7 @@ def test_checkpoint_callback_is_wrapped_nonfatally(trainer):
     from conftest import source_without_comments
     src = source_without_comments(_ROOT / trainer)
     # Two ways to satisfy the invariant: delegate the save to
-    # checkpoint_criterion.save_checkpoint (which runs the hook inside its own
+    # _checkpoint_criterion.save_checkpoint (which runs the hook inside its own
     # try -- covered by test_save_checkpoint_hook_failure_does_not_kill_training)
     # by passing on_saved=on_checkpoint_saved; or, for a not-yet-extracted
     # trainer, call the hook inline wrapped in a try.

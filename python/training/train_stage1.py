@@ -24,7 +24,7 @@ from utils.logging_utils import print_run_parameters, EpochProgress
 from models.autoencoder import Autoencoder
 from models.constants import LATENT_SPATIAL_SIZE
 from models.latent_streams import DEFAULT_STREAM_NAME, LatentStreamMode
-from training.checkpoint_criterion import (
+from training._checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save, clamp_grace_epochs,
 )
 from training.datasets import MicrostructureSnapshotDataset, complete_run_dirs, split_run_dirs

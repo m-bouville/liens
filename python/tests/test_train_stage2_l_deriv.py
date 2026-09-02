@@ -1266,7 +1266,7 @@ def test_spike_skip_factor_wires_the_guard_and_skips(tmp_path, isolated_project_
     spiked could corrupt the checkpoint. This forces one skip and checks
     the step was withheld.
     """
-    import training.spike_guard as sg
+    import training._spike_guard as sg
     import torch as _torch
 
     base_path, stage1_path = cached_stage1_ancestor(
@@ -1320,7 +1320,7 @@ def test_spike_skip_factor_wires_the_guard_and_skips(tmp_path, isolated_project_
 def test_spike_skip_factor_zero_leaves_guard_off(tmp_path, isolated_project_root, monkeypatch):
     """spike_skip_factor=0 (default) must NOT construct a guard: should_skip
     is never called, so the default path is exactly the old behaviour."""
-    import training.spike_guard as sg
+    import training._spike_guard as sg
 
     base_path, stage1_path = cached_stage1_ancestor(
         tmp_path, lambda d: _build_sweep(d, n_runs=6, size=32),

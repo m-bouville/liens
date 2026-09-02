@@ -33,7 +33,7 @@ import torch
 
 from orchestration.paths import _STAGE_DIRS
 from orchestration.stage_params import _backup_before_overwrite
-from training.checkpoint_criterion import atomic_torch_save
+from training._checkpoint_criterion import atomic_torch_save
 from training.rescale_checkpoint import (
     describe_rescale, extract_stage1_checkpoint, reestimate_batchnorm_statistics,
     rescale_checkpoint_to_size,

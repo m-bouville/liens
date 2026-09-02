@@ -16,21 +16,21 @@ from torch.utils.data import DataLoader
 
 from training.checkpoint_components import cross_check_ancestor_config
 from training.checkpoint_components import assemble_joint_checkpoint, load_joint_refinement_checkpoint
-from training.spike_guard import (
+from training._spike_guard import (
     _SpikeGuard, _record_spike, difficulty_band, early_stop_message, end_epoch_pair,
     restore_running_stats, snapshot_running_stats, SkipReporter,
 )
 from utils.logging_utils import print_run_parameters, EpochProgress
 from training._training_loop import (accumulate_epoch, weighted_contributions,
                                     write_epoch_figures)
-from training.checkpoint_criterion import (
+from training._checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, save_checkpoint,
     ramp_completion_grace, scale_balance_report,
 )
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import StatsLoss
 from training.model_assembly import build_models_from_components
-from training.refinement_loss import compute_stage45_loss
+from training._refinement_loss import compute_stage45_loss
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
 
@@ -449,8 +449,8 @@ def train_refinement(
             # judged against batches of similar difficulty rather than against
             # the whole population's median.
             _band = difficulty_band(float(dt_window.detach().max()))
-            if spike_guard.should_skip(float(loss.detach()), band=_band):
-                _record_spike(spike_guard, loss, dt_window, theta)
+            if _spike_guard.should_skip(float(loss.detach()), band=_band):
+                _record_spike(_spike_guard, loss, dt_window, theta)
                 optimizer.zero_grad()
                 restore_running_stats(_bn_snapshot)
             else:
@@ -518,7 +518,7 @@ def train_refinement(
              if recon_predict_weight != 0.0 else "")
           + " | valid = ...  | ema")
 
-    spike_guard = _SpikeGuard(spike_skip_factor)
+    _spike_guard = _SpikeGuard(spike_skip_factor)
     # Separate history: gradient norms and losses live on different scales.
     grad_guard = _SpikeGuard(grad_spike_factor)
     # Same digesting reporter stages 3 uses, so stage 4/5 gets the SAME merged
@@ -682,26 +682,26 @@ def train_refinement(
         # healthy while training on a filtered distribution.
         # BOTH counts captured before either reset -- see end_epoch_pair's own
         # docstring for the ordering bug this replaces.
-        _deadlocked = end_epoch_pair(spike_guard, grad_guard, _n_train_batches)
+        _deadlocked = end_epoch_pair(_spike_guard, grad_guard, _n_train_batches)
         # ONE merged report via the shared reporter: when both guards fire in an
         # epoch it is a single block (both worst-clauses, boilerplate once), not
         # two near-identical ones; routine skips digest to a compact line. The
         # reporter owns the running-total-to-delta bookkeeping (report_epoch), so
         # this is the SAME path stage 3 uses from the SAME counters.
         _line = _skip_reporter.report_epoch(
-            epoch, spike_guard, grad_guard, _n_train_batches,
+            epoch, _spike_guard, grad_guard, _n_train_batches,
             dt_label=("du_max" if getattr(f_theta, "time_coordinate", "t") == "log10_t"
                       else "dt_max"))
         if _line:
             print(_line)
-        if _deadlocked and spike_guard.consecutive_total_skip_epochs >= 5:
+        if _deadlocked and _spike_guard.consecutive_total_skip_epochs >= 5:
             # STOP, keeping the best checkpoint -- the stage-3 lesson. No
             # rollback here: at ~135 batches per epoch an all-skipped epoch
             # means the model is comprehensively broken, not that one window
             # tripped a threshold, and stage 4/5's checkpoint is a JOINT one
             # whose restore path would need its own testing to be trustworthy.
             print(f"\nSTOPPING at epoch {epoch}: every batch has been skipped for "
-                  f"{spike_guard.consecutive_total_skip_epochs} consecutive epochs, so no "
+                  f"{_spike_guard.consecutive_total_skip_epochs} consecutive epochs, so no "
                   f"gradient step is being taken and the weights cannot recover. Keeping "
                   f"the best checkpoint so far. LOWER lr (currently {lr:g}); raising "
                   f"spike_skip_factor only lets the damaging batches through.\n")

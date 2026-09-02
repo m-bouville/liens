@@ -25,7 +25,7 @@ import pytest
 import torch
 
 from conftest import source_without_comments
-from training.checkpoint_criterion import CheckpointCriterionTracker
+from training._checkpoint_criterion import CheckpointCriterionTracker
 
 
 def test_without_a_reference_epoch_one_always_saves():
