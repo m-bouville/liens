@@ -259,15 +259,16 @@ def test_the_criterion_is_reset_when_the_ramp_completes():
     Same situation stage 2 handles with reset_with_grace when
     deriv_target_centered switches.
     """
-    src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "tracker.reset_with_grace(grace)" in src
-    # the reset fires when the LAST of the two ramps completes -- epoch equals
-    # max(rollout, recon_predict) warmup epochs (whitespace-insensitive check)
-    _cond = " ".join(src.split())
-    assert "epoch == max(rollout_weight_warmup_epochs, "\
-           "recon_predict_weight_warmup_epochs)" in _cond, (
-        "the reset must happen exactly when the LAST ramp completes"
-    )
+    # The fire-on-the-LAST-ramp timing and the reset itself now live in
+    # checkpoint_criterion.ramp_completion_grace (behaviour covered by
+    # test_ramp_grace_fires_on_the_LAST_ramp_not_each and, end-to-end, by
+    # test_train_refinement's EMA-rebaseline test). Here: the trainer delegates
+    # to it, passing BOTH warmups so "the last ramp" is computed correctly.
+    _cond = " ".join(source_without_comments(
+        _ROOT / "training/train_refinement.py").split())
+    assert "ramp_completion_grace(" in _cond, "the reset is not delegated to the shared helper"
+    assert '"rollout_weight": rollout_weight_warmup_epochs' in _cond
+    assert '"recon_predict_weight": recon_predict_weight_warmup_epochs' in _cond
 
 
 def test_the_reset_grace_is_at_least_two_epochs():
@@ -291,9 +292,10 @@ def test_the_reset_grace_is_at_least_two_epochs():
     assert grace_epochs_for_ema(0.9) == 10
     assert grace_epochs_for_ema(0.99) == 100
 
-    # And this trainer must use it rather than re-deriving it.
+    # The trainer reaches this derivation THROUGH ramp_completion_grace (which
+    # calls grace_epochs_for_ema internally) rather than re-deriving it inline.
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "grace_epochs_for_ema(val_ema_decay)" in src
+    assert "ramp_completion_grace(" in src
 
 
 def test_the_reset_is_clamped_against_the_remaining_epochs():
@@ -307,11 +309,13 @@ def test_the_reset_is_clamped_against_the_remaining_epochs():
     Anchored on the CALL, not the exact argument expression, so a refactor that
     moves the loop or renames the epoch counter doesn't trip it spuriously while
     the behaviour is unchanged."""
-    src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "clamp_grace_epochs(" in src, "the grace is not clamped at all"
-    # the remaining-epoch budget (some epochs - epoch expression) is what's passed
-    assert re.search(r"clamp_grace_epochs\(\s*grace\s*,\s*epochs\b", src), (
-        "clamp must be passed the grace and a remaining-epochs budget")
+    # clamp_grace_epochs(grace, remaining) now runs inside ramp_completion_grace;
+    # its MATH is covered by test_checkpoint_criterion (clamp + ramp_grace_is_clamped).
+    # Wiring: the trainer delegates with its epoch budget so the clamp sees the remainder.
+    _cond = " ".join(source_without_comments(
+        _ROOT / "training/train_refinement.py").split())
+    assert "ramp_completion_grace(" in _cond and "epoch, epochs," in _cond, (
+        "the grace must be delegated with the epoch budget so it can be clamped")
 
 
 def test_no_reset_when_there_is_no_warmup():
@@ -323,10 +327,13 @@ def test_no_reset_when_there_is_no_warmup():
     grace machinery stays silent). This fast check pins that the reset is gated
     on a warmup existing at all -- anchored on the guard's condition rather than
     its exact whitespace."""
+    # ramp_completion_grace ignores zero-length warmups and returns None when
+    # none are active (test_ramp_grace_ignores_zero_length_warmups); the behavioural
+    # end-to-end guard is test_no_grace_message_when_there_is_no_warmup. Wiring:
+    # the trainer only acts on a non-None result.
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    _cond = " ".join(src.split())
-    assert "if (max(rollout_weight_warmup_epochs, recon_predict_weight_warmup_epochs) > 0" in _cond, (
-        "the reset must be gated on at least one warmup being active")
+    assert "ramp_completion_grace(" in src and "if _gr is not None:" in src, (
+        "the trainer must act only when the shared helper reports a completion")
 
 
 def test_the_dominance_warning_waits_for_the_ramp():

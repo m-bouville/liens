@@ -393,6 +393,13 @@ class SkipReporter:
         self.digest_every = digest_every
         self._explained = False
         self._quiet_epochs = 0
+        # cumulative counts already REPORTED, so report_epoch can turn each
+        # guard's running totals into this-epoch deltas without the caller
+        # threading four counters by hand (the arithmetic that drifted between
+        # train_lds and train_refinement before it was shared).
+        self._loss_reported = 0
+        self._grad_reported = 0
+        self._nonfinite_reported = 0
         self._quiet_batches = 0
         self._quiet_total = 0
         self._quiet_worst = 0.0
@@ -403,6 +410,31 @@ class SkipReporter:
         if worst is None or not math.isfinite(worst[1]) or worst[1] <= 0:
             return float("inf") if worst is not None else 0.0
         return worst[0] / worst[1]
+
+    def report_epoch(self, epoch: int, loss_guard, grad_guard, n_batches: int,
+                     *, dt_label: str = "dt_max") -> str:
+        """Turn the guards' RUNNING totals into this-epoch deltas and report them.
+
+        The trainers each tracked four "already reported" counters inline
+        (loss skips, grad skips, non-finite, and the running totals) and diffed
+        them by hand every epoch -- fiddly, duplicated, and the kind of
+        off-by-one bookkeeping that silently under- or double-counts. This owns
+        those counters so the caller passes only the guards. `grad_guard` may be
+        None for a single-guard stage (stage 2 has only the loss guard).
+        """
+        loss_new = loss_guard.n_skipped - self._loss_reported
+        self._loss_reported = loss_guard.n_skipped
+        if grad_guard is not None:
+            grad_new = grad_guard.n_skipped - self._grad_reported
+            self._grad_reported = grad_guard.n_skipped
+            grad_worst = grad_guard.last_worst
+            total_nonfinite = loss_guard.n_nonfinite + grad_guard.n_nonfinite
+        else:
+            grad_new, grad_worst, total_nonfinite = 0, None, loss_guard.n_nonfinite
+        nonfinite_new = total_nonfinite - self._nonfinite_reported
+        self._nonfinite_reported = total_nonfinite
+        return self.epoch(epoch, loss_new, loss_guard.last_worst, grad_new, grad_worst,
+                          n_batches, n_nonfinite_new=nonfinite_new, dt_label=dt_label)
 
     def epoch(self, epoch: int, loss_new: int, loss_worst, grad_new: int, grad_worst,
                n_batches: int, n_nonfinite_new: int = 0, dt_label: str = "dt_max") -> str:

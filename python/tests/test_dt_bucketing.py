@@ -1209,7 +1209,12 @@ def test_train_lds_isolates_each_batchs_measurement():
     import pathlib
     src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
                                    / "training/train_lds.py")
-    i = src.index("for batch in train_loader:")
+    # The per-batch memory diagnostic now wraps the step inside the
+    # _train_forward closure handed to accumulate_epoch (rather than an inline
+    # `for batch in train_loader` loop). The ordering it guards -- reset the
+    # peak BEFORE the step, record AFTER, with a synchronize on each side -- is
+    # unchanged and still checked here within the closure body.
+    i = src.index("def _train_forward(batch):")
     body = src[i:i + 2500]
     reset = body.index("reset_peak_memory_stats")
     record = body.index("_mem_diag.record")

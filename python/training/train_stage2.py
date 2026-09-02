@@ -27,7 +27,7 @@ from models.encoder import Encoder
 from models.latent_streams import cross_check_stream_configs_against_state_dict, \
                                    resolve_stream_configs_from_checkpoint_config
 from training.checkpoint_criterion import (
-    CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save, clamp_grace_epochs,
+    CheckpointCriterionTracker, ComponentBestTracker, save_checkpoint, clamp_grace_epochs,
     grace_epochs_for_ema, scale_balance_report,
 )
 import re
@@ -39,9 +39,10 @@ from training.losses import (ReconLoss, StatsLoss, InterpLoss, centered_deriv_ta
 from training.stats_head import StatsHead
 from training.spike_guard import (_SpikeGuard, _record_spike, difficulty_band,
                                    snapshot_running_stats, restore_running_stats)
+from training.training_loop import accumulate_epoch, write_epoch_figures
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
-from utils.plots import loss_component_scatter, loss_curve, write_loss_history, should_write_loss_figure
+from utils.plots import loss_component_scatter
 from evaluation.check_interpolation import check_interpolation
 from evaluation.check_perturbation import check_perturbation
 
@@ -1165,9 +1166,9 @@ def train_stage2(
                     _record_spike(spike_guard, total, dt_window, theta)
                     optimizer.zero_grad()
                     restore_running_stats(_bn_snapshot)   # undo the forward's BN drift
-                    return (total.detach(), recon.detach(),
-                            stats_loss_val.detach(), stats1_loss_val.detach(),
-                            deriv_loss.detach(), interp.detach())
+                    return {"total": total.detach(), "recon": recon.detach(),
+                            "stats": stats_loss_val.detach(), "stats1": stats1_loss_val.detach(),
+                            "deriv": deriv_loss.detach(), "interp": interp.detach()}
             optimizer.zero_grad()
             total.backward()
             if grad_clip > 0:
@@ -1186,9 +1187,9 @@ def train_stage2(
         # (and keep growing) for the rest of the epoch if left
         # attached. Same fix as train_lds.py's own step() -- see that
         # function's own identical comment for the full rationale.
-        return (total.detach(), recon.detach(),
-                stats_loss_val.detach(), stats1_loss_val.detach(),
-                deriv_loss.detach(), interp.detach())
+        return {"total": total.detach(), "recon": recon.detach(),
+                "stats": stats_loss_val.detach(), "stats1": stats1_loss_val.detach(),
+                "deriv": deriv_loss.detach(), "interp": interp.detach()}
 
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=0, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
@@ -1281,12 +1282,6 @@ def train_stage2(
         reference_use_centered = bool(deriv_target_centered) and (
             prior_stage2_epochs + 1 >= deriv_switch_epoch)
         ae.eval()
-        ref_total_sum = torch.zeros((), device=device)
-        ref_recon_sum = torch.zeros((), device=device)
-        ref_stats_sum = torch.zeros((), device=device)
-        ref_stats1_sum = torch.zeros((), device=device)
-        ref_deriv_sum = torch.zeros((), device=device)
-        ref_interp_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         # The ancestor's val_loss (the "ref" line) runs a full validation pass
         # BEFORE epoch 1 -- minutes at 128x128 with no output, looking hung.
@@ -1294,20 +1289,13 @@ def train_stage2(
         _ref_prog = EpochProgress(len(val_loader), label="reference validation",
                                   unit="batches")
         with torch.no_grad():
-            for batch in val_loader:
-                _ref_prog.tick()
-                bs = batch[0].size(0)
-                total, recon, stats, stats1, deriv, interp_val = step(
-                    batch, train=False, deriv_weight_used=deriv_weight,
-                    use_centered=reference_use_centered)
-                ref_total_sum += total * bs
-                ref_recon_sum += recon * bs
-                ref_stats_sum += stats * bs
-                ref_stats1_sum += stats1 * bs
-                ref_deriv_sum += deriv * bs
-                ref_interp_sum += interp_val * bs
+            _ref_means, _ = accumulate_epoch(
+                val_loader,
+                lambda b: step(b, train=False, deriv_weight_used=deriv_weight,
+                               use_centered=reference_use_centered),
+                n_val, progress=_ref_prog)
         _ref_prog.close()
-        ref_total = (ref_total_sum / n_val).item()
+        ref_total = _ref_means["total"]
         # The reference IS the ancestor's val_loss under this run's own
         # objective, and this pass has just measured it -- previously it was
         # printed and thrown away. Handing it to the tracker as a ceiling means
@@ -1351,11 +1339,11 @@ def train_stage2(
         if not switch_lands_mid_run:
             loss_curve_levels.append(
                 (ref_total, f"ancestor ({_ancestor_stamp})"))
-        ref_recon = (ref_recon_sum / n_val).item()
-        ref_stats = (ref_stats_sum / n_val).item()
-        ref_stats1 = (ref_stats1_sum / n_val).item()
-        ref_deriv = (ref_deriv_sum / n_val).item()
-        ref_interp = (ref_interp_sum / n_val).item()
+        ref_recon = _ref_means["recon"]
+        ref_stats = _ref_means["stats"]
+        ref_stats1 = _ref_means["stats1"]
+        ref_deriv = _ref_means["deriv"]
+        ref_interp = _ref_means["interp"]
         ref_term_values = {
             stats_label: (stats0_weight, stats0_scale, ref_stats),
             stats1_label: (stats1_weight, stats1_scale, ref_stats1),
@@ -1387,6 +1375,24 @@ def train_stage2(
     #                            the training bar's ETA so it reflects the WHOLE
     #                            epoch, not just training (None until 1st epoch's
     #                            validation has been timed -> shown as "+ validation")
+
+    # In stage 2a only the deriv stream trains -- recon0 and stats0 are frozen
+    # and dead-flat, so a stacked-component scatter is two flat bands plus deriv:
+    # visual noise. The scatter is stage2-specific (skipped in 2a, carries the
+    # ancestor reference), so it rides write_epoch_figures' extra hook rather
+    # than its built-in component path. Defined once (captures epoch_history /
+    # component_histories by reference, so both the periodic and final writes
+    # see the current state).
+    def _stage2_component_scatter():
+        if stage2a:
+            return
+        loss_component_scatter(
+            epoch_history, component_histories, loss_components_path,
+            title="Stage 2 loss components",
+            ref_components=ref_components_for_scatter,
+            ref_label=f"ancestor ({_ancestor_stamp})",
+        )
+
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         # Linear ramp: 0 at epoch 0 (never reached, epochs are 1-indexed)
         # up to deriv_weight at epoch=deriv_weight_warmup_epochs and
@@ -1533,32 +1539,29 @@ def train_stage2(
         # val) is the batch of five .item() calls after each loop ends,
         # not five per batch. Same fix as train_lds.py's own epoch
         # loop -- see that function's own identical comment.
-        train_total_sum = torch.zeros((), device=device)
-        train_recon_sum = torch.zeros((), device=device)
-        train_stats_sum = torch.zeros((), device=device)
-        train_stats1_sum = torch.zeros((), device=device)
-        train_deriv_sum = torch.zeros((), device=device)
-        train_interp_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
-            _n_train_batches = 0
             _epoch_progress = EpochProgress(
                 len(train_loader),
                 tail_label="validation", tail_seconds=_prev_val_seconds)
-            for batch in train_loader:
-                _epoch_progress.tick()
-                bs = batch[0].size(0)
-                _n_train_batches += 1
-                total, recon, stats, stats1, deriv, interp_val = step(
-                    batch, train=True, deriv_weight_used=effective_deriv_weight,
-                    use_centered=use_centered_this_epoch)
-                train_total_sum += total * bs
-                train_recon_sum += recon * bs
-                train_stats_sum += stats * bs
-                train_stats1_sum += stats1 * bs
-                train_deriv_sum += deriv * bs
-                train_interp_sum += interp_val * bs
+            _train_means, _n_train_batches = accumulate_epoch(
+                train_loader,
+                lambda b: step(b, train=True, deriv_weight_used=effective_deriv_weight,
+                               use_centered=use_centered_this_epoch),
+                n_train, progress=_epoch_progress)
             _epoch_progress.close()
+            # Stage 2 keeps its OWN skip message rather than the shared
+            # SkipReporter.report_epoch that stages 3/4/5 use, on purpose. Three
+            # structural differences make report_epoch a poor fit here: (1) stage 2
+            # has a SINGLE loss guard (and none at all when spike_skip_factor=0),
+            # not the loss+gradient pair; (2) it uses the PER-EPOCH guard API
+            # (n_skipped_this_epoch / worst / end_epoch) rather than the cumulative
+            # n_skipped / last_worst that report_epoch diffs; (3) it prints a plain
+            # every-epoch "skipped N/M" line, not report_epoch's notability-gated
+            # DIGEST (report the notable, digest the routine). Switching to
+            # report_epoch would therefore CHANGE stage 2's log format and gating
+            # -- a deliberate unification decision, not the faithful extraction the
+            # rest of this refactor is, so it is left as an explicit opt-in.
             if spike_guard is not None:
                 _n_skipped = spike_guard.n_skipped_this_epoch
                 _worst = spike_guard.worst
@@ -1577,12 +1580,12 @@ def train_stage2(
                           f"epoch -- weights took no step. If this persists the run "
                           f"is deadlocked (broken weights make every batch an "
                           f"outlier); lower lr or raise spike_skip_factor.")
-            train_total = (train_total_sum / n_train).item()
-            train_recon = (train_recon_sum / n_train).item()
-            train_stats = (train_stats_sum / n_train).item()
-            train_stats1 = (train_stats1_sum / n_train).item()
-            train_deriv = (train_deriv_sum / n_train).item()
-            train_interp = (train_interp_sum / n_train).item()
+            train_total = _train_means["total"]
+            train_recon = _train_means["recon"]
+            train_stats = _train_means["stats"]
+            train_stats1 = _train_means["stats1"]
+            train_deriv = _train_means["deriv"]
+            train_interp = _train_means["interp"]
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
@@ -1591,12 +1594,6 @@ def train_stage2(
             train_interp = float("nan")
 
         ae.eval()
-        val_total_sum = torch.zeros((), device=device)
-        val_recon_sum = torch.zeros((), device=device)
-        val_stats_sum = torch.zeros((), device=device)
-        val_stats1_sum = torch.zeros((), device=device)
-        val_deriv_sum = torch.zeros((), device=device)
-        val_interp_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         # Per-epoch validation pass: after the train bar finishes, this full
         # val_loader pass runs unbarred before the epoch summary. Same silent-
@@ -1606,26 +1603,19 @@ def train_stage2(
                                   unit="batches")
         _val_t0 = time.monotonic()
         with torch.no_grad():
-            for batch in val_loader:
-                _val_prog.tick()
-                bs = batch[0].size(0)
-                total, recon, stats, stats1, deriv, interp_val = step(
-                    batch, train=False, deriv_weight_used=val_deriv_weight,
-                    use_centered=use_centered_this_epoch)
-                val_total_sum += total * bs
-                val_recon_sum += recon * bs
-                val_stats_sum += stats * bs
-                val_stats1_sum += stats1 * bs
-                val_deriv_sum += deriv * bs
-                val_interp_sum += interp_val * bs
+            _val_means, _ = accumulate_epoch(
+                val_loader,
+                lambda b: step(b, train=False, deriv_weight_used=val_deriv_weight,
+                               use_centered=use_centered_this_epoch),
+                n_val, progress=_val_prog)
         _val_prog.close()
         _prev_val_seconds = time.monotonic() - _val_t0   # feeds next epoch's ETA
-        val_total = (val_total_sum / n_val).item()
-        val_recon = (val_recon_sum / n_val).item()
-        val_stats = (val_stats_sum / n_val).item()
-        val_stats1 = (val_stats1_sum / n_val).item()
-        val_deriv = (val_deriv_sum / n_val).item()
-        val_interp = (val_interp_sum / n_val).item()
+        val_total = _val_means["total"]
+        val_recon = _val_means["recon"]
+        val_stats = _val_means["stats"]
+        val_stats1 = _val_means["stats1"]
+        val_deriv = _val_means["deriv"]
+        val_interp = _val_means["interp"]
 
         # Scale-balance check, ported from train_refinement. Fires ONCE, at the
         # first FULL-weight epoch (max(1, deriv_weight_warmup_epochs)) -- after
@@ -1681,11 +1671,11 @@ def train_stage2(
         # though val_total itself (computed inside step(), which DOES
         # already use the right weight) stayed correct.
         #
-        # Moved ABOVE loss_curve()/loss_component_scatter() (used to sit
-        # just below) so the same weighted, scale-normalized values feed
-        # BOTH the console breakdown below AND the per-component history
-        # that loss_component_scatter needs -- computing it twice would
-        # risk the two silently drifting apart from each other.
+        # Moved ABOVE the figure write (write_epoch_figures and the
+        # _stage2_component_scatter it invokes; used to sit just below) so the
+        # same weighted, scale-normalized values feed BOTH the console breakdown
+        # below AND the per-component history that loss_component_scatter needs
+        # -- computing it twice would risk the two silently drifting apart.
         term_values = {
             stats_label: (stats0_weight, stats0_weight, stats0_scale, train_stats, val_stats),
             stats1_label: (stats1_weight, stats1_weight, stats1_scale, train_stats1, val_stats1),
@@ -1697,13 +1687,6 @@ def train_stage2(
         train_loss_history.append(train_total)
         val_loss_history.append(val_total)
         best_so_far_history.append(tracker.best_val_loss)
-        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
-            loss_curve(
-                epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-                loss_curve_path, title="Stage 2 loss", event_epochs=loss_curve_events,
-                reference_levels=loss_curve_levels,
-            )
-            write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
 
         # loss_component_scatter: recon0 (always present, weight 1) plus
         # whichever of stats0/stats1/deriv are actually active this run
@@ -1720,17 +1703,15 @@ def train_stage2(
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
             component_histories[name]["best_so_far"].append(best_components[name])
-        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)) and not stage2a:
-            # In stage 2a only the deriv stream trains -- recon0 and stats0 are
-            # frozen and dead-flat, so a stacked-component scatter is two flat
-            # bands plus deriv: visual noise. The single moving term is already
-            # in the per-epoch console line and the plain loss_curve below.
-            loss_component_scatter(
-                epoch_history, component_histories, loss_components_path,
-                title="Stage 2 loss components",
-                ref_components=ref_components_for_scatter,
-                ref_label=f"ancestor ({_ancestor_stamp})",
-            )
+        # loss_component_scatter (via write_epoch_figures' extra hook) is
+        # stage2-specific -- see _stage2_component_scatter defined before the loop.
+        write_epoch_figures(
+            epoch, log_every_epoch,
+            epoch_history=epoch_history, train_loss_history=train_loss_history,
+            val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+            loss_curve_path=loss_curve_path, title="Stage 2",
+            event_epochs=loss_curve_events, reference_levels=loss_curve_levels,
+            extra=_stage2_component_scatter)
 
         train_terms = " ".join(f"+{tw*tv/s:7.4f}" for lbl, (tw, _, s, tv, _) in term_values.items()
                                 if any(lbl == l for _, l, _ in active_terms))
@@ -1743,93 +1724,79 @@ def train_stage2(
 
         if saved_this_epoch:
             epochs_since_improvement = 0
-            atomic_torch_save({
-                "model_state": ae.state_dict(),
-                "stats_head_state": stats_head.state_dict(),
-                "stats_head1_state": stats_head1.state_dict() if stats_head1 is not None else None,
-                "epoch": epoch,
-                "val_loss": val_total,
-                "val_loss_ema": val_ema,
-                "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
-                "config": {
-                    "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],
-                    "latent_channels": recon_stream.channels,
-                    "latent_spatial_size": recon_stream.spatial_size,
-                    "stats_weight": ancestor_stats_weight,
-                    "stream_configs": {
-                        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,
-                               "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
-                        for name, cfg in stream_configs.items()
+            msg += save_checkpoint(
+                checkpoint_path,
+                model_states={
+                    "model_state": ae.state_dict(),
+                    "stats_head_state": stats_head.state_dict(),
+                    "stats_head1_state": stats_head1.state_dict() if stats_head1 is not None else None,
+                },
+                provenance={
+                    "config": {
+                        "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],
+                        "latent_channels": recon_stream.channels,
+                        "latent_spatial_size": recon_stream.spatial_size,
+                        "stats_weight": ancestor_stats_weight,
+                        "stream_configs": {
+                            name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
+                                   "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,
+                                   "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
+                            for name, cfg in stream_configs.items()
+                        },
+                        "recon_stream_name": recon_stream_name,
+                        "decoder_for_stream": decoder_for_stream,
                     },
-                    "recon_stream_name": recon_stream_name,
-                    "decoder_for_stream": decoder_for_stream,
+                    "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
+                    # Mirrors train_lds's own data_config, and exists for the
+                    # same reason: a diagnostic reading this checkpoint has
+                    # no other way to reproduce the window set it was
+                    # actually trained on, and its own CLI defaults
+                    # (min_step=None -> 0, min_stdev_phi=None) mean NO
+                    # filtering at all -- silently a different, much larger
+                    # population than training ever saw.
+                    #
+                    # min_std_deriv especially: it is applied ONLY here, in
+                    # stage 2, and on real 64x64 data discards tens of
+                    # thousands of windows (33683 train / 13090 val in one
+                    # real run). Until this was saved it appeared in no
+                    # checkpoint at all, so every stage-2 evaluation
+                    # SILENTLY ran against windows training had deliberately
+                    # excluded.
+                    #
+                    # Saving it made that difference REPORTABLE, not
+                    # reproducible -- an important distinction. The filter
+                    # is raw-pixel-only (it thresholds the spatial std of
+                    # the pixel-space derivative), and
+                    # MicrostructureEvolutionDataset rejects it outright in
+                    # cached-latent mode, where it has no defined meaning.
+                    # train_stage2 can apply it only because it trains E/D
+                    # and therefore runs in raw-pixel mode; every stage-2
+                    # DIAGNOSTIC uses a frozen encoder instead. So
+                    # check_deriv_temperature reads this value and prints an
+                    # explicit NOTE that its window population differs from
+                    # training's -- it does not, and cannot, match it.
+                    "data_config": {
+                        "min_step": min_step, "min_stdev_phi": min_stdev_phi,
+                        "min_passing_steps": min_passing_steps, "min_std_deriv": min_std_deriv,
+                        "window_length": 3 if deriv_target_centered else 2,
+                        "augment": augment,
+                    },
+                    "stage2_config": {"deriv_weight": deriv_weight,
+                                       "interp_weight": interp_weight,
+                                       "interp_scale": interp_scale,
+                                       "trunk_from_deriv_weight": trunk_from_deriv_weight,
+                                       "stage2a": stage2a,
+                                       "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
+                                       "deriv_dt_weight_exponent": deriv_dt_weight_exponent,
+                                       "deriv_target_centered": deriv_target_centered,
+                                       "val_aug_averaging": val_aug_averaging,
+                                       "deriv_switch_epoch": deriv_switch_epoch,
+                                       "use_centered_at_save": use_centered_this_epoch,
+                                       "stats0_weight": stats0_weight, "stats1_weight": stats1_weight,
+                                       "n_frozen_stages": n_frozen_stages, "resumed_from": str(resume_from)},
                 },
-                "stats_config": {"stat_names": stat_names, "stats_mean": mean.cpu(), "stats_std": std.cpu()},
-                # Mirrors train_lds's own data_config, and exists for the
-                # same reason: a diagnostic reading this checkpoint has
-                # no other way to reproduce the window set it was
-                # actually trained on, and its own CLI defaults
-                # (min_step=None -> 0, min_stdev_phi=None) mean NO
-                # filtering at all -- silently a different, much larger
-                # population than training ever saw.
-                #
-                # min_std_deriv especially: it is applied ONLY here, in
-                # stage 2, and on real 64x64 data discards tens of
-                # thousands of windows (33683 train / 13090 val in one
-                # real run). Until this was saved it appeared in no
-                # checkpoint at all, so every stage-2 evaluation
-                # SILENTLY ran against windows training had deliberately
-                # excluded.
-                #
-                # Saving it made that difference REPORTABLE, not
-                # reproducible -- an important distinction. The filter
-                # is raw-pixel-only (it thresholds the spatial std of
-                # the pixel-space derivative), and
-                # MicrostructureEvolutionDataset rejects it outright in
-                # cached-latent mode, where it has no defined meaning.
-                # train_stage2 can apply it only because it trains E/D
-                # and therefore runs in raw-pixel mode; every stage-2
-                # DIAGNOSTIC uses a frozen encoder instead. So
-                # check_deriv_temperature reads this value and prints an
-                # explicit NOTE that its window population differs from
-                # training's -- it does not, and cannot, match it.
-                "data_config": {
-                    "min_step": min_step, "min_stdev_phi": min_stdev_phi,
-                    "min_passing_steps": min_passing_steps, "min_std_deriv": min_std_deriv,
-                    "window_length": 3 if deriv_target_centered else 2,
-                    "augment": augment,
-                },
-                "stage2_config": {"deriv_weight": deriv_weight,
-                                   "interp_weight": interp_weight,
-                                   "interp_scale": interp_scale,
-                                   "trunk_from_deriv_weight": trunk_from_deriv_weight,
-                                   "stage2a": stage2a,
-                                   "deriv_weight_warmup_epochs": deriv_weight_warmup_epochs,
-                                   "deriv_dt_weight_exponent": deriv_dt_weight_exponent,
-                                   "deriv_target_centered": deriv_target_centered,
-                                   "val_aug_averaging": val_aug_averaging,
-                                   "deriv_switch_epoch": deriv_switch_epoch,
-                                   "use_centered_at_save": use_centered_this_epoch,
-                                   "stats0_weight": stats0_weight, "stats1_weight": stats1_weight,
-                                   "n_frozen_stages": n_frozen_stages, "resumed_from": str(resume_from)},
-            }, checkpoint_path)
-            msg += "  -> saved"
-            # Stamp the save time (HH:MM) so a "-> saved" epoch line can be
-            # matched to the checkpoint file it produced -- the checkpoint
-            # filename carries the timestamp (e.g. ...-20260819_11h20.pt), and
-            # without this there was no way to tell WHICH epoch a given .pt is.
-            msg += f" at {time.strftime('%H:%M')}"
-            if on_checkpoint_saved is not None:
-                try:
-                    on_checkpoint_saved(checkpoint_path, epoch)
-                except Exception as e:
-                    # Bookkeeping must never kill training: a failed registry
-                    # upsert crashed one real run BETWEEN the save and the epoch
-                    # line (checkpoint one epoch newer than the log). Announce
-                    # and continue -- a lost registry row, never a lost run.
-                    print(f"  WARNING: on_checkpoint_saved failed "
-                          f"({type(e).__name__}: {e}) -- continuing training")
+                epoch=epoch, val_loss=val_total, val_loss_ema=val_ema,
+                test_dirs=test_dirs, on_saved=on_checkpoint_saved)
         elif not was_in_grace_period:
             epochs_since_improvement += 1
         # During a grace window should_save is UNCONDITIONALLY False (see
@@ -1938,19 +1905,13 @@ def train_stage2(
     # wasn't a multiple of the interval. Without this the figures left on
     # disk could be up to `every` epochs stale, which is exactly the
     # state a finished run gets judged from.
-    loss_curve(
-        epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-        loss_curve_path, title="Stage 2 loss", event_epochs=loss_curve_events,
-        reference_levels=loss_curve_levels,
-    )
-    write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
-    if not stage2a:      # see the periodic call above: moot when only deriv moves
-        loss_component_scatter(
-            epoch_history, component_histories, loss_components_path,
-            title="Stage 2 loss components",
-            ref_components=ref_components_for_scatter,
-            ref_label=f"ancestor ({_ancestor_stamp})",
-        )
+    write_epoch_figures(
+        epoch, log_every_epoch, force=True,
+        epoch_history=epoch_history, train_loss_history=train_loss_history,
+        val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+        loss_curve_path=loss_curve_path, title="Stage 2",
+        event_epochs=loss_curve_events, reference_levels=loss_curve_levels,
+        extra=_stage2_component_scatter)
 
     print("\nPer-block PARAMETER drift (L2 norm of change from stage-1 starting point):")
     frozen_groups = {group for group, value in param_drift.items() if value == 0.0}

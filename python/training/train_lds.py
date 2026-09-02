@@ -15,7 +15,6 @@ being on sys.path):
         --size 64 --base ../../datasets --n-rollout-steps 6
 """
 
-import time
 import argparse
 import math
 from collections.abc import Callable
@@ -35,13 +34,14 @@ from models.latent_streams import (
     resolve_stream_configs_from_checkpoint_config,
 )
 from training.checkpoint_criterion import (
-    CheckpointCriterionTracker, atomic_torch_save, clamp_grace_epochs, grace_epochs_for_ema,
+    CheckpointCriterionTracker, save_checkpoint, clamp_grace_epochs, grace_epochs_for_ema,
 )
 from training.checkpoint_components import cross_check_ancestor_config
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import RolloutLoss, compute_dt_decade_weights
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
-from utils.plots import loss_curve, write_loss_history, should_write_loss_figure, rollout_vs_1step_scatter
+from utils.plots import rollout_vs_1step_scatter
+from training.training_loop import accumulate_epoch, write_epoch_figures
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -1167,7 +1167,7 @@ def train_lds(
         # above has already consumed and which would otherwise be kept
         # alive (and keep growing) for the rest of the epoch if left
         # attached.
-        return total.detach(), l_1step_scaled.detach()
+        return {"total": total.detach(), "1step": l_1step_scaled.detach()}
 
     # Clamped against how many epoch iterations this run ACTUALLY makes
     # -- see clamp_grace_epochs' own docstring. The loop below is
@@ -1249,17 +1249,15 @@ def train_lds(
     # Separate history: gradient norms and losses live on different scales, so
     # one shared median would be meaningless for both.
     grad_guard = _SpikeGuard(grad_spike_factor)
-    _spikes_reported = 0
-    _grad_spikes_reported = 0
     # The guards' rationale is printed ONCE, then every later epoch gets a
     # single compact line -- see skip_report. Routine skipping (1-4 batches of
     # 13, every epoch) was producing six lines of unchanging exposition
     # between consecutive epoch lines.
     # Only NOTABLE skips get a line; the rest are digested periodically. One
     # batch of 13 at 11.9x a 10x threshold is the guard working, and a line
-    # for it every epoch buries the ones that are not.
+    # for it every epoch buries the ones that are not. The reporter owns the
+    # running-total-to-delta bookkeeping (report_epoch).
     _skip_reporter = SkipReporter()
-    _nonfinite_reported = 0
     # PEAK MEMORY IS A HIGH-WATER MARK, tracked all run. Measuring it once
     # after epoch 1 measured the CHEAPEST epoch: sub-step counts climb as
     # f_theta sharpens (46 -> 209 mean on one run), and with
@@ -1394,39 +1392,38 @@ def train_lds(
         # own docstring/comment: `loss * bs` below stays a GPU tensor
         # op (no sync), so the ONLY host sync in this whole loop is the
         # single .item() call after it ends, not one per batch.
-        train_loss_sum = torch.zeros((), device=device)
-        train_1step_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
-            _n_train_batches = 0
             _epoch_progress = EpochProgress(len(train_loader))
-            for batch in train_loader:
-                _epoch_progress.tick()
-                _n_train_batches += 1
+            # The per-batch memory diagnostic (opt-in) resets the CUDA peak
+            # BEFORE the step and reads/records it AFTER, and needs the batch
+            # index -- so it wraps the forward here rather than living in the
+            # shared accumulate_epoch. A closure counter mirrors the batch count
+            # accumulate_epoch also returns.
+            _batch_idx = [0]
+
+            def _train_forward(batch):
+                _batch_idx[0] += 1
                 if _mem_diag is not None:
-                    # Per-batch isolation: synchronise so the previous batch's
-                    # kernels have finished, then reset the peak so the next
-                    # reading is THIS batch's alone. This is the measurement
-                    # every failed model lacked -- they were all fitted to one
-                    # run-level number.
                     torch.cuda.synchronize(device)
                     torch.cuda.reset_peak_memory_stats(device)
                     f_theta.retained_peak(reset=True)
-                bs = batch[0].size(0)
-                loss, l_1step = step(batch, train=True)
-                train_loss_sum += loss * bs
-                train_1step_sum += l_1step * bs
+                out = step(batch, train=True)
                 if _mem_diag is not None:
                     torch.cuda.synchronize(device)
                     _counts = f_theta.last_counts()
                     if _counts:
                         _mem_diag.record(
-                            epoch, _n_train_batches,
+                            epoch, _batch_idx[0],
                             torch.cat(_counts).numpy(),
                             float(torch.cuda.max_memory_allocated(device)),
                             float(torch.cuda.max_memory_reserved(device)))
-            train_loss = (train_loss_sum / n_train).item()
-            train_1step = (train_1step_sum / n_train).item()
+                return out
+
+            _train_means, _n_train_batches = accumulate_epoch(
+                train_loader, _train_forward, n_train, progress=_epoch_progress)
+            train_loss = _train_means["total"]
+            train_1step = _train_means["1step"]
             _epoch_progress.close()
             if _bucket_sampler is not None and device.type == "cuda":
                 _alloc = float(torch.cuda.max_memory_allocated(device))
@@ -1484,17 +1481,12 @@ def train_lds(
             _train_substeps = None
 
         f_theta.eval()
-        val_loss_sum = torch.zeros((), device=device)
-        val_1step_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         with torch.no_grad():
-            for batch in val_loader:
-                bs = batch[0].size(0)
-                loss, l_1step = step(batch, train=False)
-                val_loss_sum += loss * bs
-                val_1step_sum += l_1step * bs
-        val_loss = (val_loss_sum / n_val).item()
-        val_1step = (val_1step_sum / n_val).item()
+            _val_means, _ = accumulate_epoch(
+                val_loader, lambda b: step(b, train=False), n_val)
+        val_loss = _val_means["total"]
+        val_1step = _val_means["1step"]
 
         # Captured BEFORE update(): the reference must be where the run WAS,
         # not an average this epoch's own excursion has already pulled up.
@@ -1617,33 +1609,24 @@ def train_lds(
         if show_1step:
             train_1step_history.append(train_1step)
             val_1step_history.append(val_1step)
-        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
-            loss_curve(
-                epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-                loss_curve_path, title="Stage 3 loss",
-                secondary_train=train_1step_history if show_1step else None,
-                secondary_val=val_1step_history if show_1step else None,
-                secondary_label="1step", reference_levels=_ref_levels(),
-            )
-            write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
-            if show_1step:
-                _write_rollout_scatter()
+        write_epoch_figures(
+            epoch, log_every_epoch,
+            epoch_history=epoch_history, train_loss_history=train_loss_history,
+            val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+            loss_curve_path=loss_curve_path, title="Stage 3",
+            secondary_train=train_1step_history if show_1step else None,
+            secondary_val=val_1step_history if show_1step else None,
+            secondary_label="1step", reference_levels=_ref_levels(),
+            extra=_write_rollout_scatter if show_1step else None)
 
         # SKIPPED BATCHES ARE NEVER SILENT. A guard that quietly drops data
         # would be worse than the crash it prevents: the run would look
-        # healthy while training on a filtered distribution.
-        _newg = grad_guard.n_skipped - _grad_spikes_reported
-        _new = spike_guard.n_skipped - _spikes_reported
-        _grad_spikes_reported = grad_guard.n_skipped
-        _spikes_reported = spike_guard.n_skipped
-        # Non-finite is ALWAYS notable: an inf gradient turns the whole
-        # parameter vector to nan in a single step if it gets through.
-        _all_nonfinite = spike_guard.n_nonfinite + grad_guard.n_nonfinite
-        _new_nonfinite = _all_nonfinite - _nonfinite_reported
-        _nonfinite_reported = _all_nonfinite
-        _line = _skip_reporter.epoch(
-            epoch, _new, spike_guard.last_worst, _newg, grad_guard.last_worst,
-            _n_train_batches, n_nonfinite_new=_new_nonfinite,
+        # healthy while training on a filtered distribution. The reporter owns
+        # the running-total-to-delta bookkeeping (report_epoch), the SAME path
+        # stage 4/5 uses -- non-finite is always notable (an inf gradient turns
+        # the whole parameter vector to nan in a single step if it gets through).
+        _line = _skip_reporter.report_epoch(
+            epoch, spike_guard, grad_guard, _n_train_batches,
             dt_label=("du_max" if time_coordinate == "log10_t" else "dt_max"))
         if _line:
             print(_line)
@@ -1667,61 +1650,51 @@ def train_lds(
                 saved_train_1step_hist.append(train_1step)
                 saved_train_rollout_hist.append(train_loss)
                 saved_epoch_hist.append(epoch)
-            atomic_torch_save({
-                "model_state": f_theta.state_dict(),
-                "epoch": epoch,
-                "val_loss": val_loss,
-                "val_loss_ema": tracker.val_ema,
-                "ae_checkpoint": str(Path(ae_checkpoint_path).resolve()),
-                # The resume ancestor (3b -> 3a), stored so lineage is walkable
-                # from the checkpoint alone -- same as stage 4/5's joint save.
-                # Without it the 3b -> 3a link is registry-only (asymmetric).
-                **({"resumed_from": str(Path(resume_from).resolve())}
-                   if resume_from is not None else {}),
-                "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
-                "config": {
-                    "latent_channels": ae_config["latent_channels"], "n_theta": N_THETA,
-                    "latent_spatial_size": ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
-                    "hidden_dim": hidden_dim, "n_hidden_layers": n_hidden_layers,
-                    "dt_cap": dt_cap,
-                    "n_substeps": n_substeps,
-                    # alpha belongs here for the same reason dt_cap does: it
-                    # defines what f_theta was fitted to MEAN. Two checkpoints
-                    # with the same weights and different alpha are corrections
-                    # calibrated to different step sizes.
-                    "alpha": alpha,
-                    "dynamics_mode": dynamics_mode,
-                    "derivative_source": derivative_source,
-                    "derivative_time": derivative_time,
-                    "time_coordinate": time_coordinate,
-                    # Recorded for provenance only. Deliberately NOT in
-                    # _MEANING_FIELDS: truncation changes how the gradient was
-                    # computed, not what f_theta means, so a rebuild without it
-                    # evaluates exactly as this run trained.
-                    "truncate_bptt": truncate_bptt,
-                    "max_substeps": max_substeps,
-                    "z1_resync": z1_resync,
+            msg += save_checkpoint(
+                checkpoint_path,
+                model_states={
+                    "model_state": f_theta.state_dict(),
+                    "ae_checkpoint": str(Path(ae_checkpoint_path).resolve()),
+                    # The resume ancestor (3b -> 3a), stored so lineage is walkable
+                    # from the checkpoint alone -- same as stage 4/5's joint save.
+                    # Without it the 3b -> 3a link is registry-only (asymmetric).
+                    **({"resumed_from": str(Path(resume_from).resolve())}
+                       if resume_from is not None else {}),
                 },
-                "data_config": {
-                    "min_step": min_step, "min_stdev_phi": min_stdev_phi,
-                    "min_normalized_stdev_phi": min_normalized_stdev_phi,
-                    "min_passing_steps": min_passing_steps, "max_dt": max_dt,
-                    "window_length": window_length, "n_rollout_steps": n_rollout_steps,
-                    "z0_noise_scale": z0_noise_scale,
+                provenance={
+                    "config": {
+                        "latent_channels": ae_config["latent_channels"], "n_theta": N_THETA,
+                        "latent_spatial_size": ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
+                        "hidden_dim": hidden_dim, "n_hidden_layers": n_hidden_layers,
+                        "dt_cap": dt_cap,
+                        "n_substeps": n_substeps,
+                        # alpha belongs here for the same reason dt_cap does: it
+                        # defines what f_theta was fitted to MEAN. Two checkpoints
+                        # with the same weights and different alpha are corrections
+                        # calibrated to different step sizes.
+                        "alpha": alpha,
+                        "dynamics_mode": dynamics_mode,
+                        "derivative_source": derivative_source,
+                        "derivative_time": derivative_time,
+                        "time_coordinate": time_coordinate,
+                        # Recorded for provenance only. Deliberately NOT in
+                        # _MEANING_FIELDS: truncation changes how the gradient was
+                        # computed, not what f_theta means, so a rebuild without it
+                        # evaluates exactly as this run trained.
+                        "truncate_bptt": truncate_bptt,
+                        "max_substeps": max_substeps,
+                        "z1_resync": z1_resync,
+                    },
+                    "data_config": {
+                        "min_step": min_step, "min_stdev_phi": min_stdev_phi,
+                        "min_normalized_stdev_phi": min_normalized_stdev_phi,
+                        "min_passing_steps": min_passing_steps, "max_dt": max_dt,
+                        "window_length": window_length, "n_rollout_steps": n_rollout_steps,
+                        "z0_noise_scale": z0_noise_scale,
+                    },
                 },
-            }, checkpoint_path)
-            msg += "  -> saved"
-            msg += f" at {time.strftime('%H:%M')}"  # match the checkpoint filename timestamp
-            if on_checkpoint_saved is not None:
-                try:
-                    on_checkpoint_saved(checkpoint_path, epoch)
-                except Exception as e:
-                    # Bookkeeping must never kill training: a failed registry
-                    # upsert crashed one real run BETWEEN the save and the epoch
-                    # line (checkpoint one epoch newer than the log). Announce
-                    # and continue -- a lost registry row, never a lost run.
-                    print(f"  WARNING: on_checkpoint_saved failed "
-                          f"({type(e).__name__}: {e}) -- continuing training")
+                epoch=epoch, val_loss=val_loss, val_loss_ema=tracker.val_ema,
+                test_dirs=test_dirs, on_saved=on_checkpoint_saved)
         else:
             epochs_since_improvement += 1
 
@@ -1805,23 +1778,18 @@ def train_lds(
     # skipped -- via early stopping, or simply because the last epoch
     # wasn't a multiple of the interval. Without this the figures left on
     # disk could be up to `every` epochs stale, which is exactly the
-    # state a finished run gets judged from.
-    loss_curve(
-        epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-        loss_curve_path, title="Stage 3 loss",
+    # state a finished run gets judged from. The rollout-vs-1step scatter
+    # (extra) is skipped for 3a (n_rollout_steps=1) and for runs with <2
+    # saved epochs (the scatter's own guard) via show_1step.
+    write_epoch_figures(
+        epoch, log_every_epoch, force=True,
+        epoch_history=epoch_history, train_loss_history=train_loss_history,
+        val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+        loss_curve_path=loss_curve_path, title="Stage 3",
         secondary_train=train_1step_history if show_1step else None,
         secondary_val=val_1step_history if show_1step else None,
         secondary_label="1step", reference_levels=_ref_levels(),
-    )
-    write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history, secondary_train=train_1step_history if show_1step else None, secondary_val=val_1step_history if show_1step else None)
-
-    # The L_rollout-vs-L_1step tradeoff at the SAVED checkpoints, log-log
-    # square. Same call written periodically above; repeated here so the FINAL
-    # state is always current even between periodic writes. Skipped for 3a
-    # (n_rollout_steps=1, where the two are identical) and for runs with <2
-    # saved epochs (the scatter's own guard).
-    if show_1step:
-        _write_rollout_scatter()
+        extra=_write_rollout_scatter if show_1step else None)
 
     if not checkpoint_path.exists():
         # A run that never saved is a FAILED run, and it must say so HERE.

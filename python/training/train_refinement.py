@@ -21,15 +21,16 @@ from training.spike_guard import (
     restore_running_stats, snapshot_running_stats, SkipReporter,
 )
 from utils.logging_utils import print_run_parameters, EpochProgress
+from training.training_loop import (accumulate_epoch, weighted_contributions,
+                                    write_epoch_figures)
 from training.checkpoint_criterion import (
-    CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
-    clamp_grace_epochs, grace_epochs_for_ema, scale_balance_report,
+    CheckpointCriterionTracker, ComponentBestTracker, save_checkpoint,
+    ramp_completion_grace, scale_balance_report,
 )
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import StatsLoss
 from training.model_assembly import build_models_from_components
 from training.refinement_loss import compute_stage45_loss
-from utils.plots import loss_component_scatter, loss_curve, write_loss_history, should_write_loss_figure
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
 
@@ -485,9 +486,11 @@ def train_refinement(
         # attached. Same fix as train_lds.py's/train_stage1.py's/
         # train_stage2.py's own step() -- see any of those functions'
         # own identical comment.
-        return (loss.detach(), components["rollout"].detach(),
-                components["recon0"].detach(), components["stats0"].detach(),
-                components["recon_predict"].detach())
+        return {
+            "total": loss.detach(), "rollout": components["rollout"].detach(),
+            "recon0": components["recon0"].detach(), "stats0": components["stats0"].detach(),
+            "recon_predict": components["recon_predict"].detach(),
+        }
 
     # Whether THIS run has written the checkpoint at least once -- train_lds
     # tracks the same thing for its no-save guard; here it feeds
@@ -518,9 +521,6 @@ def train_refinement(
     spike_guard = _SpikeGuard(spike_skip_factor)
     # Separate history: gradient norms and losses live on different scales.
     grad_guard = _SpikeGuard(grad_spike_factor)
-    _spikes_reported = 0
-    _grad_spikes_reported = 0
-    _nonfinite_reported = 0
     # Same digesting reporter stages 3 uses, so stage 4/5 gets the SAME merged
     # single-block message when BOTH guards fire in an epoch (was two separate
     # near-identical blocks) and the compact one-line digest for routine skips.
@@ -530,6 +530,14 @@ def train_refinement(
     _prev_val_seconds = None   # previous epoch's validation duration, added to
     #                            the training bar's ETA so it reflects the WHOLE
     #                            epoch (shown as "+ validation" on the first).
+    # The objective's weight/scale maps, constant across epochs -- the single
+    # source for the component decomposition (histories, loss line, scale-balance
+    # report) via weighted_contributions.
+    _components = ("rollout", "recon0", "stats0", "recon_predict")
+    _weights = {"rollout": rollout_weight, "recon0": recon0_weight,
+                "stats0": stats0_weight, "recon_predict": recon_predict_weight}
+    _scales = {"rollout": rollout_scale, "recon0": recon0_scale,
+               "stats0": stats0_scale, "recon_predict": recon_predict_scale}
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         ae.train()
         f_theta.train()
@@ -552,35 +560,24 @@ def train_refinement(
         # distribution f_theta was fitted to. A full-strength rollout gradient
         # immediately pulls it OFF that distribution, which raises the rollout
         # loss, which pulls harder: positive feedback, and f*dt^2/2 makes it
-        # quadratic. Measured on a real run, the raw rollout fell 6e9 between
-        # epoch 1 and epoch 10 (1.76e9 -> 0.29), so NO single rollout_scale
-        # serves both ends -- calibrated on the converged value it makes epoch
-        # 1 explosive, calibrated on epoch 1 it makes the term irrelevant
-        # later. rollout_scale=1 stalled the run outright; 10 was the largest
-        # gradient the transient tolerated.
-        #
-        # The ramp separates those two jobs: recon0 and stats0 hold the encoder
-        # (they have the decoder and the statistics as tethers, and their
-        # train/val gap stayed under 2x while rollout's hit 83x) while the
-        # rollout term comes up gradually. rollout_scale can then be set from
-        # the CONVERGED magnitude, which is what it is for.
-        #
+        # quadratic. recon0 and stats0 hold the encoder (they have the decoder
+        # and the statistics as tethers) while the rollout term comes up
+        # gradually, so rollout_scale can be set from the CONVERGED magnitude.
         # Lowering lr instead would damp the transient AND everything after it.
-        # GEOMETRIC, not linear. Linear is what stage 2 uses for
-        # deriv_weight, and it is wrong here because the quantity being ramped
-        # behaves completely differently: L_deriv is O(1) from the start, while
-        # L_rollout collapses by ~6e9 over the first ten epochs
-        # (1.76e9 -> 0.29, measured). A linear ramp at epoch 1 gives
-        # 0.10 * 1.76e9 = 1.76e8 -- still eight orders of magnitude above the
-        # converged contribution, so it barely softens the transient it exists
-        # to absorb.
         #
-        # Linear epoch/warmup_epochs over the window (starts at 1/N, not 0)
-        # tracks the collapse instead: 1e-6 * 1.76e9 = 1.8e3 at epoch 1, then
-        # ~0.34 at epochs 2 and 5, then 0.29 at epoch 10. The CONTRIBUTION is
-        # roughly flat across the ramp, which is the actual goal -- a constant
-        # gradient scale while the encoder settles, rather than a constant
-        # weight applied to a wildly varying loss.
+        # LINEAR, epoch/warmup_epochs (1/N at epoch 1, full AT epoch N) -- see
+        # linear_warmup_weight. This USED to be geometric: on the runs it was
+        # designed against, the raw rollout collapsed ~6e9 over the first ten
+        # epochs (1.76e9 -> 0.29), so a linear weight ramp left epoch 1 eight
+        # decades above the converged contribution and only a geometric one
+        # held the CONTRIBUTION roughly flat. That collapse was itself an
+        # artefact of the filter-manufactured large-dt windows (du_max=2.5e4);
+        # require_consecutive now excludes those at the window definition, and
+        # with the scales recalibrated L_rollout is O(1-10) from epoch 1 --
+        # nothing left to hold flat, so a plain linear introduction suffices,
+        # and the same helper serves recon_predict below and stage 2's deriv
+        # ramp (which was linear epoch/N all along; warmup_epochs=N now means
+        # the same ramp in every trainer).
         effective_rollout_weight = linear_warmup_weight(
             epoch, rollout_weight, rollout_weight_warmup_epochs)
         # Same linear ramp for recon_predict: it backprops a full-weight pixel
@@ -613,23 +610,13 @@ def train_refinement(
         # when deriv_target_centered switches, because "val_loss computed under
         # the OLD target isn't a fair bar for the NEW target's own val_loss to
         # clear". A weight ramp is the same change spread over several epochs.
-        if (max(rollout_weight_warmup_epochs, recon_predict_weight_warmup_epochs) > 0
-                and epoch == max(rollout_weight_warmup_epochs,
-                                 recon_predict_weight_warmup_epochs)):
-            # max(2, ...) not max(1, ...): a single-epoch grace is
-            # mathematically identical to no grace at all, since best_val_loss
-            # then ends up as that one epoch's own raw value, lucky or not.
-            # Same derivation as stage 2's, from val_ema_decay's own averaging
-            # window.
-            grace = grace_epochs_for_ema(val_ema_decay)
-            grace = clamp_grace_epochs(grace, epochs - epoch + 1)
-            # Which ramp(s) actually complete at THIS epoch (== max of the two
-            # warmups): the grace fires when the LAST one finishes, but the
-            # label must name the one that did, not always "rollout" -- a
-            # recon_predict-only warmup completing was mislabelled "rollout".
-            _done = [n for n, w in (("rollout_weight", rollout_weight_warmup_epochs),
-                                    ("recon_predict_weight", recon_predict_weight_warmup_epochs))
-                     if w == epoch]
+        _gr = ramp_completion_grace(
+            epoch, epochs,
+            {"rollout_weight": rollout_weight_warmup_epochs,
+             "recon_predict_weight": recon_predict_weight_warmup_epochs},
+            tracker, val_ema_decay)
+        if _gr is not None:
+            _done, grace = _gr
             _which = " and ".join(_done)
             _verb = "have" if len(_done) > 1 else "has"
             if grace > 0:
@@ -642,37 +629,27 @@ def train_refinement(
             # completing changes what the TRAIN column measures.
             _ramp_names = " + ".join(n.replace("_weight", "") for n in _done)
             loss_curve_events.append((epoch - 0.5, f"{_ramp_names} ramp complete"))
-            tracker.reset_with_grace(grace)
 
-        train_loss_sum = torch.zeros((), device=device)
-        train_rollout_sum = torch.zeros((), device=device)
-        train_recon0_sum = torch.zeros((), device=device)
-        train_stats0_sum = torch.zeros((), device=device)
-        train_recon_predict_sum = torch.zeros((), device=device)
         if epoch > 0:
             n_train = len(train_set)
-            _n_train_batches = 0
             _epoch_progress = EpochProgress(
                 len(train_loader),
                 tail_label="validation", tail_seconds=_prev_val_seconds)
-            for batch in train_loader:
-                _epoch_progress.tick()
-                _n_train_batches += 1
-                bs = batch[0].size(0)
-                loss, rollout, recon0, stats0, recon_predict = step(
-                    batch, train=True, effective_rollout_weight=effective_rollout_weight,
-                    effective_recon_predict_weight=effective_recon_predict_weight)
-                train_loss_sum += loss * bs
-                train_rollout_sum += rollout * bs
-                train_recon0_sum += recon0 * bs
-                train_stats0_sum += stats0 * bs
-                train_recon_predict_sum += recon_predict * bs
+            _train_means, _n_train_batches = accumulate_epoch(
+                train_loader,
+                lambda b: step(b, train=True,
+                               effective_rollout_weight=effective_rollout_weight,
+                               effective_recon_predict_weight=effective_recon_predict_weight),
+                n_train, progress=_epoch_progress)
             _epoch_progress.close()
-            train_loss = (train_loss_sum / n_train).item()
-            train_rollout = (train_rollout_sum / n_train).item()
-            train_recon0 = (train_recon0_sum / n_train).item()
-            train_stats0 = (train_stats0_sum / n_train).item()
-            train_recon_predict = (train_recon_predict_sum / n_train).item()
+            # unpack the component dict back into the names the rest of the loop
+            # uses, so this move is the ACCUMULATION only -- everything
+            # downstream (loss line, histories, scale-balance) is unchanged.
+            train_loss = _train_means["total"]
+            train_rollout = _train_means["rollout"]
+            train_recon0 = _train_means["recon0"]
+            train_stats0 = _train_means["stats0"]
+            train_recon_predict = _train_means["recon_predict"]
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
@@ -682,11 +659,6 @@ def train_refinement(
 
         ae.eval()
         f_theta.eval()
-        val_loss_sum = torch.zeros((), device=device)
-        val_rollout_sum = torch.zeros((), device=device)
-        val_recon0_sum = torch.zeros((), device=device)
-        val_stats0_sum = torch.zeros((), device=device)
-        val_recon_predict_sum = torch.zeros((), device=device)
         n_val = len(val_set)
         # Stage 4's validation runs a full val_loader pass after training with
         # no output -- looks hung on a large sweep. Bar it (self-gating delay)
@@ -695,22 +667,15 @@ def train_refinement(
                                   unit="batches")
         _val_t0 = time.monotonic()
         with torch.no_grad():
-            for batch in val_loader:
-                _val_prog.tick()
-                bs = batch[0].size(0)
-                loss, rollout, recon0, stats0, recon_predict = step(batch, train=False)
-                val_loss_sum += loss * bs
-                val_rollout_sum += rollout * bs
-                val_recon0_sum += recon0 * bs
-                val_stats0_sum += stats0 * bs
-                val_recon_predict_sum += recon_predict * bs
+            _val_means, _ = accumulate_epoch(
+                val_loader, lambda b: step(b, train=False), n_val, progress=_val_prog)
         _val_prog.close()
         _prev_val_seconds = time.monotonic() - _val_t0   # feeds next epoch's ETA
-        val_loss = (val_loss_sum / n_val).item()
-        val_rollout = (val_rollout_sum / n_val).item()
-        val_recon0 = (val_recon0_sum / n_val).item()
-        val_stats0 = (val_stats0_sum / n_val).item()
-        val_recon_predict = (val_recon_predict_sum / n_val).item()
+        val_loss = _val_means["total"]
+        val_rollout = _val_means["rollout"]
+        val_recon0 = _val_means["recon0"]
+        val_stats0 = _val_means["stats0"]
+        val_recon_predict = _val_means["recon_predict"]
 
         # SKIPPED BATCHES ARE NEVER SILENT -- a guard that quietly drops data
         # would be worse than the crash it prevents, since the run would look
@@ -720,19 +685,11 @@ def train_refinement(
         _deadlocked = end_epoch_pair(spike_guard, grad_guard, _n_train_batches)
         # ONE merged report via the shared reporter: when both guards fire in an
         # epoch it is a single block (both worst-clauses, boilerplate once), not
-        # two near-identical ones; routine skips digest to a compact line. This
-        # is the SAME path stage 3 uses -- stages 4/5 used to hand-roll two
-        # separate blocks here.
-        _newg = grad_guard.n_skipped - _grad_spikes_reported
-        _new = spike_guard.n_skipped - _spikes_reported
-        _grad_spikes_reported = grad_guard.n_skipped
-        _spikes_reported = spike_guard.n_skipped
-        _all_nonfinite = spike_guard.n_nonfinite + grad_guard.n_nonfinite
-        _new_nonfinite = _all_nonfinite - _nonfinite_reported
-        _nonfinite_reported = _all_nonfinite
-        _line = _skip_reporter.epoch(
-            epoch, _new, spike_guard.last_worst, _newg, grad_guard.last_worst,
-            _n_train_batches, n_nonfinite_new=_new_nonfinite,
+        # two near-identical ones; routine skips digest to a compact line. The
+        # reporter owns the running-total-to-delta bookkeeping (report_epoch), so
+        # this is the SAME path stage 3 uses from the SAME counters.
+        _line = _skip_reporter.report_epoch(
+            epoch, spike_guard, grad_guard, _n_train_batches,
             dt_label=("du_max" if getattr(f_theta, "time_coordinate", "t") == "log10_t"
                       else "dt_max"))
         if _line:
@@ -756,36 +713,25 @@ def train_refinement(
         train_loss_history.append(train_loss)
         val_loss_history.append(val_loss)
         best_so_far_history.append(tracker.best_val_loss)
-        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
-            loss_curve(
-                epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-                loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
-                event_epochs=loss_curve_events,
-            )
-            write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
-
-        current_val_components = {
-            "rollout": rollout_weight * val_rollout / rollout_scale,
-            "recon0": recon0_weight * val_recon0 / recon0_scale,
-            "stats0": stats0_weight * val_stats0 / stats0_scale,
-            "recon_predict": recon_predict_weight * val_recon_predict / recon_predict_scale,
-        }
+        _val_raw = {"rollout": val_rollout, "recon0": val_recon0, "stats0": val_stats0,
+                    "recon_predict": val_recon_predict}
+        _train_raw = {"rollout": train_rollout, "recon0": train_recon0,
+                      "stats0": train_stats0, "recon_predict": train_recon_predict}
+        current_val_components = weighted_contributions(_val_raw, _weights, _scales)
         best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
-        current_train_components = {
-            "rollout": rollout_weight * train_rollout / rollout_scale,
-            "recon0": recon0_weight * train_recon0 / recon0_scale,
-            "stats0": stats0_weight * train_stats0 / stats0_scale,
-            "recon_predict": recon_predict_weight * train_recon_predict / recon_predict_scale,
-        }
+        current_train_components = weighted_contributions(_train_raw, _weights, _scales)
         for name in component_histories:
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
             component_histories[name]["best_so_far"].append(best_components[name])
-        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
-            loss_component_scatter(
-                epoch_history, component_histories, loss_components_path,
-                title=f"Stage {'4' if freeze_decoder else '5'} loss components",
-            )
+        write_epoch_figures(
+            epoch, log_every_epoch,
+            epoch_history=epoch_history, train_loss_history=train_loss_history,
+            val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+            component_histories=component_histories, loss_curve_path=loss_curve_path,
+            loss_components_path=loss_components_path,
+            title=f"Stage {'4' if freeze_decoder else '5'}",
+            event_epochs=loss_curve_events)
 
         ema_str = f"{tracker.val_ema:7.4f}" if tracker.val_ema is not None else "  (warmup)"
         msg = (f"{epoch:4d}|"
@@ -834,20 +780,11 @@ def train_refinement(
             # rollout_scale=1e-6 in a params file therefore makes stage 4's
             # loss 99.997% rollout, with recon0 and stats0 contributing 26 parts
             # per MILLION. Stage 4's entire purpose is the balance between them.
-            contributions = {
-                "rollout": rollout_weight * val_rollout / rollout_scale,
-                "recon0": recon0_weight * val_recon0 / recon0_scale,
-                "stats0": stats0_weight * val_stats0 / stats0_scale,
-                "recon_predict": recon_predict_weight * val_recon_predict / recon_predict_scale,
-            }
+            # current_val_components IS the full-weight val contribution dict,
+            # and _val_raw/_weights/_scales are the same maps it was built from,
+            # so the report reuses them rather than rebuilding the arithmetic.
             _report = scale_balance_report(
-                contributions,
-                raw={"rollout": val_rollout, "recon0": val_recon0, "stats0": val_stats0,
-                     "recon_predict": val_recon_predict},
-                weights={"rollout": rollout_weight, "recon0": recon0_weight,
-                         "stats0": stats0_weight, "recon_predict": recon_predict_weight},
-                scales={"rollout": rollout_scale, "recon0": recon0_scale,
-                        "stats0": stats0_scale, "recon_predict": recon_predict_scale})
+                current_val_components, raw=_val_raw, weights=_weights, scales=_scales)
             if _report:
                 print(_report)
 
@@ -857,67 +794,59 @@ def train_refinement(
                 longest_gap = epochs_since_improvement
                 longest_gap_range = (epoch - epochs_since_improvement, epoch)
             epochs_since_improvement = 0
-            atomic_torch_save({
-                "ae_state": ae.state_dict(),
-                "f_theta_state": f_theta.state_dict(),
-                "stats_head_state": stats_head.state_dict() if stats_head is not None else None,
-                "epoch": epoch,
-                "val_loss": val_loss,
-                "val_loss_ema": tracker.val_ema,
-                "ae_checkpoint": ae_checkpoint_str,
-                "lds_checkpoint": lds_checkpoint_str,
-                **({"resumed_from": str(Path(resume_from).resolve())} if resume_from is not None else {}),
-                "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
-                "config": {
-                    **{k: v for k, v in components["encoder"].config.items() if k != "decoder_for_stream"},
-                    "stream_configs": {
-                        name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
-                               "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,
-                               # head_kind/head_hidden MUST be recorded: a residual-head
-                               # stream's Encoder has real residual_heads.<name> weights, and
-                               # a reload rebuilds a plain Encoder without them (RuntimeError:
-                               # unexpected residual_heads.deriv.*) if the config omits these.
-                               "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
-                        for name, cfg in stream_configs.items()
+            msg += save_checkpoint(
+                checkpoint_path,
+                model_states={
+                    "ae_state": ae.state_dict(),
+                    "f_theta_state": f_theta.state_dict(),
+                    "stats_head_state": stats_head.state_dict() if stats_head is not None else None,
+                    "ae_checkpoint": ae_checkpoint_str,
+                    "lds_checkpoint": lds_checkpoint_str,
+                    **({"resumed_from": str(Path(resume_from).resolve())} if resume_from is not None else {}),
+                },
+                provenance={
+                    "config": {
+                        **{k: v for k, v in components["encoder"].config.items() if k != "decoder_for_stream"},
+                        "stream_configs": {
+                            name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
+                                   "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,
+                                   # head_kind/head_hidden MUST be recorded: a residual-head
+                                   # stream's Encoder has real residual_heads.<name> weights, and
+                                   # a reload rebuilds a plain Encoder without them (RuntimeError:
+                                   # unexpected residual_heads.deriv.*) if the config omits these.
+                                   "head_kind": cfg.head_kind, "head_hidden": cfg.head_hidden}
+                            for name, cfg in stream_configs.items()
+                        },
+                        "recon_stream_name": recon_stream_name,
                     },
-                    "recon_stream_name": recon_stream_name,
+                    "lds_config": dict(components["lds"].config),
+                    # max_dt/min_passing_steps recorded too, so stage 5 (and any
+                    # diagnostic) inherits the same window population rather than
+                    # rediscovering it -- the resolved values, not the arguments,
+                    # since these may have come from f_theta's own data_config.
+                    "data_config": {"min_step": min_step, "min_stdev_phi": min_stdev_phi,
+                                    "min_passing_steps": min_passing_steps, "max_dt": max_dt,
+                                    "window_length": window_length, "n_rollout_steps": n_rollout_steps},
+                    "stats_config": (
+                        {"stat_names": stat_names, "stats_mean": stats_loss_fn.mean.cpu(),
+                         "stats_std": stats_loss_fn.std.cpu()}
+                        if stats_loss_fn is not None else None
+                    ),
+                    "stage45_config": {
+                        "freeze_decoder": freeze_decoder, "rollout_weight": rollout_weight,
+                        "recon0_weight": recon0_weight, "stats0_weight": stats0_weight,
+                        # recon_predict is the term that DEFINES a stage-5 objective
+                        # (weight 1, leading); a checkpoint that omits it reads as a
+                        # stage-4 config. Scales recorded too: the weighted objective
+                        # is weight*raw/scale, so the weights alone do not reproduce it.
+                        "recon_predict_weight": recon_predict_weight,
+                        "rollout_scale": rollout_scale, "recon0_scale": recon0_scale,
+                        "stats0_scale": stats0_scale, "recon_predict_scale": recon_predict_scale,
+                        "n_rollout_steps": n_rollout_steps,
+                    },
                 },
-                "lds_config": dict(components["lds"].config),
-                # max_dt/min_passing_steps recorded too, so stage 5 (and any
-                # diagnostic) inherits the same window population rather than
-                # rediscovering it -- the resolved values, not the arguments,
-                # since these may have come from f_theta's own data_config.
-                "data_config": {"min_step": min_step, "min_stdev_phi": min_stdev_phi,
-                                "min_passing_steps": min_passing_steps, "max_dt": max_dt,
-                                "window_length": window_length, "n_rollout_steps": n_rollout_steps},
-                "stats_config": (
-                    {"stat_names": stat_names, "stats_mean": stats_loss_fn.mean.cpu(),
-                     "stats_std": stats_loss_fn.std.cpu()}
-                    if stats_loss_fn is not None else None
-                ),
-                "stage45_config": {
-                    "freeze_decoder": freeze_decoder, "rollout_weight": rollout_weight,
-                    "recon0_weight": recon0_weight, "stats0_weight": stats0_weight,
-                    # recon_predict is the term that DEFINES a stage-5 objective
-                    # (weight 1, leading); a checkpoint that omits it reads as a
-                    # stage-4 config. Scales recorded too: the weighted objective
-                    # is weight*raw/scale, so the weights alone do not reproduce it.
-                    "recon_predict_weight": recon_predict_weight,
-                    "rollout_scale": rollout_scale, "recon0_scale": recon0_scale,
-                    "stats0_scale": stats0_scale, "recon_predict_scale": recon_predict_scale,
-                    "n_rollout_steps": n_rollout_steps,
-                },
-            }, checkpoint_path)
-            msg += "  -> saved"
-            msg += f" at {time.strftime('%H:%M')}"  # match the checkpoint filename timestamp
-            if on_checkpoint_saved is not None:
-                try:
-                    on_checkpoint_saved(checkpoint_path, epoch)
-                except Exception as e:
-                    # Bookkeeping must never kill training: a failed registry
-                    # upsert must announce and continue, never lose the run.
-                    print(f"  WARNING: on_checkpoint_saved failed "
-                          f"({type(e).__name__}: {e}) -- continuing training")
+                epoch=epoch, val_loss=val_loss, val_loss_ema=tracker.val_ema,
+                test_dirs=test_dirs, on_saved=on_checkpoint_saved)
         else:
             epochs_since_improvement += 1
 
@@ -936,16 +865,14 @@ def train_refinement(
     # wasn't a multiple of the interval. Without this the figures left on
     # disk could be up to `every` epochs stale, which is exactly the
     # state a finished run gets judged from.
-    loss_curve(
-        epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-        loss_curve_path, title=f"Stage {'4' if freeze_decoder else '5'} loss",
-        event_epochs=loss_curve_events,
-    )
-    write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
-    loss_component_scatter(
-        epoch_history, component_histories, loss_components_path,
-        title=f"Stage {'4' if freeze_decoder else '5'} loss components",
-    )
+    write_epoch_figures(
+        epoch, log_every_epoch, force=True,
+        epoch_history=epoch_history, train_loss_history=train_loss_history,
+        val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+        component_histories=component_histories, loss_curve_path=loss_curve_path,
+        loss_components_path=loss_components_path,
+        title=f"Stage {'4' if freeze_decoder else '5'}",
+        event_epochs=loss_curve_events)
 
     if not Path(checkpoint_path).exists():
         # Same guard as train_stage2/train_lds. Without it this returns a path

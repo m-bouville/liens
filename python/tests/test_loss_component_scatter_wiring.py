@@ -148,9 +148,14 @@ def test_refinement_writes_components_figure_and_survives_epochs_zero(tmp_path, 
 def test_refinement_component_values_reconstruct_train_total(tmp_path, isolated_project_root, monkeypatch):
     import io, contextlib
     import training.train_refinement as tr
+    import utils.plots as plots
 
     captured = {}
-    real_fn = tr.loss_component_scatter
+    # write_epoch_figures (in training.training_loop) now owns the scatter call
+    # and imports loss_component_scatter LAZILY from utils.plots, so patch the
+    # canonical source -- it is resolved at call time wherever the figure write
+    # ends up living, rather than a name bound into one trainer module.
+    real_fn = plots.loss_component_scatter
 
     def spy(epoch_history, component_histories, output_path, **kw):
         captured["epoch_history"] = list(epoch_history)
@@ -159,7 +164,7 @@ def test_refinement_component_values_reconstruct_train_total(tmp_path, isolated_
         }
         return real_fn(epoch_history, component_histories, output_path, **kw)
 
-    monkeypatch.setattr(tr, "loss_component_scatter", spy)
+    monkeypatch.setattr(plots, "loss_component_scatter", spy)
 
     base_path = _build_sweep_refinement(tmp_path, n_runs=6)
     ae_checkpoint_path = tmp_path / "fake-stage2.pt"

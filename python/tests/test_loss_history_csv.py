@@ -80,7 +80,14 @@ def test_every_trainer_writes_its_history(module):
     omission this suite has caught repeatedly.
     """
     src = source_without_comments(_ROOT / f"training/{module}.py")
-    assert src.count("write_loss_history(") >= 1, f"{module} never writes its history"
-    assert src.count("write_loss_history(") == src.count("loss_curve("), (
-        f"{module} draws the curve more often than it writes the numbers"
-    )
+    # A trainer either writes the history inline (paired 1:1 with loss_curve) OR
+    # delegates both to the shared write_epoch_figures (which writes the curve,
+    # its CSV and the scatter together -- guaranteed paired, covered by
+    # test_training_loop). Either satisfies "every stage produces its history".
+    if "write_epoch_figures(" in src:
+        assert src.count("write_epoch_figures(") >= 1
+    else:
+        assert src.count("write_loss_history(") >= 1, f"{module} never writes its history"
+        assert src.count("write_loss_history(") == src.count("loss_curve("), (
+            f"{module} draws the curve more often than it writes the numbers"
+        )

@@ -169,7 +169,7 @@ def test_skips_are_reported_not_silent():
         "the report must say a batch was skipped and why")
     # train_lds drives the reporter, which decides whether to call skip_report --
     # a wiring fact the report text cannot show, so it stays a source check.
-    assert "_skip_reporter.epoch(" in source_without_comments(
+    assert "_skip_reporter.report_epoch(" in source_without_comments(
         _ROOT / "training/train_lds.py")
 
 
@@ -609,13 +609,15 @@ def test_the_report_reads_last_worst_not_worst():
     both guards' values must come from last_worst wherever the report is
     assembled.
     """
-    src = source_without_comments(_ROOT / "training/train_lds.py")
-    assert "grad_guard.last_worst" in src
-    assert "spike_guard.last_worst" in src
-    assert "spike_guard.worst" not in src, (
-        "the report reads the field end_epoch has already cleared"
+    # The report is assembled in SkipReporter.report_epoch now (both trainers
+    # delegate to it), so the last_worst-not-worst property lives there.
+    import inspect
+    from training.spike_guard import SkipReporter
+    re_src = inspect.getsource(SkipReporter.report_epoch)
+    assert "loss_guard.last_worst" in re_src and "grad_guard.last_worst" in re_src
+    assert ".worst" not in re_src.replace("last_worst", ""), (
+        "report_epoch reads the field end_epoch has already cleared"
     )
-    assert "grad_guard.worst" not in src
 
 
 def test_the_excursion_message_does_not_assert_weight_damage():
@@ -886,9 +888,12 @@ def test_stage45_reports_skips_and_stops_on_deadlock():
     # routine skips. The message strings themselves live in skip_report, tested
     # separately; here we assert stage 4/5 actually routes through it.
     assert "SkipReporter()" in src, "stage 4/5 does not instantiate the shared reporter"
-    assert "_skip_reporter.epoch(" in src, "skips are computed but never reported"
-    assert "spike_guard.n_skipped - _spikes_reported" in src, (
-        "the per-epoch NEW skip delta is not computed for the reporter"
+    # routes through the reporter's report_epoch, which owns the running-total-
+    # to-delta bookkeeping (tested in test_report_epoch_*); the trainer no longer
+    # threads the four counters by hand.
+    assert "_skip_reporter.report_epoch(" in src, "skips are computed but never reported"
+    assert "spike_guard.n_skipped - _spikes_reported" not in src, (
+        "the hand-threaded delta bookkeeping should be gone -- report_epoch owns it"
     )
     assert "end_epoch_pair(spike_guard" in src
     assert "consecutive_total_skip_epochs >= 5" in src
@@ -1069,9 +1074,10 @@ def test_the_rollback_requires_THIS_RUNS_own_save():
     assert "_have_checkpoint = _saved_this_run and Path(checkpoint_path).exists()" in src, (
         "the rollback still accepts any file at the path"
     )
-    # and the flag must be set where the save ACTUALLY happens
+    # and the flag must be set where the save ACTUALLY happens -- lds now
+    # delegates the write to checkpoint_criterion.save_checkpoint.
     block = src[src.index("if saved_this_epoch:"):]
-    block = block[:block.index("atomic_torch_save(")]
+    block = block[:block.index("save_checkpoint(")]
     assert "_saved_this_run = True" in block, (
         "the flag is not set in the branch that writes the checkpoint"
     )
@@ -1456,7 +1462,10 @@ def test_both_trainers_route_skips_through_the_shared_reporter():
         assert "SkipReporter()" in src, (
             f"{fname} does not use the shared digesting skip reporter"
         )
-        assert "_skip_reporter.epoch(" in src, (
+        # via .report_epoch (delta bookkeeping owned by the reporter) or the
+        # lower-level .epoch (train_lds, until it too is extracted) -- either
+        # routes the merged single-block message through the shared reporter.
+        assert "_skip_reporter.report_epoch(" in src or "_skip_reporter.epoch(" in src, (
             f"{fname} never calls the reporter -- skips go unreported or "
             f"un-merged"
         )
@@ -1725,7 +1734,7 @@ def test_train_lds_reports_once_then_compactly():
     from conftest import source_without_comments
     from training.spike_guard import SkipReporter
     src = source_without_comments(_ROOT / "training/train_lds.py")
-    assert "_skip_reporter.epoch(" in src
+    assert "_skip_reporter.report_epoch(" in src
 
     r = SkipReporter()
     severe = (4.0e4, 1e2, 1250.0, -0.1)
@@ -1832,11 +1841,15 @@ def test_train_lds_uses_the_reporter_and_feeds_it_nonfinite_counts():
     from conftest import source_without_comments
     src = source_without_comments(_ROOT / "training/train_lds.py")
     assert "_skip_reporter = SkipReporter()" in src
-    assert "n_nonfinite_new=_new_nonfinite" in src, (
-        "non-finite skips would be judged by ratio alone and could be "
-        "suppressed as marginal"
-    )
-    assert "grad_guard.n_nonfinite" in src and "spike_guard.n_nonfinite" in src
+    assert "_skip_reporter.report_epoch(" in src, "train_lds must route skips through report_epoch"
+    # report_epoch feeds the non-finite counts through to skip_report (so an inf
+    # gradient is always notable, never suppressed as a marginal ratio); the
+    # counting now lives in the shared method.
+    import inspect
+    from training.spike_guard import SkipReporter
+    re_src = inspect.getsource(SkipReporter.report_epoch)
+    assert "n_nonfinite" in re_src and "n_nonfinite_new=" in re_src
+    assert "loss_guard.n_nonfinite" in re_src and "grad_guard.n_nonfinite" in re_src
 
 
 def test_a_band_whose_batches_all_skip_does_not_freeze_out():
@@ -2010,3 +2023,58 @@ def test_early_stop_message_never_saved_case_unchanged_by_gap_args():
                              longest_gap=50, longest_gap_range=(10, 60))
     assert "NOTHING was ever saved" in msg
     assert "longest period" not in msg           # gap clause is a saved-run detail
+
+
+def test_report_epoch_diffs_running_totals_into_per_epoch_deltas():
+    """report_epoch owns the running-total-to-delta bookkeeping the trainers used
+    to thread by hand. Feeding cumulative guard counts across epochs must yield
+    the per-epoch NEW counts, not the totals -- a double-count here would inflate
+    every skip line."""
+    from training.spike_guard import SkipReporter, _SpikeGuard
+
+    class _G:  # minimal guard stand-in with the fields report_epoch reads
+        def __init__(self): self.n_skipped = 0; self.n_nonfinite = 0; self.last_worst = None
+
+    r = SkipReporter(notable_ratio=1.0, notable_fraction=0.0)  # report any skip
+    loss_g, grad_g = _G(), _G()
+    # epoch 1: 3 loss skips cumulative
+    loss_g.n_skipped = 3; loss_g.last_worst = (1e5, 50.0, 1.0, -0.1)
+    line1 = r.report_epoch(1, loss_g, grad_g, 10)
+    assert "3" in line1
+    # epoch 2: cumulative 5 -> delta must be 2, not 5
+    loss_g.n_skipped = 5
+    line2 = r.report_epoch(2, loss_g, grad_g, 10)
+    assert "2" in line2 and " 5 " not in line2, f"double-counted: {line2!r}"
+
+
+def test_report_epoch_handles_a_single_guard_stage():
+    """Stage 2 has only the loss guard; report_epoch(grad_guard=None) must not
+    crash and must report the loss skips alone."""
+    from training.spike_guard import SkipReporter
+
+    class _G:
+        def __init__(self): self.n_skipped = 4; self.n_nonfinite = 0
+        last_worst = (1e5, 80.0, 1.0, -0.1)
+    r = SkipReporter(notable_ratio=1.0, notable_fraction=0.0)
+    line = r.report_epoch(1, _G(), None, 10)
+    assert "4" in line
+
+
+def test_report_epoch_feeds_nonfinite_counts_so_they_are_always_notable():
+    """A non-finite (inf/nan) gradient must ALWAYS get a line -- it turns the
+    whole parameter vector to nan in one step if it slips through -- so
+    report_epoch must feed the guards' n_nonfinite deltas to skip_report rather
+    than let a single inf be judged as a marginal ratio. Coverage that moved out
+    of train_lds when the bookkeeping became shared."""
+    from training.spike_guard import SkipReporter
+
+    class _G:
+        def __init__(self): self.n_skipped = 1; self.n_nonfinite = 1
+        last_worst = (float("inf"), float("inf"), 1250.0, -0.1)
+
+    # notable_ratio huge, notable_fraction huge -> a finite skip would be
+    # digested silently; the non-finite path must still force a line.
+    r = SkipReporter(notable_ratio=1e9, notable_fraction=1.0)
+    line = r.report_epoch(1, _G(), _G(), 1000)
+    assert line != "", "a non-finite skip was suppressed as marginal"
+    assert "non-finite" in line.lower() or "nonfinite" in line.lower() or "inf" in line.lower()

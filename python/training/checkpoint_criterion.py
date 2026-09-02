@@ -330,6 +330,67 @@ def atomic_torch_save(obj, path: Path) -> None:
         raise
 
 
+def save_checkpoint(path, *, model_states, provenance, epoch, val_loss,
+                    val_loss_ema, test_dirs, on_saved=None) -> str:
+    """Atomically write a stage checkpoint and return the "  -> saved at HH:MM"
+    suffix for the epoch line.
+
+    `model_states` and `provenance` are the stage-specific halves: the
+    .state_dict()s keyed as the stage's reload expects, plus the config
+    sub-dicts. The fields EVERY stage needs -- epoch, val_loss, val_loss_ema and
+    the resolved test_dirs -- are added here so a stage cannot silently omit one
+    (the class of the stage45_config gap, where a saved checkpoint was missing
+    the very config that defined its objective). The on_saved hook (registry
+    upsert, etc.) is run here too, wrapped so a failing hook announces and
+    continues rather than losing an hours-long run.
+    """
+    import time
+    atomic_torch_save({
+        **model_states,
+        "epoch": epoch,
+        "val_loss": val_loss,
+        "val_loss_ema": val_loss_ema,
+        "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
+        **provenance,
+    }, path)
+    suffix = f"  -> saved at {time.strftime('%H:%M')}"
+    if on_saved is not None:
+        try:
+            on_saved(path, epoch)
+        except Exception as e:
+            # Bookkeeping must never kill training: a failed registry upsert
+            # must announce and continue, never lose the run.
+            print(f"  WARNING: on_checkpoint_saved failed "
+                  f"({type(e).__name__}: {e}) -- continuing training")
+    return suffix
+
+
+def ramp_completion_grace(epoch, epochs, warmup_epochs, tracker, val_ema_decay):
+    """When the LAST active weight-ramp completes at `epoch`, reset the save
+    criterion with a grace period and return (completed_names, grace); else None.
+
+    `warmup_epochs` maps weight name -> its warmup length; entries of 0 (no ramp)
+    are ignored. The grace fires ONCE, at max(active warmups): until the last
+    ramp finishes, some term is still warming in and val_loss describes a model
+    trained on a different objective -- exactly what reset_with_grace exists for.
+    The grace is clamped to leave at least one saveable epoch.
+
+    The caller owns the presentation -- the grace message wording and the
+    loss-curve event label differ per stage -- so this returns which ramp(s)
+    completed and how large the grace is, and performs the reset itself. Shared
+    because all three trainers ramp something and reset on completion; the
+    max-of-active timing (fire on the LAST ramp, not each) is the subtle part
+    that must agree across them.
+    """
+    active = {name: w for name, w in warmup_epochs.items() if w > 0}
+    if not active or epoch != max(active.values()):
+        return None
+    grace = clamp_grace_epochs(grace_epochs_for_ema(val_ema_decay), epochs - epoch + 1)
+    completed = [name for name, w in active.items() if w == epoch]
+    tracker.reset_with_grace(grace)
+    return completed, grace
+
+
 def scale_balance_report(
     contributions: dict[str, float],
     raw: dict[str, float],

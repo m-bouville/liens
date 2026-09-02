@@ -80,9 +80,19 @@ def test_all_saving_trainers_stamp_the_save_time():
     """Every trainer that prints '-> saved' must also stamp the wall-clock
     time, so a saved-epoch line can be matched to the timestamped checkpoint
     filename it produced. This was applied to stage 2 first and initially
-    forgotten in the other three -- pin all of them."""
+    forgotten in the other three -- pin all of them.
+
+    A trainer that delegates the save to checkpoint_criterion.save_checkpoint
+    gets the "-> saved at HH:MM" suffix (strftime) from the helper -- covered by
+    test_save_checkpoint_returns_the_saved_suffix -- so it satisfies this without
+    an inline strftime. Comments are stripped so a mention of '-> saved' in prose
+    (e.g. describing the epoch line) does not count as printing it.
+    """
+    from conftest import source_without_comments
     for rel in _TRAINERS:
-        src = (_ROOT / rel).read_text()
+        src = source_without_comments(_ROOT / rel)
+        if "save_checkpoint(" in src:      # delegated -> helper stamps the time
+            continue
         if "-> saved" not in src:
             continue
         assert "strftime" in src, (

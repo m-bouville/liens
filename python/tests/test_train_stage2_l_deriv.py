@@ -638,14 +638,15 @@ def test_no_curve_marker_when_already_centered_at_epoch_one(tmp_path, capsys,
 
     captured_events = []
     captured_levels = []
-    real_loss_curve = train_stage2_module.loss_curve
+    import utils.plots as _plots_mod
+    real_loss_curve = _plots_mod.loss_curve
 
     def _recording_loss_curve(*args, **kwargs):
         captured_events.append(list(kwargs.get("event_epochs") or []))
         captured_levels.append(list(kwargs.get("reference_levels") or []))
         return real_loss_curve(*args, **kwargs)
 
-    train_stage2_module.loss_curve = _recording_loss_curve
+    _plots_mod.loss_curve = _recording_loss_curve
     try:
         train_stage2(
             base_path=base_path, resume_from=stage1_path,
@@ -659,7 +660,7 @@ def test_no_curve_marker_when_already_centered_at_epoch_one(tmp_path, capsys,
             deriv_target_centered=True,
         )
     finally:
-        train_stage2_module.loss_curve = real_loss_curve
+        _plots_mod.loss_curve = real_loss_curve
 
     printed = capsys.readouterr().out
     # the print/grace-period side of just_switched still fires at epoch 1 --
@@ -706,14 +707,15 @@ def test_curve_marker_is_kept_for_a_genuine_mid_run_switch(tmp_path, capsys,
 
     captured_events = []
     captured_levels = []
-    real_loss_curve = train_stage2_module.loss_curve
+    import utils.plots as _plots_mod
+    real_loss_curve = _plots_mod.loss_curve
 
     def _recording_loss_curve(*args, **kwargs):
         captured_events.append(list(kwargs.get("event_epochs") or []))
         captured_levels.append(list(kwargs.get("reference_levels") or []))
         return real_loss_curve(*args, **kwargs)
 
-    train_stage2_module.loss_curve = _recording_loss_curve
+    _plots_mod.loss_curve = _recording_loss_curve
     try:
         train_stage2(
             base_path=base_path, resume_from=stage1_path,
@@ -725,7 +727,7 @@ def test_curve_marker_is_kept_for_a_genuine_mid_run_switch(tmp_path, capsys,
             deriv_target_centered=True,
         )
     finally:
-        train_stage2_module.loss_curve = real_loss_curve
+        _plots_mod.loss_curve = real_loss_curve
 
     all_events = [e for call_events in captured_events for e in call_events]
     assert any(x == 1.5 for x, _ in all_events), (
@@ -792,13 +794,14 @@ def test_interp_and_centered_target_share_one_switch_epoch(tmp_path, capsys,
     capsys.readouterr()
 
     captured_events = []
-    real_loss_curve = train_stage2_module.loss_curve
+    import utils.plots as _plots_mod
+    real_loss_curve = _plots_mod.loss_curve
 
     def _recording(*args, **kwargs):
         captured_events.append(list(kwargs.get("event_epochs") or []))
         return real_loss_curve(*args, **kwargs)
 
-    train_stage2_module.loss_curve = _recording
+    _plots_mod.loss_curve = _recording
     try:
         train_stage2(
             base_path=base_path, resume_from=stage1_path,
@@ -811,7 +814,7 @@ def test_interp_and_centered_target_share_one_switch_epoch(tmp_path, capsys,
             deriv_target_centered=True, interp_weight=0.1,
         )
     finally:
-        train_stage2_module.loss_curve = real_loss_curve
+        _plots_mod.loss_curve = real_loss_curve
 
     labels = [lab for call in captured_events for _x, lab in call]
     assert any("L_interp" in lab for lab in labels), (

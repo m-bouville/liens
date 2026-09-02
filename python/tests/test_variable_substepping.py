@@ -687,7 +687,9 @@ def test_the_substep_report_covers_training_transitions_only():
     src = source_without_comments(pathlib.Path(__file__).resolve().parent.parent
                                    / "training/train_lds.py")
     train_end = src.index("_train_substeps = f_theta.substep_stats()")
-    val_start = src.index("val_loss_sum = torch.zeros")
+    # val-start marker: the val pass now runs through accumulate_epoch(val_loader,
+    # ...) rather than an inline val_loss_sum accumulator.
+    val_start = src.index("val_loader, lambda b: step(b, train=False)")
     assert train_end < val_start, (
         "the train sub-step capture happens after the val loop begins -- the "
         "reported numbers mix the two populations"

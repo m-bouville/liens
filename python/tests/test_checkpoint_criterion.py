@@ -357,7 +357,12 @@ def test_every_grace_site_uses_the_shared_derivation(path):
     from conftest import source_without_comments
     from pathlib import Path
     src = source_without_comments(Path(__file__).resolve().parent.parent / path)
-    assert "grace_epochs_for_ema(val_ema_decay)" in src, (
+    # Directly (train_lds, train_stage2) OR through ramp_completion_grace, which
+    # calls grace_epochs_for_ema internally (train_refinement, since the ramp
+    # extraction). Either reaches the shared derivation; what is forbidden is
+    # re-deriving the EMA window inline, which a correction would silently skip.
+    assert ("grace_epochs_for_ema(val_ema_decay)" in src
+            or "ramp_completion_grace(" in src), (
         f"{path} does not use the shared grace derivation -- if it re-derives the "
         f"window inline, a correction to grace_epochs_for_ema silently skips it"
     )
@@ -484,3 +489,95 @@ def test_the_suggestion_only_names_positive_raw_terms():
 
 def test_all_zero_contributions_returns_None():
     assert _report({"a": 0.0, "b": 0.0}, {"a": 0, "b": 0}, {"a": 1, "b": 1}, {"a": 1, "b": 1}) is None
+
+
+from training.checkpoint_criterion import ramp_completion_grace
+
+
+class _FakeTracker:
+    def __init__(self): self.reset_grace = None
+    def reset_with_grace(self, g): self.reset_grace = g
+
+
+def test_ramp_grace_fires_on_the_LAST_ramp_not_each():
+    """Two ramps of different lengths: the grace must fire once, at the LONGER
+    one's completion (the objective isn't full until the last term finishes),
+    and NOT at the shorter one's completion."""
+    warmups = {"a": 3, "b": 5}
+    # shorter ramp (a) completes at epoch 3 -> no grace yet
+    t = _FakeTracker()
+    assert ramp_completion_grace(3, 20, warmups, t, 0.7) is None
+    assert t.reset_grace is None
+    # longer ramp (b) completes at epoch 5 -> grace fires, names only b
+    t = _FakeTracker()
+    done, grace = ramp_completion_grace(5, 20, warmups, t, 0.7)
+    assert done == ["b"] and grace > 0 and t.reset_grace == grace
+
+
+def test_ramp_grace_names_all_ramps_completing_together():
+    t = _FakeTracker()
+    done, _ = ramp_completion_grace(4, 20, {"a": 4, "b": 4}, t, 0.7)
+    assert done == ["a", "b"]
+
+
+def test_ramp_grace_ignores_zero_length_warmups():
+    """A weight with no warmup (0) must not count -- a stage-4 run with only a
+    rollout ramp and recon_predict off must fire on the rollout ramp alone."""
+    t = _FakeTracker()
+    done, _ = ramp_completion_grace(6, 20, {"rollout": 6, "recon_predict": 0}, t, 0.7)
+    assert done == ["rollout"]
+    # no active warmups at all -> never fires
+    assert ramp_completion_grace(1, 20, {"a": 0, "b": 0}, _FakeTracker(), 0.7) is None
+
+
+def test_ramp_grace_is_clamped_to_leave_a_saveable_epoch():
+    """Completing near the end must not grace away every remaining epoch."""
+    t = _FakeTracker()
+    done, grace = ramp_completion_grace(19, 20, {"a": 19}, t, 0.7)
+    assert grace <= 20 - 19  # at most the remaining epochs, so >=1 stays saveable
+
+
+from training.checkpoint_criterion import save_checkpoint
+
+
+def test_save_checkpoint_guarantees_the_common_fields(tmp_path):
+    """The fields every stage's reload needs must be present even if the caller's
+    model_states/provenance omit them -- the class of the stage45_config gap."""
+    import torch as _t
+    path = tmp_path / "c.pt"
+    save_checkpoint(path, model_states={"ae_state": {"w": _t.zeros(1)}},
+                    provenance={"config": {"x": 1}}, epoch=7, val_loss=0.5,
+                    val_loss_ema=0.6, test_dirs=[])
+    saved = _t.load(path, map_location="cpu", weights_only=False)
+    assert saved["epoch"] == 7 and saved["val_loss"] == 0.5 and saved["val_loss_ema"] == 0.6
+    assert "test_dirs" in saved
+    assert saved["ae_state"]["w"].shape == (1,)   # model_states merged
+    assert saved["config"] == {"x": 1}            # provenance merged
+
+
+def test_save_checkpoint_resolves_test_dirs(tmp_path):
+    path = tmp_path / "c.pt"
+    save_checkpoint(path, model_states={}, provenance={}, epoch=1, val_loss=0.0,
+                    val_loss_ema=0.0, test_dirs=[tmp_path / "run_a"])
+    import torch as _t
+    saved = _t.load(path, map_location="cpu", weights_only=False)
+    assert saved["test_dirs"] == [str((tmp_path / "run_a").resolve())]
+
+
+def test_save_checkpoint_hook_failure_does_not_kill_training(tmp_path, capsys):
+    """A failing on_saved hook (e.g. a registry upsert) must announce and
+    continue -- never lose an hours-long run to bookkeeping."""
+    path = tmp_path / "c.pt"
+    def _boom(p, e): raise RuntimeError("registry down")
+    # must NOT raise
+    save_checkpoint(path, model_states={}, provenance={}, epoch=3, val_loss=0.0,
+                    val_loss_ema=0.0, test_dirs=[], on_saved=_boom)
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "registry down" in out
+    assert path.exists(), "the checkpoint itself must still be written"
+
+
+def test_save_checkpoint_returns_the_saved_suffix(tmp_path):
+    suffix = save_checkpoint(tmp_path / "c.pt", model_states={}, provenance={},
+                             epoch=1, val_loss=0.0, val_loss_ema=0.0, test_dirs=[])
+    assert "-> saved at" in suffix

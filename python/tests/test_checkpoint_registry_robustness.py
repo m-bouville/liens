@@ -34,6 +34,13 @@ def test_checkpoint_callback_is_wrapped_nonfatally(trainer):
     one epoch newer than the log). Every trainer must wrap the call."""
     from conftest import source_without_comments
     src = source_without_comments(_ROOT / trainer)
+    # Two ways to satisfy the invariant: delegate the save to
+    # checkpoint_criterion.save_checkpoint (which runs the hook inside its own
+    # try -- covered by test_save_checkpoint_hook_failure_does_not_kill_training)
+    # by passing on_saved=on_checkpoint_saved; or, for a not-yet-extracted
+    # trainer, call the hook inline wrapped in a try.
+    if "save_checkpoint(" in src and "on_saved=on_checkpoint_saved" in src:
+        return
     assert "on_checkpoint_saved(checkpoint_path, epoch)" in src
     call = src.index("on_checkpoint_saved(checkpoint_path, epoch)")
     assert "try:" in src[max(0, call - 200):call], (

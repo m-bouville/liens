@@ -38,9 +38,12 @@ def test_rollout_scatter_is_written_periodically_not_only_at_the_end():
     import inspect
     from training.train_lds import train_lds
     src = inspect.getsource(train_lds)
-    assert src.count("_write_rollout_scatter()") >= 2, (
-        "the rollout scatter is not written at BOTH the periodic and final "
-        "sites -- a mid-run/early-stopped run will still be missing it"
+    # The scatter is now handed to write_epoch_figures as `extra`, which invokes
+    # it on the SAME cadence: the periodic (gated) write and the final
+    # (force=True) write. Two extra= sites == both the periodic and final scatter.
+    assert src.count("extra=_write_rollout_scatter") >= 2, (
+        "the rollout scatter is not handed to write_epoch_figures at BOTH the "
+        "periodic and final sites -- a mid-run/early-stopped run will miss it"
     )
     # the scatter closure exists and is gated on show_1step (n_rollout_steps>1)
     assert "def _write_rollout_scatter()" in src
