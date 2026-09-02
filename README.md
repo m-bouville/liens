@@ -135,11 +135,14 @@ For more details on the structure of the `python` directory, see [./docs/NN-code
 - [X] 3. Latent dynamics surrogate
 - [X] 4-5. End-to-end training
 - [X] Obtaining satisfactory results for short times
-- [ ] Obtaining satisfactory results at all temperatures
+- [X] Obtaining satisfactory results for long times
+- [X] Obtaining satisfactory results at all temperatures
+- [ ] Obtaining smooth results (not moth-eaten)
 - [ ] Obtaining satisfying results overall
 
 ### For those who prefer text
 - All five training stages are implemented and run end-to-end. The work currently underway is improving the accuracy of the surrogate, not making it run at all.
 - The initial development was carried out using 64×64 images (32×32 for testing the code end-to-end). They were serviceable but hit their limit, with finite-size artifacts eventually dominating the results. The focus is now on 128×128 microstructures.
 - There is a (physically plausible) difference of behavior above and below $T \approx 0.9 \times T_0$. Microstructures are now filtered with `min_normalized_stdev_phi` instead of `min_stdev_phi` (i.e. using the temperature-dependent ground-state value for `phi` as threshold, rather than a constant) to avoid a bias at `$T \approx T_0$.
-- Predicting $t + \delta t$ gives sensible results, $t + 10 \delta t$ did not. The introduction of `u = log10 t` helped.
+- Predicting $t + \delta t$ gives sensible results, $t + 10 \delta t$ initially did not. The introduction of `u = log10 t` helped.
+- Predicted microstructures are not smooth, they look moth-eaten. `L_grad_predict` introduces a gradient term to the loss function in stages 4 and 5 in order to reduce the problem.

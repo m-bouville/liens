@@ -210,13 +210,15 @@ n_rollout_steps = 8
 rollout_weight	= 1.0       # primary term for stage 4 (default: 1.)
 recon0_weight	= 0.2  		# was 0.5       # small but > 0 anchor
 stats0_weight   = 0.05		# same ratio as stages 1 & 2: L_stats0 = L_recon0/4
-recon_predict_weight=0.2	# was implicitly 0
+recon_predict_weight=0.2
+grad_predict_weight= 0.05 	# was implicitly 0
 
 # loss scales
 rollout_scale   =  0.25 	# was 0.2, then 1.e5
 recon0_scale    =  0.04e-3 	# was 0.15e-3, then 0.07e-3
 stats0_scale    =  0.15 	# 0.03
 recon_predict_scale=0.05
+grad_predict_scale=0.01		# RANDOM GUESS
 
 val_ema_decay   =   0.8		# was 0.7 (default)
 
@@ -245,25 +247,27 @@ n_rollout_steps = 10
 
 # loss weights
 recon_predict_weight=1		# primary
+grad_predict_weight= 0.25 	# was implicitly 0
 rollout_weight 	= 0.2        
 recon0_weight   = 0.2
 stats0_weight   = 0.05		# same ratio as stages 1 & 2: L_stats0 = L_recon0/4
 
 # loss scales
 recon_predict_scale	= 0.005
+grad_predict_scale=0.01		# RANDOM GUESS
 rollout_scale   = 0.15 		# was 0.005
 recon0_scale    = 0.5e-3 	# was 0.1e-3, then 0.04e-3
 stats0_scale    = 0.15		# was 0.003
 
-lr 			  	=   2.e-6  	# was 5.e-6; default: 1.e-3
+lr 			  	=   2.e-6  	# COULD BE 4.e-6 (then make `recon_predict_weight_warmup_epochs=8`); was 5.e-6; default: 1.e-3
 
 epochs         	=  50
 patience       	=  10
-recon_predict_weight_warmup_epochs= 5
+recon_predict_weight_warmup_epochs= 3
 
 batches        	=  32		# model is larger than in stage 4 (D not longer frozen)
 
 max_dt         	= same
 
 force 	       	= True
-# resume_from = checkpoints/stage5/128x128-stage5-20260829_10h01.pt
+resume_from = checkpoints/stage5/128x128-stage5-20260902_18h03.pt

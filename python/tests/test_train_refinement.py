@@ -655,3 +655,31 @@ def test_inherited_min_normalized_stdev_phi_is_actually_saved(tmp_path, isolated
         "the inherited threshold was not saved -- a later read (compare_f_theta) "
         "would see min_passing_steps set but this field absent and crash"
     )
+
+
+@pytest.mark.slow
+def test_grad_predict_threads_through_and_shares_the_recon_predict_warmup(tmp_path, isolated_project_root):
+    """End-to-end: train_refinement(grad_predict_weight>0) wires the term through
+    step, the loss line, the histories and the SAVED provenance -- and it ramps
+    on recon_predict_weight_warmup_epochs (shared: same decode, same cold-decoder
+    risk), so passing a warmup with grad_predict active must not error and must
+    record grad_predict_weight in stage45_config."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_p, lds_p = tmp_path / "s2.pt", tmp_path / "s3.pt"
+    _build_ae_checkpoint(ae_p, include_stats_head=True)
+    _build_lds_checkpoint(lds_p)
+    ckpt = tmp_path / "s5g.pt"
+    train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_p, lds_checkpoint_path=lds_p,
+        freeze_decoder=False, rollout_weight=0.2, recon0_weight=0.2, stats0_weight=0.05,
+        recon_predict_weight=1.0, recon_predict_scale=0.05,
+        grad_predict_weight=0.5, grad_predict_scale=0.02,
+        recon_predict_weight_warmup_epochs=2,     # shared ramp; must cover grad_predict
+        rollout_scale=0.15, recon0_scale=5e-4, stats0_scale=0.15,
+        epochs=2, batch_size=4, n_rollout_steps=2,
+        min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+        checkpoint_path=ckpt, device="cpu",
+    )
+    saved = torch.load(ckpt, map_location="cpu", weights_only=True)
+    cfg = saved["stage45_config"]
+    assert cfg["grad_predict_weight"] == 0.5 and cfg["grad_predict_scale"] == 0.02

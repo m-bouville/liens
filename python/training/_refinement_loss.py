@@ -29,8 +29,10 @@ def compute_stage45_loss(
     theta: torch.Tensor, rollout_weight: float = 1.0, recon0_weight: float = 0.0,
     stats0_weight: float = 0.0,
     recon_predict_weight: float = 0.0,
+    grad_predict_weight: float = 0.0,
     rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
     recon_predict_scale: float = 1.0,
+    grad_predict_scale: float = 1.0,
     stats_loss_fn: StatsLoss | None = None,
     true_stats: torch.Tensor | None = None, return_components: bool = False,
     recon_stream_name: str = DEFAULT_STREAM_NAME, deriv_stream_name: str = "deriv",
@@ -192,21 +194,52 @@ def compute_stage45_loss(
     # training -- and one decode is cheaper than n. The decoder backprops
     # THROUGH the rollout here (z_hat carries grad), so this is also the term
     # that co-adapts encoder, f_theta and decoder toward the pixel endpoint.
-    if recon_predict_weight != 0.0:
+    # Both endpoint terms grade the SAME decoded prediction against the SAME
+    # real final frame, so decode once if either is active.
+    if recon_predict_weight != 0.0 or grad_predict_weight != 0.0:
         x_pred_n = recon_pathway.decoder(z_hat[:, -1]) * torch.exp(
             recon_pathway.log_output_scale)
-        l_recon_predict = ReconLoss()(x_pred_n, x_future[:, -1])
+        x_real_n = x_future[:, -1]
+    else:
+        x_pred_n = x_real_n = None
+
+    if recon_predict_weight != 0.0:
+        l_recon_predict = ReconLoss()(x_pred_n, x_real_n)
     else:
         l_recon_predict = torch.zeros((), device=x_window.device, dtype=x_window.dtype)
 
+    # L_grad_predict: the SPATIAL-GRADIENT sibling of L_recon_predict -- same
+    # decoded endpoint, same real frame, but matched in first difference instead
+    # of value. L_recon_predict is MSE on the field, which is blind to WHERE the
+    # error sits: a decoder can lower it by spraying low-amplitude speckle across
+    # the flat domain interiors (most of the pixels, each error tiny) while
+    # keeping interfaces sharp -- the "moth-eaten" bulk seen in stage-5 rollouts.
+    # Matching gradients penalizes exactly that: in the bulk grad(real)=0 so any
+    # predicted variation is error, while at an interface grad(real) is large so
+    # the term REQUIRES a matching sharp transition rather than blurring it. No
+    # bulk mask needed -- the real field's own gradient says where variation is
+    # allowed, and (since interface width is T-dependent in Allen-Cahn) the term
+    # also teaches the physical interface profile, not a fixed target. Plain
+    # non-periodic finite differences: the same operator on pred and real makes
+    # it a fair match regardless of the boundary convention.
+    if grad_predict_weight != 0.0:
+        l_grad_predict = (
+            ReconLoss()(x_pred_n[..., 1:, :] - x_pred_n[..., :-1, :],
+                        x_real_n[..., 1:, :] - x_real_n[..., :-1, :])
+            + ReconLoss()(x_pred_n[..., :, 1:] - x_pred_n[..., :, :-1],
+                          x_real_n[..., :, 1:] - x_real_n[..., :, :-1]))
+    else:
+        l_grad_predict = torch.zeros((), device=x_window.device, dtype=x_window.dtype)
+
     total = (rollout_weight * l_rollout / rollout_scale + recon0_weight * l_recon0 / recon0_scale
              + stats0_weight * l_stats0 / stats0_scale
-             + recon_predict_weight * l_recon_predict / recon_predict_scale)
+             + recon_predict_weight * l_recon_predict / recon_predict_scale
+             + grad_predict_weight * l_grad_predict / grad_predict_scale)
 
     if return_components:
         components = {
             "rollout": l_rollout, "recon0": l_recon0, "stats0": l_stats0,
-            "recon_predict": l_recon_predict,
+            "recon_predict": l_recon_predict, "grad_predict": l_grad_predict,
             "z0": z0, "z_true": z_true,
         }
         return total, components

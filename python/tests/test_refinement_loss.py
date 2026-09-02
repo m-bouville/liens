@@ -346,3 +346,66 @@ def test_recon_predict_weight_zero_is_an_exact_no_op():
         return_components=True)
     # the term is a zero scalar and contributes nothing (weight 0)
     assert comps["recon_predict"].item() == 0.0
+
+
+def test_grad_predict_is_zero_when_prediction_matches_real_gradients():
+    """L_grad_predict matches spatial gradients of the decoded endpoint to the
+    real endpoint's. It is a distinct component from recon_predict (value MSE);
+    a finite positive scalar in general, and it backprops to the decoder like
+    recon_predict does."""
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    _, comps = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=0.0, recon0_weight=0.0, stats0_weight=0.0,
+        grad_predict_weight=1.0, grad_predict_scale=1.0, return_components=True)
+    assert "grad_predict" in comps
+    assert comps["grad_predict"].ndim == 0 and comps["grad_predict"].item() > 0
+    # distinct from the value-MSE endpoint term
+    assert not torch.allclose(comps["grad_predict"], comps["recon_predict"])
+
+
+def test_grad_predict_backprops_to_the_DECODER():
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    total = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=0.0, recon0_weight=0.0, stats0_weight=0.0,
+        grad_predict_weight=1.0, grad_predict_scale=1.0)
+    total.backward()
+    dec = ae.decoders["shared"]
+    grads = [p.grad for p in dec.parameters() if p.grad is not None and p.grad.abs().sum() > 0]
+    assert grads, "grad_predict produced no decoder gradient -- it must decode"
+
+
+def test_grad_predict_penalises_bulk_speckle_but_not_a_flat_offset():
+    """The point of the term: a prediction that adds high-frequency speckle to an
+    otherwise-correct field has WRONG gradients (large where the real field is
+    flat), so L_grad_predict is large -- whereas a smooth constant offset has the
+    SAME gradients as the real field, so L_grad_predict is ~0 (only value-MSE
+    sees the offset). This is what makes it target moth-eaten interiors without
+    touching interfaces."""
+    import torch as _t
+    real = _t.zeros(1, 1, 16, 16)
+    real[..., 4:12, 4:12] = 1.0                      # a flat domain with sharp edges
+    speckled = real + 0.05 * _t.randn(1, 1, 16, 16)  # bulk speckle
+    offset = real + 0.3                               # smooth constant shift
+
+    def grad_mse(a, b):
+        from training._refinement_loss import ReconLoss
+        return (ReconLoss()(a[..., 1:, :] - a[..., :-1, :], b[..., 1:, :] - b[..., :-1, :])
+                + ReconLoss()(a[..., :, 1:] - a[..., :, :-1], b[..., :, 1:] - b[..., :, :-1])).item()
+
+    assert grad_mse(speckled, real) > 10 * grad_mse(offset, real), (
+        "gradient loss must see speckle (wrong bulk gradients) far more than a "
+        "flat offset (identical gradients)")
+
+
+def test_grad_predict_weight_zero_is_an_exact_no_op():
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    _, comps = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=1.0, recon0_weight=0.1, grad_predict_weight=0.0,
+        return_components=True)
+    assert comps["grad_predict"].item() == 0.0
