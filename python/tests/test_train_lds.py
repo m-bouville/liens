@@ -630,7 +630,16 @@ def _train_3b(tmp_path, base_path, stage2_path, stage3a_path, capsys=None, **ove
     kwargs = dict(
         size=32, base_path=base_path, resume_from=stage3a_path,
         ae_checkpoint_path=stage2_path, ae_stats_weight=0.01,
-        epochs=4, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        # epochs=8, not 4: a non-comparable resume graces the first
+        # grace_epochs_for_ema(0.7)=3 epochs, so with epochs=4 the ONLY saveable
+        # epoch is 4 -- and it must beat the grace-era relaxing EMA by whatever
+        # margin the tiny model happens to produce. On Linux it just clears the
+        # bar; on Windows the float noise leaves it a hair short, nothing saves,
+        # and the no-save guard raises before the test's own assertion runs.
+        # epochs=8 leaves five post-grace epochs (4-8); the descending EMA saves
+        # several of them (observed 4,5,7), so >=1 save is robust across
+        # platforms while the "no save during epochs 1-3" assertion is unchanged.
+        epochs=8, batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=2, min_step=0, min_stdev_phi=None,
         encode_batch_size=4, ema_warmup_epochs=0, val_ema_decay=0.7,

@@ -328,3 +328,66 @@ def atomic_torch_save(obj, path: Path) -> None:
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def scale_balance_report(
+    contributions: dict[str, float],
+    raw: dict[str, float],
+    weights: dict[str, float],
+    scales: dict[str, float],
+) -> str | None:
+    """Diagnose a mis-scaled multi-term objective, or return None if balanced.
+
+    A weighted objective is `sum_k weight_k * raw_k / scale_k`. When a *_scale
+    is not the raw magnitude of its own component, the weights beside it stop
+    meaning what they say and the stage silently fails to balance what it
+    exists to balance. This inspects one epoch's VALIDATION contributions and
+    returns the warning string (already formatted, ready to print) or None.
+
+    TWO-SIDED, because both failures are the same defect:
+      - DOMINANT: one term is >99% of the loss -- its scale is too SMALL, so it
+        drowns the others (stage 3 freezes the encoder and rollout loss is
+        ~1e-6; stage 4 unfreezes it and the same quantity is ~0.7, 6e5x larger,
+        so a global rollout_scale=1e-6 makes stage 4 99.997% rollout).
+      - STARVED: a term with a NONZERO weight is <1% of the loss -- its scale is
+        too LARGE, so the term the stage exists to add has effectively left the
+        objective (rollout_scale=100 against a converged raw of 0.04 dropped
+        L_rollout to 0.46% while the warning, in its dominant-only original
+        form, stayed silent).
+    Dominant takes priority when both could fire. STARVED is keyed on a nonzero
+    weight so a term the user deliberately switched off is never reported.
+
+    Extracted here (rather than inline in each epoch loop) so it is unit-tested
+    against its OUTPUT, and so train_refinement and train_stage2 share ONE copy
+    -- the two had byte-identical inline blocks, exactly the duplication this
+    module exists to prevent.
+    """
+    total = sum(abs(v) for v in contributions.values())
+    if total <= 0:
+        return None
+    shares = {k: abs(v) / total for k, v in contributions.items()}
+    raw_str = ", ".join(f"{k}={raw[k]:.3e}" for k in shares)
+    suggest = ", ".join(f"{k}_scale~{raw[k]:.3g}" for k in shares if raw[k] > 0)
+
+    dominant = [k for k, sh in shares.items() if sh > 0.99]
+    starved = [k for k, sh in shares.items()
+               if sh < 0.01 and weights.get(k, 0.0) != 0.0]
+
+    if dominant:
+        k = dominant[0]
+        others = ", ".join(f"{n} {100 * shares[n]:.4f}%" for n in shares if n != k)
+        return (f"\n  WARNING: '{k}' is {100 * shares[k]:.4f}% of the validation "
+                f"loss ({others}). The *_scale values are calibrated for a "
+                f"different stage -- each scale should be the RAW magnitude of its "
+                f"own component here, so the weights beside them mean what they say. "
+                f"Raw values this epoch: {raw_str}. Suggested: {suggest}\n")
+    if starved:
+        detail = ", ".join(
+            f"'{k}' {100 * shares[k]:.4f}% (weight {weights[k]:g}, "
+            f"scale {scales[k]:g})" for k in starved)
+        return (f"\n  WARNING: {detail} of the validation loss, despite a nonzero "
+                f"weight -- that term is effectively OUT of the objective, so this "
+                f"stage is not balancing what it exists to balance. Its scale is far "
+                f"above its own raw magnitude. Raw values this epoch: {raw_str}. "
+                f"Suggested: {suggest}\n")
+    return None

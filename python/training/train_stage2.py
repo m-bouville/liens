@@ -28,7 +28,7 @@ from models.latent_streams import cross_check_stream_configs_against_state_dict,
                                    resolve_stream_configs_from_checkpoint_config
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save, clamp_grace_epochs,
-    grace_epochs_for_ema,
+    grace_epochs_for_ema, scale_balance_report,
 )
 import re
 from training.checkpoint_components import cross_check_ancestor_config
@@ -1646,39 +1646,16 @@ def train_stage2(
                 "deriv": deriv_weight * val_deriv / deriv_scale,
                 "interp": interp_weight * val_interp / interp_scale,
             }
-            _total = sum(abs(v) for v in contributions.values())
-            _raw = {"recon0": val_recon, "stats0": val_stats, "stats1": val_stats1,
-                    "deriv": val_deriv, "interp": val_interp}
-            _wts = {"recon0": 1.0, "stats0": stats0_weight, "stats1": stats1_weight,
-                    "deriv": deriv_weight, "interp": interp_weight}
-            _scl = {"recon0": recon0_scale, "stats0": stats0_scale, "stats1": stats1_scale,
-                    "deriv": deriv_scale, "interp": interp_scale}
-            if _total > 0:
-                _shares = {k: abs(v) / _total for k, v in contributions.items()}
-                _raw_str = ", ".join(f"{k}={_raw[k]:.3e}" for k in _shares)
-                _suggest = ", ".join(
-                    f"{k}_scale~{_raw[k]:.3g}" for k in _shares if _raw[k] > 0)
-                _dominant = [k for k, sh in _shares.items() if sh > 0.99]
-                _starved = [k for k, sh in _shares.items()
-                            if sh < 0.01 and _wts.get(k, 0.0) != 0.0]
-                if _dominant:
-                    k = _dominant[0]
-                    _others = ", ".join(f"{n} {100 * _shares[n]:.4f}%"
-                                        for n in _shares if n != k)
-                    print(f"\n  WARNING: '{k}' is {100 * _shares[k]:.4f}% of the validation "
-                          f"loss ({_others}). The *_scale values are calibrated for a "
-                          f"different stage -- each scale should be the RAW magnitude of its "
-                          f"own component here, so the weights beside them mean what they say. "
-                          f"Raw values this epoch: {_raw_str}. Suggested: {_suggest}\n")
-                elif _starved:
-                    _detail = ", ".join(
-                        f"'{k}' {100 * _shares[k]:.4f}% (weight {_wts[k]:g}, "
-                        f"scale {_scl[k]:g})" for k in _starved)
-                    print(f"\n  WARNING: {_detail} of the validation loss, despite a nonzero "
-                          f"weight -- that term is effectively OUT of the objective, so this "
-                          f"stage is not balancing what it exists to balance. Its scale is far "
-                          f"above its own raw magnitude. Raw values this epoch: {_raw_str}. "
-                          f"Suggested: {_suggest}\n")
+            _report = scale_balance_report(
+                contributions,
+                raw={"recon0": val_recon, "stats0": val_stats, "stats1": val_stats1,
+                     "deriv": val_deriv, "interp": val_interp},
+                weights={"recon0": 1.0, "stats0": stats0_weight, "stats1": stats1_weight,
+                         "deriv": deriv_weight, "interp": interp_weight},
+                scales={"recon0": recon0_scale, "stats0": stats0_scale, "stats1": stats1_scale,
+                        "deriv": deriv_scale, "interp": interp_scale})
+            if _report:
+                print(_report)
 
         # Captured BEFORE update(), which decrements the grace counter and
         # flips in_grace_period to False on the FINAL grace epoch -- an epoch

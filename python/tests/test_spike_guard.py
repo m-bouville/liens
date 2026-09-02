@@ -155,13 +155,20 @@ def test_factor_zero_disables_the_guard_entirely():
 def test_skips_are_reported_not_silent():
     """
     GUARDS a guard that drops data quietly: the run would look healthy while
-    training on a filtered distribution.
+    training on a filtered distribution. The message is produced by
+    skip_report; here we call it and assert on the RETURNED text (the
+    complementary empty-when-clean case is test_nothing_is_printed_when_nothing_was_skipped),
+    then keep the one structural fact the output can't show: that train_lds
+    actually drives the reporter.
     """
-    # The message text lives in spike_guard.skip_report now (one compact line
-    # per epoch after the first); train_lds keeps only the wiring.
-    src = source_without_comments(_ROOT / "training/spike_guard.py")
-    assert "skipped" in src and "catastrophic outlier" in src
-    # train_lds drives the reporter, which decides whether to call skip_report.
+    from training.spike_guard import skip_report
+    worst = (1.1e5, 0.63, 2.5e4, -0.09)
+    report = skip_report(7, 3, worst, 0, None, 13, verbose=True)
+    assert report != "", "a batch was skipped but the report was empty (silent drop)"
+    assert "skipped" in report and "catastrophic" in report, (
+        "the report must say a batch was skipped and why")
+    # train_lds drives the reporter, which decides whether to call skip_report --
+    # a wiring fact the report text cannot show, so it stays a source check.
     assert "_skip_reporter.epoch(" in source_without_comments(
         _ROOT / "training/train_lds.py")
 
@@ -170,14 +177,23 @@ def test_the_report_names_what_was_IN_the_batch():
     """
     "Cursed with sudden peaks" is not actionable; "the spikes are all dt near
     max_dt at low noise" is. dt_max and theta are what turn one into the other.
+    Asserted on skip_report's OUTPUT, including that the dt label defaults to
+    "dt_max" when not passed (u-mode passes du_max explicitly).
     """
-    src = source_without_comments(_ROOT / "training/spike_guard.py")
-    assert "{dt_label}=" in src and "theta[0]" in src
-    assert 'dt_label: str = "dt_max"' in src   # default label; u-mode passes du_max
-    # _record_spike moved to training/spike_guard.py when stages 4 and 5
-    # became a second caller; train_lds re-exports it.
-    shared = source_without_comments(_ROOT / "training/spike_guard.py")
-    assert "def _record_spike" in shared
+    from training.spike_guard import skip_report
+    # worst tuple: (worst_value, median, dt, theta[0])
+    report = skip_report(31, 4, (4.4e8, 1.2e7, 1250.0, -0.15),
+                         0, None, 13, verbose=True)   # no dt_label -> default
+    assert "dt_max=1250" in report, "the report must name the dt of the batch (default label)"
+    assert "theta[0]=-0.15" in report or "theta[0]=-0.1" in report, (
+        "the report must name the batch's theta")
+    # a u-mode caller passes its own label, which must replace the default
+    u_report = skip_report(31, 4, (4.4e8, 1.2e7, 1250.0, -0.15),
+                           0, None, 13, verbose=True, dt_label="du_max")
+    assert "du_max=1250" in u_report and "dt_max" not in u_report
+    # _record_spike (which builds the worst-tuple) lives in spike_guard so both
+    # trainers share it -- a structural fact, kept as a source check.
+    assert "def _record_spike" in source_without_comments(_ROOT / "training/spike_guard.py")
 
 
 def test_the_step_is_skipped_not_just_the_backward():
@@ -511,10 +527,19 @@ def test_grad_skips_are_reported_distinctly():
     The two guards mean different things: a loss outlier is a bad WINDOW, a
     gradient outlier with an ordinary loss is ill-conditioning. Reporting them
     identically would erase the distinction that took a CSV to establish.
+    Asserted on skip_report's OUTPUT: a grad-only skip and a loss-only skip
+    produce visibly different text.
     """
-    src = source_without_comments(_ROOT / "training/spike_guard.py")
-    assert "GRADIENT NORM was a" in src
-    assert "despite an ordinary loss" in src
+    from training.spike_guard import skip_report
+    gw = (6.0e6, 29.4, 2.5e4, -0.15)
+    lw = (1.1e5, 0.63, 2.5e4, -0.09)
+    grad_only = skip_report(3, 0, None, 5, gw, 48, verbose=True)
+    loss_only = skip_report(3, 5, lw, 0, None, 48, verbose=True)
+    assert "GRADIENT NORM was a" in grad_only, "a grad-only skip must name the gradient norm"
+    assert "despite an ordinary loss" in grad_only, (
+        "a grad outlier with an ordinary loss is the ill-conditioning case")
+    assert "catastrophic" in loss_only and "despite an ordinary loss" not in loss_only, (
+        "a loss outlier is a different event and must not borrow the grad wording")
 
 
 def test_a_rollback_also_resets_the_CRITERION():

@@ -1398,31 +1398,15 @@ def test_balance_warning_fires_once_after_the_deriv_ramp():
     )
 
 
-def test_balance_warning_is_two_sided_and_names_the_raws():
+def test_stage2_feeds_recon0_to_the_shared_report_at_implicit_weight_one():
+    """Stage-2 WIRING: recon0 has no recon0_weight parameter -- it is the fixed
+    anchor (coef 1 in the total), so it must be passed to scale_balance_report
+    with weight 1.0, or a run that is ~100% recon0 (deriv starved) would not
+    register. The dominance/starvation logic itself is tested against the
+    shared function's output in test_checkpoint_criterion."""
     w = _balance_warning_src()
-    assert "sh > 0.99" in w, "must catch a term DOMINATING"
-    assert "sh < 0.01" in w, "must catch a term STARVED"
-    assert "_raw_str" in w and "_suggest" in w, (
-        "the report must name the raw magnitudes and the scale they imply"
-    )
-
-
-def test_starved_is_guarded_on_a_nonzero_weight():
-    """stats0/stats1/interp default to weight 0. A term the user deliberately
-    switched off must NEVER be reported as 'effectively OUT' -- that guard is
-    what makes the warning trustworthy rather than noise on every default run."""
-    w = _balance_warning_src()
-    assert '_wts.get(k, 0.0) != 0.0' in w, (
-        "the starved branch must exclude zero-weight (deliberately-off) terms"
-    )
-
-
-def test_recon0_is_the_implicit_weight_one_anchor_in_the_check():
-    """recon0 has no recon0_weight parameter -- it is the fixed anchor (coef 1
-    in the total). The check must weight it 1.0, not omit it, or a run that is
-    ~100% recon0 (deriv starved) would not register recon0's dominance."""
-    w = _balance_warning_src()
-    assert '"recon0": 1.0' in w, "recon0 must enter the check at implicit weight 1"
+    assert "scale_balance_report(" in w, "stage 2 must call the shared report"
+    assert '"recon0": 1.0' in w, "recon0 must enter at implicit weight 1"
     assert '"recon0": val_recon / recon0_scale' in w
 
 

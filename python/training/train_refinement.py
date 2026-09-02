@@ -23,7 +23,7 @@ from training.spike_guard import (
 from utils.logging_utils import print_run_parameters, EpochProgress
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save,
-    clamp_grace_epochs, grace_epochs_for_ema,
+    clamp_grace_epochs, grace_epochs_for_ema, scale_balance_report,
 )
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
 from training.losses import StatsLoss
@@ -840,51 +840,16 @@ def train_refinement(
                 "stats0": stats0_weight * val_stats0 / stats0_scale,
                 "recon_predict": recon_predict_weight * val_recon_predict / recon_predict_scale,
             }
-            total = sum(abs(v) for v in contributions.values())
-            raw = {"rollout": val_rollout, "recon0": val_recon0, "stats0": val_stats0,
-                   "recon_predict": val_recon_predict}
-            weights = {"rollout": rollout_weight, "recon0": recon0_weight,
-                        "stats0": stats0_weight, "recon_predict": recon_predict_weight}
-            scales = {"rollout": rollout_scale, "recon0": recon0_scale,
-                       "stats0": stats0_scale, "recon_predict": recon_predict_scale}
-            if total > 0:
-                shares = {k: abs(v) / total for k, v in contributions.items()}
-                _raw_str = ", ".join(f"{k}={raw[k]:.3e}" for k in shares)
-                _suggest = ", ".join(
-                    f"{k}_scale~{raw[k]:.3g}" for k in shares if raw[k] > 0)
-
-                # TWO-SIDED. The original check only caught a component
-                # DOMINATING, and stage 4 has since hit the opposite end just
-                # as hard: with rollout_scale=100 against a converged raw of
-                # 0.04, L_rollout fell to 0.46% of the validation loss and the
-                # warning stayed silent -- while the term stage 4 exists to
-                # balance had effectively left the objective. Both failures are
-                # the same defect (a scale that is not the raw magnitude of its
-                # own component) and both deserve the same report.
-                dominant = [k for k, sh in shares.items() if sh > 0.99]
-                # "starved" is keyed on a NONZERO weight: a component the user
-                # deliberately switched off must not be reported as a problem.
-                starved = [k for k, sh in shares.items()
-                            if sh < 0.01 and weights.get(k, 0.0) != 0.0]
-
-                if dominant:
-                    k = dominant[0]
-                    others = ", ".join(f"{n} {100 * shares[n]:.4f}%"
-                                        for n in shares if n != k)
-                    print(f"\n  WARNING: '{k}' is {100 * shares[k]:.4f}% of the validation "
-                          f"loss ({others}). The *_scale values are calibrated for a "
-                          f"different stage -- each scale should be the RAW magnitude of its "
-                          f"own component here, so the weights beside them mean what they say. "
-                          f"Raw values this epoch: {_raw_str}. Suggested: {_suggest}\n")
-                elif starved:
-                    detail = ", ".join(
-                        f"'{k}' {100 * shares[k]:.4f}% (weight {weights[k]:g}, "
-                        f"scale {scales[k]:g})" for k in starved)
-                    print(f"\n  WARNING: {detail} of the validation loss, despite a nonzero "
-                          f"weight -- that term is effectively OUT of the objective, so this "
-                          f"stage is not balancing what it exists to balance. Its scale is far "
-                          f"above its own raw magnitude. Raw values this epoch: {_raw_str}. "
-                          f"Suggested: {_suggest}\n")
+            _report = scale_balance_report(
+                contributions,
+                raw={"rollout": val_rollout, "recon0": val_recon0, "stats0": val_stats0,
+                     "recon_predict": val_recon_predict},
+                weights={"rollout": rollout_weight, "recon0": recon0_weight,
+                         "stats0": stats0_weight, "recon_predict": recon_predict_weight},
+                scales={"rollout": rollout_scale, "recon0": recon0_scale,
+                        "stats0": stats0_scale, "recon_predict": recon_predict_scale})
+            if _report:
+                print(_report)
 
         if saved_this_epoch:
             _saved_this_run = True

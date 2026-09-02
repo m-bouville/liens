@@ -405,3 +405,82 @@ def test_low_raw_val_with_worse_ema_does_not_save_or_move_the_raw_bar():
     _, save = t.update(3, 0.5)               # raw 0.5 < 1.0 but EMA still > best_ema
     assert save is False
     assert t.best_raw_val_loss == raw_bar_before   # raw bar NOT lowered off-save
+
+
+# --------------------------------------------------------------------
+# scale_balance_report: the two-sided objective-balance diagnostic,
+# extracted from train_refinement/train_stage2 (which had byte-identical
+# inline copies). Tested here against its OUTPUT rather than by asserting
+# the source string in either trainer.
+# --------------------------------------------------------------------
+from training.checkpoint_criterion import scale_balance_report
+
+
+def _report(contribs, raw, weights, scales):
+    return scale_balance_report(contribs, raw, weights, scales)
+
+
+def test_balanced_objective_returns_None():
+    r = _report({"a": 1.0, "b": 1.0, "c": 1.0},
+                {"a": 1, "b": 1, "c": 1}, {"a": 1, "b": 1, "c": 1}, {"a": 1, "b": 1, "c": 1})
+    assert r is None
+
+
+def test_a_dominant_term_is_reported_with_its_share_and_a_scale_suggestion():
+    # rollout at scale 1e-6 against raw 0.7 dwarfs everyone (the stage-3->4 trap)
+    contribs = {"rollout": 1.0 * 0.7 / 1e-6, "recon0": 0.2 * 0.005 / 4e-5,
+                "stats0": 0.05 * 0.14 / 0.15}
+    r = _report(contribs, {"rollout": 0.7, "recon0": 0.005, "stats0": 0.14},
+                {"rollout": 1.0, "recon0": 0.2, "stats0": 0.05},
+                {"rollout": 1e-6, "recon0": 4e-5, "stats0": 0.15})
+    assert r is not None and "'rollout'" in r and "99.99" in r
+    assert "calibrated for a" in r                 # the dominant message
+    assert "rollout_scale~0.7" in r                # suggests the raw magnitude as the scale
+
+
+def test_a_starved_term_with_nonzero_weight_is_reported_as_effectively_OUT():
+    # stats0 scaled far above its raw -> <1% of the loss despite weight 0.05
+    contribs = {"rollout": 0.2 * 0.24 / 0.15, "recon0": 0.2 * 0.009 / 0.0005,
+                "stats0": 0.05 * 0.12 / 0.15, "recon_predict": 1.0 * 0.062 / 0.005}
+    r = _report(contribs, {"rollout": 0.24, "recon0": 0.009, "stats0": 0.12, "recon_predict": 0.062},
+                {"rollout": 0.2, "recon0": 0.2, "stats0": 0.05, "recon_predict": 1.0},
+                {"rollout": 0.15, "recon0": 0.0005, "stats0": 0.15, "recon_predict": 0.005})
+    assert r is not None and "'stats0'" in r and "effectively OUT" in r
+    assert "weight 0.05" in r and "scale 0.15" in r
+
+
+def test_starvation_is_keyed_on_a_NONZERO_weight():
+    """A term the user deliberately switched off (weight 0) contributes nothing
+    but must NEVER be reported as starved -- that guard is what keeps the
+    warning trustworthy on every default run (stage 2 leaves stats0/stats1/
+    interp at weight 0)."""
+    # two balanced terms (neither dominates) + one starved nonzero-weight term
+    # + one deliberately-off term. deriv is <1% and nonzero -> named; interp is
+    # off -> never named.
+    contribs = {"a": 50.0, "b": 49.0, "deriv": 0.3, "interp": 0.0}
+    r = _report(contribs, {"a": 1, "b": 1, "deriv": 0.5, "interp": 0.3},
+                {"a": 1.0, "b": 1.0, "deriv": 1.0, "interp": 0.0},    # interp weight 0
+                {"a": 1.0, "b": 1.0, "deriv": 1.0, "interp": 1.0})
+    assert r is not None and "'deriv'" in r and "effectively OUT" in r
+    assert "'interp'" not in r, "a deliberately-off term was reported as starved"
+
+
+def test_dominance_takes_priority_over_starvation():
+    # one term >99% AND another <1%: the dominant message wins
+    contribs = {"big": 200.0, "tiny": 0.1}
+    r = _report(contribs, {"big": 2.0, "tiny": 0.1}, {"big": 1.0, "tiny": 1.0},
+                {"big": 0.01, "tiny": 1.0})
+    assert "is 99." in r and "calibrated for a" in r   # dominant, not the starved wording
+    assert "effectively OUT" not in r
+
+
+def test_the_suggestion_only_names_positive_raw_terms():
+    """A term whose raw value is exactly 0 has no meaningful scale to suggest,
+    so it is omitted from the Suggested list (not suggested as `_scale~0`)."""
+    contribs = {"a": 200.0, "b": 0.0}
+    r = _report(contribs, {"a": 2.0, "b": 0.0}, {"a": 1.0, "b": 1.0}, {"a": 0.01, "b": 1.0})
+    assert "a_scale~2" in r and "b_scale" not in r
+
+
+def test_all_zero_contributions_returns_None():
+    assert _report({"a": 0.0, "b": 0.0}, {"a": 0, "b": 0}, {"a": 1, "b": 1}, {"a": 1, "b": 1}) is None

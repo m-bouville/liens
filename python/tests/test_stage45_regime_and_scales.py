@@ -9,6 +9,7 @@ the handoffs.
 """
 import inspect
 import pathlib
+import re
 
 import pytest
 
@@ -75,41 +76,16 @@ def test_all_three_semantic_parameters_reach_stage45():
 # scales
 # --------------------------------------------------------------------
 
-def test_stage45_warns_when_one_component_dominates():
-    """
-    rollout_scale=1e-6 is right for stage 3, which FREEZES the encoder so
-    f_theta sees the latents it was fitted to (raw rollout ~1e-6). Stage 4
-    unfreezes it, f_theta is immediately off-distribution, and the same
-    quantity is ~0.7 -- 6e5 times larger. A single global rollout_scale then
-    makes stage 4's loss 99.997% rollout, with recon0+stats0 at 26 parts per
-    million.
-
-    Stage 4 exists for the balance between those terms, so this is not a
-    cosmetic imbalance -- it removes the decoder tether the stage is built
-    around, and it is invisible without undoing the scale arithmetic by hand.
-    """
+def test_stage45_wires_in_the_shared_scale_balance_report():
+    """The dominance/starvation LOGIC is tested against scale_balance_report's
+    OUTPUT in test_checkpoint_criterion; here we pin only that train_refinement
+    WIRES it in -- calls the shared function with all four components. The two
+    trainers had byte-identical inline copies of this logic; it now lives once
+    in checkpoint_criterion.py."""
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "sh > 0.99" in src, "no dominance check"
-    assert "WARNING" in src
-    # Reported once the ramp completes, not at epoch 1 -- during a warmup the
-    # imbalance is deliberate. See test_the_dominance_warning_waits_for_the_ramp.
-    assert "epoch == max(1, rollout_weight_warmup_epochs)" in src, (
-        "must report exactly once, at the first epoch the full objective is in effect"
-    )
-
-
-def test_the_dominance_warning_names_the_raw_magnitudes():
-    """
-    A percentage alone does not say what to set the scale TO. The raw values
-    are exactly the numbers a corrected *_scale should equal.
-    """
-    src = source_without_comments(_ROOT / "training/train_refinement.py")
-    warning = src[src.index("sh > 0.99"):]
-    warning = warning[:warning.index("if saved_this_epoch")]
-    assert "Raw values" in warning
-    assert "_raw_str" in warning and "_suggest" in warning, (
-        "the report must name the raw magnitudes AND the scale they imply"
-    )
+    assert "scale_balance_report(" in src, "the balance check is not wired in"
+    for comp in ("rollout", "recon0", "stats0", "recon_predict"):
+        assert f'"{comp}"' in src, f"{comp} is not fed to the balance report"
 
 
 @pytest.mark.parametrize("scale", ["rollout_scale", "recon0_scale", "stats0_scale"])
@@ -158,8 +134,18 @@ def test_the_ramp_is_LINEAR_not_geometric():
     definition, and with the scales recalibrated L_rollout is O(1-10) from
     epoch 1 -- nothing left to hold flat, so a plain linear introduction is the
     right ramp, and the same helper serves recon_predict.
+
+    Anchored on inspect.getsource(linear_warmup_weight) -- the imported FUNCTION,
+    not a file path -- so when the shared epoch-loop extraction moves the ramp
+    helper to another module the guard follows the symbol instead of breaking on
+    the path. The linear VALUES are covered behaviourally by
+    test_the_ramp_endpoints_are_exact / test_the_ramp_is_linear_in_the_WEIGHT
+    (a geometric ramp would give the geometric mean, not k/N); this adds only the
+    cheap anti-regression that the two obsolete forms have not returned.
     """
-    src = source_without_comments(_ROOT / "training/train_refinement.py")
+    import inspect
+    from training.train_refinement import linear_warmup_weight
+    src = inspect.getsource(linear_warmup_weight)
     assert "full_weight * (epoch / warmup_epochs)" in src, (
         "the ramp must be linear as epoch/warmup_epochs"
     )
@@ -312,18 +298,35 @@ def test_the_reset_grace_is_at_least_two_epochs():
 
 def test_the_reset_is_clamped_against_the_remaining_epochs():
     """A grace covering every remaining epoch means NO checkpoint is written
-    after the reset -- a missing file rather than a worse one."""
+    after the reset -- a missing file rather than a worse one.
+
+    WIRING check only: that train_refinement clamps the grace against the
+    remaining-epoch budget. clamp_grace_epochs' actual MATH (always leaves at
+    least one saveable epoch, incl. the epochs=0 edge) is covered directly in
+    test_checkpoint_criterion::test_clamp_grace_epochs_always_leaves_one_saveable_epoch.
+    Anchored on the CALL, not the exact argument expression, so a refactor that
+    moves the loop or renames the epoch counter doesn't trip it spuriously while
+    the behaviour is unchanged."""
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "clamp_grace_epochs(grace, epochs - epoch + 1)" in src
+    assert "clamp_grace_epochs(" in src, "the grace is not clamped at all"
+    # the remaining-epoch budget (some epochs - epoch expression) is what's passed
+    assert re.search(r"clamp_grace_epochs\(\s*grace\s*,\s*epochs\b", src), (
+        "clamp must be passed the grace and a remaining-epochs budget")
 
 
 def test_no_reset_when_there_is_no_warmup():
     """GUARDS resetting unconditionally, which would discard a perfectly good
-    criterion history for every existing run."""
+    criterion history for every existing run.
+
+    WIRING companion to the behavioral test_no_grace_message_when_there_is_no_warmup
+    in test_train_refinement (which RUNS a no-warmup stage 4 and asserts the
+    grace machinery stays silent). This fast check pins that the reset is gated
+    on a warmup existing at all -- anchored on the guard's condition rather than
+    its exact whitespace."""
     src = source_without_comments(_ROOT / "training/train_refinement.py")
-    guard = src[src.index("if (max(rollout_weight_warmup_epochs,"):]
-    guard = guard[:guard.index("tracker.reset_with_grace")]
-    assert "> 0" in guard and "rollout_weight_warmup_epochs" in guard
+    _cond = " ".join(src.split())
+    assert "if (max(rollout_weight_warmup_epochs, recon_predict_weight_warmup_epochs) > 0" in _cond, (
+        "the reset must be gated on at least one warmup being active")
 
 
 def test_the_dominance_warning_waits_for_the_ramp():
@@ -334,6 +337,8 @@ def test_the_dominance_warning_waits_for_the_ramp():
     converged value was 0.053. Acting on that would have undone the ramp.
     """
     src = source_without_comments(_ROOT / "training/train_refinement.py")
+    # the shared report is CALLED only at the first full-weight epoch -- the
+    # timing guard is train_refinement's, not scale_balance_report's.
     assert "epoch == max(1, rollout_weight_warmup_epochs)" in src
     assert "if epoch == 1:" not in src, "the warning must not fire during the ramp"
 
@@ -397,65 +402,6 @@ def test_non_inherited_population_filters_are_at_least_reported():
 # --------------------------------------------------------------------
 # the scale check must be TWO-SIDED
 # --------------------------------------------------------------------
-
-def test_the_check_catches_a_STARVED_component_too():
-    """
-    The original check fired only on a component DOMINATING (>99%), and stage 4
-    then hit the opposite end just as hard: rollout_scale=100 against a
-    converged raw of 0.04 left L_rollout at 0.46% of the validation loss, and
-    the warning stayed silent while the term stage 4 exists to balance had
-    effectively left the objective.
-
-    Both are the same defect -- a scale that is not the raw magnitude of its
-    own component -- so both must report.
-    """
-    src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "sh > 0.99" in src, "the dominance branch is gone"
-    assert "sh < 0.01" in src, "no starvation branch"
-    assert "effectively OUT of the objective" in src
-
-
-def test_starvation_is_keyed_on_a_NONZERO_weight():
-    """
-    GUARDS warning about a term the user deliberately switched off. Stage 5
-    runs recon0_weight=1 with rollout_weight small; a weight of exactly 0 is a
-    choice, not a mis-scaled component, and reporting it would train the
-    reader to ignore the warning.
-    """
-    src = source_without_comments(_ROOT / "training/train_refinement.py")
-    starved = src[src.index("starved = ["):]
-    starved = starved[:starved.index("\n\n")]
-    assert "weights.get(k, 0.0) != 0.0" in starved
-
-
-def test_the_report_suggests_the_scale_to_USE():
-    """
-    A percentage says something is wrong; the raw magnitude says what to set.
-    Both ends of this took manual arithmetic to convert into a params change,
-    twice -- the second time after the first had already been diagnosed.
-    """
-    src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "_scale~" in src, "the suggestion is not computed at all"
-    # Scoped to the PRINTED message, not the file: an earlier version matched
-    # the _suggest DEFINITION, so deleting it from the print left the test
-    # green -- verified.
-    block = src[src.index("if dominant:"):src.index("if saved_this_epoch")]
-    assert block.count("Suggested: {_suggest}") == 2, (
-        "both branches must print the suggested scales, not just compute them"
-    )
-
-
-def test_dominance_takes_priority_over_starvation():
-    """
-    With one component at 99.9%, the others are necessarily under 1% -- both
-    branches would fire and say contradictory things about the same imbalance.
-    The dominant reading is the useful one, so it wins.
-    """
-    src = source_without_comments(_ROOT / "training/train_refinement.py")
-    assert "if dominant:" in src and "elif starved:" in src, (
-        "the branches must be exclusive, dominance first"
-    )
-
 
 def test_n_rollout_steps_is_inherited_from_f_theta():
     """

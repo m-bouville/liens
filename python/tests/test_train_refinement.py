@@ -128,15 +128,16 @@ def _build_ae_checkpoint(path: Path, include_stats_head: bool = True):
     torch.save(checkpoint, path)
 
 
-def _build_lds_checkpoint(path: Path):
+def _build_lds_checkpoint(path: Path, n_rollout_steps: int = 1):
     f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=N_THETA, hidden_dim=8, n_hidden_layers=1)
     checkpoint = {
         "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05,
         "val_loss_ema": 0.05, "ae_checkpoint": "fake", "test_dirs": [],
         "config": {"latent_channels": LATENT_CHANNELS, "n_theta": N_THETA, "hidden_dim": 8,
                    "n_hidden_layers": 1},
-        "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2,
-                         "n_rollout_steps": 1},
+        "data_config": {"min_step": 0, "min_stdev_phi": None,
+                        "window_length": n_rollout_steps + 1,
+                        "n_rollout_steps": n_rollout_steps},
     }
     torch.save(checkpoint, path)
 
@@ -462,3 +463,158 @@ def test_stage4_handles_log10_t_f_theta(tmp_path, isolated_project_root):
     saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     assert math.isfinite(saved["val_loss"]), saved["val_loss"]
     assert saved["stage45_config"]["freeze_decoder"] is True
+
+
+@pytest.mark.slow
+def test_printed_component_columns_sum_to_the_totals_beside_them(tmp_path, capsys,
+                                                                 isolated_project_root):
+    """Behavioral guard for the effective-weight rule the source-assertion in
+    test_stage45_regime_and_scales pins: during a ramp the TRAIN columns must be
+    computed with the effective (ramped) weight, because the train_total beside
+    them is. If a column printed the full weight while the total used the ramped
+    one, the columns would not sum to the total and the discrepancy would read
+    as a loss bug. Checking the sum proves the columns and the total use the same
+    weights -- without needing the raw magnitudes. Run mid-ramp
+    (recon_predict_weight_warmup_epochs=3, epochs=2) so the effective weight is
+    strictly below full on the epochs printed."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_checkpoint_path = tmp_path / "fake-stage2.pt"
+    lds_checkpoint_path = tmp_path / "fake-stage3.pt"
+    _build_ae_checkpoint(ae_checkpoint_path, include_stats_head=True)
+    _build_lds_checkpoint(lds_checkpoint_path)
+
+    train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_checkpoint_path,
+        lds_checkpoint_path=lds_checkpoint_path, freeze_decoder=False,
+        rollout_weight=0.2, recon0_weight=0.2, stats0_weight=0.05,
+        recon_predict_weight=1.0, recon_predict_scale=0.05,
+        recon_predict_weight_warmup_epochs=3,   # ramp still active on epochs 1-2
+        rollout_scale=0.15, recon0_scale=5e-4, stats0_scale=0.15,
+        epochs=2, batch_size=4, n_rollout_steps=2,
+        min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+        checkpoint_path=tmp_path / "s5.pt", device="cpu",
+    )
+    out = capsys.readouterr().out
+
+    import re
+    # epoch lines look like:  "   1| T_tot =c0 +c1 +c2 +c3 | V_tot =d0 +d1 +d2 +d3 |   ema ..."
+    checked = 0
+    for line in out.splitlines():
+        m = re.match(r"\s*\d+\|\s*(-?\d+\.\d+)\s*=(.+?)\|\s*(-?\d+\.\d+)\s*=(.+?)\|", line)
+        if not m:
+            continue
+        for total_str, cols_str in ((m.group(1), m.group(2)), (m.group(3), m.group(4))):
+            total = float(total_str)
+            cols = [float(x) for x in re.findall(r"-?\d+\.\d+", cols_str)]
+            assert cols, f"no component columns parsed from {cols_str!r}"
+            # 4-decimal rounding per column -> tolerance scales with column count
+            assert abs(sum(cols) - total) < 0.001 * len(cols) + 1e-4, (
+                f"columns {cols} sum to {sum(cols):.4f}, not the printed total {total:.4f} "
+                f"-- a column used a different weight than the total (the ramped-weight bug)")
+            checked += 1
+    assert checked >= 2, f"expected to check both train and val on >=1 epoch, checked {checked}"
+
+
+@pytest.mark.slow
+def test_the_grace_message_fires_at_the_ramp_completion_epoch(tmp_path, capsys,
+                                                              isolated_project_root):
+    """Behavioral form of test_the_criterion_is_reset_when_the_ramp_completes:
+    val_loss is never ramped, so during the warmup it grades a model not yet
+    trained on the full objective -- terrible numbers that dominate the EMA and
+    make the save criterion blind. The tracker is reset (grace) when the ramp
+    completes. Here we RUN a ramped stage 5 and assert the grace message fires
+    at exactly the completion epoch and not before -- the observable proof the
+    reset happened at the right time, rather than the source string."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_p, lds_p = tmp_path / "s2.pt", tmp_path / "s3.pt"
+    _build_ae_checkpoint(ae_p, include_stats_head=True)
+    _build_lds_checkpoint(lds_p)
+    train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_p, lds_checkpoint_path=lds_p,
+        freeze_decoder=False, rollout_weight=0.2, recon0_weight=0.2, stats0_weight=0.05,
+        recon_predict_weight=1.0, recon_predict_scale=0.05,
+        recon_predict_weight_warmup_epochs=2,   # completes at epoch 2
+        rollout_scale=0.15, recon0_scale=5e-4, stats0_scale=0.15,
+        epochs=4, batch_size=4, n_rollout_steps=2,
+        min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+        checkpoint_path=tmp_path / "s5.pt", device="cpu",
+    )
+    out = capsys.readouterr().out
+    import re
+    fired = [int(m.group(1)) for m in
+             re.finditer(r"\[epoch (\d+): [^\]]*reached full strength", out)]
+    assert fired == [2], (
+        f"grace/reset must fire once, at the ramp-completion epoch 2, got {fired}")
+    assert "grace period" in out
+
+    # Observe the reset's EFFECT, not just the message (the two are separable --
+    # a refactor could keep the print and drop the reset). reset_with_grace
+    # re-baselines the val EMA to the current val_loss, so at the completion
+    # epoch the printed EMA equals val_loss exactly; without the reset the EMA
+    # would be the smoothed continuation (0.7*prev_ema + 0.3*val), a different
+    # number. (Epoch 1 also has ema==val from EMA seeding, so we check epoch 2.)
+    rows = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\|[^|]*\|\s*(-?\d+\.\d+)[^|]*\|\s*(-?\d+\.\d+)", line)
+        if m:
+            rows[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+    assert 2 in rows, f"no epoch-2 row parsed from:\n{out}"
+    val2, ema2 = rows[2]
+    assert abs(ema2 - val2) < 1e-3, (
+        f"at the ramp-completion epoch the EMA ({ema2}) must be re-baselined to "
+        f"val_loss ({val2}) by reset_with_grace; it wasn't -- the reset did not fire")
+    # and epoch 3 must have RESUMED smoothing (ema != val), confirming the reset
+    # was a one-off re-baseline, not a permanent ema=val
+    if 3 in rows:
+        val3, ema3 = rows[3]
+        assert abs(ema3 - val3) > 1e-4, "EMA never resumed smoothing after the reset"
+
+
+@pytest.mark.slow
+def test_no_grace_message_when_there_is_no_warmup(tmp_path, capsys, isolated_project_root):
+    """Behavioral form of test_no_reset_when_there_is_no_warmup: with no ramp,
+    val_loss is comparable from epoch 1, so the criterion needs no reset and the
+    grace machinery must stay silent."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_p, lds_p = tmp_path / "s2.pt", tmp_path / "s3.pt"
+    _build_ae_checkpoint(ae_p, include_stats_head=True)
+    _build_lds_checkpoint(lds_p)
+    train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_p, lds_checkpoint_path=lds_p,
+        freeze_decoder=True, rollout_weight=1.0, recon0_weight=0.2, stats0_weight=0.05,
+        # no warmup on either weight
+        rollout_scale=0.15, recon0_scale=5e-4, stats0_scale=0.15,
+        epochs=3, batch_size=4, n_rollout_steps=2,
+        min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+        checkpoint_path=tmp_path / "s4.pt", device="cpu",
+    )
+    out = capsys.readouterr().out
+    assert "reached full strength" not in out and "grace period" not in out, (
+        "the grace machinery fired without any warmup to complete")
+
+
+@pytest.mark.slow
+def test_n_rollout_steps_is_inherited_from_the_lds_checkpoint(tmp_path, isolated_project_root):
+    """Behavioral form of test_n_rollout_steps_is_inherited_from_f_theta: build
+    an f_theta checkpoint that recorded n_rollout_steps=2, run stage 4 WITHOUT
+    passing n_rollout_steps, and assert the run actually used 2 (inherited) --
+    not the old signature default of 1, which silently applied f_theta 2-step-
+    trained at 1 step across a whole real chain before this was caught. Read
+    back from the saved stage45_config (which records the resolved value)."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_p, lds_p = tmp_path / "s2.pt", tmp_path / "s3.pt"
+    _build_ae_checkpoint(ae_p, include_stats_head=True)
+    _build_lds_checkpoint(lds_p, n_rollout_steps=2)    # f_theta trained at 2
+    ckpt = tmp_path / "s4.pt"
+    train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_p, lds_checkpoint_path=lds_p,
+        freeze_decoder=True, rollout_weight=1.0, recon0_weight=0.2, stats0_weight=0.05,
+        rollout_scale=0.15, recon0_scale=5e-4, stats0_scale=0.15,
+        # n_rollout_steps NOT passed -> must inherit 2 from the checkpoint
+        epochs=1, batch_size=4,
+        min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+        checkpoint_path=ckpt, device="cpu",
+    )
+    saved = torch.load(ckpt, map_location="cpu", weights_only=True)
+    assert saved["stage45_config"]["n_rollout_steps"] == 2, (
+        "stage 4 did not inherit f_theta's n_rollout_steps=2 -- it used the default")
