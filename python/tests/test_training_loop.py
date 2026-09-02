@@ -5,7 +5,7 @@ whole point of the extraction is that a fix to it lands once for all three
 trainers -- so its contract must be pinned independently of any trainer."""
 import torch
 
-from training.training_loop import accumulate_epoch
+from training._training_loop import accumulate_epoch
 
 
 def _loader(batch_sizes):
@@ -50,7 +50,7 @@ def test_an_empty_loader_reduces_to_no_components_and_zero_batches():
     assert means == {} and n == 0
 
 
-from training.training_loop import weighted_contributions
+from training._training_loop import weighted_contributions
 
 
 def test_weighted_contributions_is_weight_times_raw_over_scale():

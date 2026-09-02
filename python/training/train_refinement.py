@@ -21,7 +21,7 @@ from training.spike_guard import (
     restore_running_stats, snapshot_running_stats, SkipReporter,
 )
 from utils.logging_utils import print_run_parameters, EpochProgress
-from training.training_loop import (accumulate_epoch, weighted_contributions,
+from training._training_loop import (accumulate_epoch, weighted_contributions,
                                     write_epoch_figures)
 from training.checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, save_checkpoint,
@@ -825,6 +825,7 @@ def train_refinement(
                     # rediscovering it -- the resolved values, not the arguments,
                     # since these may have come from f_theta's own data_config.
                     "data_config": {"min_step": min_step, "min_stdev_phi": min_stdev_phi,
+                                    "min_normalized_stdev_phi": min_normalized_stdev_phi,
                                     "min_passing_steps": min_passing_steps, "max_dt": max_dt,
                                     "window_length": window_length, "n_rollout_steps": n_rollout_steps},
                     "stats_config": (

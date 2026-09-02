@@ -39,7 +39,7 @@ from training.losses import (ReconLoss, StatsLoss, InterpLoss, centered_deriv_ta
 from training.stats_head import StatsHead
 from training.spike_guard import (_SpikeGuard, _record_spike, difficulty_band,
                                    snapshot_running_stats, restore_running_stats)
-from training.training_loop import accumulate_epoch, write_epoch_figures
+from training._training_loop import accumulate_epoch, write_epoch_figures
 from training.train_ae_common import freeze_outer_layers, compute_weight_drift
 from utils.naming import ae_checkpoint_name
 from utils.plots import loss_component_scatter

@@ -128,7 +128,7 @@ def _build_ae_checkpoint(path: Path, include_stats_head: bool = True):
     torch.save(checkpoint, path)
 
 
-def _build_lds_checkpoint(path: Path, n_rollout_steps: int = 1):
+def _build_lds_checkpoint(path: Path, n_rollout_steps: int = 1, min_normalized_stdev_phi=None):
     f_theta = LatentDynamics(latent_channels=LATENT_CHANNELS, n_theta=N_THETA, hidden_dim=8, n_hidden_layers=1)
     checkpoint = {
         "model_state": f_theta.state_dict(), "epoch": 1, "val_loss": 0.05,
@@ -136,6 +136,7 @@ def _build_lds_checkpoint(path: Path, n_rollout_steps: int = 1):
         "config": {"latent_channels": LATENT_CHANNELS, "n_theta": N_THETA, "hidden_dim": 8,
                    "n_hidden_layers": 1},
         "data_config": {"min_step": 0, "min_stdev_phi": None,
+                        "min_normalized_stdev_phi": min_normalized_stdev_phi,
                         "window_length": n_rollout_steps + 1,
                         "n_rollout_steps": n_rollout_steps},
     }
@@ -618,3 +619,39 @@ def test_n_rollout_steps_is_inherited_from_the_lds_checkpoint(tmp_path, isolated
     saved = torch.load(ckpt, map_location="cpu", weights_only=True)
     assert saved["stage45_config"]["n_rollout_steps"] == 2, (
         "stage 4 did not inherit f_theta's n_rollout_steps=2 -- it used the default")
+
+
+@pytest.mark.slow
+def test_inherited_min_normalized_stdev_phi_is_actually_saved(tmp_path, isolated_project_root):
+    """Regression test for a real crash: min_normalized_stdev_phi is INHERITED
+    from the lds ancestor (like min_passing_steps and n_rollout_steps) when not
+    passed explicitly, and that resolved value must be SAVED in data_config --
+    not just used locally for THIS run's own filtering.
+
+    The bug this catches: min_passing_steps was correctly saved (so a later
+    compare_f_theta run reads it as e.g. 12), but min_normalized_stdev_phi was
+    silently absent from the saved dict entirely. compare_f_theta then read
+    min_passing_steps=12 with min_normalized_stdev_phi=None and build_good_steps
+    raised -- "min_passing_steps requires min_stdev_phi or
+    min_normalized_stdev_phi to also be set" -- on every checkpoint saved by a
+    run that inherited rather than explicitly passed the threshold, which is the
+    common case (stage 5 inherits from stage 4, which inherits from stage 3)."""
+    base_path = _build_sweep(tmp_path, n_runs=6)
+    ae_p, lds_p = tmp_path / "s2.pt", tmp_path / "s3.pt"
+    _build_ae_checkpoint(ae_p, include_stats_head=True)
+    _build_lds_checkpoint(lds_p, min_normalized_stdev_phi=0.02)   # the ancestor's threshold
+    ckpt = tmp_path / "s4.pt"
+    train_refinement(
+        base_path=base_path, ae_checkpoint_path=ae_p, lds_checkpoint_path=lds_p,
+        freeze_decoder=True, rollout_weight=1.0, recon0_weight=0.2, stats0_weight=0.05,
+        rollout_scale=0.15, recon0_scale=5e-4, stats0_scale=0.15,
+        # min_normalized_stdev_phi NOT passed -> must inherit 0.02 from the checkpoint
+        epochs=1, batch_size=4, n_rollout_steps=1,
+        min_step=0, min_stdev_phi=None, val_fraction=0.3, test_fraction=0.0,
+        checkpoint_path=ckpt, device="cpu",
+    )
+    saved = torch.load(ckpt, map_location="cpu", weights_only=True)
+    assert saved["data_config"]["min_normalized_stdev_phi"] == 0.02, (
+        "the inherited threshold was not saved -- a later read (compare_f_theta) "
+        "would see min_passing_steps set but this field absent and crash"
+    )

@@ -41,7 +41,7 @@ from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs,
 from training.losses import RolloutLoss, compute_dt_decade_weights
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
 from utils.plots import rollout_vs_1step_scatter
-from training.training_loop import accumulate_epoch, write_epoch_figures
+from training._training_loop import accumulate_epoch, write_epoch_figures
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
