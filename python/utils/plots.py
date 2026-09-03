@@ -108,7 +108,8 @@ def write_loss_history(output_path: Path, epochs: list[int], train_loss: list[fl
                         val_loss: list[float], best_so_far: list[float],
                         secondary_train: list[float] | None = None,
                         secondary_val: list[float] | None = None,
-                        secondary_label: str = "1step") -> Path:
+                        secondary_label: str = "1step",
+                        train_full_weight: list[float] | None = None) -> Path:
     """Dump the per-epoch history beside the loss curve, as CSV.
 
     Until this existed the history survived ONLY as pixels: it lives in memory
@@ -132,6 +133,12 @@ def write_loss_history(output_path: Path, epochs: list[int], train_loss: list[fl
     if secondary_val is not None:
         cols.append(f"val_{secondary_label}")
         data.append(secondary_val)
+    if train_full_weight is not None:
+        # the dashed overlay's data: train loss recomputed at FULL weights, so the
+        # corrected (warmup-artifact-free) curve survives as numbers, not only as
+        # pixels in the PNG -- the same reason this CSV exists at all.
+        cols.append("train_full_weight")
+        data.append(train_full_weight)
     tmp = csv_path.with_suffix(".csv.tmp")
     with open(tmp, "w", encoding="utf-8", newline="") as fh:
         fh.write(",".join(cols) + "\n")
@@ -148,6 +155,7 @@ def loss_curve(
     secondary_label: str = "1step",
     event_epochs: list[tuple[float, str]] | None = None,
     reference_levels: list[tuple[float, str]] | None = None,
+    train_full_weight: list[float] | None = None,
 ) -> Path:
     """
     Called from every stage's epoch loop (see train_stage1.py/
@@ -198,19 +206,38 @@ def loss_curve(
     fig, ax = plt.subplots(figsize=(8, 5))
 
     ax.plot(epochs, train_loss, label="train", color="tab:blue", alpha=0.8)
+    # Full-weight train overlay: what the train loss WOULD have been with the
+    # final weights all along. During a weight warmup the plotted `train` rises
+    # only because the ramped weights grow, reading as divergence when the model
+    # is improving; this dotted line (same colour) descends honestly and meets
+    # the solid one where the ramp completes. Drawn only over the span where it
+    # differs (the warmup), plus the meeting point, so it isn't extra noise over
+    # the identical post-ramp tail. DASHED, not dotted -- dotted is reserved for
+    # the vertical event lines, so a different meaning gets a different style.
+    if train_full_weight is not None and len(train_full_weight) == len(epochs):
+        _diff = [i for i, (a, b) in enumerate(zip(train_loss, train_full_weight))
+                 if abs(a - b) > 1e-9]
+        if _diff:
+            _last = min(_diff[-1] + 1, len(epochs) - 1)   # include the meeting point
+            _e = epochs[: _last + 1]
+            _y = train_full_weight[: _last + 1]
+            ax.plot(_e, _y, label="train (full weights)", color="tab:blue",
+                    linestyle="--", linewidth=1.5, alpha=0.9)
     ax.plot(epochs, val_loss, label="valid", color="tab:orange", alpha=0.8)
     ax.plot(epochs, best_so_far, label="best EMA so far", color="tab:green", linewidth=2)
 
     # Mid-run events (objective switches, ramp completions, criterion resets)
-    # drawn as labelled vertical lines. Without them the curve shows a
-    # discontinuity that reads as a learning event: stage 2's centered-target
-    # switch drops val_loss sharply in one epoch because the QUANTITY changed,
-    # not the model -- and on a log-log axis that cliff is the most prominent
-    # feature of the whole figure. The label goes in the legend rather than as
-    # rotated text on the line, which collides with the curves at small sizes.
+    # drawn as red DOTTED vertical lines with the label written directly on the
+    # line (rotated), consistently -- an on-plot label reads at a glance where a
+    # legend entry has to be cross-referenced. Placed just inside the top of the
+    # axis so it clears the curves.
     for event_x, event_label in (event_epochs or []):
-        ax.axvline(event_x, color="tab:red", linestyle=":", linewidth=1.2,
-                    alpha=0.8, label=event_label)
+        ax.axvline(event_x, color="tab:red", linestyle=":", linewidth=1.2, alpha=0.8)
+        # Label at the BOTTOM of the axis, rotated -- there is usually more clear
+        # space below the curves than above them (best/val sit near the top).
+        ax.text(event_x, 0.02, f" {event_label}", color="tab:red", fontsize=8,
+                rotation=90, ha="right", va="bottom", alpha=0.9,
+                transform=ax.get_xaxis_transform())
 
     # Reference LEVELS are horizontal: a loss VALUE the curve is measured
     # against (the ancestor's val_loss under this run's own objective),
@@ -230,6 +257,8 @@ def loss_curve(
                 color="tab:orange", linestyle="--", linewidth=1, alpha=0.5)
 
     all_series = [train_loss, val_loss, best_so_far]
+    if train_full_weight is not None and len(train_full_weight) == len(epochs):
+        all_series.append(train_full_weight)   # the overlay peaks above train; keep it in view
     if secondary_train is not None:
         all_series.append(secondary_train)
     if secondary_val is not None:

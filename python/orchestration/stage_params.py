@@ -423,10 +423,10 @@ def _backup_before_overwrite(path: Path) -> None:
     -- e.g. continuing an already-trained stage-2 checkpoint's own
     deriv_target_centered curriculum in place, which force=True would
     otherwise silently overwrite mid-run, with NOTHING left of the
-    original if anything goes wrong partway through -- the log file
-    especially, since _log_to_file's own open(log_path, "w") truncates
-    it immediately, before training even starts, regardless of whether
-    the run succeeds.
+    original if anything goes wrong partway through. (`_log_to_file` now
+    defers touching the .log until the first epoch, so a crash DURING
+    setup no longer clobbers it; this backup still guards the .pt and the
+    case where the run does reach an epoch and legitimately overwrites.)
     """
     if not path.exists():
         return

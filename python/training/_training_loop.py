@@ -104,6 +104,7 @@ def write_epoch_figures(
     secondary_val=None,
     secondary_label: str = "1step",
     reference_levels=None,
+    train_full_weight=None,
     component_histories=None,
     loss_components_path=None,
     extra=None,
@@ -136,10 +137,12 @@ def write_epoch_figures(
     loss_curve(epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                loss_curve_path, title=f"{title} loss", event_epochs=event_epochs,
                secondary_train=secondary_train, secondary_val=secondary_val,
-               secondary_label=secondary_label, reference_levels=reference_levels)
+               secondary_label=secondary_label, reference_levels=reference_levels,
+               train_full_weight=train_full_weight)
     write_loss_history(loss_curve_path, epoch_history, train_loss_history,
                        val_loss_history, best_so_far_history,
-                       secondary_train=secondary_train, secondary_val=secondary_val)
+                       secondary_train=secondary_train, secondary_val=secondary_val,
+                       train_full_weight=train_full_weight)
     if component_histories is not None:
         loss_component_scatter(epoch_history, component_histories, loss_components_path,
                                title=f"{title} loss components")

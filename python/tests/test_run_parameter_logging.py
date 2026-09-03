@@ -221,31 +221,39 @@ def test_log_is_readable_before_the_run_ends(tmp_path):
     a run that was killed after 16 hours cannot.
 
     Also makes the log tail-able while training is in progress.
+
+    Since the deferred-commit change, this live-flush contract holds from the
+    FIRST EPOCH onward (the point the file is created on disk); output printed
+    during the pre-epoch setup phase is intentionally buffered in memory and not
+    on disk yet -- see test_deferred_log.py -- so this test drives a real epoch
+    line first, then checks the log is readable mid-run.
     """
     from utils.logging_utils import _log_to_file
 
     log_path = tmp_path / "run.log"
     with _log_to_file(log_path):
-        print("epoch 1 | loss 0.5")
+        print("   1| loss 0.5")            # real epoch-line format -> commits
         mid_run = log_path.read_text()
-    assert "epoch 1 | loss 0.5" in mid_run, (
-        "the log was empty while the run was still going -- output is "
-        "buffered, so a killed run loses everything"
+    assert "0.5" in mid_run, (
+        "the log was empty while the run was still going after epoch 1 -- "
+        "output is buffered post-commit, so a killed run loses everything"
     )
 
 
 def test_log_survives_an_interrupt(tmp_path):
     """The realistic failure: KeyboardInterrupt unwinds through the
-    contextmanager's finally, which must leave a complete log behind."""
+    contextmanager's finally, which must leave a complete log behind -- for the
+    training phase (after the first epoch commits the file to disk; a pre-epoch
+    interrupt intentionally leaves the OLD log untouched, see test_deferred_log)."""
     from utils.logging_utils import _log_to_file
 
     log_path = tmp_path / "run.log"
     try:
         with _log_to_file(log_path):
-            print("epoch 1 | loss 0.5")
-            print("epoch 2 | loss 0.4")
+            print("   1| loss 0.5")         # commits the file at epoch 1
+            print("   2| loss 0.4")
             raise KeyboardInterrupt
     except KeyboardInterrupt:
         pass
     written = log_path.read_text()
-    assert "epoch 1" in written and "epoch 2" in written, written
+    assert "   1|" in written and "   2|" in written, written

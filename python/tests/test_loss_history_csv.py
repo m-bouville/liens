@@ -91,3 +91,20 @@ def test_every_trainer_writes_its_history(module):
         assert src.count("write_loss_history(") == src.count("loss_curve("), (
             f"{module} draws the curve more often than it writes the numbers"
         )
+
+
+def test_full_weight_overlay_is_saved_in_the_csv(tmp_path):
+    """The dashed full-weight overlay's DATA must survive as numbers in the CSV
+    sidecar, not only as pixels in the PNG -- the whole reason this CSV exists.
+    Present as a 'train_full_weight' column when given, absent otherwise (no empty
+    trailing column for the stages/runs without a weight ramp)."""
+    from utils.plots import write_loss_history
+    ep, tr, va = [1, 2, 3], [0.5, 0.7, 0.9], [2.1, 2.2, 2.0]
+    p = write_loss_history(tmp_path / "a.png", ep, tr, va, va,
+                           train_full_weight=[2.0, 1.9, 1.8])
+    header, first = p.read_text().splitlines()[0], p.read_text().splitlines()[1]
+    assert header.split(",")[-1] == "train_full_weight"
+    assert first.split(",")[-1] == "2.0"
+    # absent when not provided
+    p2 = write_loss_history(tmp_path / "b.png", ep, tr, va, va)
+    assert "train_full_weight" not in p2.read_text().splitlines()[0]

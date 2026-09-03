@@ -387,12 +387,24 @@ def train_refinement(
     loss_components_path = loss_curve_path.with_name(
         loss_curve_path.stem + "-components" + loss_curve_path.suffix)
 
+    # Seed the ramp-completion marker(s) from the START, so every loss-curve
+    # render -- including the early ones DURING the warmup -- shows where the
+    # ramp will finish, not only the renders written after it has. rollout and
+    # recon_predict (which grad_predict shares) may warm over different lengths;
+    # one marker per distinct nonzero warmup epoch. Label kept short ("ramp
+    # complete") -- the on-plot text sits alongside the line, where a verbose
+    # "recon_predict + grad_predict ramp complete" would overrun the axis.
     loss_curve_events = []
+    _ramp_ends = {_we for _we in (rollout_weight_warmup_epochs,
+                                  recon_predict_weight_warmup_epochs) if _we and _we > 1}
+    for _we in sorted(_ramp_ends):
+        loss_curve_events.append((_we - 0.5, "ramp complete"))
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
+    train_full_weight_history: list[float] = []   # train loss recomputed at FULL weights (dotted overlay)
     # loss_component_scatter's own bookkeeping -- rollout/recon0/stats0
     # are all always active in this stage (no conditional gating like
     # stage 1's include_stats or stage 2's active_terms).
@@ -645,11 +657,9 @@ def train_refinement(
                       f"the tracker a {grace}-epoch grace period before comparing again, since "
                       f"val_loss recorded DURING the ramp described a model trained on a "
                       f"different objective and is not a fair bar for the full one to clear]")
-            # Same marking as stage 2's target switch: the criterion reset
-            # makes "best EMA so far" jump discontinuously, and the ramp
-            # completing changes what the TRAIN column measures.
-            _ramp_names = " + ".join(n.replace("_weight", "") for n in _done)
-            loss_curve_events.append((epoch - 0.5, f"{_ramp_names} ramp complete"))
+            # The loss-curve "ramp complete" marker is seeded at the top of the
+            # run (so it shows during the warmup, not only after), not appended
+            # here -- this block keeps only the grace reset and its message.
 
         if epoch > 0:
             n_train = len(train_set)
@@ -745,6 +755,14 @@ def train_refinement(
         current_val_components = weighted_contributions(_val_raw, _weights, _scales)
         best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
         current_train_components = weighted_contributions(_train_raw, _weights, _scales)
+        # The TRAIN loss line is displayed with the ramped (effective) weights, so
+        # during warmup it rises purely because the weights grow -- not because the
+        # model worsens. current_train_components already uses the FULL weights
+        # (_weights holds the full values; only the console train columns apply the
+        # effective ones), so its sum is what the train loss WOULD have been at full
+        # weight all along: a monotone, honest curve that meets the displayed one at
+        # ramp completion. Plotted as a dotted overlay (see loss_curve).
+        train_full_weight_history.append(sum(current_train_components.values()))
         for name in component_histories:
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
@@ -753,6 +771,7 @@ def train_refinement(
             epoch, log_every_epoch,
             epoch_history=epoch_history, train_loss_history=train_loss_history,
             val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+            train_full_weight=train_full_weight_history,
             component_histories=component_histories, loss_curve_path=loss_curve_path,
             loss_components_path=loss_components_path,
             title=f"Stage {'4' if freeze_decoder else '5'}",
@@ -903,6 +922,7 @@ def train_refinement(
         epoch, log_every_epoch, force=True,
         epoch_history=epoch_history, train_loss_history=train_loss_history,
         val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+        train_full_weight=train_full_weight_history,
         component_histories=component_histories, loss_curve_path=loss_curve_path,
         loss_components_path=loss_components_path,
         title=f"Stage {'4' if freeze_decoder else '5'}",

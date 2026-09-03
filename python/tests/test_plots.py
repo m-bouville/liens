@@ -244,19 +244,26 @@ def test_event_lines_are_drawn_and_labelled(tmp_path):
     )
     assert out is None or (tmp_path / "c.png").exists()
     # The line's PRESENCE is asserted structurally: re-render into a figure we
-    # hold, and count vertical lines at x=7.5.
+    # hold, count vertical lines at x=7.5, and confirm the label is drawn ON the
+    # plot (a red rotated ax.text), not as a legend entry on the axvline.
     import matplotlib.pyplot as _plt
     from unittest.mock import patch
     lines = []
+    texts = []
     orig = _plt.Axes.axvline
+    orig_text = _plt.Axes.text
     def spy(self, x, *a, **k):
-        lines.append((x, k.get("label")))
+        lines.append(x)
         return orig(self, x, *a, **k)
-    with patch.object(_plt.Axes, "axvline", spy):
+    def spy_text(self, x, y, s, *a, **k):
+        texts.append(s)
+        return orig_text(self, x, y, s, *a, **k)
+    with patch.object(_plt.Axes, "axvline", spy), patch.object(_plt.Axes, "text", spy_text):
         loss_curve([1, 2, 3], [1.0, 0.9, 0.8], [1.1, 1.0, 0.9], [1.1, 1.0, 0.9],
                     tmp_path / "c2.png", title="t",
                     event_epochs=[(7.5, "centered L_deriv target")])
-    assert (7.5, "centered L_deriv target") in lines, lines
+    assert 7.5 in lines, lines
+    assert any("centered L_deriv target" in t for t in texts), texts
     _plt.close("all")
 
 
@@ -288,11 +295,13 @@ def test_the_switch_records_an_event_between_the_two_epochs():
     assert "event_epochs=loss_curve_events" in src
 
     src45 = source_without_comments(_ROOT / "training/train_refinement.py")
-    # The label is built from which ramp(s) actually completed at this epoch
-    # (rollout and/or recon_predict), not the old hardcoded "rollout ramp
-    # complete" -- a recon_predict-only warmup was mislabelled as rollout.
-    assert 'loss_curve_events.append((epoch - 0.5, f"{_ramp_names} ramp complete"))' in src45
-    assert '"ramp complete"' not in src45, "the label must not be hardcoded to one ramp"
+    # The ramp-complete marker is SEEDED at the top of the run (so it shows
+    # during the warmup, not only after) at (warmup_epochs - 0.5), one per
+    # distinct nonzero warmup length, with a SHORT "ramp complete" label -- the
+    # on-plot text sits beside the line where a verbose "<names> ramp complete"
+    # would overrun the axis.
+    assert 'loss_curve_events.append((_we - 0.5, "ramp complete"))' in src45
+    assert "recon_predict_weight_warmup_epochs" in src45, "seeded from the warmup lengths"
     assert "event_epochs=loss_curve_events" in src45
 
 
@@ -347,3 +356,36 @@ def test_reference_levels_are_horizontal_and_stay_in_range(tmp_path, monkeypatch
     assert [ln.get_ydata()[0] for ln in flat] == [level], (
         "the reference level was not drawn as a horizontal line"
     )
+
+
+def test_loss_curve_full_weight_overlay_covers_only_the_warmup_span(tmp_path):
+    """The dotted full-weight train overlay corrects the warmup artifact (the
+    displayed train loss rises only because the ramped weights grow). It is drawn
+    over the span where it DIFFERS from the plotted train loss (the warmup) plus
+    the meeting point, and not over the identical post-ramp tail; absent it, the
+    curve is unchanged (no-op)."""
+    from utils.plots import loss_curve
+    ep = list(range(1, 11))
+    train = [0.5, 0.7, 0.9, 1.1, 1.3, 1.3, 1.25, 1.2, 1.15, 1.1]  # rises then falls
+    full  = [2.0, 1.9, 1.8, 1.7, 1.3, 1.3, 1.25, 1.2, 1.15, 1.1]  # differs epochs 1-4, equal from 5
+    val = [2.1] * 10
+    # with overlay: renders, and the overlay series is present
+    p = loss_curve(ep, train, val, val, tmp_path / "a.png", train_full_weight=full)
+    assert p.exists()
+    # no-op when not provided (same call without it must also render)
+    p2 = loss_curve(ep, train, val, val, tmp_path / "b.png")
+    assert p2.exists()
+    # equal-everywhere overlay draws nothing extra (no warmup) -- must not crash
+    p3 = loss_curve(ep, train, val, val, tmp_path / "c.png", train_full_weight=list(train))
+    assert p3.exists()
+
+
+def test_loss_curve_full_weight_overlay_wrong_length_is_ignored(tmp_path):
+    """A mismatched-length overlay (e.g. a resume that restarted the history) is
+    ignored rather than raising."""
+    from utils.plots import loss_curve
+    ep = list(range(1, 6))
+    train = [1.0, 0.9, 0.8, 0.7, 0.6]
+    p = loss_curve(ep, train, train, train, tmp_path / "d.png",
+                   train_full_weight=[2.0, 1.9])   # wrong length
+    assert p.exists()

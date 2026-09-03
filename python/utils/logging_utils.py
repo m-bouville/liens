@@ -45,6 +45,76 @@ class _Tee:
             s.flush()
 
 
+import re
+
+
+# An epoch-summary line begins with `{epoch:4d}` (<=3 leading spaces then the
+# number) followed immediately by '|' (stages 1/2/4-5) or whitespace then a
+# number (stage 3's "  1 0.53, ..."). Setup lines that also start with a number
+# ("     4114 runs", "4364 complete runs", "1023/103725 ...") are excluded: they
+# have >3 leading spaces, or a letter/slash after the number, not '|' or a digit.
+_EPOCH_LINE = re.compile(r"^\s{0,3}\d+\s*\|") 
+_EPOCH_LINE_LDS = re.compile(r"^\s{0,3}\d+\s+-?[\d.]")
+
+
+class _DeferredLogFile:
+    """A write-only file that does NOT touch `path` on disk until the run reaches
+    its FIRST epoch, so a crash (or a mistaken re-launch) during the minutes-long
+    setup phase cannot overwrite a valuable existing log with a near-empty one.
+
+    Until the first epoch line is seen, output is held in memory (and still teed
+    to the console by the enclosing _Tee, so nothing is hidden live). On the
+    first epoch line the real file is opened in "w" -- only now is there content
+    worth committing -- the buffer is flushed to it, and every later write goes
+    straight to disk (flushed per write, so a killed run keeps its log, as
+    before). If the run ends BEFORE any epoch (setup crash, epochs=0 ablation
+    without an epoch-0 line), `path` is never opened and the old file survives
+    untouched; the buffered setup output is discarded (it was shown on the
+    console).
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._buffer: list[str] = []
+        self._file = None
+        self._line_frag = ""
+        self.committed = False
+
+    def _looks_like_epoch(self, line: str) -> bool:
+        return bool(_EPOCH_LINE.match(line) or _EPOCH_LINE_LDS.match(line))
+
+    def _commit(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(self.path, "w")
+        self._file.write("".join(self._buffer))
+        self._file.flush()
+        self._buffer = None
+        self._line_frag = None
+        self.committed = True
+
+    def write(self, data):
+        if self.committed:
+            self._file.write(data)
+            self._file.flush()
+            return
+        self._buffer.append(data)
+        # scan completed lines for the first epoch summary
+        self._line_frag += data
+        if "\n" in self._line_frag:
+            *lines, self._line_frag = self._line_frag.split("\n")
+            if any(self._looks_like_epoch(ln) for ln in lines):
+                self._commit()
+
+    def flush(self):
+        if self.committed:
+            self._file.flush()
+
+    def close(self):
+        if self.committed:
+            self._file.close()
+        # else: never reached an epoch -- leave `path` untouched, drop the buffer.
+
+
 @contextmanager
 def _log_to_file(log_path: Path):
     """
@@ -52,22 +122,26 @@ def _log_to_file(log_path: Path):
     duration of this block, IN ADDITION TO the normal console output --
     so a stage's full progress log survives even if the console itself
     is later closed/lost (e.g. an IDE crash after a long training run).
-    Uses try/finally so the log is properly flushed and stdout/stderr
-    restored even if the wrapped code raises.
+
+    The file is written via _DeferredLogFile: log_path on disk is not touched
+    until the run's first epoch, so a crash during setup cannot overwrite a
+    valuable existing log with a near-empty one. Uses try/finally so the log is
+    properly flushed/committed and stdout/stderr restored even if the wrapped
+    code raises.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "w") as log_file:
-        original_stdout, original_stderr = sys.stdout, sys.stderr
-        sys.stdout = _Tee(original_stdout, log_file)
-        sys.stderr = _Tee(original_stderr, log_file)
-        try:
-            yield
-        finally:
-            # Restore FIRST, then flush what the tee already wrote: a
-            # KeyboardInterrupt unwinds through here, and leaving the tee
-            # installed while flushing risks re-entering it.
-            sys.stdout, sys.stderr = original_stdout, original_stderr
-            log_file.flush()
+    log_file = _DeferredLogFile(log_path)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout = _Tee(original_stdout, log_file)
+    sys.stderr = _Tee(original_stderr, log_file)
+    try:
+        yield
+    finally:
+        # Restore FIRST, then flush/close what the tee wrote: a
+        # KeyboardInterrupt unwinds through here, and leaving the tee
+        # installed while flushing risks re-entering it.
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+        log_file.close()
 
 
 # Infrastructure, not science: paths, callables, worker/device plumbing and

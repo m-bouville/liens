@@ -1443,3 +1443,23 @@ def test_a_starved_deriv_actually_prints_the_warning(tmp_path, capsys, isolated_
     # the zero-weight terms must NOT be blamed
     assert "'stats0'" not in out and "'interp'" not in out, (
         "a deliberately-off term was reported as starved -- the weight guard failed")
+
+
+def test_full_weight_overlay_uses_the_full_deriv_weight_not_the_ramped_one():
+    """The dotted 'full weights' train overlay must recompute the train total with
+    the FULL deriv_weight (vw, the val weight -- val is never ramped), NOT the
+    ramped effective_deriv_weight (tw). Using tw would reproduce the very artifact
+    the overlay exists to correct. Structural guard on the crux: the overlay sums
+    vw*tv/s, and train_full_weight is passed to the figure."""
+    import pathlib
+    from conftest import source_without_comments
+    _ROOT = pathlib.Path(__file__).resolve().parent.parent
+    src = source_without_comments(_ROOT / "training/train_stage2.py")
+    cond = " ".join(src.split())
+    # the corrected sum unpacks term_values and multiplies the VAL weight (_vw)
+    # by the TRAIN value (_tv), divided by scale -- not _tw (effective/ramped).
+    assert "_tw, _vw, _s, _tv, _vv = term_values[_lbl]" in cond
+    assert "_corrected_train += _vw * _tv / _s" in cond, (
+        "the overlay must apply the FULL (val) weight to the train value; "
+        "using the ramped train weight _tw would reproduce the warmup artifact")
+    assert "train_full_weight=train_full_weight_history" in cond

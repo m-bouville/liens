@@ -731,6 +731,7 @@ def train_stage2(
     loss_curve_events: list[tuple[float, str]] = []
     loss_curve_levels: list[tuple[float, str]] = []
     train_loss_history: list[float] = []
+    train_full_weight_history: list[float] = []   # train recomputed at FULL weights (dotted overlay)
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
 
@@ -1699,6 +1700,19 @@ def train_stage2(
             current_train_components[lbl] = tw * tv / s
             current_val_components[lbl] = vw * vv / s
         best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
+        # Full-weight train overlay (see loss_curve): the train loss line is
+        # displayed with the RAMPED effective_deriv_weight, so during the deriv
+        # warmup it rises purely because the weight grows -- not because the model
+        # worsens. Recompute the train total with the FULL weight for every term:
+        # vw == tw for the un-ramped terms (recon0/stats0/stats1/interp), and the
+        # full deriv_weight (vw, the val weight -- val is never ramped) for deriv.
+        # The dotted overlay is then the honest, monotone train curve, meeting the
+        # displayed one where the deriv ramp completes.
+        _corrected_train = train_recon / recon0_scale
+        for _, _lbl, _ in active_terms:
+            _tw, _vw, _s, _tv, _vv = term_values[_lbl]
+            _corrected_train += _vw * _tv / _s
+        train_full_weight_history.append(_corrected_train)
         for name in current_train_components:
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
@@ -1709,6 +1723,7 @@ def train_stage2(
             epoch, log_every_epoch,
             epoch_history=epoch_history, train_loss_history=train_loss_history,
             val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+            train_full_weight=train_full_weight_history,
             loss_curve_path=loss_curve_path, title="Stage 2",
             event_epochs=loss_curve_events, reference_levels=loss_curve_levels,
             extra=_stage2_component_scatter)
@@ -1909,6 +1924,7 @@ def train_stage2(
         epoch, log_every_epoch, force=True,
         epoch_history=epoch_history, train_loss_history=train_loss_history,
         val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+        train_full_weight=train_full_weight_history,
         loss_curve_path=loss_curve_path, title="Stage 2",
         event_epochs=loss_curve_events, reference_levels=loss_curve_levels,
         extra=_stage2_component_scatter)

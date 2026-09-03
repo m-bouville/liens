@@ -413,9 +413,10 @@ def test_pipeline_backs_up_before_self_resume_overwrite(tmp_path, isolated_proje
     checkpoint (continuing its own deriv_target_centered curriculum in
     place, per train_stage2's own docstring). force=True (needed for
     resolve_checkpoint to even attempt a rerun against an existing
-    checkpoint) would otherwise overwrite BOTH the .pt AND, per
-    _log_to_file's own open(log_path, "w"), the .log -- silently, with
-    nothing left of either if the second run failed partway through.
+    checkpoint) would otherwise overwrite BOTH the .pt AND, once the rerun
+    reaches its first epoch, the .log -- with nothing left of either if the
+    second run then failed partway through. (_log_to_file now DEFERS the .log
+    overwrite to the first epoch; the pre-run backup still guards the .pt.)
 
     Deliberately does NOT check the normal stage1->stage2 flow here:
     that's covered implicitly by every OTHER test in this file never
@@ -522,7 +523,7 @@ stats0_weight = 0.01
         f"expected exactly one .log backup (the overwrite backup), got {backup_logs}")
     assert backup_logs[0].read_bytes() == original_log_bytes, (
         "the backed-up .log doesn't match the ORIGINAL log's own bytes -- "
-        "backup must happen BEFORE _log_to_file's own truncating open(..., 'w')"
+        "backup must happen BEFORE the rerun's own eventual .log overwrite"
     )
 
     captured = capsys.readouterr()
