@@ -231,13 +231,13 @@ def test_figures_are_throttled_but_ALWAYS_flushed_at_the_end(tmp_path, isolated_
     )
 
     seen_epoch_counts = []
-    real = t1.loss_curve
+    from utils.plots import loss_curve as real
 
     def spy(epoch_history, *args, **kwargs):
         seen_epoch_counts.append(len(epoch_history))
         return real(epoch_history, *args, **kwargs)
 
-    monkeypatch.setattr(t1, "loss_curve", spy)
+    monkeypatch.setattr("utils.plots.loss_curve", spy)
 
     base_path = _build_sweep(tmp_path, n_runs=6, size=32)
     t1.train_autoencoder(
@@ -274,13 +274,13 @@ def test_log_every_epoch_true_writes_every_epoch_not_throttled(tmp_path, isolate
 
     epochs = 12
     seen_epoch_counts = []
-    real = t1.loss_curve
+    from utils.plots import loss_curve as real
 
     def spy(epoch_history, *args, **kwargs):
         seen_epoch_counts.append(len(epoch_history))
         return real(epoch_history, *args, **kwargs)
 
-    monkeypatch.setattr(t1, "loss_curve", spy)
+    monkeypatch.setattr("utils.plots.loss_curve", spy)
 
     base_path = _build_sweep(tmp_path, n_runs=6, size=32)
     t1.train_autoencoder(

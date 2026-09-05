@@ -362,6 +362,7 @@ dict_key_imports_values = {
         'models/encoder.py',
         'models/latent_streams.py',
         'training/_checkpoint_criterion.py',
+        'training/_training_loop.py',
         'training/datasets.py',
         'training/losses.py',
         'training/stats_head.py',
@@ -614,6 +615,7 @@ dict_key_imported_by_values = {
     'training/_training_loop.py': {
         'training/train_lds.py',
         'training/train_refinement.py',
+        'training/train_stage1.py',
         'training/train_stage2.py',
     },
     'training/checkpoint_components.py': {

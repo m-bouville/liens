@@ -60,7 +60,10 @@ def accumulate_epoch(
         if progress is not None:
             progress.tick()
         n_batches += 1
-        bs = batch[0].size(0)
+        # Tuple/list batch (the rollout trainers: x_window, dt_window, theta) ->
+        # size from element 0; a bare-tensor batch (stage 1 without stats) -> its
+        # own size. Backward-compatible: a tuple still takes batch[0].size(0).
+        bs = (batch[0] if isinstance(batch, (list, tuple)) else batch).size(0)
         components = forward_fn(batch)
         for name, value in components.items():
             sums[name] = sums.get(name, value.new_zeros(())) + value * bs
@@ -87,6 +90,19 @@ def weighted_contributions(
     """
     return {name: weights.get(name, 1.0) * raw[name] / scales[name] for name in raw}
 
+
+
+def format_component_side(total: float, contribs: list[float]) -> str:
+    """One side of an epoch loss line: ``{total} =c0 +c1 +c2 ...`` with the shared
+    7.4f width convention. `contribs` are the already-WEIGHTED per-component values
+    in display order -- the caller builds that list, since which weight is
+    effective vs full and which components are active is stage-specific. Extracted
+    so the width/`+` convention is single-sourced across the component-decomposition
+    stages (refinement, stage 2, stage 1); train_lds's rollout/1step line is a
+    different format and does not use this.
+    """
+    body = f"{contribs[0]:7.4f}" + "".join(f" +{c:7.4f}" for c in contribs[1:])
+    return f"{total:7.4f} ={body}"
 
 def write_epoch_figures(
     epoch: int,

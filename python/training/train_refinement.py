@@ -22,7 +22,7 @@ from training._spike_guard import (
 )
 from utils.logging_utils import print_run_parameters, EpochProgress
 from training._training_loop import (accumulate_epoch, weighted_contributions,
-                                    write_epoch_figures)
+                                    write_epoch_figures, format_component_side)
 from training._checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, save_checkpoint,
     ramp_completion_grace, scale_balance_report,
@@ -802,29 +802,32 @@ def train_refinement(
             title=f"Stage {'4' if freeze_decoder else '5'}",
             event_epochs=loss_curve_events)
 
-        ema_str = f"{tracker.val_ema:7.4f}" if tracker.val_ema is not None else "  (warmup)"
+        ema_str = f"{tracker.val_ema:7.4f}" if tracker.val_ema is not None else " warmup"   # both 7 wide
+        # Weighted per-component contributions in display order. TRAIN uses the
+        # EFFECTIVE (ramped) weights -- the printed component must be what was
+        # actually OPTIMISED, or the columns won't sum to the train_loss beside
+        # them and the discrepancy reads as a bug. recon_predict/grad_predict are
+        # shown only when active. The 7.4f/`+` width convention lives in
+        # format_component_side, not here.
+        train_contribs = [effective_rollout_weight*train_rollout/rollout_scale,
+                          recon0_weight*train_recon0/recon0_scale,
+                          stats0_weight*train_stats0/stats0_scale]
+        val_contribs = [rollout_weight*val_rollout/rollout_scale,
+                        recon0_weight*val_recon0/recon0_scale,
+                        stats0_weight*val_stats0/stats0_scale]
+        if recon_predict_weight != 0.0:
+            train_contribs.append(
+                effective_recon_predict_weight*train_recon_predict/recon_predict_scale)
+            val_contribs.append(recon_predict_weight*val_recon_predict/recon_predict_scale)
+        if grad_predict_weight != 0.0:
+            train_contribs.append(
+                effective_grad_predict_weight*train_grad_predict/grad_predict_scale)
+            val_contribs.append(grad_predict_weight*val_grad_predict/grad_predict_scale)
         msg = (f"{epoch:4d}|"
-               # effective_rollout_weight, not rollout_weight: during the ramp
-               # the printed train component must be what was actually
-               # OPTIMISED, or the columns will not sum to the train_loss
-               # beside them and the discrepancy reads as a bug.
-               f"{train_loss:7.4f} ={effective_rollout_weight*train_rollout/rollout_scale:7.4f} "
-               f"+{recon0_weight*train_recon0/recon0_scale:7.4f} "
-               f"+{stats0_weight*train_stats0/stats0_scale:7.4f}"
-               + (f" +{effective_recon_predict_weight*train_recon_predict/recon_predict_scale:7.4f}"
-                  if recon_predict_weight != 0.0 else "")
-               + (f" +{effective_grad_predict_weight*train_grad_predict/grad_predict_scale:7.4f}"
-                  if grad_predict_weight != 0.0 else "")
+               + format_component_side(train_loss, train_contribs)
+               + f" |" + format_component_side(val_loss, val_contribs)
                + f" |"
-               f"{val_loss:7.4f} ={rollout_weight*val_rollout/rollout_scale:7.4f} "
-               f"+{recon0_weight*val_recon0/recon0_scale:7.4f} "
-               f"+{stats0_weight*val_stats0/stats0_scale:7.4f}"
-               + (f" +{recon_predict_weight*val_recon_predict/recon_predict_scale:7.4f}"
-                  if recon_predict_weight != 0.0 else "")
-               + (f" +{grad_predict_weight*val_grad_predict/grad_predict_scale:7.4f}"
-                  if grad_predict_weight != 0.0 else "")
-               + f" |"
-               f"{ema_str:>10}"
+               f"{ema_str:>7}"
                + "".join(
                    f"  [{name} {eff:.3g}/{full:g}]"
                    for name, eff, full in (

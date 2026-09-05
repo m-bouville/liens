@@ -33,6 +33,7 @@ from training.stats_head import StatsHead
 from utils.naming import ae_checkpoint_name
 from utils.plots import (loss_component_scatter, loss_curve, loss_scale_curve,
                           write_loss_history, should_write_loss_figure)
+from training._training_loop import write_epoch_figures, accumulate_epoch
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -599,20 +600,20 @@ def train_autoencoder(
         ae.eval()
         if stats_head is not None:
             stats_head.eval()
-        val_total_sum = torch.zeros((), device=device)
-        val_recon0_sum = torch.zeros((), device=device)
-        val_stats0_sum = torch.zeros((), device=device)
-        n_val = len(val_set)
+        # Val loop via the shared accumulate_epoch (train loop stays inline: its
+        # per-batch VRAM logging and epoch-0 NaN branch are stage-1-specific). The
+        # step-wrapper adapts step()'s tuple return to the {name: scalar} dict
+        # accumulate_epoch expects; the z0_val_stats side effect happens inside
+        # step, unchanged. Sample-weighted mean over len(val_set) -- no drop_last,
+        # so that equals the summed batch sizes, bit-identical to the old loop.
         with torch.no_grad():
-            for batch in val_loader:
-                bs = batch[0].size(0) if include_stats else batch.size(0)
-                total, recon0, stats0 = step(batch, train=False)
-                val_total_sum += total * bs
-                val_recon0_sum += recon0 * bs
-                val_stats0_sum += stats0 * bs
-        val_total = (val_total_sum / n_val).item()
-        val_recon0 = (val_recon0_sum / n_val).item()
-        val_stats0 = (val_stats0_sum / n_val).item()
+            _val_means, _ = accumulate_epoch(
+                val_loader,
+                lambda b: dict(zip(("total", "recon0", "stats0"), step(b, train=False))),
+                len(val_set))
+        val_total = _val_means["total"]
+        val_recon0 = _val_means["recon0"]
+        val_stats0 = _val_means["stats0"]
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
@@ -626,14 +627,6 @@ def train_autoencoder(
         scale_ratio_history.setdefault("recon0", []).append(val_recon0 / recon0_scale)
         if include_stats:
             scale_ratio_history.setdefault("stats0", []).append(val_stats0 / stats0_scale)
-        if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
-            loss_curve(
-                epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-                loss_curve_path, title="Stage 1 loss",
-            )
-            write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
-            loss_scale_curve(epoch_history, scale_ratio_history, loss_scales_path,
-                             title="Stage 1 loss/scale ratios (val)")
         if include_stats:
             current_val_components = {
                 "recon0": val_recon0 / recon0_scale,
@@ -646,11 +639,19 @@ def train_autoencoder(
             component_histories["stats0"]["train"].append(stats0_weight * train_stats0 / stats0_scale)
             component_histories["stats0"]["val"].append(current_val_components["stats0"])
             component_histories["stats0"]["best_so_far"].append(best_components["stats0"])
-            if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
-                loss_component_scatter(
-                    epoch_history, component_histories, loss_components_path,
-                    title="Stage 1 loss components",
-                )
+        # Figures via the shared writer (throttled + component/scale gating). The
+        # data-collection appends above happen every epoch; only the figure writes
+        # are gated. component_histories is `or None` so an empty dict (no stats)
+        # produces NO components figure, matching the include_stats behaviour.
+        write_epoch_figures(
+            epoch, log_every_epoch,
+            epoch_history=epoch_history, train_loss_history=train_loss_history,
+            val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+            component_histories=(component_histories or None),
+            loss_components_path=loss_components_path,
+            scale_ratios=scale_ratio_history, scales_path=loss_scales_path,
+            loss_curve_path=loss_curve_path, title="Stage 1",
+        )
 
         msg = f"{epoch:4d}|"
         if include_stats:
@@ -746,19 +747,15 @@ def train_autoencoder(
     # wasn't a multiple of the interval. Without this the figures left on
     # disk could be up to `every` epochs stale, which is exactly the
     # state a finished run gets judged from.
-    loss_curve(
-        epoch_history, train_loss_history, val_loss_history, best_so_far_history,
-        loss_curve_path, title="Stage 1 loss",
+    write_epoch_figures(
+        epoch, log_every_epoch, force=True,
+        epoch_history=epoch_history, train_loss_history=train_loss_history,
+        val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+        component_histories=(component_histories or None),
+        loss_components_path=loss_components_path,
+        scale_ratios=scale_ratio_history, scales_path=loss_scales_path,
+        loss_curve_path=loss_curve_path, title="Stage 1",
     )
-    write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
-    if scale_ratio_history:
-        loss_scale_curve(epoch_history, scale_ratio_history, loss_scales_path,
-                         title="Stage 1 loss/scale ratios (val)")
-    if component_histories:
-        loss_component_scatter(
-            epoch_history, component_histories, loss_components_path,
-            title="Stage 1 loss components",
-        )
 
     if not Path(checkpoint_path).exists() and resume_from is not None:
         # NOTHING BEAT THE ANCESTOR. Keyed on resume_from, NOT on
