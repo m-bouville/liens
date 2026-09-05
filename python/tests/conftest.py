@@ -506,7 +506,7 @@ def isolated_project_root(tmp_path, monkeypatch):
     tmp_path instead, for the duration of one test. Covers every
     module actually involved in a full stage 1->2->3a->3b run
     (train_stage1.py/train_stage2.py/train_lds.py/train_refinement.py/
-    orchestration.paths/orchestration.pipeline) -- NOT the individual
+    utils.paths/orchestration.pipeline) -- NOT the individual
     evaluation/*.py scripts, which each have their own, separate
     _PYTHON_ROOT too, but only ever use it for CLI argument defaults
     (argparse), never when called programmatically with an explicit
@@ -514,9 +514,9 @@ def isolated_project_root(tmp_path, monkeypatch):
     does internally.
 
     orchestration.pipeline specifically imports _PYTHON_ROOT/
-    _STAGE_DIRS via `from orchestration.paths import ...` -- a
+    _STAGE_DIRS via `from utils.paths import ...` -- a
     same-name BINDING in its own namespace, not a live reference back
-    to orchestration.paths's own copy, so patching paths.py's copy
+    to utils.paths's own copy, so patching paths.py's copy
     alone would NOT affect what pipeline.py itself actually reads.
     Both need patching separately, or this fixture would silently miss
     exactly the module that matters most (the one run_from_params_file
@@ -538,9 +538,9 @@ def isolated_project_root(tmp_path, monkeypatch):
     import training.train_stage2 as train_stage2
     import training.train_lds as train_lds
     import training.train_refinement as train_refinement
-    import orchestration.paths as orch_paths
+    import utils.paths as orch_paths
     import orchestration.pipeline as orch_pipeline
-    # checkpoint_registry does `from orchestration.paths import
+    # checkpoint_registry does `from utils.paths import
     # _CHECKPOINTS_ROOT, _STAGE_DIRS`, binding its OWN module-level names
     # at import time -- so patching orch_paths alone never reaches them,
     # and its _resolve_checkpoint_field would resolve relative registry

@@ -66,7 +66,7 @@ from utils import load_datasets as load
 # place" bug hit repeatedly on this project. Path(__file__) is anchored
 # to THIS FILE's own on-disk location instead, which is invariant
 # regardless of how/from-where the process was launched.
-from orchestration.paths import default_latent_cache_dir
+from utils.paths import default_latent_cache_dir
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/
 

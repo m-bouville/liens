@@ -76,7 +76,7 @@ from evaluation._latent_eval import (
     _load_ae_f_theta_and_dataset, _stage_folder_from_checkpoint_stem,
 )
 from utils.fits import fit_broken_power_law
-from orchestration.paths import default_latent_cache_dir
+from utils.paths import default_latent_cache_dir
 from utils.plots import log_axis_ticks
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/

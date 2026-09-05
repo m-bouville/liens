@@ -20,7 +20,7 @@ from orchestration.checkpoint_registry import (
     _signature_kwargs, _upsert_registry,
 )
 from utils.logging_utils import _log_to_file
-from orchestration.paths import default_latent_cache_dir, _PYTHON_ROOT, _STAGE_DIRS
+from utils.paths import default_latent_cache_dir, _PYTHON_ROOT, _STAGE_DIRS
 from orchestration.stage_params import (
     _archive_ancestor, _backup_before_overwrite, _prepare_stage_kwargs, _resolve_stage_specific_ancestor,
     _strip_unrecognized_params, parse_stage_params, renamed_keys,

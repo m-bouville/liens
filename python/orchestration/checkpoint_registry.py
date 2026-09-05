@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from orchestration.paths import _CHECKPOINTS_ROOT, _STAGE_DIRS
+from utils.paths import _CHECKPOINTS_ROOT, _STAGE_DIRS
 
 
 _NON_SIGNATURE_KEYS = {"batch_size", "log_every_epoch"}

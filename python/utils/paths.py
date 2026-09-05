@@ -21,7 +21,7 @@ path-policy history).
 """
 from pathlib import Path
 
-_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/orchestration/paths.py -> python/
+_PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/utils/paths.py -> python/
 # No "1b" entry: stage 1b was removed entirely (train_stage2 now builds
 # the deriv stream itself, see training/extend_encoder.py), so a
 # checkpoints/stage1b directory has nothing that could ever write to it.

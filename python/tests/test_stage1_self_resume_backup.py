@@ -48,7 +48,7 @@ def test_stage1_archives_its_own_output_before_a_self_resume(tmp_path, isolated_
     """
     # stage_output_path is nested inside run_from_params_file, so the test
     # reproduces its one-line rule: _STAGE_DIRS[n] / f"{params stem}-stage{n}.pt"
-    from orchestration.paths import _STAGE_DIRS
+    from utils.paths import _STAGE_DIRS
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
     from test_train_lds import _build_sweep
@@ -81,7 +81,7 @@ def test_no_archive_when_stage1_is_not_resuming_from_itself(tmp_path, isolated_p
     file nothing else was going to keep, and an archive per run would
     accumulate copies of checkpoints no one asked to preserve.
     """
-    from orchestration.paths import _STAGE_DIRS
+    from utils.paths import _STAGE_DIRS
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
     from test_train_lds import _build_sweep

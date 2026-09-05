@@ -31,7 +31,7 @@ from pathlib import Path
 
 import torch
 
-from orchestration.paths import _STAGE_DIRS
+from utils.paths import _STAGE_DIRS
 from orchestration.stage_params import _backup_before_overwrite
 from training._checkpoint_criterion import atomic_torch_save
 from training.rescale_checkpoint import (

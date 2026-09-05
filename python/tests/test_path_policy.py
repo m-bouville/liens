@@ -90,12 +90,12 @@ def test_scripts_that_define_output_paths_have_the_anchor():
     path (i.e. references "checkpoints" or "output" as a path component
     anywhere) must have access to a real _PYTHON_ROOT-style anchor --
     EITHER by defining its own (the original per-file pattern, still
-    used by orchestration/paths.py itself and every training/evaluation
-    script), OR by importing it from orchestration.paths (the pattern
+    used by utils/paths.py itself and every training/evaluation
+    script), OR by importing it from utils.paths (the pattern
     main.py and the rest of the orchestration/ package use instead,
     specifically so there's ONE shared anchor rather than N
     independently-computed copies that could drift apart -- see
-    orchestration/paths.py's own docstring). Catches a file being given
+    utils/paths.py's own docstring). Catches a file being given
     a fixed relative-string replacement without ever gaining a working
     anchor either way (a plain NameError/ImportError in practice, but
     worth failing here with a clearer message than that)."""

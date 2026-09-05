@@ -43,7 +43,7 @@ import numpy as np
 import torch
 
 from evaluation._latent_eval import _load_ae_f_theta_and_dataset
-from orchestration.paths import default_latent_cache_dir
+from utils.paths import default_latent_cache_dir
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/evaluation/X.py -> python/
 

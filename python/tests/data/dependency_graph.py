@@ -38,8 +38,8 @@ dict_key_imports_values = {
     },
     'evaluation/check_alpha.py': {
         'evaluation/_latent_eval.py',
-        'orchestration/paths.py',
         'utils/fits.py',
+        'utils/paths.py',
         'utils/plots.py',
     },
     'evaluation/check_deriv_temperature.py': {
@@ -51,7 +51,7 @@ dict_key_imports_values = {
     },
     'evaluation/check_dt_vs_time.py': {
         'evaluation/_latent_eval.py',
-        'orchestration/paths.py',
+        'utils/paths.py',
     },
     'evaluation/check_f_theta.py': {
         'evaluation/_latent_eval.py',
@@ -88,10 +88,10 @@ dict_key_imports_values = {
     'evaluation/check_parameter_dependence.py': {
         'evaluation/_latent_eval.py',
         'evaluation/check_stdev_phi_time.py',
-        'orchestration/paths.py',
         'training/losses.py',
         'utils/fits.py',
         'utils/load_datasets.py',
+        'utils/paths.py',
         'utils/plot_helpers.py',
     },
     'evaluation/check_perturbation.py': {
@@ -152,13 +152,13 @@ dict_key_imports_values = {
         'models/encoder.py',
         'models/latent_dynamics.py',
         'models/latent_streams.py',
-        'orchestration/paths.py',
         'training/checkpoint_components.py',
         'training/datasets.py',
         'training/losses.py',
         'training/model_assembly.py',
         'utils/load_datasets.py',
         'utils/logging_utils.py',
+        'utils/paths.py',
         'utils/window_parsing.py',
     },
     'evaluation/compare_integrators.py': {
@@ -196,9 +196,9 @@ dict_key_imports_values = {
         'utils/sweep_filters_common.py',
     },
     'main.py': {
-        'orchestration/paths.py',
         'orchestration/pipeline.py',
         'orchestration/sweep_status.py',
+        'utils/paths.py',
     },
     'models/autoencoder.py': {
         'models/constants.py',
@@ -227,9 +227,8 @@ dict_key_imports_values = {
         'training/train_lds.py',
     },
     'orchestration/checkpoint_registry.py': {
-        'orchestration/paths.py',
+        'utils/paths.py',
     },
-    'orchestration/paths.py': set(),
     'orchestration/pipeline.py': {
         'evaluation/check_interpolation.py',
         'evaluation/check_latent_channels.py',
@@ -239,7 +238,6 @@ dict_key_imports_values = {
         'evaluation/check_rollout.py',
         'orchestration/checkpoint_identification.py',
         'orchestration/checkpoint_registry.py',
-        'orchestration/paths.py',
         'orchestration/stage_params.py',
         'training/checkpoint_components.py',
         'training/train_lds.py',
@@ -247,6 +245,7 @@ dict_key_imports_values = {
         'training/train_stage1.py',
         'training/train_stage2.py',
         'utils/logging_utils.py',
+        'utils/paths.py',
     },
     'orchestration/stage_params.py': set(),
     'orchestration/sweep_status.py': {
@@ -309,12 +308,12 @@ dict_key_imports_values = {
         'training/stats_head.py',
     },
     'training/port_checkpoint.py': {
-        'orchestration/paths.py',
         'orchestration/stage_params.py',
         'training/_checkpoint_criterion.py',
         'training/datasets.py',
         'training/rescale_checkpoint.py',
         'utils/load_datasets.py',
+        'utils/paths.py',
     },
     'training/rescale_checkpoint.py': {
         'models/autoencoder.py',
@@ -395,6 +394,7 @@ dict_key_imports_values = {
     'utils/load_datasets.py': set(),
     'utils/logging_utils.py': set(),
     'utils/naming.py': set(),
+    'utils/paths.py': set(),
     'utils/plot_helpers.py': set(),
     'utils/plots.py': {
         'utils/fits.py',
@@ -569,16 +569,6 @@ dict_key_imported_by_values = {
     'orchestration/checkpoint_registry.py': {
         'evaluation/lineage.py',
         'orchestration/pipeline.py',
-    },
-    'orchestration/paths.py': {
-        'evaluation/check_alpha.py',
-        'evaluation/check_dt_vs_time.py',
-        'evaluation/check_parameter_dependence.py',
-        'evaluation/compare_f_theta.py',
-        'main.py',
-        'orchestration/checkpoint_registry.py',
-        'orchestration/pipeline.py',
-        'training/port_checkpoint.py',
     },
     'orchestration/pipeline.py': {
         'main.py',
@@ -759,6 +749,16 @@ dict_key_imported_by_values = {
         'training/train_lds.py',
         'training/train_stage1.py',
         'training/train_stage2.py',
+    },
+    'utils/paths.py': {
+        'evaluation/check_alpha.py',
+        'evaluation/check_dt_vs_time.py',
+        'evaluation/check_parameter_dependence.py',
+        'evaluation/compare_f_theta.py',
+        'main.py',
+        'orchestration/checkpoint_registry.py',
+        'orchestration/pipeline.py',
+        'training/port_checkpoint.py',
     },
     'utils/plot_helpers.py': {
         'evaluation/check_f_theta.py',

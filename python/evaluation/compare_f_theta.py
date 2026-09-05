@@ -68,7 +68,7 @@ from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 # output/ wherever it is invoked from.
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent
 from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates, N_THETA
-from orchestration.paths import default_latent_cache_dir
+from utils.paths import default_latent_cache_dir
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset

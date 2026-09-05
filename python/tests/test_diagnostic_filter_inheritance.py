@@ -355,7 +355,7 @@ def test_the_cache_root_has_ONE_definition():
     cache or the sharing is theoretical -- and the pipeline had the only copy,
     written inline.
     """
-    from orchestration.paths import default_latent_cache_dir
+    from utils.paths import default_latent_cache_dir
     root = _ROOT
     assert default_latent_cache_dir(root) == root / "checkpoints" / "latent_cache"
     pipeline_src = source_without_comments(_ROOT / "orchestration/pipeline.py")

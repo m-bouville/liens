@@ -100,7 +100,7 @@ epochs = 0
         "expected an explicit warning about the stale '# Stage 1b' section, got none"
     )
 
-    from orchestration.paths import _CHECKPOINTS_ROOT, _STAGE_DIRS
+    from utils.paths import _CHECKPOINTS_ROOT, _STAGE_DIRS
     # Strictly stronger than the old "no .pt files in stage1b/" check:
     # _STAGE_DIRS has no "1b" key at all anymore, and nothing should
     # create that directory either. The old wholesale "mkdir every stage
@@ -168,7 +168,7 @@ stats0_weight = 0.01
         if "train_lds()" not in str(e):
             raise
 
-    from orchestration.paths import _STAGE_DIRS
+    from utils.paths import _STAGE_DIRS
     stage2_files = list(_STAGE_DIRS[2].glob("test_pipeline_stage2-stage2.pt"))
     assert len(stage2_files) == 1, "stage 2's own checkpoint file was not created"
     checkpoint = torch.load(stage2_files[0], map_location="cpu", weights_only=True)
@@ -279,7 +279,7 @@ epochs = 0
         if "train_lds()" not in str(e):
             raise
 
-    from orchestration.paths import _STAGE_DIRS
+    from utils.paths import _STAGE_DIRS
     stage2_files = list(_STAGE_DIRS[2].glob("test_pipeline_global_resume_from-stage2.pt"))
     assert len(stage2_files) == 1, "stage 2's own checkpoint file was not created"
     checkpoint = torch.load(stage2_files[0], map_location="cpu", weights_only=True)
@@ -345,7 +345,7 @@ force = true
         if "train_lds()" not in str(e):
             raise
 
-    from orchestration.paths import _STAGE_DIRS
+    from utils.paths import _STAGE_DIRS
     prior_stage2_files = list(_STAGE_DIRS[2].glob("test_pipeline_stage2_ancestor-stage2.pt"))
     assert len(prior_stage2_files) == 1
     prior_stage2_checkpoint = prior_stage2_files[0]
@@ -462,7 +462,7 @@ stats0_weight = 0.01
         if "train_lds()" not in str(e):
             raise
 
-    from orchestration.paths import _STAGE_DIRS
+    from utils.paths import _STAGE_DIRS
     stage2_pt = _STAGE_DIRS[2] / "test_pipeline_self_resume-stage2.pt"
     stage2_log = _STAGE_DIRS[2] / "test_pipeline_self_resume-stage2.log"
     assert stage2_pt.exists() and stage2_log.exists(), "fixture assumption: first pass must produce both files"
