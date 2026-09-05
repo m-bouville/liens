@@ -100,7 +100,7 @@ def test_scripts_that_define_output_paths_have_the_anchor():
     anchor either way (a plain NameError/ImportError in practice, but
     worth failing here with a clearer message than that)."""
     anchor_pattern = re.compile(r"_PYTHON_ROOT\s*=\s*Path\(__file__\)\.resolve\(\)")
-    shared_anchor_import = re.compile(r"from orchestration\.paths import\b")
+    shared_anchor_import = re.compile(r"from utils\.paths import\b")
     missing = []
     for path in _project_python_files():
         text = path.read_text()

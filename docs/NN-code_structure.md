@@ -51,6 +51,17 @@ extracted helpers/leaf modules (`_training_loop`, `_dataset_filtering`,
 not to every local module -- `blocks`, `latent_cache`, `lineage` are local but
 first-class enough to keep plain names.
 
+The corollary is that a module imported from OTHER packages should NOT be
+underscore-prefixed and often belongs in `utils/`, not the app layer. Four
+general helpers were moved out of `evaluation/` into `utils/` on this basis --
+`fits.py` (power-law/exponential fits, pure numpy), `plot_helpers.py`,
+`window_parsing.py`, `sweep_filters_common.py` -- each had no evaluation-specific
+dependency, and `fits` is now imported by `utils/plots.py` too, so keeping it in
+`evaluation/` inverted the layering (a foundational module reaching up into an
+app layer). The underscore was dropped on the move. (`paths.py` is a similar
+case still parked -- foundational path constants living in `orchestration/`,
+imported everywhere -- a higher-stakes move because of its reach.)
+
 
 
 ## The pipeline: five training stages
@@ -106,10 +117,7 @@ Two stage-2 additions share one schedule:
   degenerate minimum is any `z0` affine in t, INCLUDING A CONSTANT; only `L_recon0`
   prevents that collapse, deliberately (an internal guard would hide the collapse
   rather than prevent it), so `recon0` must be watched from the switch epoch whenever
-  the weight is raised. First real run (weight 0.1, lr 1e-4): every component improved
-  together — interp -52%, deriv -49%, recon0 flat-at-converged; an earlier run at
-  weight 0.5 / lr 1e-3 degraded recon0 +30%, diagnosed as the learning rate, not the
-  term.
+  the weight is raised.
 
 There used to be a separate stage 1b between them, whose job was building this second
 stream. It's gone: `train_stage2()` now builds the deriv stream itself, in memory, directly
@@ -416,10 +424,8 @@ Two interactions are easy to get wrong and are now guarded:
   Both stage 2 and stage 3 now exempt grace epochs.
 - **Stage 1 has `ema_warmup_epochs=5`** (was 0, and it was the only stage
   without one). With no warmup, epoch 1's raw `val_loss` seeds BOTH the EMA and
-  `best_val_loss`, so a lucky first epoch sets a bar later smoothed values
-  struggle to clear. Observed on a 128x128 run: epoch 1 was the minimum of all
-  11 epochs, nothing saved again, early stop at 11 with train loss still falling
-  19.6% — and stage 2 then trained from that epoch-1 checkpoint.
+  `best_val_loss`, so a lucky first epoch can set a bar later smoothed values
+  struggle to clear, starving the rest of the run of saves.
 
 - **Saving is an AND-gate: raw `val_loss` AND its EMA must both be at new lows**,
   and both bars advance ONLY on an actual save. A low-EMA epoch whose raw valid was
@@ -540,8 +546,11 @@ The terms and *what each is applied to* (they differ in a way that matters):
   bulk seen in stage-5 rollouts. Matching gradients penalizes exactly that: in the bulk
   ∇(real)=0 so any predicted variation is error, while at an interface ∇(real) is large so
   the term REQUIRES a matching sharp transition rather than blurring it — no bulk mask needed,
-  the real field's own gradient says where variation is allowed, and (Allen–Cahn interface
-  width being T-dependent) it teaches the physical profile rather than a fixed target. A
+  the real field's own gradient says where variation is allowed. The point is
+  SCALE-SELECTIVE: a few-pixel spurious feature (a "moth") is nearly invisible to
+  value-MSE — few pixels, each error small — but a sharp small feature carries
+  LARGE local gradients, so `L_grad_predict` weights exactly the small-scale
+  errors `L_recon_predict` neglects, by their gradient content. A
   SEPARATE component (`grad_predict_weight`/`grad_predict_scale`) so its magnitude scales
   independently; endpoint-only, reusing `L_recon_predict`'s decode (decoded once if either is
   active). Default off, no-op at weight 0.
@@ -549,8 +558,9 @@ The terms and *what each is applied to* (they differ in a way that matters):
 `train_refinement` warms `rollout_weight`, `recon_predict_weight` AND `grad_predict_weight`
 in via **`linear_warmup_weight`** (in `train_refinement`) — LINEAR, as `epoch/warmup_epochs`
 (1/N at epoch 1, full AT epoch N), the same convention stage 2's deriv_weight warmup uses, so
-`warmup_epochs=N` means the same ramp everywhere. It was geometric while `L_rollout` collapsed
-~6e9 over the first epochs (so a linear ramp left epoch 1 eight decades hot);
+`warmup_epochs=N` means the same ramp everywhere. It was geometric while `L_rollout`
+collapsed by many orders of magnitude over the first epochs (so a linear ramp left epoch 1
+far too hot);
 `require_consecutive` removed the filter-manufactured large-dt windows that caused that
 collapse, so `L_rollout` is O(1–10) from epoch 1 and a plain linear introduction suffices
 (and `start_fraction` — a geometric-era floor, since a multiplicative ramp cannot start at 0 —
@@ -559,14 +569,24 @@ both backprop a full-weight pixel loss through the rollout into a decoder that (
 stage 4) only ever saw frame-0 latents, so both are warmed in on the one schedule. The
 save-criterion grace fires when the LAST active ramp completes (`ramp_completion_grace`).
 
+Separately from the WEIGHT ramps, `train_lds` and `train_refinement` take an optional
+**`lr_warmup_epochs`** (a LEARNING-RATE warmup, default 0 = off): a `LinearLR` from 1% to
+full over the first `lr_warmup_epochs` epochs, converted to optimiser steps as
+`lr_warmup_epochs * len(train_loader)` (epoch-units, consistent across the two stages — the
+name is `_epochs`, not `_steps`). It is stepped ONLY on a taken optimiser step, never on a
+skipped batch (advancing on a skip consumes the warmup without training and torch warns). It
+damps the early shock when a trainer resumes onto an objective the encoder was not fitted to
+(e.g. stage 4's first stage-2→rollout contact), where a few surviving high-gradient batches
+jerk the weights.
+
 #### Gradient/loss spike guard (`_spike_guard.py`)
 Shared by `train_lds` and `train_refinement` (stage 2 has its own single-guard variant — see
 below). Two `_SpikeGuard` instances (one on the
 per-batch loss, one on the gradient norm) skip a batch whose value is a catastrophic
 outlier vs the epoch's running median — the optimizer step is NOT taken AND the BatchNorm
 running-stat buffers the forward pass moved are RESTORED (`snapshot`/`restore_running_stats`),
-because "the step wasn't taken" covers parameters but not buffers, and a run once moved
-val_loss ~1.2% via skipped batches alone. `SkipReporter` digests the per-epoch skips into ONE
+because "the step wasn't taken" covers parameters but not buffers, and unrestored buffers
+can move val_loss measurably via skipped batches alone. `SkipReporter` digests the per-epoch skips into ONE
 line — verbose the first time, then a compact `N grad (Kx) + M loss (Lx) of B @ du_max=…`
 per epoch — and MERGES the two guards' reports into a single block when both fire (they used
 to print two near-identical paragraphs). `SkipReporter.report_epoch(epoch, loss_guard,
@@ -606,13 +626,19 @@ no weight ramp (so no `ramp_completion_grace`) and no component decomposition (s
 of the extraction — forcing a helper where the trainer genuinely differs would be a behaviour
 change dressed as a refactor.
 
-**Stage 1 (`train_autoencoder`) is the FOURTH trainer and uses NONE of these** — it predates
-the extraction and trains a plain autoencoder (no rollout, no f_theta, no multi-component
-objective, no weight ramp), so it keeps its own inline batch pass, `loss_curve`/CSV writes and
-`atomic_torch_save`. Tier-2 scoped the extraction to the rollout trainers (stage 2/3/4-5),
-where the copied machinery had actually drifted. `accumulate_epoch` and `write_epoch_figures`
-would fit stage 1 too and it is a reasonable future migration; it was left out of scope, not
-found incompatible.
+**Stage 1 (`train_autoencoder`) is the FOURTH trainer and is PARTIALLY migrated** — it
+predates the extraction and trains a plain autoencoder (no rollout, no f_theta, no weight
+ramp). It now uses `write_epoch_figures` (all its figures) and `accumulate_epoch` for its
+VALIDATION loop. Two pieces stay deliberately inline, each a genuine non-fit rather than an
+omission: the TRAIN loop (its per-batch VRAM logging and epoch-0 NaN branch have no hook in
+`accumulate_epoch`; forcing them through a closure counter would be a behaviour change dressed
+as a refactor) and the checkpoint save (stage 1's hand-built dict -- `model_state`,
+`stats_head_state`, `config` with `stream_configs`, `stats_config` -- is the contract stage 2,
+`build_ae_from_checkpoint` and the identity-resume tests read key-for-key, so it is not routed
+through `save_checkpoint` without a byte-identical guarantee). Migrating the val loop required
+one shared change: `accumulate_epoch`'s batch size is now
+`(batch[0] if isinstance(batch, (list, tuple)) else batch).size(0)`, because stage 1 without
+stats targets yields a bare-tensor batch, not the rollout trainers' tuple.
 
 #### Bucketed batching (`dt_bucketing.py`)
 `bucket_batches=True` groups windows of similar `dt` (or `Δu`) into batches so a batch's
@@ -738,7 +764,12 @@ safe stopping point: splitting it is a draw-reorder that needs a render gate.
   time, e.g. a fixed-window set) shows a note instead of an empty legend. Eval windows are
   selected under the anchor model's OWN training filters (`min_normalized_stdev_phi`,
   `min_passing_steps`) so the population matches training, and eval-created latent caches are
-  stamped with the encoder source. Also carries the two diagnostic sweeps that produced
+  stamped with the encoder source. `_reconcile_data_config` runs before window selection: if a
+  filter field one compared checkpoint recorded is missing from another (an older lineage
+  predating the field being saved), it borrows the value from the sibling with a printed NOTE
+  — they were, in practice, trained on the same filter; warns without overriding on a genuine
+  disagreement; and leaves a field absent from ALL of them absent (so the usual 'no threshold'
+  error still fires when nobody has a value). Also carries the two diagnostic sweeps that produced
   stage 3's current verdict: `--f-scale-sweep` (scale `f_theta`'s output by lambda in [0,1];
   0 reproduces stage 2 bit-exactly through the real integrator) and `--alpha-sweep`
   (h -> 0 refinement; refuses fixed-`n_substeps` checkpoints, whose `f_theta` is a
@@ -789,7 +820,15 @@ safe stopping point: splitting it is a draw-reorder that needs a render gate.
   existing checkpoint without an explicit override.
 - `logging_utils.py` — console/log plumbing shared across the pipeline:
   - `_log_to_file()` tees stdout/stderr into a per-stage log file in addition to the
-    console for the duration of a training call, via `_Tee`.
+    console for the duration of a training call, via `_Tee`. The file is written through
+    `_DeferredLogFile`: the log on disk is NOT touched until the run's FIRST epoch, so a
+    crash during the (minutes-long) setup phase, or a mistaken re-launch on the same
+    checkpoint name, cannot overwrite a valuable existing log with a near-empty one.
+    Output before the first epoch is buffered in memory (still teed live to the console);
+    the first epoch-summary line commits it — opens the file, flushes the buffer, then
+    writes live-and-flushed from there (so a killed training run keeps its log, as before).
+    The first epoch is detected by the epoch-line format all four stages share (`{epoch:4d}`
+    then `|` or a number), distinguishable from setup lines that also start with digits.
   - `_Tee` follows one convention: chunks beginning with `\r` are in-place progress
     updates (transient by definition — each overwrites the last on a terminal), so they go
     to the CONSOLE ONLY, never the log file, where they would otherwise pile up as a
@@ -810,17 +849,38 @@ safe stopping point: splitting it is a draw-reorder that needs a render gate.
     so the unit never flips mid-run. Used by `EpochProgress` and by the dataset/interpolation
     progress bars (below).
   - `print_run_parameters()` — the flat parameter echo at the top of every run's log.
-- `plots.py`
+- `plots.py` — every figure is written through **`_save_figure()`**, which is NON-FATAL:
+  it retries the `savefig` a few times with a short backoff (on Windows a just-written PNG
+  is intermittently held for a few ms by an antivirus/Defender scan or a viewer, so the
+  rewrite can raise `OSError [Errno 22]` despite a valid path), then warns-and-skips if the
+  lock persists, and ALWAYS closes the figure. A figure write must never kill an hours-long
+  training run — the same non-fatal principle as the checkpoint hook and the deferred log.
   -  `show_snapshot`: raw-snapshot visualization;
   - `loss_curve()`: produces every stage's loss curve — called directly by stage 1, and via
     `write_epoch_figures` by stage 2/3/4-5. Y-axis capped so early instability
-    spikes don't squash the rest of the curve. Two annotation kinds, mutually exclusive by
-    construction: vertical `event_epochs` markers at `epoch - 0.5` (a mid-run objective
-    switch; suppressed at epoch 1, where no plotted point precedes it) and horizontal
-    `reference_levels` (the ancestor's val under THIS run's objective; withheld when a
-    mid-run switch makes it an unfair bar; the y-cap explicitly makes room for a level
+    spikes don't squash the rest of the curve. Vertical `event_epochs` markers (red dotted,
+    label written on the plot at the bottom, where there is more clear space than at the top)
+    and horizontal `reference_levels` (the ancestor's val under THIS run's objective; withheld
+    when a mid-run switch makes it an unfair bar; the y-cap explicitly makes room for a level
     above it — feeding levels into the percentile does not work, one value among hundreds
-    barely moves p99).
+    barely moves p99). Optional **`train_full_weight`** dashed overlay: during a weight warmup
+    the displayed train loss RISES purely because the ramped weights grow (not because the
+    model worsens), so this shows the train loss recomputed at FULL weights — a monotone,
+    honest curve that meets the displayed one where the ramp completes. Drawn only over the
+    warmup span (plus the meeting point) and saved as a column in the loss-history CSV, so the
+    corrected curve survives as numbers, not only pixels.
+  - `loss_scale_curve()`: per-component `L_XX / XX_scale` (VALIDATION) vs epoch, log-log,
+    written as `…-scales.png`. Diagnoses whether each term's SCALE matches its magnitude: the
+    ratio should sit near 1 or be converging there; a ratio far off is the
+    `scale_balance_report` 'effectively OUT of the objective' warning made visual and
+    time-resolved. Fits TWO models per term and shows whichever wins — a power law `amp·xᵇ`
+    (excluded if `b>0`, a growing ratio is not converging via decay) vs a constant `c`,
+    picking the higher R² (via `utils.fits.fit_power_law`); the amplitude is shown, not just
+    the exponent. Paired colours (recon0/stats0, recon_predict/grad_predict) and the same red
+    dotted `event_epochs` marker as the loss curve. Emitted by stages 1, 2 and 4/5, all via
+    `write_epoch_figures`' `scale_ratios` argument (stage 1's earlier direct call was migrated).
+    Guarded against empty/epoch-0 renders (needs a positive epoch and a positive ratio to
+    log-scale).
   - `loss_component_scatter()`: per-component train/val trajectories as a LOWER-TRIANGULAR
     corner plot (row = y variable, column = x variable; the upper triangle is the redundant
     transpose). Axis padding proportional to the data's own spread (`span**0.15`; a fixed
