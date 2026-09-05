@@ -109,6 +109,7 @@ def train_refinement(
     min_normalized_stdev_phi: float | None = None,
     val_ema_decay: float = 0.7, ema_warmup_epochs: int = 0,
     early_stopping_patience: int | None = None, grad_clip: float = 1.0,
+    lr_warmup_epochs: int = 0,
     spike_skip_factor: float = 10.0, grad_spike_factor: float = 10.0,
     seed: int = 0, checkpoint_path: Path | None = None, device: str | None = None,
     on_checkpoint_saved=None, log_every_epoch: bool = True,
@@ -374,6 +375,19 @@ def train_refinement(
     trainable_params = ([p for p in ae.parameters() if p.requires_grad]
                          + [p for p in f_theta.parameters() if p.requires_grad])
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
+    # LR warmup, same mechanism/semantics as train_lds: ramp lr from 1% to full
+    # over the first lr_warmup_epochs epochs (converted to optimiser steps via
+    # len(train_loader)). Damps the
+    # early stage-2->rollout shock, where a few surviving high-gradient batches
+    # jerk the weights (violent train-loss oscillation) before the encoder
+    # settles. Stepped ONLY on a taken step (see the guard block), never on a
+    # skipped batch -- else it consumes the warmup without training and torch
+    # warns. Default 0 = off, so runs that do not pass it are unchanged.
+    lr_scheduler = None
+    if lr_warmup_epochs > 0 and train_loader is not None:
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01,
+            total_iters=lr_warmup_epochs * len(train_loader))   # epochs -> optimiser steps
 
     if checkpoint_path is None:
         stage_dir = "stage4" if freeze_decoder else "stage5"
@@ -386,6 +400,8 @@ def train_refinement(
         loss_curve_path = _PYTHON_ROOT.parent / "output" / stage_dir / "loss_curve.png"
     loss_components_path = loss_curve_path.with_name(
         loss_curve_path.stem + "-components" + loss_curve_path.suffix)
+    loss_scales_path = loss_curve_path.with_name(
+        loss_curve_path.stem + "-scales" + loss_curve_path.suffix)
 
     # Seed the ramp-completion marker(s) from the START, so every loss-curve
     # render -- including the early ones DURING the warmup -- shows where the
@@ -405,12 +421,13 @@ def train_refinement(
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
     train_full_weight_history: list[float] = []   # train loss recomputed at FULL weights (dotted overlay)
+    scale_ratio_history: dict[str, list[float]] = {}   # per component: VAL raw / scale, vs epoch
     # loss_component_scatter's own bookkeeping -- rollout/recon0/stats0
     # are all always active in this stage (no conditional gating like
     # stage 1's include_stats or stage 2's active_terms).
     component_histories: dict[str, dict[str, list[float]]] = {
         name: {"train": [], "val": [], "best_so_far": []}
-        for name in ("rollout", "recon0", "stats0", "recon_predict")
+        for name in ("rollout", "recon0", "stats0", "recon_predict", "grad_predict")
     }
     component_best_tracker = ComponentBestTracker()
 
@@ -495,6 +512,10 @@ def train_refinement(
                     restore_running_stats(_bn_snapshot)
                 else:
                     optimizer.step()
+                    # ONLY on a taken step -- advancing on a skipped batch
+                    # consumes lr_warmup_epochs without training and torch warns.
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
         # Returned as GPU tensors, NOT .item()'d here -- .item() blocks
         # the CPU until the GPU actually finishes and forces a full
         # round trip EVERY batch. .detach() keeps each value a scalar
@@ -767,6 +788,9 @@ def train_refinement(
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
             component_histories[name]["best_so_far"].append(best_components[name])
+        # L_XX / XX_scale (val): how well each term's scale matches its magnitude
+        for name in _val_raw:
+            scale_ratio_history.setdefault(name, []).append(_val_raw[name] / _scales[name])
         write_epoch_figures(
             epoch, log_every_epoch,
             epoch_history=epoch_history, train_loss_history=train_loss_history,
@@ -774,6 +798,7 @@ def train_refinement(
             train_full_weight=train_full_weight_history,
             component_histories=component_histories, loss_curve_path=loss_curve_path,
             loss_components_path=loss_components_path,
+            scale_ratios=scale_ratio_history, scales_path=loss_scales_path,
             title=f"Stage {'4' if freeze_decoder else '5'}",
             event_epochs=loss_curve_events)
 
@@ -925,6 +950,7 @@ def train_refinement(
         train_full_weight=train_full_weight_history,
         component_histories=component_histories, loss_curve_path=loss_curve_path,
         loss_components_path=loss_components_path,
+        scale_ratios=scale_ratio_history, scales_path=loss_scales_path,
         title=f"Stage {'4' if freeze_decoder else '5'}",
         event_epochs=loss_curve_events)
 

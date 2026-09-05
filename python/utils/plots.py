@@ -17,6 +17,43 @@ from . import load_datasets as load
 LOSS_FIGURE_EVERY = 10
 
 
+def _save_figure(fig, output_path: Path, dpi: int = 100, retries: int = 3) -> bool:
+    """Save `fig` to `output_path`, then close it -- NON-FATALLY.
+
+    A figure write must never kill a training run. On Windows a just-written PNG
+    is intermittently held open for a few ms by an antivirus/Defender scan (or a
+    viewer re-reading it), so `savefig`'s `open(..., "w+b")` can raise
+    `OSError: [Errno 22]` on the NEXT epoch's rewrite even though the path is
+    valid -- a transient external lock, not our bug. We retry a few times with a
+    short backoff to ride it out, and if it still fails we warn and skip this
+    epoch's figure (the next epoch, or the forced end-of-run write, produces a
+    current one). The figure is ALWAYS closed, even on failure, so a raising
+    savefig cannot also leak the figure. Returns True if written.
+
+    Same principle as the checkpoint hook and the deferred log: output/bookkeeping
+    is best-effort and must not abort an hours-long run.
+    """
+    import time
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        for attempt in range(retries):
+            try:
+                fig.savefig(output_path, dpi=dpi)
+                return True
+            except OSError as e:
+                if attempt < retries - 1:
+                    time.sleep(0.25 * (attempt + 1))   # let a transient lock clear
+                    continue
+                print(f"  WARNING: could not write {output_path.name} "
+                      f"({type(e).__name__}: {e}) -- skipping this epoch's figure, "
+                      f"training continues")
+                return False
+    finally:
+        plt.close(fig)
+    return False
+
+
+
 def log_axis_ticks(axis, lo: float, hi: float, mantissas=None) -> None:
     """
     Label a log axis at {1,2,3,5}x10^k rather than at decades only.
@@ -343,8 +380,7 @@ def loss_curve(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=100)
-    plt.close(fig)
+    _save_figure(fig, output_path)
     return output_path
 
 
@@ -461,8 +497,103 @@ def rollout_vs_1step_scatter(l_1step_val, l_rollout_val, output_path, title="",
     ax2.set_ylim(bottom=0)
     ax2.legend(fontsize=8, loc="lower right")
     fig.tight_layout()
-    fig.savefig(output_path, dpi=100)
-    plt.close(fig)
+    _save_figure(fig, output_path)
+    return output_path
+
+
+def loss_scale_curve(
+    epochs: list[int],
+    scale_ratios: dict[str, list[float]],
+    output_path: Path,
+    title: str = "",
+    event_epochs: list[tuple[float, str]] | None = None,
+) -> Path:
+    """Per-component L_XX / XX_scale (VALIDATION) vs epoch, log-log.
+
+    Diagnoses whether each objective term's SCALE is set to the term's actual
+    magnitude: the ratio should sit near 1 (so the term's `weight` alone sets its
+    share) or be converging there. A ratio far below 1 is the scale_balance_report
+    'effectively OUT of the objective' warning made visual and time-resolved:
+    some terms drift a lot over training, some little, and this shows which scale
+    is mis-set and whether it is settling. A dashed reference line marks the
+    target of 1. Validation only (train would double the lines and clutter it);
+    the scales are the same for train and val anyway.
+
+    Paired colours group related terms so the eye reads them together: the
+    frozen-decoder anchors recon0/stats0 as a red/orange pair, the endpoint terms
+    recon_predict/grad_predict as a blue/purple pair, rollout its own green.
+    `event_epochs` draws the same red dotted 'ramp complete' markers as the loss
+    curve, with the label on the plot.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    # Nothing to log-log-plot yet -- epochs=0 ablation (a single epoch-0 render,
+    # whose x=0 cannot be log-scaled) or the pre-first-epoch render with no
+    # positive ratios. Need at least one POSITIVE epoch (for log-x) AND one
+    # positive ratio (for log-y); otherwise skip rather than emit matplotlib
+    # 'no positive values'/'tight layout' warnings for a degenerate figure.
+    if not any(e is not None and e > 0 for e in epochs) or not any(
+            any(r is not None and r > 0 for r in ratios)
+            for ratios in scale_ratios.values()):
+        return output_path
+    # explicit paired colours; anything unlisted falls back to the default cycle
+    _COLORS = {"rollout": "tab:green",
+               "recon0": "tab:red", "stats0": "tab:orange",
+               "recon_predict": "tab:blue", "grad_predict": "tab:purple"}
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for name, ratios in scale_ratios.items():
+        if not any(r is not None and r > 0 for r in ratios):
+            continue
+        color = _COLORS.get(name)
+        xs = np.asarray(epochs[:len(ratios)], dtype=float)
+        ys = np.asarray(ratios, dtype=float)
+        ok = np.isfinite(ys) & (ys > 0) & (xs > 0)
+        label = name
+        # Fit TWO models and show whichever describes the term better:
+        #   power law  amp * x^exp   (a straight line on these log-log axes)
+        #   constant   c             (a flat line = the term has settled)
+        # via the project's fit_power_law (returns exponent `a`, log-intercept
+        # `b` so amp = exp(b), and r2_log). A constant fit is the mean, whose
+        # log-space R^2 is 0 by construction, so "pick the higher R^2" means the
+        # power law wins iff its R^2 > 0 -- UNLESS its exponent is POSITIVE, in
+        # which case it is excluded (a ratio that GROWS is not converging via
+        # power-law decay; the constant is the honest description). The amplitude
+        # is shown, not just the exponent: 'x^-0.6' alone hides the level.
+        if ok.sum() >= 3:
+            try:
+                from utils.fits import fit_power_law
+                a, b, r2_pl, _sse, _pred = fit_power_law(xs[ok], ys[ok])
+                amp = float(np.exp(b))
+                xf = np.array([xs[ok].min(), xs[ok].max()])
+                if a <= 0 and r2_pl > 0:                       # power law wins
+                    ax.plot(xf, amp * xf ** a, color=color, linestyle="--",
+                            linewidth=1.0, alpha=0.6)
+                    label = f"{name}  {amp:.2g}\u00b7x^{a:.2f} (R\u00b2={r2_pl:.2f})"
+                else:                                          # constant describes it
+                    c = float(np.exp(np.mean(np.log(ys[ok]))))  # log-space best constant
+                    ax.plot(xf, [c, c], color=color, linestyle="--",
+                            linewidth=1.0, alpha=0.6)
+                    label = f"{name}  c={c:.2g}"
+            except Exception:
+                pass
+        ax.plot(xs, ys, marker=".", label=label, alpha=0.85, color=color)
+    ax.axhline(1.0, color="grey", linestyle="--", linewidth=1.0, alpha=0.7)
+    ax.text(epochs[0] if epochs else 1, 1.0, " target = 1", color="grey",
+            fontsize=8, va="bottom", ha="left")
+    for event_x, event_label in (event_epochs or []):
+        ax.axvline(event_x, color="tab:red", linestyle=":", linewidth=1.2, alpha=0.8)
+        ax.text(event_x, 0.02, f" {event_label}", color="tab:red", fontsize=8,
+                rotation=90, ha="right", va="bottom", alpha=0.9,
+                transform=ax.get_xaxis_transform())
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("L_component / component_scale  (validation)")
+    ax.set_title(title or "loss / scale ratios (validation)")
+    ax.legend(fontsize=8)
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    _save_figure(fig, output_path)
     return output_path
 
 
@@ -753,8 +884,7 @@ def loss_component_scatter(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=100)
-    plt.close(fig)
+    _save_figure(fig, output_path)
     return output_path
 
 

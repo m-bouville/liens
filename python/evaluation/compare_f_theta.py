@@ -57,7 +57,7 @@ import torch
 from evaluation.lineage import (
     resolve_lineage, _stage_label, _ancestor_pointers, _registry_resume_of)
 
-from evaluation._window_parsing import parse_fixed_window
+from utils.window_parsing import parse_fixed_window
 from evaluation.check_rollout import (
     _correlation_pct, _format_small, _padded_bounds, compute_sample,
 )
@@ -82,7 +82,7 @@ import time
 def _fmt_corr_pct(corr: float | None) -> str:
     """Format a correlation that is ALREADY IN PERCENT (this module's
     _correlation_pct convention) -- hence the _pct name, distinguishing it
-    from evaluation._plot_helpers.fmt_corr which takes raw [-1, 1].
+    from utils.plot_helpers.fmt_corr which takes raw [-1, 1].
     None happens on real data: a quiet window's real dx has ~zero std --
     the low-|z1| population -- and correlation is undefined there. 'n/a'
     rather than a crash in the title formatting."""
@@ -1477,6 +1477,54 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     return output_path
 
 
+_RECONCILED_FIELDS = ("min_step", "min_stdev_phi", "min_normalized_stdev_phi",
+                      "min_passing_steps", "max_dt")
+
+
+def _reconcile_data_config(models):
+    """Fill a data_config filtering field missing from one compared checkpoint
+    with the value another one recorded.
+
+    Two checkpoints in a comparison were, in practice, trained on the same window
+    filter -- but a field only started being SAVED at some point, so an older
+    lineage (e.g. a stage-4 from before `min_normalized_stdev_phi` was recorded)
+    can lack a field its sibling has. Window selection reads only the discovery
+    model's config, so a missing field there raises spuriously even though the
+    value is knowable from the other checkpoint. This borrows it, prints what it
+    took, and:
+      - if two checkpoints genuinely DISAGREE on a field (both present, different
+        values), it WARNS -- they were trained on different window populations,
+        so the comparison is not like-for-like -- but does NOT override either;
+      - if a field is absent from ALL of them, it is left absent, so the usual
+        'no threshold to count against' error still fires when nobody has a value.
+    """
+    dcs = []
+    for m in models:
+        dc = m["ck"].get("data_config")
+        if dc is None:
+            dc = {}
+            m["ck"]["data_config"] = dc
+        dcs.append(dc)
+    for field in _RECONCILED_FIELDS:
+        present = [(m["label"], dc[field]) for m, dc in zip(models, dcs)
+                   if dc.get(field) is not None]
+        if not present:
+            continue                       # nobody has it -> leave absent
+        if len({v for _, v in present}) > 1:
+            print("WARNING: checkpoints disagree on " + field + ": "
+                  + ", ".join(f"{lbl}={v}" for lbl, v in present)
+                  + " -- trained on different window populations, so this "
+                    "comparison is not like-for-like on that filter (not overridden).")
+        fill, source = present[0][1], present[0][0]
+        borrowers = [m["label"] for m, dc in zip(models, dcs) if dc.get(field) is None]
+        for dc in dcs:
+            if dc.get(field) is None:
+                dc[field] = fill
+        if borrowers:
+            print(f"NOTE: {field} not recorded in {', '.join(borrowers)}; "
+                  f"using {fill} from {source}.")
+
+
 def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
                        fixed_windows, max_dt, z1_resync, t0_range=None):
     """Shared prologue for the panel and statistics tools: load both models,
@@ -1511,6 +1559,7 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
             raise ValueError(f"fixed windows have mixed lengths {sorted(lens)}; "
                               f"the comparison needs one common horizon")
     else:
+        _reconcile_data_config([a, b])   # borrow a missing filter field from the sibling
         windows = _select_windows(a, max(n_samples, 1), n_steps, seed, max_dt,
                                    device, t0_range=t0_range)
     window_strings = [f"{run_dir}:{':'.join(str(sp) for sp in steps)}"
@@ -1775,6 +1824,7 @@ def compare_stage2_rollouts(paths: list[Path], n_stats: int = 200,
     for m in models:
         m["label"] = _pretty_label(m["label"], _need_year)
 
+    _reconcile_data_config(models)   # borrow a missing filter field across the set
     windows = _select_windows(models[0], n_stats, n_steps, seed, max_dt, device,
                                t0_range=t0_range)
     print(f"\nstage-2 rollout comparison over {len(windows)} windows "

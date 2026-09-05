@@ -75,7 +75,7 @@ import torch
 from evaluation._latent_eval import (
     _load_ae_f_theta_and_dataset, _stage_folder_from_checkpoint_stem,
 )
-from evaluation._fits import fit_broken_power_law
+from utils.fits import fit_broken_power_law
 from orchestration.paths import default_latent_cache_dir
 from utils.plots import log_axis_ticks
 

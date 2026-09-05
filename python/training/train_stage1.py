@@ -31,7 +31,8 @@ from training.datasets import MicrostructureSnapshotDataset, complete_run_dirs, 
 from training.losses import ReconLoss, StatsLoss
 from training.stats_head import StatsHead
 from utils.naming import ae_checkpoint_name
-from utils.plots import loss_component_scatter, loss_curve, write_loss_history, should_write_loss_figure
+from utils.plots import (loss_component_scatter, loss_curve, loss_scale_curve,
+                          write_loss_history, should_write_loss_figure)
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -291,9 +292,12 @@ def train_autoencoder(
         loss_curve_path = _PYTHON_ROOT.parent / "output" / "stage1" / f"{name}-loss_curve.png"
     loss_components_path = loss_curve_path.with_name(
         loss_curve_path.stem + "-components" + loss_curve_path.suffix)
+    loss_scales_path = loss_curve_path.with_name(
+        loss_curve_path.stem + "-scales" + loss_curve_path.suffix)
 
     epoch_history: list[int] = []
     train_loss_history: list[float] = []
+    scale_ratio_history: dict[str, list[float]] = {}   # per component: VAL raw / scale, vs epoch
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
     # loss_component_scatter's own bookkeeping -- only meaningful when
@@ -618,12 +622,18 @@ def train_autoencoder(
         train_loss_history.append(train_total)
         val_loss_history.append(val_total)
         best_so_far_history.append(tracker.best_val_loss)
+        # L_XX / XX_scale (val): recon0 always; stats0 only when it is an active term
+        scale_ratio_history.setdefault("recon0", []).append(val_recon0 / recon0_scale)
+        if include_stats:
+            scale_ratio_history.setdefault("stats0", []).append(val_stats0 / stats0_scale)
         if should_write_loss_figure(epoch, log_every_epoch, n_points=len(epoch_history)):
             loss_curve(
                 epoch_history, train_loss_history, val_loss_history, best_so_far_history,
                 loss_curve_path, title="Stage 1 loss",
             )
             write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
+            loss_scale_curve(epoch_history, scale_ratio_history, loss_scales_path,
+                             title="Stage 1 loss/scale ratios (val)")
         if include_stats:
             current_val_components = {
                 "recon0": val_recon0 / recon0_scale,
@@ -741,6 +751,9 @@ def train_autoencoder(
         loss_curve_path, title="Stage 1 loss",
     )
     write_loss_history(loss_curve_path, epoch_history, train_loss_history, val_loss_history, best_so_far_history)
+    if scale_ratio_history:
+        loss_scale_curve(epoch_history, scale_ratio_history, loss_scales_path,
+                         title="Stage 1 loss/scale ratios (val)")
     if component_histories:
         loss_component_scatter(
             epoch_history, component_histories, loss_components_path,

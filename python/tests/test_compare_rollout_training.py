@@ -29,7 +29,7 @@ from models.latent_streams import LatentStreamConfig, LatentStreamMode
 from utils import load_datasets as load
 
 from evaluation.compare_rollout_training import compare_rollout_training
-from evaluation._window_parsing import parse_fixed_window
+from utils.window_parsing import parse_fixed_window
 from models.constants import N_THETA
 
 

@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import pytest
 
 from conftest import source_without_comments
-from evaluation._plot_helpers import log_scale_if_positive as _log_scale_if_positive
+from utils.plot_helpers import log_scale_if_positive as _log_scale_if_positive
 
 import pathlib
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -80,7 +80,7 @@ def test_no_raw_log_scale_calls_remain_in_the_figure_builders():
     go through the helper, or the next degenerate population takes the figure
     down again.
 
-    The helper now lives in evaluation/_plot_helpers.py (shared home after the
+    The helper now lives in utils/plot_helpers.py (shared home after the
     diverged-copies reconciliation), so check_parameter_dependence.py is
     scanned WHOLE -- it must contain no raw set_*scale("log") at all -- and
     _plot_helpers.py is scanned excluding the helper's own body (the one
@@ -92,7 +92,7 @@ def test_no_raw_log_scale_calls_remain_in_the_figure_builders():
             f"a raw {bad} remains in check_parameter_dependence -- route it "
             f"through log_scale_if_positive"
         )
-    helpers = source_without_comments(_ROOT / "evaluation/_plot_helpers.py")
+    helpers = source_without_comments(_ROOT / "utils/plot_helpers.py")
     body = helpers[helpers.index("def log_scale_if_positive"):]
     after = body[body.index("\ndef ", 1):] if "\ndef " in body[1:] else ""
     for bad in ('set_yscale("log")', 'set_xscale("log")'):

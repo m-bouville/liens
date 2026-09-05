@@ -106,7 +106,7 @@ def test_every_scale_defaults_to_one(scale):
 
 def test_stage45_has_a_rollout_weight_warmup():
     """
-    Stage 2 has deriv_weight_warmup_epochs; stage 3 has lr_warmup_steps;
+    Stage 2 has deriv_weight_warmup_epochs; stage 3 has lr_warmup_epochs;
     stage 4/5 had neither -- and needs one for a sharper reason than either.
 
     Its f_theta is FROZEN. The encoder starts on exactly the distribution

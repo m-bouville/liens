@@ -18,7 +18,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from test_train_lds import _build_sweep
 
-from evaluation._window_parsing import parse_fixed_window
+from utils.window_parsing import parse_fixed_window
 from evaluation.find_windows import find_windows
 
 

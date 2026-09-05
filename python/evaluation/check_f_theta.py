@@ -44,7 +44,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from evaluation._plot_helpers import fmt_corr as _fmt_corr, \
+from utils.plot_helpers import fmt_corr as _fmt_corr, \
     log_scale_if_positive as _log_scale_if_positive
 import torch
 from torch.utils.data import DataLoader

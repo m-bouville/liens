@@ -697,7 +697,7 @@ def test_END_TO_END_a_deadlock_really_rolls_back_and_keeps_training(tmp_path, ca
             _SpikeGuard.should_skip = real
 
     # A skipped batch takes no optimizer step, so it must not consume a step of
-    # the lr schedule either -- during warmup that spends lr_warmup_steps
+    # the lr schedule either -- during warmup that spends lr_warmup_epochs
     # without training. torch says so itself, and this is how it surfaced: the
     # first end-to-end run of the rollback path emitted this warning on every
     # skipped batch, invisible to every source-matching test.
@@ -773,7 +773,7 @@ def test_the_scheduler_is_rebuilt_WITH_the_optimizer():
     against torch below.
 
     Source-matched deliberately, and this is the honest case for it: with
-    lr_warmup_steps=20 the warmup is finished thousands of steps before any
+    lr_warmup_epochs=20 the warmup is finished thousands of steps before any
     rollback, so both paths read the same lr and NO behavioural test can tell
     them apart in the configuration that actually runs. The bug is latent --
     it bites a decaying schedule, or a rollback during warmup.
@@ -809,7 +809,7 @@ def test_the_scheduler_is_rebuilt_WITH_the_optimizer():
 def test_the_lr_schedule_does_not_advance_on_a_skipped_batch():
     """
     A skipped batch takes no optimizer step, so it must not consume a step of
-    the lr schedule either -- during warmup that spends lr_warmup_steps without
+    the lr schedule either -- during warmup that spends lr_warmup_epochs without
     training.
 
     Surfaced by the first END-TO-END run of the rollback path: torch emitted

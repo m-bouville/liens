@@ -150,7 +150,7 @@ def test_ast_detector_agrees_with_an_independent_regex_scan():
 
     The independent scan blanks STRING and COMMENT tokens (via tokenize, purely
     lexical -- it shares none of _imports_of's import-node logic) so prose that
-    reads like an import ('from evaluation._plot_helpers.fmt_corr which takes...'
+    reads like an import ('from utils.plot_helpers.fmt_corr which takes...'
     in a docstring) can't create a false hit, then regex-matches real import
     syntax on what remains. Any project-module import it finds that the AST
     missed is a genuine gap."""

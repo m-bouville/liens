@@ -51,7 +51,7 @@ from models.constants import theta_coordinates
 from utils.logging_utils import EpochProgress
 
 from evaluation._ae_stats_eval import load_ae_and_stats_head
-from evaluation._window_parsing import _is_int
+from utils.window_parsing import _is_int
 from utils import load_datasets as load
 from utils.naming import ae_checkpoint_name
 

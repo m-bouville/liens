@@ -107,6 +107,8 @@ def write_epoch_figures(
     train_full_weight=None,
     component_histories=None,
     loss_components_path=None,
+    scale_ratios=None,
+    scales_path=None,
     extra=None,
 ) -> None:
     """The per-epoch figure/CSV writes shared by every trainer: the loss curve
@@ -146,5 +148,10 @@ def write_epoch_figures(
     if component_histories is not None:
         loss_component_scatter(epoch_history, component_histories, loss_components_path,
                                title=f"{title} loss components")
+    if scale_ratios is not None:
+        from utils.plots import loss_scale_curve
+        loss_scale_curve(epoch_history, scale_ratios, scales_path,
+                         title=f"{title} loss/scale ratios (val)",
+                         event_epochs=event_epochs)
     if extra is not None:
         extra()

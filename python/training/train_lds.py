@@ -523,7 +523,7 @@ _LDS_PREAMBLE_PARAMS = (
     # it noisy enough to stop being read, which is how the old hand-rolled
     # preamble drifted in the first place.
     "min_step", "min_stdev_phi", "min_normalized_stdev_phi", "min_passing_steps", "ae_stats_weight", "max_dt",
-    "n_rollout_steps", "one_step_weight", "grad_clip", "lr_warmup_steps",
+    "n_rollout_steps", "one_step_weight", "grad_clip", "lr_warmup_epochs",
     "z0_noise_scale", "lr", "seed", "epochs", "batch_size", "early_stopping_patience",
     "use_dt_decade_weights", "n_substeps",
 )
@@ -543,7 +543,7 @@ def train_lds(
     condition_on_theta: bool | None = None,
     encode_batch_size: int = 256, val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5,
     early_stopping_patience: int | None = None,
-    lr_warmup_steps: int = 20, grad_clip: float = 1.0,
+    lr_warmup_epochs: int = 0, grad_clip: float = 1.0,
     spike_skip_factor: float = 10.0, grad_spike_factor: float = 10.0,
     val_excursion_factor: float = 3.0,
     spike_deadlock_epochs: int = 5, max_spike_rollbacks: int = 3,
@@ -757,7 +757,7 @@ def train_lds(
         # aggregate val loss (which those same windows dominate).
         print(f"max_dt={max_dt} -- windows with ANY transition longer than this are excluded")
     print(f"n_rollout_steps={n_rollout_steps}  one_step_weight={one_step_weight}")
-    print(f"grad_clip={grad_clip}  lr_warmup_steps={lr_warmup_steps}  z0_noise_scale={z0_noise_scale}")
+    print(f"grad_clip={grad_clip}  lr_warmup_epochs={lr_warmup_epochs}  z0_noise_scale={z0_noise_scale}")
     print(f"lr={lr}  seed={seed}")
     print_run_parameters(train_lds, locals(), _LDS_PREAMBLE_PARAMS)
 
@@ -979,9 +979,10 @@ def train_lds(
     optimizer = torch.optim.Adam(f_theta.parameters(), lr=lr)
 
     lr_scheduler = None
-    if lr_warmup_steps > 0:
+    if lr_warmup_epochs > 0 and train_loader is not None:
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.01, total_iters=lr_warmup_steps,
+            optimizer, start_factor=0.01,
+            total_iters=lr_warmup_epochs * len(train_loader),   # epochs -> optimiser steps
         )
 
     def step(batch, train: bool) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1143,7 +1144,7 @@ def train_lds(
                 else:
                     optimizer.step()
                     # ONLY when a step was actually taken. Advancing the
-                    # schedule on a skipped batch consumes lr_warmup_steps
+                    # schedule on a skipped batch consumes lr_warmup_epochs
                     # without training, and torch warns about it
                     # ("lr_scheduler.step() before optimizer.step()") -- which
                     # is how this surfaced, from the first end-to-end run of
@@ -1568,9 +1569,10 @@ def train_lds(
             #
             # Restarting the warmup is deliberate, not incidental: re-entering
             # gently after a divergence is exactly what is wanted.
-            if lr_warmup_steps > 0:
+            if lr_warmup_epochs > 0 and train_loader is not None:
                 lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-                    optimizer, start_factor=0.01, total_iters=lr_warmup_steps,
+                    optimizer, start_factor=0.01,
+                    total_iters=lr_warmup_epochs * len(train_loader),   # epochs -> optimiser steps
                 )
             _spike_guard.forget_history()
             grad_guard.forget_history()
@@ -1875,7 +1877,7 @@ def main():
     parser.add_argument("--val-ema-decay", type=float, default=0.7)
     parser.add_argument("--ema-warmup-epochs", type=int, default=5)
     parser.add_argument("--early-stopping-patience", type=int, default=None)
-    parser.add_argument("--lr-warmup-steps", type=int, default=20)
+    parser.add_argument("--lr-warmup-epochs", type=int, default=0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--z0-noise-scale", type=float, default=0.0,
                          help="perturb z0 during training only, scaled per-window to that "
@@ -1997,7 +1999,7 @@ def main():
         encode_batch_size=args.encode_batch_size, val_ema_decay=args.val_ema_decay,
         ema_warmup_epochs=args.ema_warmup_epochs,
         early_stopping_patience=args.early_stopping_patience,
-        lr_warmup_steps=args.lr_warmup_steps, grad_clip=args.grad_clip,
+        lr_warmup_epochs=args.lr_warmup_epochs, grad_clip=args.grad_clip,
         z0_noise_scale=args.z0_noise_scale,
         seed=args.seed, checkpoint_path=args.checkpoint, device=args.device,
         resume_from=args.resume_from, log_every_epoch=not args.quiet,

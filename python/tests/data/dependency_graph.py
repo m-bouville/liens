@@ -28,7 +28,6 @@ dict_key_imports_values = {
         'training/checkpoint_components.py',
         'training/stats_head.py',
     },
-    'evaluation/_fits.py': set(),
     'evaluation/_latent_eval.py': {
         'models/constants.py',
         'models/latent_dynamics.py',
@@ -37,22 +36,17 @@ dict_key_imports_values = {
         'training/datasets.py',
         'utils/load_datasets.py',
     },
-    'evaluation/_plot_helpers.py': set(),
-    'evaluation/_sweep_filters_common.py': {
-        'utils/load_datasets.py',
-    },
-    'evaluation/_window_parsing.py': set(),
     'evaluation/check_alpha.py': {
-        'evaluation/_fits.py',
         'evaluation/_latent_eval.py',
         'orchestration/paths.py',
+        'utils/fits.py',
         'utils/plots.py',
     },
     'evaluation/check_deriv_temperature.py': {
-        'evaluation/_fits.py',
         'training/checkpoint_components.py',
         'training/datasets.py',
         'training/losses.py',
+        'utils/fits.py',
         'utils/load_datasets.py',
     },
     'evaluation/check_dt_vs_time.py': {
@@ -61,20 +55,20 @@ dict_key_imports_values = {
     },
     'evaluation/check_f_theta.py': {
         'evaluation/_latent_eval.py',
-        'evaluation/_plot_helpers.py',
         'models/latent_dynamics.py',
         'training/datasets.py',
+        'utils/plot_helpers.py',
     },
     'evaluation/check_grad_spikes.py': {
         'evaluation/_latent_eval.py',
     },
     'evaluation/check_interpolation.py': {
         'evaluation/_ae_stats_eval.py',
-        'evaluation/_window_parsing.py',
         'models/constants.py',
         'utils/load_datasets.py',
         'utils/logging_utils.py',
         'utils/naming.py',
+        'utils/window_parsing.py',
     },
     'evaluation/check_latent_channels.py': {
         'evaluation/check_rollout.py',
@@ -92,13 +86,13 @@ dict_key_imports_values = {
         'training/dt_bucketing.py',
     },
     'evaluation/check_parameter_dependence.py': {
-        'evaluation/_fits.py',
         'evaluation/_latent_eval.py',
-        'evaluation/_plot_helpers.py',
         'evaluation/check_stdev_phi_time.py',
         'orchestration/paths.py',
         'training/losses.py',
+        'utils/fits.py',
         'utils/load_datasets.py',
+        'utils/plot_helpers.py',
     },
     'evaluation/check_perturbation.py': {
         'evaluation/_ae_stats_eval.py',
@@ -119,7 +113,6 @@ dict_key_imports_values = {
         'utils/naming.py',
     },
     'evaluation/check_rollout.py': {
-        'evaluation/_window_parsing.py',
         'models/constants.py',
         'models/latent_dynamics.py',
         'models/latent_streams.py',
@@ -128,6 +121,7 @@ dict_key_imports_values = {
         'training/losses.py',
         'utils/load_datasets.py',
         'utils/naming.py',
+        'utils/window_parsing.py',
     },
     'evaluation/check_stdev_phi_temperature.py': {
         'training/datasets.py',
@@ -152,7 +146,6 @@ dict_key_imports_values = {
         'utils/load_datasets.py',
     },
     'evaluation/compare_f_theta.py': {
-        'evaluation/_window_parsing.py',
         'evaluation/check_rollout.py',
         'evaluation/lineage.py',
         'models/constants.py',
@@ -166,6 +159,7 @@ dict_key_imports_values = {
         'training/model_assembly.py',
         'utils/load_datasets.py',
         'utils/logging_utils.py',
+        'utils/window_parsing.py',
     },
     'evaluation/compare_integrators.py': {
         'models/constants.py',
@@ -175,12 +169,12 @@ dict_key_imports_values = {
         'training/losses.py',
     },
     'evaluation/compare_rollout_training.py': {
-        'evaluation/_window_parsing.py',
         'models/constants.py',
         'models/encoder.py',
         'models/latent_dynamics.py',
         'training/checkpoint_components.py',
         'utils/load_datasets.py',
+        'utils/window_parsing.py',
     },
     'evaluation/find_windows.py': {
         'training/datasets.py',
@@ -191,15 +185,15 @@ dict_key_imports_values = {
         'orchestration/checkpoint_registry.py',
     },
     'evaluation/sweep_min_passing_steps.py': {
-        'evaluation/_sweep_filters_common.py',
         'training/datasets.py',
+        'utils/sweep_filters_common.py',
     },
     'evaluation/sweep_min_std_deriv.py': {
         'training/datasets.py',
     },
     'evaluation/sweep_min_stdev_phi.py': {
-        'evaluation/_sweep_filters_common.py',
         'training/datasets.py',
+        'utils/sweep_filters_common.py',
     },
     'main.py': {
         'orchestration/paths.py',
@@ -396,23 +390,25 @@ dict_key_imports_values = {
         'utils/naming.py',
         'utils/plots.py',
     },
+    'utils/fits.py': set(),
     'utils/load_datasets.py': set(),
     'utils/logging_utils.py': set(),
     'utils/naming.py': set(),
+    'utils/plot_helpers.py': set(),
     'utils/plots.py': {
+        'utils/fits.py',
         'utils/load_datasets.py',
     },
+    'utils/sweep_filters_common.py': {
+        'utils/load_datasets.py',
+    },
+    'utils/window_parsing.py': set(),
 }
 
 dict_key_imported_by_values = {
     'evaluation/_ae_stats_eval.py': {
         'evaluation/check_interpolation.py',
         'evaluation/check_perturbation.py',
-    },
-    'evaluation/_fits.py': {
-        'evaluation/check_alpha.py',
-        'evaluation/check_deriv_temperature.py',
-        'evaluation/check_parameter_dependence.py',
     },
     'evaluation/_latent_eval.py': {
         'evaluation/check_alpha.py',
@@ -422,20 +418,6 @@ dict_key_imported_by_values = {
         'evaluation/check_memory.py',
         'evaluation/check_parameter_dependence.py',
         'evaluation/check_substep_convergence.py',
-    },
-    'evaluation/_plot_helpers.py': {
-        'evaluation/check_f_theta.py',
-        'evaluation/check_parameter_dependence.py',
-    },
-    'evaluation/_sweep_filters_common.py': {
-        'evaluation/sweep_min_passing_steps.py',
-        'evaluation/sweep_min_stdev_phi.py',
-    },
-    'evaluation/_window_parsing.py': {
-        'evaluation/check_interpolation.py',
-        'evaluation/check_rollout.py',
-        'evaluation/compare_f_theta.py',
-        'evaluation/compare_rollout_training.py',
     },
     'evaluation/check_alpha.py': set(),
     'evaluation/check_deriv_temperature.py': set(),
@@ -728,9 +710,14 @@ dict_key_imported_by_values = {
     'training/train_stage2.py': {
         'orchestration/pipeline.py',
     },
+    'utils/fits.py': {
+        'evaluation/check_alpha.py',
+        'evaluation/check_deriv_temperature.py',
+        'evaluation/check_parameter_dependence.py',
+        'utils/plots.py',
+    },
     'utils/load_datasets.py': {
         'evaluation/_latent_eval.py',
-        'evaluation/_sweep_filters_common.py',
         'evaluation/check_deriv_temperature.py',
         'evaluation/check_interpolation.py',
         'evaluation/check_latent_channels.py',
@@ -750,6 +737,7 @@ dict_key_imported_by_values = {
         'training/datasets.py',
         'training/port_checkpoint.py',
         'utils/plots.py',
+        'utils/sweep_filters_common.py',
     },
     'utils/logging_utils.py': {
         'evaluation/check_interpolation.py',
@@ -770,6 +758,10 @@ dict_key_imported_by_values = {
         'training/train_stage1.py',
         'training/train_stage2.py',
     },
+    'utils/plot_helpers.py': {
+        'evaluation/check_f_theta.py',
+        'evaluation/check_parameter_dependence.py',
+    },
     'utils/plots.py': {
         'evaluation/check_alpha.py',
         'evaluation/check_stdev_phi_time.py',
@@ -777,5 +769,15 @@ dict_key_imported_by_values = {
         'training/train_lds.py',
         'training/train_stage1.py',
         'training/train_stage2.py',
+    },
+    'utils/sweep_filters_common.py': {
+        'evaluation/sweep_min_passing_steps.py',
+        'evaluation/sweep_min_stdev_phi.py',
+    },
+    'utils/window_parsing.py': {
+        'evaluation/check_interpolation.py',
+        'evaluation/check_rollout.py',
+        'evaluation/compare_f_theta.py',
+        'evaluation/compare_rollout_training.py',
     },
 }

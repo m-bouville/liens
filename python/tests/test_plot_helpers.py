@@ -1,11 +1,11 @@
-"""Tests for evaluation/_plot_helpers.py -- the shared home of helpers that
+"""Tests for utils/plot_helpers.py -- the shared home of helpers that
 had drifted into diverged per-file copies (see the module docstring)."""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from evaluation._plot_helpers import fmt_corr, log_scale_if_positive
+from utils.plot_helpers import fmt_corr, log_scale_if_positive
 
 
 def test_explicit_arrays_mode_applies_log_when_positive():

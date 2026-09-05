@@ -40,7 +40,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from evaluation._fits import robust_polynomial_fit
+from utils.fits import robust_polynomial_fit
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import centered_deriv_target

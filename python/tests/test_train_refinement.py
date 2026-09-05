@@ -683,3 +683,25 @@ def test_grad_predict_threads_through_and_shares_the_recon_predict_warmup(tmp_pa
     saved = torch.load(ckpt, map_location="cpu", weights_only=True)
     cfg = saved["stage45_config"]
     assert cfg["grad_predict_weight"] == 0.5 and cfg["grad_predict_scale"] == 0.02
+
+
+def test_component_histories_covers_every_objective_term_including_grad_predict():
+    """REGRESSION: grad_predict was added to the contribution set (_components,
+    weighted_contributions) but NOT to component_histories' init tuple, so it was
+    computed every epoch and silently dropped from the loss-components scatter --
+    the figure was missing the gradient term. The two lists must stay in sync:
+    every term that gets a weighted contribution must also get a history to plot."""
+    import inspect
+    from training import train_refinement as tr
+    src = inspect.getsource(tr.train_refinement)
+    # the component_histories init tuple and the _components tuple must both list
+    # all five terms, grad_predict included.
+    for term in ("rollout", "recon0", "stats0", "recon_predict", "grad_predict"):
+        assert f'"{term}"' in src, term
+    # specifically: grad_predict is in the component_histories init (not just the
+    # contribution computation), so it reaches the scatter.
+    _hist_init = src[src.index("component_histories: dict"):
+                     src.index("component_best_tracker")]
+    assert '"grad_predict"' in _hist_init, (
+        "grad_predict is missing from component_histories -- it will be computed "
+        "but not plotted in the components scatter")

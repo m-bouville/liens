@@ -33,7 +33,7 @@ import torch
 
 from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates, N_THETA
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
-from evaluation._window_parsing import parse_fixed_window
+from utils.window_parsing import parse_fixed_window
 from training.checkpoint_components import build_ae_from_checkpoint
 from utils import load_datasets as load
 

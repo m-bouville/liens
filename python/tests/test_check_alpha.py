@@ -876,7 +876,7 @@ def test_a_break_is_only_reported_when_it_earns_its_parameters():
     with a dotted line and a number, gets believed -- so the threshold matters
     more than the fit.
     """
-    from evaluation._fits import fit_broken_power_law
+    from utils.fits import fit_broken_power_law
     rng = np.random.default_rng(0)
     x = np.logspace(2, 4, 400)
 
@@ -971,7 +971,7 @@ def test_a_regime_covering_a_sliver_of_the_range_is_refused():
     would have believed. A regime covering under a sixth of the range is a
     tail artefact whatever it does to the SSE.
     """
-    from evaluation._fits import fit_broken_power_law
+    from utils.fits import fit_broken_power_law
     rng = np.random.default_rng(3)
     x = np.logspace(2, 4, 1800)
     y = x ** -0.3 * np.exp(rng.normal(0, 0.05, x.size))
@@ -998,7 +998,7 @@ def test_a_regime_covering_a_sliver_of_the_range_is_refused():
 def test_the_broken_fit_refuses_a_knee_at_the_very_edge():
     """min_side keeps at least a few points on each side, so a 'regime change'
     cannot be fitted to two outliers at one end."""
-    from evaluation._fits import fit_broken_power_law
+    from utils.fits import fit_broken_power_law
     x = np.logspace(2, 4, 200)
     y = x ** -0.3
     # A few wild points at the very end. Unguarded, the best two-segment fit

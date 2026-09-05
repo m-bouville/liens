@@ -1,6 +1,6 @@
 """
 Tests for evaluation/check_deriv_temperature.py -- specifically, that it
-shares evaluation._fits.robust_polynomial_fit rather than carrying its
+shares utils.fits.robust_polynomial_fit rather than carrying its
 own copy (as it used to). See _fits.py's own module docstring for why
 that duplication was a real problem, not just untidy: the two copies
 were used to fit the SAME underlying quantity (eps/eps') against
@@ -19,14 +19,14 @@ from test_compare_rollout_training import (
 from test_train_stage2_l_deriv import _build_sweep
 
 import evaluation.check_deriv_temperature as cdt
-from evaluation._fits import robust_polynomial_fit
+from utils.fits import robust_polynomial_fit
 from evaluation.check_deriv_temperature import check_deriv_temperature
 
 
 def test_shares_fits_module_rather_than_redefining_it():
     """
     REGRESSION: check_deriv_temperature.py must import
-    robust_polynomial_fit from evaluation._fits, not define its own
+    robust_polynomial_fit from utils.fits, not define its own
     module-level copy again. `is`, not just numeric equality -- the
     whole point is ONE implementation, not two that happen to agree
     right now and can silently drift apart later (exactly how this

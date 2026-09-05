@@ -49,7 +49,7 @@ import matplotlib.pyplot as plt
 import math
 import numpy as np
 
-from evaluation._plot_helpers import log_scale_if_positive as _shared_log_scale
+from utils.plot_helpers import log_scale_if_positive as _shared_log_scale
 import torch
 
 from training.losses import centered_deriv_target
@@ -93,7 +93,7 @@ def max_autocorr_dist(nx: int, ny: int) -> int:
     return min(nx * 2 // 3, ny * 2 // 3)
 
 
-from evaluation._fits import (
+from utils.fits import (
     fit_exponential, fit_power_law, fit_saturating_exponential,
     fit_taylor_residual_coefficients,
 )

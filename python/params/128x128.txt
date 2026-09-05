@@ -123,6 +123,7 @@ use_dt_decade_weights = False  # incompatible with `deriv_linear`
 
 epochs 		  	= 6000	# improvements are barely noticeable after that
 patience 	  	=  500
+lr_warmup_epochs=  500
 
 num_workers	  	=    4 	# was 4, then 0
 batches		  	= 4096
@@ -149,8 +150,8 @@ ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 #   latent dynamics surrogate (rollout)
 #############################################################
 
-n_rollout_steps= 6			# always > 1 for 3b
-z1_resync      = False		# always False for 3b
+n_rollout_steps	= 6			# always > 1 for 3b
+z1_resync      	= False		# always False for 3b
 
 bucket_batches 	= True		# default: True
 batch_cost_budget = 2000000000     # ~2.8 GiB, i.e. 5.5 GiB / 1.9
@@ -160,19 +161,20 @@ bucket_refresh_epochs=0
 
 memory_cost_a_bytes= 120787
 memory_cost_b_bytes= 18469
-memory_cost_p      = 0.79
+memory_cost_p	= 0.79
 
-rollout_scale  = 0.3e-6	# 0.05e-6 * n_rollout_steps; was 1e-6, then 0.25e-6
-ae_stats_weight= same
-one_step_weight= 0.5 		# was 0.5
+rollout_scale  	= 0.3e-6	# 0.05e-6 * n_rollout_steps; was 1e-6, then 0.25e-6
+ae_stats_weight	= same
+one_step_weight	= 0.5 		# was 0.5
 
-use_dt_decade_weights = False 	# incompatible with `deriv_linear`
+use_dt_decade_weights= False 	# incompatible with `deriv_linear`
 
-epochs 		  = 6000
-patience 	  =  500
+epochs 		  	= 6000
+patience 	  	=  500
+lr_warmup_epochs=  500
 
-num_workers	  =    4
-batches		  = 4096
+num_workers	  	=    4
+batches		  	= 4096
 spike_skip_factor= same
 # grad_spike_factor = 0        # disable the gradient guard; grad_clip does the bounding
 grad_clip		= 1.		# was 1.
@@ -181,16 +183,15 @@ dynamics_mode=deriv_linear
 time_coordinate = log10_t
 derivative_source= previous_quotient   # NEW: the q-scheme (autonomous q-rollout)
 derivative_time	= initial	# NEW
-alpha            = None                # UNSET: deriv_linear forbids sub-stepping
-n_substeps       = 1                    # full-step
+alpha        	= None                # UNSET: deriv_linear forbids sub-stepping
+n_substeps    	= 1                    # full-step
 
-lr 			  =   1.e-3  	# was 0.5e-3; default: 1.e-3
-lr_warmup_steps= 20			# default: 20
+lr 			  	=   1.e-3  	# was 0.5e-3; default: 1.e-3
 
-z0_noise_scale= same
+z0_noise_scale	= same
 
-dt_cap		  = same		# must be
-max_dt        = inf 		# possible with `deriv_linear`
+dt_cap		  	= same		# must be
+max_dt        	= inf 		# possible with `deriv_linear`
 
 
 # force 	      = True
@@ -201,7 +202,7 @@ ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 
 
 # Stage 4
-#   encoder refinement
+#   encoder-LDS refinement
 #############################################################
 
 n_rollout_steps = 8
@@ -211,21 +212,24 @@ rollout_weight	= 1.0       # primary term for stage 4 (default: 1.)
 recon0_weight	= 0.2  		# was 0.5       # small but > 0 anchor
 stats0_weight   = 0.05		# same ratio as stages 1 & 2: L_stats0 = L_recon0/4
 recon_predict_weight=0.2
-grad_predict_weight= 0.05 	# was implicitly 0
+grad_predict_weight= 0.2 	# was implicitly 0
 
 # loss scales
-rollout_scale   =  0.25 	# was 0.2, then 1.e5
-recon0_scale    =  0.04e-3 	# was 0.15e-3, then 0.07e-3
-stats0_scale    =  0.15 	# 0.03
-recon_predict_scale=0.05
-grad_predict_scale=0.01		# RANDOM GUESS
+rollout_scale   =   0.15 	# was 0.25
+recon0_scale    =   2.0e-3 	# was 0.04e-3 
+stats0_scale    =   0.15 
+recon_predict_scale=20.e-3	# was 0.05,  then 2.e-3
+grad_predict_scale=	 5.e-3	# was 0.001, then 0.5e-3
 
 val_ema_decay   =   0.8		# was 0.7 (default)
 
 lr 			  	=   0.2e-6  # default: 1.e-3
 
-epochs 		  	=  40
+epochs 		  	=  50
 patience 	  	=   8
+
+# warmups
+lr_warmup_epochs	=  10
 rollout_weight_warmup_epochs      = 10	# 10 w/o `resume_from`
 recon_predict_weight_warmup_epochs= 10
 
@@ -235,7 +239,7 @@ max_dt        	= inf
 
 # force 	      	= True
 ae_checkpoint_path=checkpoints/stage2/128x128-stage2-20260827_02h22.pt
-# resume_from 	=  checkpoints/stage4/128x128-stage4-20260901_18h25.pt
+# resume_from 	=  checkpoints/stage4/128x128-stage4-20260904_23h45.pt
 
 
 
@@ -246,28 +250,28 @@ ae_checkpoint_path=checkpoints/stage2/128x128-stage2-20260827_02h22.pt
 n_rollout_steps = 10
 
 # loss weights
-recon_predict_weight=1		# primary
-grad_predict_weight= 0.25 	# was implicitly 0
+recon_predict_weight=1.		# primary
+grad_predict_weight= 1. 	# was implicitly 0.; same ratio as stage4: L_grad_predict = L_recon_predict
 rollout_weight 	= 0.2        
 recon0_weight   = 0.2
 stats0_weight   = 0.05		# same ratio as stages 1 & 2: L_stats0 = L_recon0/4
 
 # loss scales
-recon_predict_scale	= 0.005
-grad_predict_scale=0.01		# RANDOM GUESS
+recon_predict_scale	= 2.0e-3 # was 3.5e-3
+grad_predict_scale=0.5e-3 	# was 1.0e-3
 rollout_scale   = 0.15 		# was 0.005
-recon0_scale    = 0.5e-3 	# was 0.1e-3, then 0.04e-3
+recon0_scale    = 2.0e-3 	# was 0.5e-3
 stats0_scale    = 0.15		# was 0.003
 
-lr 			  	=   2.e-6  	# COULD BE 4.e-6 (then make `recon_predict_weight_warmup_epochs=8`); was 5.e-6; default: 1.e-3
+lr 			  	=   6.e-6  	# COULD BE 10.e-6; was 5.e-6; default: 1.e-3
 
-epochs         	=  50
+epochs         	=  60
 patience       	=  10
-recon_predict_weight_warmup_epochs= 3
+recon_predict_weight_warmup_epochs= 8
 
 batches        	=  32		# model is larger than in stage 4 (D not longer frozen)
 
 max_dt         	= same
 
 force 	       	= True
-resume_from = checkpoints/stage5/128x128-stage5-20260902_18h03.pt
+# resume_from = checkpoints/stage5/128x128-stage5-20260904_07h20.pt

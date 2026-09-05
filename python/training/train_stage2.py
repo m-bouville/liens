@@ -724,6 +724,8 @@ def train_stage2(
     # "override just the one path you care about" pattern already used
     # elsewhere in this project (see _latent_eval.py's own
     # dz0dt_output_path/dt_dependence_output_path).
+    loss_scales_path = loss_curve_path.with_name(
+        loss_curve_path.stem + "-scales" + loss_curve_path.suffix)
     loss_components_path = loss_curve_path.with_name(
         loss_curve_path.stem + "-components" + loss_curve_path.suffix)
 
@@ -731,6 +733,7 @@ def train_stage2(
     loss_curve_events: list[tuple[float, str]] = []
     loss_curve_levels: list[tuple[float, str]] = []
     train_loss_history: list[float] = []
+    scale_ratio_history: dict[str, list[float]] = {}   # per component: VAL raw / scale, vs epoch
     train_full_weight_history: list[float] = []   # train recomputed at FULL weights (dotted overlay)
     val_loss_history: list[float] = []
     best_so_far_history: list[float] = []
@@ -1713,6 +1716,11 @@ def train_stage2(
             _tw, _vw, _s, _tv, _vv = term_values[_lbl]
             _corrected_train += _vw * _tv / _s
         train_full_weight_history.append(_corrected_train)
+        # L_XX / XX_scale (val): recon0 = val_recon/recon0_scale; each active term = vv/s
+        scale_ratio_history.setdefault("recon0", []).append(val_recon / recon0_scale)
+        for _, _rlbl, _ in active_terms:
+            _rtw, _rvw, _rs, _rtv, _rvv = term_values[_rlbl]
+            scale_ratio_history.setdefault(_rlbl, []).append(_rvv / _rs)
         for name in current_train_components:
             component_histories[name]["train"].append(current_train_components[name])
             component_histories[name]["val"].append(current_val_components[name])
@@ -1724,6 +1732,7 @@ def train_stage2(
             epoch_history=epoch_history, train_loss_history=train_loss_history,
             val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
             train_full_weight=train_full_weight_history,
+            scale_ratios=scale_ratio_history, scales_path=loss_scales_path,
             loss_curve_path=loss_curve_path, title="Stage 2",
             event_epochs=loss_curve_events, reference_levels=loss_curve_levels,
             extra=_stage2_component_scatter)
@@ -1925,6 +1934,7 @@ def train_stage2(
         epoch_history=epoch_history, train_loss_history=train_loss_history,
         val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
         train_full_weight=train_full_weight_history,
+        scale_ratios=scale_ratio_history, scales_path=loss_scales_path,
         loss_curve_path=loss_curve_path, title="Stage 2",
         event_epochs=loss_curve_events, reference_levels=loss_curve_levels,
         extra=_stage2_component_scatter)
