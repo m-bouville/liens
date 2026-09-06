@@ -494,7 +494,9 @@ def rollout_vs_1step_scatter(l_1step_val, l_rollout_val, output_path, title="",
     ax2.set_xlabel("epoch")
     ax2.set_ylabel("L_rollout / L_1step")
     ax2.set_title("rollout/1step ratio over training")
-    ax2.set_ylim(bottom=0)
+    ax2.set_xscale("log")   # epoch: log (matches panel 1's log axes)
+    ax2.set_yscale("log")   # ratio: log -- spans <1 to >n_rollout_steps; the 1.0
+                            # and n_rollout_steps reference lines stay positive.
     ax2.legend(fontsize=8, loc="lower right")
     fig.tight_layout()
     _save_figure(fig, output_path)
@@ -539,12 +541,20 @@ def loss_scale_curve(
     # explicit paired colours; anything unlisted falls back to the default cycle
     _COLORS = {"rollout": "tab:green",
                "recon0": "tab:red", "stats0": "tab:orange",
-               "recon_predict": "tab:blue", "grad_predict": "tab:purple"}
+               "recon_predict": "tab:blue", "grad_predict": "tab:purple",
+               "stats0_predict": "tab:blue", "z0_growth": "tab:brown"}
     fig, ax = plt.subplots(figsize=(8, 5))
+    _fallback = 0
     for name, ratios in scale_ratios.items():
         if not any(r is not None and r > 0 for r in ratios):
             continue
+        # Resolve to a CONCRETE colour: color=None makes matplotlib pick the next
+        # cycle colour SEPARATELY for the fit line and the dots -> they mismatch.
+        # A stable per-name fallback keeps a component's line and dots the same.
         color = _COLORS.get(name)
+        if color is None:
+            color = f"C{_fallback % 10}"
+            _fallback += 1
         xs = np.asarray(epochs[:len(ratios)], dtype=float)
         ys = np.asarray(ratios, dtype=float)
         ok = np.isfinite(ys) & (ys > 0) & (xs > 0)

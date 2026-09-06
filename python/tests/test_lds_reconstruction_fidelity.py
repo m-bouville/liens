@@ -34,6 +34,7 @@ _SITES = [
     "training/model_assembly.py",
     "evaluation/compare_rollout_training.py",
     "evaluation/compare_f_theta.py",
+    "evaluation/check_stats_head_rollout.py",   # rolls out f_theta for the stats-head diagnostic
 ]
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 # Parameters that alter what the loaded weights MEAN or how they are applied.

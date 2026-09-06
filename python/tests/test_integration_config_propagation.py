@@ -41,6 +41,7 @@ _REBUILD_SITES = [
     "evaluation/compare_rollout_training.py",
     "evaluation/compare_integrators.py",
     "evaluation/compare_f_theta.py",
+    "evaluation/check_stats_head_rollout.py",   # rolls out f_theta for the stats-head diagnostic
 ]
 
 

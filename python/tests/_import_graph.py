@@ -264,7 +264,9 @@ def _load_stored(out_path: pathlib.Path) -> dict[str, set[str]]:
 if __name__ == "__main__":
     _root = pathlib.Path(__file__).resolve().parent.parent
     _out = _root / "tests" / "data" / "dependency_graph.py"
-    _changed = set(sys.argv[1:])
+    _args = sys.argv[1:]
+    _verbose = "--verbose" in _args or "-v" in _args
+    _changed = set(a for a in _args if not a.startswith("-"))
     if _changed and _out.exists():
         _imports = update_imports(_root, _load_stored(_out), _changed)
         print(f"updated {len(_changed)} module(s): {', '.join(sorted(_changed))}")
@@ -273,4 +275,5 @@ if __name__ == "__main__":
         print(f"regenerated whole snapshot ({len(_imports)} modules)")
     _write(_out, _imports)
     print(f"wrote {_out.relative_to(_root)}")
-    print(_report(_imports))
+    if _verbose:
+        print(_report(_imports))

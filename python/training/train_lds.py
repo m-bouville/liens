@@ -35,6 +35,7 @@ from models.latent_streams import (
 )
 from training._checkpoint_criterion import (
     CheckpointCriterionTracker, save_checkpoint, clamp_grace_epochs, grace_epochs_for_ema,
+    ComponentBestTracker,
 )
 from training.checkpoint_components import cross_check_ancestor_config
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
@@ -148,6 +149,35 @@ def compute_euler_only_losses(
     all_dts = np.concatenate(all_dts_parts)
     all_losses = np.concatenate(all_losses_parts)
     return all_dts, all_losses
+
+
+def _load_frozen_stats_head(ae_checkpoint: dict, ae_config: dict, device: torch.device):
+    """Frozen stats head + its StatsLoss (per-stat normalization) from a stage-1/2
+    AE checkpoint, for stage 3's self-consistent stats0_predict term. Returns
+    (None, None) when the checkpoint has no stats head (AE trained with
+    stats0_weight=0). Reference is stats_head(z_true), NOT statistics.csv --
+    latent-only, and cancels the head's own bias (both sides through one head)."""
+    sh_state = ae_checkpoint.get("stats_head_state")
+    stats_config = ae_checkpoint.get("stats_config")
+    if sh_state is None or not stats_config:
+        return None, None
+    from training.stats_head import StatsHead
+    from training.losses import StatsLoss
+    stat_names = list(stats_config["stat_names"])
+    stream_configs, recon_name = resolve_stream_configs_from_checkpoint_config(ae_config)
+    recon = stream_configs[recon_name]
+    stats_head = StatsHead(latent_channels=recon.channels, stat_names=stat_names,
+                           latent_spatial=recon.spatial_size).to(device)
+    stats_head.load_state_dict(sh_state)
+    stats_head.eval()
+    for _p in stats_head.parameters():
+        _p.requires_grad_(False)
+    mean = torch.as_tensor(stats_config["stats_mean"], dtype=torch.float32, device=device)
+    std = torch.as_tensor(stats_config["stats_std"], dtype=torch.float32, device=device)
+    stats_loss_fn = StatsLoss(mean, std, stat_names).to(device)
+    print(f"Loaded frozen stats head ({len(stat_names)} stats: {', '.join(stat_names)}) "
+          f"for stats0_predict\n")
+    return stats_head, stats_loss_fn
 
 
 def _load_frozen_encoder(
@@ -554,6 +584,10 @@ def train_lds(
     step_weights: list[float] | None = None,
     loss_curve_path: Path | None = None,
     one_step_weight: float = 0.0,
+    stats0_predict_weight: float = 0.0,
+    stats0_predict_scale: float = 1.0,
+    z0_growth_weight: float = 0.0,
+    z0_growth_scale: float = 1.0,
     use_dt_decade_weights: bool = False,
     z0_noise_scale: float = 0.0,
     dt_cap: float = float("inf"), n_substeps: int = 1, alpha: float | None = None,
@@ -764,6 +798,16 @@ def train_lds(
     encoder, ae_checkpoint, ae_config, ae_checkpoint_path = _load_frozen_encoder(
         ae_checkpoint_path, ae_latent_channels, ae_stats_weight, size, condition_on_theta, device,
     )
+    # Frozen stats head for the self-consistent stats0_predict term (None if the
+    # AE was trained without stats). Only built/used when stats0_predict_weight>0.
+    stats_head = stats_loss_fn = None
+    if stats0_predict_weight != 0.0:
+        stats_head, stats_loss_fn = _load_frozen_stats_head(ae_checkpoint, ae_config, device)
+        if stats_head is None:
+            raise ValueError(
+                "stats0_predict_weight > 0 but the ancestor AE checkpoint has no stats "
+                "head (stats_head_state/stats_config missing) -- it was trained without "
+                "stats. Retrain the AE with a stats head, or set stats0_predict_weight=0.")
     if derivative_source == "previous_quotient":
         print("  derivative_source='previous_quotient': the encoder's z1 (deriv) "
               "head is loaded but NOT used as the derivative -- f is fed the "
@@ -794,6 +838,22 @@ def train_lds(
     best_so_far_history: list[float] = []
     train_1step_history: list[float] = []
     val_1step_history: list[float] = []
+    _active_components = ["rollout"]
+    if stats0_predict_weight != 0.0:
+        _active_components.append("stats0_predict")
+    if z0_growth_weight != 0.0:
+        _active_components.append("z0_growth")
+    component_histories = {c: {"train": [], "val": [], "best_so_far": []}
+                           for c in _active_components}
+    scale_ratio_history: dict[str, list[float]] = {c: [] for c in _active_components}
+    _show_components = len(_active_components) > 1   # >1 term -> print the breakdown
+    component_best_tracker = ComponentBestTracker()
+    loss_components_path = loss_curve_path.with_name(
+        loss_curve_path.stem.replace("-loss_curve", "") + "-components.png") \
+        if loss_curve_path is not None else None
+    loss_scales_path = loss_curve_path.with_name(
+        loss_curve_path.stem.replace("-loss_curve", "") + "-scales.png") \
+        if loss_curve_path is not None else None
     # (L_1step, L_rollout, epoch) at each SAVED epoch only -- for the
     # rollout-vs-1step tradeoff scatter (stage 3b).
     saved_1step_hist: list[float] = []
@@ -1078,6 +1138,26 @@ def train_lds(
         # on the same data, not an approximation).
         l_1step = z0_per_step[0]
 
+        # L_z0_growth: keep the STATE-latent norm from exploding (or collapsing)
+        # over the rollout. The real trajectory's per-step |ln(||z0||_{k+1}/||z0||_k)|
+        # is ~0.004 (max ~0.14 over 400 steps); an unstable f_theta hits ln-ratio ~7-9
+        # (x10^3-10^4 per step). L2 of the LOG ratio -> symmetric (x10 as bad as /10,
+        # geometrically) and self-tolerating (gradient vanishes at ratio 1, so the
+        # ~0.004 physical fluctuation is ignored without an explicit epsilon).
+        # Difference-of-logs, NOT log(a/b): ||z0_hat|| overflows to inf on a diverging
+        # rollout, and inf/inf -> nan BEFORE the log; log||z0|| stays finite far longer
+        # (log(1e38)~87), so the loss is still finite while the model is diverging and
+        # its gradient can pull it back, instead of nan-ing and being skipped.
+        # NOTE dodgeable by f_theta->0 (predict no change): needs a correct-direction
+        # partner (L_rollout above already is one, and unforced would apply it here).
+        if z0_growth_weight != 0.0:
+            _zc = torch.cat([z0.unsqueeze(1), z0_hat], dim=1)   # (B, n+1, C,H,W): predecessor + steps
+            _ln = torch.log(_zc.flatten(2).pow(2).mean(dim=2).clamp_min(1e-30).sqrt())  # (B, n+1)
+            _dln = _ln[:, 1:] - _ln[:, :-1]                     # (B, n) per-step log-growth
+            l_z0_growth = (_dln ** 2).mean()
+        else:
+            l_z0_growth = torch.zeros((), device=device, dtype=z0_hat.dtype)
+
         # total is what's actually optimized -- see one_step_weight's
         # docstring. At the default one_step_weight=0.0, total is
         # exactly z0_loss/rollout_scale (l_1step contributes nothing,
@@ -1087,6 +1167,38 @@ def train_lds(
         # aggregations (l_1step is loss restricted to the first step
         # only).
         total = (z0_loss + one_step_weight * l_1step) / rollout_scale
+        total = total + z0_growth_weight * l_z0_growth / z0_growth_scale
+        # All-steps self-consistent: frozen stats head read on the PREDICTED rollout
+        # must match its read on the TRUE rollout at every step (deep supervision for
+        # the deep recurrent f_theta^n; step_weights match L_rollout). Cheap -- the
+        # head is a small MLP, no decode (the cost that makes recon_predict endpoint-only).
+        if stats0_predict_weight != 0.0 and stats_head is not None:
+            _B, _n = z0_hat.shape[:2]
+            _sh_hat = stats_head(z0_hat.reshape(_B * _n, *z0_hat.shape[2:])).reshape(_B, _n, -1)
+            _sh_true = stats_head(z0_true.reshape(_B * _n, *z0_true.shape[2:])).reshape(_B, _n, -1)
+            # BOTH sides are stats_head outputs, which are ALREADY in normalized
+            # space (the head is trained to predict normalized stats). So compare
+            # them DIRECTLY -- do NOT route through StatsLoss._wrapped_diff, which
+            # normalizes its `target` argument again (it expects a RAW target, as in
+            # stage-1 L_stats0). That double-normalization added a constant -mean/std
+            # offset that dominated the difference and made this term FROZEN and
+            # model-independent. Only the angle column needs wrapping (period pi/std
+            # in normalized units), which we apply by hand.
+            _diff = _sh_hat - _sh_true
+            _ai = stats_loss_fn.angle_idx
+            if _ai is not None:
+                _period = torch.pi / stats_loss_fn.std[_ai]
+                _wrapped = ((_diff[..., _ai] + _period / 2) % _period) - _period / 2
+                _diff = _diff.clone()
+                _diff[..., _ai] = _wrapped
+            _per_step = (_diff ** 2).mean(dim=(0, 2))                 # (n_steps,)
+            if step_weights_tensor is not None:                 # match L_rollout's weighting
+                l_stats0_predict = (_per_step * step_weights_tensor).sum() / step_weights_tensor.sum()
+            else:
+                l_stats0_predict = _per_step.mean()                # uniform (step_weights unset)
+            total = total + stats0_predict_weight * l_stats0_predict / stats0_predict_scale
+        else:
+            l_stats0_predict = torch.zeros((), device=device, dtype=total.dtype)
         # l_1step ITSELF must also be scaled before being returned --
         # it's displayed/plotted directly (the "(1step)" figure and the
         # loss_curve.png secondary line), not folded into total, so if
@@ -1168,7 +1280,14 @@ def train_lds(
         # above has already consumed and which would otherwise be kept
         # alive (and keep growing) for the rest of the epoch if left
         # attached.
-        return {"total": total.detach(), "1step": l_1step_scaled.detach()}
+        return {"total": total.detach(), "1step": l_1step_scaled.detach(),
+                "rollout": ((z0_loss + one_step_weight * l_1step) / rollout_scale).detach(),
+                "stats0_predict": (stats0_predict_weight * l_stats0_predict
+                                   / stats0_predict_scale).detach(),
+                "z0_growth": (z0_growth_weight * l_z0_growth / z0_growth_scale).detach(),
+                "rollout_ratio": (z0_loss / rollout_scale).detach(),
+                "stats0_predict_ratio": (l_stats0_predict / stats0_predict_scale).detach(),
+                "z0_growth_ratio": (l_z0_growth / z0_growth_scale).detach()}
 
     # Clamped against how many epoch iterations this run ACTUALLY makes
     # -- see clamp_grace_epochs' own docstring. The loop below is
@@ -1372,6 +1491,14 @@ def train_lds(
         print(f"/{epochs:3d}  train  (1step)   valid  (1step)     ema")
     else:
         print(f"/{epochs:3d}  train    valid      ema")
+    if _show_components:
+        _one = "  (1step)" if show_1step else ""
+        print(f"/{epochs:3d} train = 1*rollout/{rollout_scale}"
+              + (f" +{stats0_predict_weight}*stats0_predict/{stats0_predict_scale}"
+                 if stats0_predict_weight != 0.0 else "")
+              + (f" +{z0_growth_weight}*z0_growth/{z0_growth_scale}"
+                 if z0_growth_weight != 0.0 else "")
+              + f" | valid = ...{_one} | ema")
 
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         # REFRESH the bucketing on a schedule, not every epoch. The estimate
@@ -1611,10 +1738,20 @@ def train_lds(
         if show_1step:
             train_1step_history.append(train_1step)
             val_1step_history.append(val_1step)
+        _cur_val_components = {c: _val_means[c] for c in _active_components}
+        _best_components = component_best_tracker.update(_cur_val_components, saved_this_epoch)
+        for c in _active_components:
+            component_histories[c]["train"].append(
+                _train_means[c] if epoch > 0 else float("nan"))
+            component_histories[c]["val"].append(_cur_val_components[c])
+            component_histories[c]["best_so_far"].append(_best_components[c])
+            scale_ratio_history[c].append(_val_means[c + "_ratio"])
         write_epoch_figures(
             epoch, log_every_epoch,
             epoch_history=epoch_history, train_loss_history=train_loss_history,
             val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+            component_histories=component_histories, loss_components_path=loss_components_path,
+            scale_ratios=scale_ratio_history, scales_path=loss_scales_path,
             loss_curve_path=loss_curve_path, title="Stage 3",
             secondary_train=train_1step_history if show_1step else None,
             secondary_val=val_1step_history if show_1step else None,
@@ -1634,7 +1771,21 @@ def train_lds(
             print(_line)
 
         ema_str = f"{tracker.val_ema:.6f}" if tracker.val_ema is not None else "  (warmup)"
-        if show_1step:
+        # total = rollout + stats0_predict + z0_growth (active only). L_1step stays a
+        # SINGLE parenthetical diagnostic, not summed into total.
+        def _brk(total, means):
+            body = " +".join(f"{means[c]:6.3f}" for c in _active_components)
+            return f"{total:6.3f} ={body}"
+        if _show_components:
+            _tr = _brk(train_loss, {c: (_train_means[c] if epoch > 0 else float("nan"))
+                                    for c in _active_components})
+            _vl = _brk(val_loss, _cur_val_components)
+            if show_1step:
+                msg = (f"{epoch:4d} {_tr} ({train_1step:6.3f}) |"
+                       f" {_vl} ({val_1step:6.3f}) |{ema_str:>9}")
+            else:
+                msg = f"{epoch:4d} {_tr} | {_vl} |{ema_str:>9}"
+        elif show_1step:
             msg = (f"{epoch:4d} {train_loss:7.3f} ({train_1step:6.3f}),"
                    f"{val_loss:7.3f} ({val_1step:6.3f}) |{ema_str:>9}")
         else:
@@ -1787,6 +1938,8 @@ def train_lds(
         epoch, log_every_epoch, force=True,
         epoch_history=epoch_history, train_loss_history=train_loss_history,
         val_loss_history=val_loss_history, best_so_far_history=best_so_far_history,
+        component_histories=component_histories, loss_components_path=loss_components_path,
+        scale_ratios=scale_ratio_history, scales_path=loss_scales_path,
         loss_curve_path=loss_curve_path, title="Stage 3",
         secondary_train=train_1step_history if show_1step else None,
         secondary_val=val_1step_history if show_1step else None,
