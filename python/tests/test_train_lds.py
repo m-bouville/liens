@@ -639,7 +639,9 @@ def _train_3b(tmp_path, base_path, stage2_path, stage3a_path, capsys=None, **ove
         # epochs=8 leaves five post-grace epochs (4-8); the descending EMA saves
         # several of them (observed 4,5,7), so >=1 save is robust across
         # platforms while the "no save during epochs 1-3" assertion is unchanged.
-        epochs=8, batch_size=4, hidden_dim=8, n_hidden_layers=1,
+        epochs=12,   # was 8: five post-grace epochs is still Windows/xdist float-noise-marginal
+        # (nothing cleared the criterion on one parallel run); 12 leaves nine.
+        batch_size=4, hidden_dim=8, n_hidden_layers=1,
         val_fraction=0.34, test_fraction=0.17, num_workers=0,
         n_rollout_steps=2, min_step=0, min_stdev_phi=None,
         encode_batch_size=4, ema_warmup_epochs=0, val_ema_decay=0.7,

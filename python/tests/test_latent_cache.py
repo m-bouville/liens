@@ -22,7 +22,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from test_train_lds import _build_sweep  # noqa: E402
 
 from training.datasets import MicrostructureEvolutionDataset, _truncate_to_max_dt  # noqa: E402
-from training.latent_cache import encoder_fingerprint  # noqa: E402
+from training.latent_cache import encoder_fingerprint, cache_path_for_run  # noqa: E402
 
 
 class _Meta:
@@ -267,3 +267,39 @@ def test_cached_latents_are_on_the_SAME_DEVICE_as_freshly_encoded_ones(sweep, tm
     )
     assert devices == {"cpu"}, devices
     assert {t.device.type for t in full._run_data} == {"cpu"}
+
+
+# ---------------------------------------------------------------------
+# theta is an ENCODER INPUT under condition_on_theta, so the cached latent is
+# E(x, theta) -- theta must be in the per-run key. These pin that: different theta
+# -> different file (so a theta_coordinates change writes new files, invisible to
+# the weights-only fingerprint otherwise), and theta=None -> the pre-theta name
+# (so existing non-theta caches stay readable). Untested before; a silent
+# stale-latent hazard if the key regressed.
+# ---------------------------------------------------------------------
+
+def _cache_args(tmp_path):
+    return dict(cache_root=tmp_path, fingerprint="deadbeef",
+                run_dir=pathlib.Path("T600_n003_s79"), steps=[0, 500, 1000],
+                encode_both_streams=True, size=128)
+
+
+def test_different_theta_gives_a_different_cache_file(tmp_path):
+    a = _cache_args(tmp_path)
+    p1 = cache_path_for_run(**a, theta=[-0.2, -1.609])
+    p2 = cache_path_for_run(**a, theta=[-0.1, -2.303])   # a different temperature
+    assert p1 != p2, "different theta must key to different files (E(x,theta) differs)"
+
+
+def test_same_theta_same_file_and_tuple_list_agree(tmp_path):
+    a = _cache_args(tmp_path)
+    assert cache_path_for_run(**a, theta=[-0.2, -1.609]) == \
+           cache_path_for_run(**a, theta=(-0.2, -1.609)), "tuple/list of same theta must agree"
+
+
+def test_theta_none_matches_the_pre_theta_filename(tmp_path):
+    a = _cache_args(tmp_path)
+    none_path = cache_path_for_run(**a, theta=None)
+    assert "-t" not in none_path.name.rsplit("-", 1)[-1], \
+        "theta=None must produce the un-tagged (pre-theta) filename so old caches stay readable"
+    assert cache_path_for_run(**a, theta=[-0.2, -1.609]) != none_path

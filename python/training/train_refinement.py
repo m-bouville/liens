@@ -775,8 +775,14 @@ def train_refinement(
         # this is the SAME path stage 3 uses from the SAME counters.
         _line = _skip_reporter.report_epoch(
             epoch, _spike_guard, grad_guard, _n_train_batches,
-            dt_label=("du_max" if getattr(f_theta, "time_coordinate", "t") == "log10_t"
-                      else "dt_max"))
+            # The guard is fed the DATASET's dt_window (lines ~510/525). Refinement's
+            # dataset is built in t-mode (only return_frame_t is passed, never
+            # time_coordinate), so that dt_window is PHYSICAL Delta-t even when f_theta
+            # runs in log10_t (it recomputes its own Delta-u from t_window in the loss).
+            # So the label is always dt_max here -- unlike train_lds, whose dataset IS
+            # u-mode and whose guard therefore genuinely sees Delta-u ("du_max"). A log
+            # printing "du_max=2.5e+04" was this mislabel: 2.5e4 is a physical dt.
+            dt_label="dt_max")
         if _line:
             print(_line)
         if _deadlocked and _spike_guard.consecutive_total_skip_epochs >= 5:

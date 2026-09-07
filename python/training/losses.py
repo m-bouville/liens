@@ -242,6 +242,53 @@ class StatsLoss(nn.Module):
         return (diff ** 2).mean(dim=tuple(range(diff.ndim - 1)))
 
 
+def stats0_predict_loss(stats_head, z0_hat, z0_true, stats_loss_fn, step_weights=None):
+    """Self-consistent latent-space stats loss for stage 3 (train_lds): the frozen
+    stats head read on the PREDICTED rollout must match its read on the TRUE rollout,
+    at every step -- ``mean_k ||stats_head(z0_hat_k) - stats_head(z0_true_k)||^2``.
+
+    Both sides are stats_head outputs, which are ALREADY normalized (the head is
+    trained to predict normalized stats), so they are compared DIRECTLY. It must NOT
+    route through StatsLoss._wrapped_diff, which re-normalizes its ``target`` argument
+    (it expects a RAW target, as in stage-1 L_stats0): that double-normalization adds a
+    constant -mean/std offset that dominates the difference and FREEZES the term
+    model-independent. Only the angle column is wrapped (period pi/std in normalized
+    units). ``step_weights`` (per rollout step) weight the pairs like L_rollout; None ->
+    uniform mean.
+    """
+    B, n = z0_hat.shape[:2]
+    sh_hat = stats_head(z0_hat.reshape(B * n, *z0_hat.shape[2:])).reshape(B, n, -1)
+    sh_true = stats_head(z0_true.reshape(B * n, *z0_true.shape[2:])).reshape(B, n, -1)
+    diff = sh_hat - sh_true
+    ai = stats_loss_fn.angle_idx
+    if ai is not None:
+        period = torch.pi / stats_loss_fn.std[ai]
+        wrapped = ((diff[..., ai] + period / 2) % period) - period / 2
+        diff = diff.clone()
+        diff[..., ai] = wrapped
+    per_step = (diff ** 2).mean(dim=(0, 2))
+    if step_weights is not None:
+        return (per_step * step_weights).sum() / step_weights.sum()
+    return per_step.mean()
+
+
+def z0_growth_loss(z0, z0_hat):
+    """Symmetric latent-norm growth penalty for stage 3: keeps the state-latent norm
+    from exploding OR collapsing over the rollout. ``mean_k (ln||z0_{k+1}|| -
+    ln||z0_k||)^2`` over the predecessor ``z0`` prepended to the rollout ``z0_hat``.
+
+    Difference-of-logs, NOT log of a ratio: ||z0_hat|| overflows to inf on a diverging
+    rollout and inf/inf -> nan before the log, whereas log||z0|| stays finite far
+    longer, so the loss (and its restoring gradient) survives the divergence.
+    Geometrically symmetric -- x10 and /10 per step cost the same -- because the real
+    trajectory does neither.
+    """
+    zc = torch.cat([z0.unsqueeze(1), z0_hat], dim=1)
+    ln = torch.log(zc.flatten(2).pow(2).mean(dim=2).clamp_min(1e-30).sqrt())
+    dln = ln[:, 1:] - ln[:, :-1]
+    return (dln ** 2).mean()
+
+
 class OneStepLoss(nn.Module):
     """
     L_1step = || [z(t) + f_theta(z(t), dt)] - z(t+dt) ||_2^2 (docs/neural_nets.md),

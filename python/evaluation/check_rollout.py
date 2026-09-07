@@ -439,6 +439,11 @@ def check_rollout(
             test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
             max_dt=max_dt,
             min_step=min_step, min_stdev_phi=min_stdev_phi,
+            # Match the model's deriv stream: a previous_quotient f_theta is seeded with
+            # the backward quotient q, not the z1 head (the dataset default). The
+            # COORDINATE is handled below (t-mode build, converted to Delta-u/z~1 at
+            # rollout), but the derivative stream must be chosen at construction.
+            derivative_source=getattr(f_theta, "derivative_source", "z1"),
         )
         if len(dataset) == 0:
             raise ValueError(f"No windows found in the checkpoint's {len(test_dirs)} "

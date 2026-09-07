@@ -389,3 +389,15 @@ def test_loss_curve_full_weight_overlay_wrong_length_is_ignored(tmp_path):
     p = loss_curve(ep, train, train, train, tmp_path / "d.png",
                    train_full_weight=[2.0, 1.9])   # wrong length
     assert p.exists()
+
+
+def test_scale_curve_colours_are_all_distinct():
+    """Every loss_scale_curve component colour must be unique -- a duplicate makes
+    two components draw in the same colour on the -scales figure. This exact bug
+    recurred three times (recon_predict==stats0_predict blue; allen_cahn missing ->
+    fallback collided with recon_predict) before the palette was hoisted to module
+    level and pinned here."""
+    palette = plots._SCALE_CURVE_COLORS
+    assert len(set(palette.values())) == len(palette), (
+        "duplicate colour(s) in _SCALE_CURVE_COLORS: "
+        f"{[c for c in palette.values() if list(palette.values()).count(c) > 1]}")

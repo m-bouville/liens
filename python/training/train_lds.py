@@ -39,7 +39,8 @@ from training._checkpoint_criterion import (
 )
 from training.checkpoint_components import cross_check_ancestor_config
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
-from training.losses import RolloutLoss, compute_dt_decade_weights
+from training.losses import (RolloutLoss, compute_dt_decade_weights,
+                             stats0_predict_loss, z0_growth_loss)
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
 from utils.plots import rollout_vs_1step_scatter
 from training._training_loop import accumulate_epoch, write_epoch_figures
@@ -1151,10 +1152,7 @@ def train_lds(
         # NOTE dodgeable by f_theta->0 (predict no change): needs a correct-direction
         # partner (L_rollout above already is one, and unforced would apply it here).
         if z0_growth_weight != 0.0:
-            _zc = torch.cat([z0.unsqueeze(1), z0_hat], dim=1)   # (B, n+1, C,H,W): predecessor + steps
-            _ln = torch.log(_zc.flatten(2).pow(2).mean(dim=2).clamp_min(1e-30).sqrt())  # (B, n+1)
-            _dln = _ln[:, 1:] - _ln[:, :-1]                     # (B, n) per-step log-growth
-            l_z0_growth = (_dln ** 2).mean()
+            l_z0_growth = z0_growth_loss(z0, z0_hat)
         else:
             l_z0_growth = torch.zeros((), device=device, dtype=z0_hat.dtype)
 
@@ -1173,29 +1171,8 @@ def train_lds(
         # the deep recurrent f_theta^n; step_weights match L_rollout). Cheap -- the
         # head is a small MLP, no decode (the cost that makes recon_predict endpoint-only).
         if stats0_predict_weight != 0.0 and stats_head is not None:
-            _B, _n = z0_hat.shape[:2]
-            _sh_hat = stats_head(z0_hat.reshape(_B * _n, *z0_hat.shape[2:])).reshape(_B, _n, -1)
-            _sh_true = stats_head(z0_true.reshape(_B * _n, *z0_true.shape[2:])).reshape(_B, _n, -1)
-            # BOTH sides are stats_head outputs, which are ALREADY in normalized
-            # space (the head is trained to predict normalized stats). So compare
-            # them DIRECTLY -- do NOT route through StatsLoss._wrapped_diff, which
-            # normalizes its `target` argument again (it expects a RAW target, as in
-            # stage-1 L_stats0). That double-normalization added a constant -mean/std
-            # offset that dominated the difference and made this term FROZEN and
-            # model-independent. Only the angle column needs wrapping (period pi/std
-            # in normalized units), which we apply by hand.
-            _diff = _sh_hat - _sh_true
-            _ai = stats_loss_fn.angle_idx
-            if _ai is not None:
-                _period = torch.pi / stats_loss_fn.std[_ai]
-                _wrapped = ((_diff[..., _ai] + _period / 2) % _period) - _period / 2
-                _diff = _diff.clone()
-                _diff[..., _ai] = _wrapped
-            _per_step = (_diff ** 2).mean(dim=(0, 2))                 # (n_steps,)
-            if step_weights_tensor is not None:                 # match L_rollout's weighting
-                l_stats0_predict = (_per_step * step_weights_tensor).sum() / step_weights_tensor.sum()
-            else:
-                l_stats0_predict = _per_step.mean()                # uniform (step_weights unset)
+            l_stats0_predict = stats0_predict_loss(
+                stats_head, z0_hat, z0_true, stats_loss_fn, step_weights_tensor)
             total = total + stats0_predict_weight * l_stats0_predict / stats0_predict_scale
         else:
             l_stats0_predict = torch.zeros((), device=device, dtype=total.dtype)

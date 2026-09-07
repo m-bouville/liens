@@ -8,6 +8,8 @@ Run from python/ (imports rely on that root being on sys.path):
 """
 import torch
 
+from training.losses import StatsLoss, stats0_predict_loss, z0_growth_loss
+
 from training.losses import RolloutLoss
 
 
@@ -352,3 +354,79 @@ def test_dt_decade_weights_clamps_out_of_range_dt_to_nearest_known_decade():
     # 1.0 is decade 0 -- never seen; should clamp to decade 1's own weight (the min known).
     out_of_range_low = weights_fn(torch.tensor([1.0]))
     assert out_of_range_low[0] == pytest.approx(weights_fn.decade_weight[1])
+
+
+# ---------------------------------------------------------------------
+# stats0_predict_loss -- self-consistent latent-space stats loss.
+# REGRESSION: it once routed through StatsLoss._wrapped_diff, which re-normalized
+# its (already-normalized) second argument, adding a constant -mean/std offset that
+# dominated the difference and FROZE the term model-independent. These pin that the
+# term is identity-zero and actually descends as the prediction approaches truth.
+# ---------------------------------------------------------------------
+
+class _IdentityStatsHead(torch.nn.Module):
+    """A stub 'stats head': flattens the latent and takes the first `n_stats` means as
+    the (already-normalized) statistics. Deterministic, differentiable -- enough to
+    exercise the comparison logic without a trained head."""
+    def __init__(self, n_stats=4):
+        super().__init__()
+        self.n_stats = n_stats
+
+    def forward(self, z):                                   # z: (N, C, H, W)
+        flat = z.flatten(1)
+        # n_stats simple linear reductions of the latent -> "normalized" stats
+        return torch.stack([flat[:, i::self.n_stats].mean(dim=1) for i in range(self.n_stats)], dim=1)
+
+
+def _stats_loss(n_stats=4):
+    # mean/std chosen LARGE and off-zero: the old double-normalization bug was worst
+    # exactly when mean/std are big, so this makes a regressed version fail loudly.
+    mean = torch.tensor([5.0, -3.0, 10.0, 2.0][:n_stats])
+    std = torch.tensor([2.0, 0.5, 4.0, 1.5][:n_stats])
+    return StatsLoss(mean, std, stat_names=["avg_phi", "energy", "stdev_phi", "gradient_sqr"][:n_stats])
+
+
+def test_stats0_predict_is_exactly_zero_when_prediction_equals_truth():
+    """The sharp anti-freeze test: identical z_hat and z_true must give EXACTLY 0.
+    The double-normalization bug (_wrapped_diff on two head outputs) returns a
+    constant (-mean/std)^2 offset here instead of 0."""
+    head, sl = _IdentityStatsHead(), _stats_loss()
+    z = torch.randn(2, 3, 4, 4)
+    z_hat = z.unsqueeze(1).repeat(1, 3, 1, 1, 1)            # (B, n, C, H, W)
+    loss = stats0_predict_loss(head, z_hat, z_hat, sl)
+    assert loss.item() == 0.0, "identical prediction and truth must give exactly 0 (not a constant offset)"
+
+
+def test_stats0_predict_descends_as_prediction_approaches_truth():
+    """It must DECREASE as z_hat -> z_true. The frozen (double-normalized) version was
+    model-independent, so this monotone descent would not hold."""
+    head, sl = _IdentityStatsHead(), _stats_loss()
+    z_true = torch.randn(2, 3, 4, 4).unsqueeze(1).repeat(1, 3, 1, 1, 1)
+    noise = torch.randn_like(z_true)
+    losses = [stats0_predict_loss(head, z_true + f * noise, z_true, sl).item()
+              for f in (1.0, 0.5, 0.1, 0.0)]
+    assert losses == sorted(losses, reverse=True), f"must descend toward 0, got {losses}"
+    assert losses[-1] == 0.0
+
+
+# ---------------------------------------------------------------------
+# z0_growth_loss -- symmetric latent-norm growth penalty.
+# ---------------------------------------------------------------------
+
+def test_z0_growth_is_zero_for_a_constant_norm():
+    z0 = torch.ones(2, 3, 4, 4)                             # norm 1
+    z0_hat = torch.ones(2, 3, 3, 4, 4)                      # (B, n, C, H, W), same norm
+    assert z0_growth_loss(z0, z0_hat).item() < 1e-12, "constant norm -> ~0 growth penalty"
+
+
+def test_z0_growth_is_geometrically_symmetric_explode_equals_collapse():
+    """The key property: x10 per step and /10 per step must cost the SAME (the log
+    makes it symmetric). A linear |ratio-1| penalty would score explosion far higher."""
+    C = torch.ones(1, 2, 4, 4)                              # unit-norm predecessor
+    steps = torch.arange(1, 4).float()                     # 1,2,3
+    explode = torch.stack([(10.0 ** k) * torch.ones(1, 2, 4, 4) for k in steps], dim=1)  # x10/step
+    collapse = torch.stack([(10.0 ** -k) * torch.ones(1, 2, 4, 4) for k in steps], dim=1)  # /10/step
+    l_up = z0_growth_loss(C, explode).item()
+    l_dn = z0_growth_loss(C, collapse).item()
+    assert abs(l_up - l_dn) < 1e-6, f"explosion and collapse must cost equally, got {l_up} vs {l_dn}"
+    assert l_up > 0

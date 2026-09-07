@@ -409,3 +409,94 @@ def test_grad_predict_weight_zero_is_an_exact_no_op():
         rollout_weight=1.0, recon0_weight=0.1, grad_predict_weight=0.0,
         return_components=True)
     assert comps["grad_predict"].item() == 0.0
+
+
+# ---------------------------------------------------------------------
+# L_allen_cahn -- the PINN PDE residual (stages 4/5). Added after the term
+# shipped with two bugs no test caught: the cubic f'(phi)=a*phi+b*phi^3 applied
+# to an UNBOUNDED decoder output (train 8e6 vs val 0.02), fixed by the phi_max
+# soft-bound; and a missing consecutive-pair / all_steps distinction. These pin
+# both, plus the no-op and the t_window requirement.
+# ---------------------------------------------------------------------
+
+def _t_window(batch_size=2, n_rollout_steps=2):
+    # physical, strictly increasing so every dt_phys = t[k+1]-t[k] > 0
+    import torch as _t
+    return _t.cumsum(_t.ones(batch_size, n_rollout_steps + 1) * 25.0, dim=1)
+
+
+def test_allen_cahn_weight_zero_is_an_exact_no_op():
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    t_window = _t_window(n_rollout_steps=2)
+    _, comps = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=1.0, recon0_weight=0.1, allen_cahn_weight=0.0,
+        t_window=t_window, return_components=True)
+    assert comps["allen_cahn"].item() == 0.0, "weight 0 must leave the term an exact 0"
+
+
+def test_allen_cahn_requires_t_window():
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    with pytest.raises(ValueError, match="t_window"):
+        compute_stage45_loss(
+            ae, f_theta, stats_head, x_window, dt_window, theta,
+            allen_cahn_weight=1.0, t_window=None)
+
+
+def test_allen_cahn_is_a_finite_positive_scalar():
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=3)
+    _, comps = compute_stage45_loss(
+        ae, f_theta, stats_head, x_window, dt_window, theta,
+        rollout_weight=0.0, recon0_weight=0.0, stats0_weight=0.0,
+        allen_cahn_weight=1.0, allen_cahn_scale=1.0,
+        t_window=_t_window(n_rollout_steps=3), return_components=True)
+    ac = comps["allen_cahn"]
+    assert ac.ndim == 0 and torch.isfinite(ac) and ac.item() > 0
+
+
+def test_allen_cahn_phi_max_bounds_the_cubic_regression():
+    """THE regression test for the 59,000x cubic explosion: the residual is graded
+    on phi_max*tanh(phi/phi_max), so phi_max MUST change the value (it is applied)
+    and MUST keep it finite even when the decoded field is large. A build that
+    dropped the bound would make phi_max inert -> the two calls equal -> this fails.
+    """
+    ae, f_theta, stats_head = _make_models()
+    x_window, dt_window, theta = _make_batch(n_rollout_steps=2)
+    t_window = _t_window(n_rollout_steps=2)
+
+    def _ac(phi_max):
+        _, c = compute_stage45_loss(
+            ae, f_theta, stats_head, x_window, dt_window, theta,
+            allen_cahn_weight=1.0, allen_cahn_scale=1.0, allen_cahn_phi_max=phi_max,
+            t_window=t_window, return_components=True)
+        return c["allen_cahn"]
+
+    tight, loose = _ac(0.05), _ac(50.0)
+    assert torch.isfinite(tight) and torch.isfinite(loose)
+    # a tight bound saturates the field toward +-0.05 -> tiny cubic/Laplacian ->
+    # strictly smaller residual than a near-unbounded one. Equality would mean the
+    # bound is not applied (the pre-fix cubic-on-raw-output bug).
+    assert tight.item() < loose.item(), "allen_cahn_phi_max is not being applied"
+
+
+def test_allen_cahn_all_steps_equals_last_pair_only_at_one_step():
+    """all_steps=True grades every consecutive decoded pair; False grades only the
+    last pair. With n_rollout_steps=1 there is exactly ONE pair, so the two must
+    agree; with n>1 they must (in general) differ -- which pins that all_steps
+    actually selects the frame set rather than being ignored."""
+    ae, f_theta, stats_head = _make_models()
+
+    def _ac(n, all_steps):
+        x_window, dt_window, theta = _make_batch(n_rollout_steps=n)
+        _, c = compute_stage45_loss(
+            ae, f_theta, stats_head, x_window, dt_window, theta,
+            allen_cahn_weight=1.0, allen_cahn_scale=1.0, allen_cahn_all_steps=all_steps,
+            t_window=_t_window(n_rollout_steps=n), return_components=True)
+        return c["allen_cahn"]
+
+    assert torch.allclose(_ac(1, True), _ac(1, False)), "one pair -> all_steps is a no-op"
+    assert not torch.allclose(_ac(3, True), _ac(3, False)), \
+        "n>1 -> all-pairs and last-pair must differ (all_steps must select frames)"

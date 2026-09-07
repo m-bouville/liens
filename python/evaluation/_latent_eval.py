@@ -297,6 +297,10 @@ def _load_ae_f_theta_and_dataset(
         # ~dt/Delta-u while euler-only (z1*dt == z̃1*Delta-u to leading order)
         # stays correct -- the spurious orange blow-up in dt_dependence.
         time_coordinate=lds_config.get("time_coordinate", "t"),
+        # derivative_source must ALSO match training: a previous_quotient model is
+        # seeded with the backward quotient q (mid-run windows), not the z1 head.
+        # Omitting it (dataset default "z1") mis-seeds every first step quietly.
+        derivative_source=lds_config.get("derivative_source", "z1"),
         # The diagnostics re-encoded their whole population on every run while
         # the trainers had been caching since the feature landed. Nothing about
         # the cache is training-specific: the key is the ENCODER's own

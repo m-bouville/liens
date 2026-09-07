@@ -503,6 +503,19 @@ def rollout_vs_1step_scatter(l_1step_val, l_rollout_val, output_path, title="",
     return output_path
 
 
+# Per-component colours for loss_scale_curve. Module-level (not buried in the
+# function) so it is testable: every VALUE must be distinct, or two components draw
+# in the same colour -- a bug that recurred three times before this was pinned. A
+# name not listed falls back to a stable default-cycle colour.
+_SCALE_CURVE_COLORS = {
+    "rollout": "tab:green",
+    "recon0": "tab:red", "stats0": "tab:orange",
+    "recon_predict": "tab:blue", "grad_predict": "tab:purple",
+    "allen_cahn": "tab:cyan",
+    "stats0_predict": "tab:pink", "z0_growth": "tab:brown",
+}
+
+
 def loss_scale_curve(
     epochs: list[int],
     scale_ratios: dict[str, list[float]],
@@ -538,12 +551,6 @@ def loss_scale_curve(
             any(r is not None and r > 0 for r in ratios)
             for ratios in scale_ratios.values()):
         return output_path
-    # explicit paired colours; anything unlisted falls back to the default cycle
-    _COLORS = {"rollout": "tab:green",
-               "recon0": "tab:red", "stats0": "tab:orange",
-               "recon_predict": "tab:blue", "grad_predict": "tab:purple",
-               "allen_cahn": "tab:cyan",
-               "stats0_predict": "tab:pink", "z0_growth": "tab:brown"}
     fig, ax = plt.subplots(figsize=(8, 5))
     _fallback = 0
     for name, ratios in scale_ratios.items():
@@ -552,7 +559,7 @@ def loss_scale_curve(
         # Resolve to a CONCRETE colour: color=None makes matplotlib pick the next
         # cycle colour SEPARATELY for the fit line and the dots -> they mismatch.
         # A stable per-name fallback keeps a component's line and dots the same.
-        color = _COLORS.get(name)
+        color = _SCALE_CURVE_COLORS.get(name)
         if color is None:
             color = f"C{_fallback % 10}"
             _fallback += 1
