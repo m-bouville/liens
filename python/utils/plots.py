@@ -542,7 +542,8 @@ def loss_scale_curve(
     _COLORS = {"rollout": "tab:green",
                "recon0": "tab:red", "stats0": "tab:orange",
                "recon_predict": "tab:blue", "grad_predict": "tab:purple",
-               "stats0_predict": "tab:blue", "z0_growth": "tab:brown"}
+               "allen_cahn": "tab:cyan",
+               "stats0_predict": "tab:pink", "z0_growth": "tab:brown"}
     fig, ax = plt.subplots(figsize=(8, 5))
     _fallback = 0
     for name, ratios in scale_ratios.items():
@@ -559,31 +560,65 @@ def loss_scale_curve(
         ys = np.asarray(ratios, dtype=float)
         ok = np.isfinite(ys) & (ys > 0) & (xs > 0)
         label = name
-        # Fit TWO models and show whichever describes the term better:
-        #   power law  amp * x^exp   (a straight line on these log-log axes)
-        #   constant   c             (a flat line = the term has settled)
-        # via the project's fit_power_law (returns exponent `a`, log-intercept
-        # `b` so amp = exp(b), and r2_log). A constant fit is the mean, whose
-        # log-space R^2 is 0 by construction, so "pick the higher R^2" means the
-        # power law wins iff its R^2 > 0 -- UNLESS its exponent is POSITIVE, in
-        # which case it is excluded (a ratio that GROWS is not converging via
-        # power-law decay; the constant is the honest description). The amplitude
-        # is shown, not just the exponent: 'x^-0.6' alone hides the level.
+        # Fit FOUR candidate models and show whichever describes the term best:
+        #   power  amp*x^a        linear  m*x + c
+        #   exp    A*e^(k x)      constant c   (the settled/flat baseline)
+        # Keep only the DECREASING trend fits (a<0 / m<0 / k<0) -- a ratio that
+        # grows or is flat is not converging, so those trend fits are discarded;
+        # the constant is always kept as the flat baseline. Among the survivors,
+        # pick the highest R^2. R^2 is computed in LOG space for all four (the axes
+        # are log-log and the ratio spans decades, so relative error is what
+        # matters, and this makes the four forms comparable). The winning form and
+        # its R^2 go in the legend; the constant shows just c (its log-R^2 is ~0).
         if ok.sum() >= 3:
             try:
                 from utils.fits import fit_power_law
-                a, b, r2_pl, _sse, _pred = fit_power_law(xs[ok], ys[ok])
+                x_ok, y_ok = xs[ok], ys[ok]
+                ly = np.log(y_ok)
+                ss_tot = float(np.sum((ly - ly.mean()) ** 2))
+
+                def _r2_log(yhat):
+                    lyh = np.log(np.clip(yhat, 1e-300, None))
+                    return (1.0 - float(np.sum((ly - lyh) ** 2)) / ss_tot
+                            if ss_tot > 0 else 0.0)
+
+                cands = []   # (r2_log, curve_fn(xf), legend_suffix)
+                # Constant FIRST so it wins ties: on flat data every fit scores
+                # R^2=0 (zero log-variance), and a spurious ~1e-17 linear slope would
+                # otherwise count as "decreasing" and displace the honest c=. max()
+                # returns the first argmax, so listing const first = const wins ties.
+                c0 = float(np.exp(ly.mean()))                          # constant (flat baseline)
+                cands.append((_r2_log(np.full_like(y_ok, c0)),
+                              lambda xf, c0=c0: np.full_like(xf, c0), f"c={c0:.2g}"))
+                a, b, _r2pl, _sse, _pred = fit_power_law(x_ok, y_ok)   # power: amp*x^a
                 amp = float(np.exp(b))
-                xf = np.array([xs[ok].min(), xs[ok].max()])
-                if a <= 0 and r2_pl > 0:                       # power law wins
-                    ax.plot(xf, amp * xf ** a, color=color, linestyle="--",
-                            linewidth=1.0, alpha=0.6)
-                    label = f"{name}  {amp:.2g}\u00b7x^{a:.2f} (R\u00b2={r2_pl:.2f})"
-                else:                                          # constant describes it
-                    c = float(np.exp(np.mean(np.log(ys[ok]))))  # log-space best constant
-                    ax.plot(xf, [c, c], color=color, linestyle="--",
-                            linewidth=1.0, alpha=0.6)
-                    label = f"{name}  c={c:.2g}"
+                if a < 0:
+                    cands.append((_r2_log(amp * x_ok ** a),
+                                  lambda xf, amp=amp, a=a: amp * xf ** a,
+                                  f"{amp:.2g}\u00b7x^{a:.2f}"))
+                m, c_lin = np.polyfit(x_ok, y_ok, 1)                   # linear: m*x+c
+                if m < 0:
+                    cands.append((_r2_log(m * x_ok + c_lin),
+                                  lambda xf, m=m, c=c_lin: m * xf + c,
+                                  f"{m:.2g}\u00b7x+{c_lin:.2g}"))
+                k, la = np.polyfit(x_ok, ly, 1)                        # exp: A*e^(k x)
+                A = float(np.exp(la))
+                if k < 0:
+                    cands.append((_r2_log(A * np.exp(k * x_ok)),
+                                  lambda xf, A=A, k=k: A * np.exp(k * xf),
+                                  f"{A:.2g}\u00b7e^{k:.2g}x"))
+
+                r2_best, curve_fn, suffix = max(cands, key=lambda t: t[0])
+                # A trend fit with R^2 < 0.4 barely beats a flat line -- showing it as
+                # "amp*x^-0.1 (R^2=0.12)" over-reads noise. Below that bar, fall back to
+                # the constant (which is always cands[0]) and label it plainly as c=.
+                if r2_best < 0.4 and not suffix.startswith("c="):
+                    r2_best, curve_fn, suffix = cands[0]
+                xf = np.geomspace(x_ok.min(), x_ok.max(), 50)
+                ax.plot(xf, curve_fn(xf), color=color, linestyle="--",
+                        linewidth=1.0, alpha=0.6)
+                label = (f"{name}  {suffix}" if suffix.startswith("c=")
+                         else f"{name}  {suffix} (R\u00b2={r2_best:.2f})")
             except Exception:
                 pass
         ax.plot(xs, ys, marker=".", label=label, alpha=0.85, color=color)

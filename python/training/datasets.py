@@ -1361,7 +1361,9 @@ class MicrostructureEvolutionDataset(Dataset):
                         latent_cache.cache_path_for_run(
                             self._latent_cache_root, self._encoder_fingerprint, run_dir,
                             kept_steps, self.encode_both_streams,
-                            size=metadata.nx))
+                            size=metadata.nx,
+                            theta=(theta_coordinates(metadata.temperature, metadata.T0)
+                                   if encoder_accepts_theta else None)))
                     if cached is not None:
                         # Skips the READ as well as the encode -- at 128x128 a
                         # frame is 32 KB against a 2 KB latent, so the disk
@@ -1410,7 +1412,11 @@ class MicrostructureEvolutionDataset(Dataset):
                                         self._latent_cache_root, self._encoder_fingerprint,
                                         pending_meta[pos][0], pending_meta[pos][2],
                                         self.encode_both_streams,
-                                        size=pending_meta[pos][1].nx),
+                                        size=pending_meta[pos][1].nx,
+                                        theta=(theta_coordinates(
+                                            pending_meta[pos][1].temperature,
+                                            pending_meta[pos][1].T0)
+                                            if encoder_accepts_theta else None)),
                                     latents, deriv)
                         buffer_run_indices = []
                 else:
@@ -1434,7 +1440,11 @@ class MicrostructureEvolutionDataset(Dataset):
                                 self._latent_cache_root, self._encoder_fingerprint,
                                 pending_meta[pos][0], pending_meta[pos][2],
                                 self.encode_both_streams,
-                                size=pending_meta[pos][1].nx),
+                                size=pending_meta[pos][1].nx,
+                                theta=(theta_coordinates(
+                                    pending_meta[pos][1].temperature,
+                                    pending_meta[pos][1].T0)
+                                    if encoder_accepts_theta else None)),
                             latents, deriv)
                 buffer_run_indices = []
 

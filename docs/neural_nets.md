@@ -89,13 +89,16 @@ Currently, the first type works more reliably than the other.
 
 ### Stages, losses and checkpoints
 
-There are seven losses, which can be mixed and matched at the different stages:
+There are ten losses, which can be mixed and matched at the different stages:
 - reconstruction loss: `L_recon0`,
 - statistics loss: `L_stats0`,
 - derivative loss: `L_deriv`,
 - one-step latent prediction loss: `L_1step`,
 - multi-step rollout loss (latent space): `L_rollout`,
-- reconstruction after multi-step rollout: `L_recon_predict` (state, real space) and `L_grad_predict` (gradient, real).
+- reconstruction after multi-step rollout: `L_recon_predict` (state, real space) and `L_grad_predict` (gradient, real),
+- self-consistent stats-head loss: `L_stats0_predict`,
+- latent-norm growth penalty (regularization): `L_z0_growth`,
+- Physics-informed neural networks (PINN): residual from partial differential equations (PDE), `L_allen_cahn`.
 
 For each loss `XX`:
 - `XX_scale` normalize the loss for it to be around 1 (objective),
@@ -111,10 +114,10 @@ Interpolation loss, $L_\mathrm{interp}$, is no longer used in loss function.
 |---|-------------------|--------------|------|------|-------|-------|---------------------------------|
 | 1 a| autoencoder ($z_0$)|E, D, SH|   | f    | real  | 1    | `L_recon0 + λ L_stats0`           |
 | 2 | derivative ($z_1$) |E*, D*| SH | f | both | 3 | `L_recon0 + λ L_stats0 + λ₁ L_deriv` |
-| 3a| LDS               | f       | E, SH | D | latent| 2    | `L_1step + λ₁ L_deriv`           |
-| 3b| LDS               | f       | E, SH | D | latent| $n+1$  | `L_rollout + ε L_1step + λ₁ L_deriv` |
-| 4 | encoder refinement| E, f  | D, SH|  | latent†|$n+1$|`L_rollout + ε L_stats0 + ε₁ L_recon0 + ε₂ L_recon_predict + ε₃ L_grad_predict` |
-| 5 | end-to-end        | E, f, D | SH  |      | real  | $n+1$ | `L_recon_predict + λ L_grad_predict + ε L_recon0 + ε₁ L_stats0 + ε₂ L_rollout` |
+| 3a| LDS               | f       | E, SH | D | latent| 2    | `L_1step + λ₁ L_deriv + λ₂ L_stats0_predict + λ₃ L_z0_growth`           |
+| 3b| LDS               | f       | E, SH | D | latent| $n+1$  | `L_rollout + ε L_1step + λ₁ L_deriv + λ₂ L_stats0_predict + λ₃ L_z0_growth` |
+| 4 | encoder refinement| E, f  | D, SH|  | latent†|$n+1$|`L_rollout + ε L_stats0 + ε₁ L_recon0 + ε₂ L_recon_predict + ε₃ L_grad_predict + ε₄ L_allen_cahn` |
+| 5 | end-to-end        | E, f, D | SH  |      | real  | $n+1$ | `L_recon_predict + λ L_grad_predict + ε L_recon0 + ε₁ L_stats0 + ε₂ L_rollout + ε₃ L_allen_cahn` |
 
 Notes:
 - SH: `stats_head`, $n$: `n_rollout_steps`;
@@ -268,6 +271,7 @@ $$L_\mathrm{1step} = \left\| z_0(t+\Delta t) - [z_0(t) + z_1(t) \Delta t + f_\th
 
 Doing so in latent space avoids reliance on the decoder, cleanly separating decoder loss and prediction loss.
 
+
 ### Multi-step rollout loss
 By having several predictions in a row, we let error accumulate:
 
@@ -282,6 +286,15 @@ where
 $$\hat{z}_0(t_k + (i+1) \Delta t) = \hat{z}_0(t_k + i \Delta t) + z_1(t_k + i \Delta t) \Delta t + f_\theta(t_k + i \Delta t) \Delta t.$$
 
 Perhaps weigh later predictions slightly more? (The first prediction is easy, long-term stability is what matters.)
+
+
+### Statistics loss
+Stage 3 takes place entirely in latent space, without ever decoding, which is risky. `L_stats0_predict` provides a tether to the real space though statistics. Rather than calculating statistics (which would require to be in real space), it uses the stats head (which lives in latent space). The loss is applied to the rollout: do the statistics of the prediction at $t + \Delta t$ match the real ones?
+
+
+### Growth loss
+There is always a risk of a drift in latent space, with `z0` growing always larger. `L_z0_growth` aims to tame this explosion by penalizing latent-norm growth: $(\ln\|z_0^{k+1}\| - \ln\|z_0^k\|)^2$. By being (geometrically) symmetric, it penalizes the latent state exploding or collapsing over the rollout.
+
 
 ### Semi-implicit (predictor-corrector) velocity-Verlet
 This section and the next pertain to the `dynamics_mode=z1_taylor` mode. It is no longer used, because it is less stable for long times.
@@ -332,6 +345,12 @@ Stages 4 and 5 are similar in structure and use the same losses:
 The two differences are:
 - D is frozen in stage 4 (even though `L_recon0` is in the loss function).
 - Stage 5 focuses on `L_recon_predict` and `L_grad_predict`; `L_recon0`, `L_stats0` and `L_rollout` are maintained, but with a lower weight. Stage 4 handles E and $f_\theta$ separately, with a small weight to `L_recon_predict` and `L_grad_predict` to reduce the risk of drift.
+
+
+### Allen–Cahn loss
+Stages 4 and 5 decode the latent predictions into real space, so the physics can be checked directly (unlike in stage 3). A physics-informed neural network (PINN) loss is introduced based on the Allen–Cahn partial differential equation (PDE). See [./docs/phase_field.md](phase_field.md) for the equations.
+
+`L_allen_cahn` penalizes the residual between the predicted change between time steps and the PDE. If `allen_cahn_all_steps = True`, the residual is applied over every rollout pair, otherwise to the last pair only (to keep decoding to a minimum).
 
 
 

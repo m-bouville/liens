@@ -165,8 +165,7 @@ integrator: `alpha` bounds the curvature correction as a fraction of the
 linear term, so the sub-step count is derived per window
 (`n ~ |f| dt / (alpha |z1|)`), capped at `max_substeps`. When the cap binds
 (`CLAMPED ...x` in the log), the alpha criterion is NOT in force on exactly
-the longest-dt windows — the source of one deadlocked run at
-max_dt=5000/max_substeps=512. Memory is governed separately: retained
+the longest-dt windows (a source of deadlocked runs). Memory is governed separately: retained
 autograd depth is bounded by `truncate_bptt` (gradients flow within
 segments), batches are cost-budgeted (`batch_cost_budget`, an ESTIMATE the
 integrator's realised counts can outgrow as |f_theta| grows through
@@ -178,7 +177,7 @@ learning rate, so a binding budget from epoch 1 is preferable. The alpha /
 (alpha-trained) supports h -> 0 refinement, a fixed-`n_substeps` one is a
 dt-averaged corrector and does not — and resuming an alpha-trained
 checkpoint at a coarser alpha asks a finely-fitted field to act as a
-one-shot corrector, which produced one 3b run at loss ~1e19 (the log's own
+one-shot corrector, which diverges badly (the log's own
 NOTE warns when this mismatch is configured).
 
 Two newer, checkpointed (`_MEANING_FIELDS`, so they round-trip through
@@ -202,6 +201,16 @@ save/rebuild) axes sit on top of this:
   training matches the test-time regime (training on encoder-z1 then rolling
   out on q was a confirmed train/test mismatch). Inert in a 1-step
   `z1_resync=True` 3a, by construction.
+
+`train_lds` also carries two latent-space regularizers (checkpointed weights, default 0):
+- **`L_stats0_predict`** — `‖stats_head(ẑ_k) − stats_head(z_true_k)‖²` over the rollout,
+  self-consistent (both sides through the frozen stats head, no C++ stats; compared
+  DIRECTLY, not via `StatsLoss._wrapped_diff`, which re-normalizes its target and froze the
+  term). Needs the frozen stats head, loaded by `_load_frozen_stats_head` from the AE
+  checkpoint — stage 3 otherwise loads only the encoder.
+- **`L_z0_growth`** — `(ln‖z0_{k+1}‖ − ln‖z0_k‖)²`, a symmetric latent-norm growth penalty.
+Both feed the shared component-tracking (`component_histories`, `scale_ratio_history`, the
+console breakdown), as in the rollout trainers.
 
 Empirical status (as of the u-arc): u-trained-on-q improves IN-BOX accuracy
 (97% 5-step in the active regime vs ~92% t-scheme) but does NOT widen the
@@ -527,57 +536,37 @@ The terms and *what each is applied to* (they differ in a way that matters):
   the frame-0 half of the decoder's training signal.
 - **`L_stats0`** — latent-space, frame 0: `stats_head(E(x0))` vs the true statistics.
 - **`L_recon_predict`** (stage 5's lead term) — pixel-space, the FINAL rolled-out step
-  ONLY: decode `z_hat[:, -1] = f_theta^n(E(x0))` and grade against the true final frame
-  `x_future[:, -1]`. This is the only term that closes the loop on what is actually
-  rendered at inference — `L_rollout` checks the rolled-out latent only as a *proxy*, and
-  `L_recon0` trains the decoder only on frame-0 latents. Graded *solely* at the endpoint
-  (not every step): it is the frame that gets decoded, the most-drifted latent (least
-  protected by `L_recon0`'s frame-0 training), and one decode is cheaper than `n`. It
-  backprops the decoder THROUGH the rollout (`z_hat` carries grad), so it co-adapts `E`,
-  `f_theta` and `D` toward the pixel endpoint — the first term to give `D` a signal about
-  rendering *predictions*, which is the whole point of unfreezing it in stage 5. Guarded by
-  `recon_predict_weight`/`recon_predict_scale` and a linear warmup (see below); default off,
-  a no-op at weight 0.
-- **`L_grad_predict`** — the SPATIAL-GRADIENT sibling of `L_recon_predict`: the same decoded
-  endpoint, the same real frame, matched in first spatial difference (`‖∇x̂ − ∇x_real‖²`, H
-  and W) instead of value. `L_recon_predict` is value-MSE, which is blind to WHERE the error
-  sits: a decoder can lower it by spraying low-amplitude speckle across the flat domain
-  interiors (most pixels, each error tiny) while keeping interfaces sharp — the "moth-eaten"
-  bulk seen in stage-5 rollouts. Matching gradients penalizes exactly that: in the bulk
-  ∇(real)=0 so any predicted variation is error, while at an interface ∇(real) is large so
-  the term REQUIRES a matching sharp transition rather than blurring it — no bulk mask needed,
-  the real field's own gradient says where variation is allowed. The point is
-  SCALE-SELECTIVE: a few-pixel spurious feature (a "moth") is nearly invisible to
-  value-MSE — few pixels, each error small — but a sharp small feature carries
-  LARGE local gradients, so `L_grad_predict` weights exactly the small-scale
-  errors `L_recon_predict` neglects, by their gradient content. A
-  SEPARATE component (`grad_predict_weight`/`grad_predict_scale`) so its magnitude scales
-  independently; endpoint-only, reusing `L_recon_predict`'s decode (decoded once if either is
-  active). Default off, no-op at weight 0.
+  ONLY: decode `z_hat[:, -1] = f_theta^n(E(x0))`, grade against `x_future[:, -1]`. The only
+  term that closes the loop on what is actually rendered at inference. Endpoint-only (the
+  decoded frame, the most-drifted latent, and one decode not `n`); backprops the decoder
+  THROUGH the rollout, co-adapting `E`/`f_theta`/`D` — the first `D` signal about rendering
+  *predictions* (the point of unfreezing `D` in stage 5). Weight/scale + linear warmup;
+  no-op at weight 0.
+- **`L_grad_predict`** — the spatial-gradient sibling of `L_recon_predict`: same decoded
+  endpoint and real frame, matched in first spatial difference (`‖∇x̂ − ∇x_real‖²`) instead
+  of value. Scale-selective: it weights the small-scale "moth" errors that value-MSE neglects
+  (rationale in `neural_nets.md`). Separate weight/scale; reuses `L_recon_predict`'s decode
+  (decoded once if either is active); no-op at weight 0.
+- **`L_allen_cahn`** — PINN PDE residual on the decoded prediction (stages 4/5). For each
+  consecutive decoded pair, `[φ̂_{k+1}−φ̂_k]/Δt − M(κ∇²φ̂ − (a(T)φ̂ + bφ̂³))`, Crank–Nicolson
+  RHS, periodic 5-point Laplacian. Needs physical `t_window`; constants `a0,b,kappa,mobility`
+  are params (from metadata, defaults are the current sweep's), `a(T)=a0·theta[0]`.
+  `allen_cahn_all_steps` decodes the whole rollout (all pairs) or just the last pair (minimal
+  decode). Shares `recon_predict`'s warmup (same cold decoder); no-op at weight 0.
+  (`neural_nets.md` has the physics and the large-Δt caveat.)
 
-`train_refinement` warms `rollout_weight`, `recon_predict_weight` AND `grad_predict_weight`
-in via **`linear_warmup_weight`** (in `train_refinement`) — LINEAR, as `epoch/warmup_epochs`
-(1/N at epoch 1, full AT epoch N), the same convention stage 2's deriv_weight warmup uses, so
-`warmup_epochs=N` means the same ramp everywhere. It was geometric while `L_rollout`
-collapsed by many orders of magnitude over the first epochs (so a linear ramp left epoch 1
-far too hot);
-`require_consecutive` removed the filter-manufactured large-dt windows that caused that
-collapse, so `L_rollout` is O(1–10) from epoch 1 and a plain linear introduction suffices
-(and `start_fraction` — a geometric-era floor, since a multiplicative ramp cannot start at 0 —
-was dropped). `recon_predict` AND `grad_predict` share `recon_predict_weight_warmup_epochs`:
-both backprop a full-weight pixel loss through the rollout into a decoder that (resuming from
-stage 4) only ever saw frame-0 latents, so both are warmed in on the one schedule. The
-save-criterion grace fires when the LAST active ramp completes (`ramp_completion_grace`).
+`train_refinement` warms `rollout_weight`, `recon_predict_weight`, `grad_predict_weight` and
+`allen_cahn_weight` in via **`linear_warmup_weight`** — linear (`epoch/warmup_epochs`), the
+same convention as stage 2's deriv warmup. The three pixel-endpoint terms share
+`recon_predict_weight_warmup_epochs` (all backprop through the rollout into a decoder that,
+resuming from stage 4, only saw frame-0 latents). The save-criterion grace fires when the
+last active ramp completes (`ramp_completion_grace`).
 
-Separately from the WEIGHT ramps, `train_lds` and `train_refinement` take an optional
-**`lr_warmup_epochs`** (a LEARNING-RATE warmup, default 0 = off): a `LinearLR` from 1% to
-full over the first `lr_warmup_epochs` epochs, converted to optimiser steps as
-`lr_warmup_epochs * len(train_loader)` (epoch-units, consistent across the two stages — the
-name is `_epochs`, not `_steps`). It is stepped ONLY on a taken optimiser step, never on a
-skipped batch (advancing on a skip consumes the warmup without training and torch warns). It
-damps the early shock when a trainer resumes onto an objective the encoder was not fitted to
-(e.g. stage 4's first stage-2→rollout contact), where a few surviving high-gradient batches
-jerk the weights.
+Separately, `train_lds`/`train_refinement` take an optional **`lr_warmup_epochs`** (a
+learning-rate warmup, default 0): `LinearLR` 1%→full over `lr_warmup_epochs * len(train_loader)`
+steps (epoch-units), stepped only on a taken optimiser step. It damps the early shock when a
+trainer resumes onto an objective the encoder was not fitted to.
+
 
 #### Gradient/loss spike guard (`_spike_guard.py`)
 Shared by `train_lds` and `train_refinement` (stage 2 has its own single-guard variant — see
@@ -873,10 +862,9 @@ safe stopping point: splitting it is a draw-reorder that needs a render gate.
     written as `…-scales.png`. Diagnoses whether each term's SCALE matches its magnitude: the
     ratio should sit near 1 or be converging there; a ratio far off is the
     `scale_balance_report` 'effectively OUT of the objective' warning made visual and
-    time-resolved. Fits TWO models per term and shows whichever wins — a power law `amp·xᵇ`
-    (excluded if `b>0`, a growing ratio is not converging via decay) vs a constant `c`,
-    picking the higher R² (via `utils.fits.fit_power_law`); the amplitude is shown, not just
-    the exponent. Paired colours (recon0/stats0, recon_predict/grad_predict) and the same red
+    time-resolved. Fits FOUR models per term — power `amp·xᵇ`, linear `m·x+c`, exp `A·eᵏˣ`,
+    and a constant baseline — keeps only the DECREASING trend fits (a growing ratio is not
+    converging), and shows the highest (log-space) R²; the constant wins ties. Paired colours (recon0/stats0, recon_predict/grad_predict) and the same red
     dotted `event_epochs` marker as the loss curve. Emitted by stages 1, 2 and 4/5, all via
     `write_epoch_figures`' `scale_ratios` argument (stage 1's earlier direct call was migrated).
     Guarded against empty/epoch-0 renders (needs a positive epoch and a positive ratio to
@@ -898,13 +886,17 @@ safe stopping point: splitting it is a draw-reorder that needs a render gate.
     FIRST epoch (one history point plots as an empty figure — by point count, so a resume
     whose history restarts at one point is skipped too).
 - `latent_cache.py` (in `training/`) — frozen-encoder latents cached per
-  `(encoder fingerprint, run, step list, stream)`. Directories are named
+  `(encoder fingerprint, run, step list, stream, theta)`. Directories are named
   `<size>x<size>-<fingerprint>` (size is a LABEL for humans; the fingerprint is the key,
   and weight shapes are hashed so cross-resolution collisions are impossible). One
   directory per exact encoder state — stage 2 training changes the fingerprint every
   epoch, which is why the cache root accumulates many one-shot directories; a pruning
   utility (drop directories whose fingerprint matches no checkpoint on disk) is the
-  intended fix, not yet built.
+  intended fix, not yet built. `theta` is in the per-run filename key (the cached latent is
+  `E(x, theta)` when `condition_on_theta`): hashing the theta VALUES content-addresses it, so
+  a change to how `theta_coordinates` computes theta — invisible to the weights-only
+  fingerprint — writes new files rather than silently serving stale ones. `theta=None` gives
+  the pre-theta filename, so old caches stay readable.
 
 
 

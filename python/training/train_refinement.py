@@ -85,6 +85,7 @@ _REFINEMENT_PREAMBLE_PARAMS = (
     "max_dt", "rollout_weight", "recon0_weight", "stats0_weight", "recon_predict_weight",
     "rollout_scale", "recon0_scale", "stats0_scale", "recon_predict_scale",
     "grad_predict_weight", "grad_predict_scale",
+    "allen_cahn_weight", "allen_cahn_scale", "allen_cahn_all_steps",
     "epochs", "batch_size", "n_rollout_steps",
     "min_step", "min_stdev_phi", "min_normalized_stdev_phi", "early_stopping_patience",
 )
@@ -100,9 +101,15 @@ def train_refinement(
     rollout_weight: float = 1.0, recon0_weight: float = 0.0, stats0_weight: float = 0.0,
     recon_predict_weight: float = 0.0,
     grad_predict_weight: float = 0.0,
+    allen_cahn_weight: float = 0.0,
     rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
     recon_predict_scale: float = 1.0,
     grad_predict_scale: float = 1.0,
+    allen_cahn_scale: float = 1.0,
+    allen_cahn_a0: float = 1.0, allen_cahn_b: float = 1.0,
+    allen_cahn_kappa: float = 0.2, allen_cahn_mobility: float = 0.05,
+    allen_cahn_all_steps: bool = True,
+    allen_cahn_phi_max: float = 1.5,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-4,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int | None = None, min_step: int | None = None, min_stdev_phi: float | None = None,
@@ -230,6 +237,9 @@ def train_refinement(
     print(f"rollout_weight={rollout_weight}  recon0_weight={recon0_weight}  "
           f"stats0_weight={stats0_weight}  recon_predict_weight={recon_predict_weight}  "
           f"grad_predict_weight={grad_predict_weight}")
+    print(f"  allen_cahn_weight={allen_cahn_weight}  allen_cahn_scale={allen_cahn_scale}  "
+          f"all_steps={allen_cahn_all_steps}  (a0={allen_cahn_a0}, b={allen_cahn_b}, "
+          f"kappa={allen_cahn_kappa}, M={allen_cahn_mobility}, phi_max={allen_cahn_phi_max})")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  "
           f"min_normalized_stdev_phi={min_normalized_stdev_phi}  n_rollout_steps={n_rollout_steps}")
     print_run_parameters(train_refinement, locals(), _REFINEMENT_PREAMBLE_PARAMS)
@@ -427,7 +437,7 @@ def train_refinement(
     # stage 1's include_stats or stage 2's active_terms).
     component_histories: dict[str, dict[str, list[float]]] = {
         name: {"train": [], "val": [], "best_so_far": []}
-        for name in ("rollout", "recon0", "stats0", "recon_predict", "grad_predict")
+        for name in ("rollout", "recon0", "stats0", "recon_predict", "grad_predict", "allen_cahn")
     }
     component_best_tracker = ComponentBestTracker()
 
@@ -446,7 +456,8 @@ def train_refinement(
 
     def step(batch, train: bool, effective_rollout_weight: float | None = None,
              effective_recon_predict_weight: float | None = None,
-             effective_grad_predict_weight: float | None = None):
+             effective_grad_predict_weight: float | None = None,
+             effective_allen_cahn_weight: float | None = None):
         x_window, dt_window, theta, true_stats, t_window = unpack(batch)
         # BEFORE the forward, because the forward is what moves the buffers.
         # A skipped batch must leave the model exactly as it found it, and
@@ -468,6 +479,14 @@ def train_refinement(
                                   if effective_grad_predict_weight is None
                                   else effective_grad_predict_weight),
             grad_predict_scale=grad_predict_scale,
+            allen_cahn_weight=(allen_cahn_weight
+                                if effective_allen_cahn_weight is None
+                                else effective_allen_cahn_weight),
+            allen_cahn_scale=allen_cahn_scale,
+            allen_cahn_a0=allen_cahn_a0, allen_cahn_b=allen_cahn_b,
+            allen_cahn_kappa=allen_cahn_kappa, allen_cahn_mobility=allen_cahn_mobility,
+            allen_cahn_all_steps=allen_cahn_all_steps,
+            allen_cahn_phi_max=allen_cahn_phi_max,
             stats_loss_fn=stats_loss_fn, true_stats=true_stats,
             recon_stream_name=recon_stream_name, return_components=True,
             z1_resync=lds_z1_resync, t_window=t_window,
@@ -533,6 +552,7 @@ def train_refinement(
             "recon0": components["recon0"].detach(), "stats0": components["stats0"].detach(),
             "recon_predict": components["recon_predict"].detach(),
             "grad_predict": components["grad_predict"].detach(),
+            "allen_cahn": components["allen_cahn"].detach(),
         }
 
     # Whether THIS run has written the checkpoint at least once -- train_lds
@@ -561,6 +581,8 @@ def train_refinement(
              if recon_predict_weight != 0.0 else "")
           + (f" +{grad_predict_weight}*grad_predict/{grad_predict_scale}"
              if grad_predict_weight != 0.0 else "")
+          + (f" +{allen_cahn_weight}*allen_cahn/{allen_cahn_scale}"
+             if allen_cahn_weight != 0.0 else "")
           + " | valid = ...  | ema")
 
     _spike_guard = _SpikeGuard(spike_skip_factor)
@@ -578,13 +600,13 @@ def train_refinement(
     # The objective's weight/scale maps, constant across epochs -- the single
     # source for the component decomposition (histories, loss line, scale-balance
     # report) via weighted_contributions.
-    _components = ("rollout", "recon0", "stats0", "recon_predict", "grad_predict")
+    _components = ("rollout", "recon0", "stats0", "recon_predict", "grad_predict", "allen_cahn")
     _weights = {"rollout": rollout_weight, "recon0": recon0_weight,
                 "stats0": stats0_weight, "recon_predict": recon_predict_weight,
-                "grad_predict": grad_predict_weight}
+                "grad_predict": grad_predict_weight, "allen_cahn": allen_cahn_weight}
     _scales = {"rollout": rollout_scale, "recon0": recon0_scale,
                "stats0": stats0_scale, "recon_predict": recon_predict_scale,
-               "grad_predict": grad_predict_scale}
+               "grad_predict": grad_predict_scale, "allen_cahn": allen_cahn_scale}
     for epoch in range(0 if epochs == 0 else 1, epochs + 1):
         ae.train()
         f_theta.train()
@@ -642,6 +664,11 @@ def train_refinement(
         # ramp-completion grace below already covers it -- no separate entry.
         effective_grad_predict_weight = linear_warmup_weight(
             epoch, grad_predict_weight, recon_predict_weight_warmup_epochs)
+        # allen_cahn also decodes through the same cold decoder (the whole rollout, or
+        # the last pair) -- same epoch-1 instability risk -- so it shares the same
+        # recon_predict warmup schedule, exactly like grad_predict.
+        effective_allen_cahn_weight = linear_warmup_weight(
+            epoch, allen_cahn_weight, recon_predict_weight_warmup_epochs)
 
         # THE END OF THE RAMP RESETS THE SAVE CRITERION.
         #
@@ -692,7 +719,8 @@ def train_refinement(
                 lambda b: step(b, train=True,
                                effective_rollout_weight=effective_rollout_weight,
                                effective_recon_predict_weight=effective_recon_predict_weight,
-                               effective_grad_predict_weight=effective_grad_predict_weight),
+                               effective_grad_predict_weight=effective_grad_predict_weight,
+                               effective_allen_cahn_weight=effective_allen_cahn_weight),
                 n_train, progress=_epoch_progress)
             _epoch_progress.close()
             # unpack the component dict back into the names the rest of the loop
@@ -704,12 +732,13 @@ def train_refinement(
             train_stats0 = _train_means["stats0"]
             train_recon_predict = _train_means["recon_predict"]
             train_grad_predict = _train_means["grad_predict"]
+            train_allen_cahn = _train_means["allen_cahn"]
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
             # "epoch", rather than a misleading 0.0.
             train_loss = train_rollout = train_recon0 = train_stats0 = float("nan")
-            train_recon_predict = train_grad_predict = float("nan")
+            train_recon_predict = train_grad_predict = train_allen_cahn = float("nan")
 
         ae.eval()
         f_theta.eval()
@@ -731,6 +760,7 @@ def train_refinement(
         val_stats0 = _val_means["stats0"]
         val_recon_predict = _val_means["recon_predict"]
         val_grad_predict = _val_means["grad_predict"]
+        val_allen_cahn = _val_means["allen_cahn"]
 
         # SKIPPED BATCHES ARE NEVER SILENT -- a guard that quietly drops data
         # would be worse than the crash it prevents, since the run would look
@@ -769,10 +799,12 @@ def train_refinement(
         val_loss_history.append(val_loss)
         best_so_far_history.append(tracker.best_val_loss)
         _val_raw = {"rollout": val_rollout, "recon0": val_recon0, "stats0": val_stats0,
-                    "recon_predict": val_recon_predict, "grad_predict": val_grad_predict}
+                    "recon_predict": val_recon_predict, "grad_predict": val_grad_predict,
+                    "allen_cahn": val_allen_cahn}
         _train_raw = {"rollout": train_rollout, "recon0": train_recon0,
                       "stats0": train_stats0, "recon_predict": train_recon_predict,
-                      "grad_predict": train_grad_predict}
+                      "grad_predict": train_grad_predict,
+                      "allen_cahn": train_allen_cahn}
         current_val_components = weighted_contributions(_val_raw, _weights, _scales)
         best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
         current_train_components = weighted_contributions(_train_raw, _weights, _scales)
@@ -823,6 +855,10 @@ def train_refinement(
             train_contribs.append(
                 effective_grad_predict_weight*train_grad_predict/grad_predict_scale)
             val_contribs.append(grad_predict_weight*val_grad_predict/grad_predict_scale)
+        if allen_cahn_weight != 0.0:
+            train_contribs.append(
+                effective_allen_cahn_weight*train_allen_cahn/allen_cahn_scale)
+            val_contribs.append(allen_cahn_weight*val_allen_cahn/allen_cahn_scale)
         msg = (f"{epoch:4d}|"
                + format_component_side(train_loss, train_contribs)
                + f" |" + format_component_side(val_loss, val_contribs)
@@ -835,7 +871,9 @@ def train_refinement(
                        ("recon_predict_weight", effective_recon_predict_weight,
                         recon_predict_weight),
                        ("grad_predict_weight", effective_grad_predict_weight,
-                        grad_predict_weight))
+                        grad_predict_weight),
+                       ("allen_cahn_weight", effective_allen_cahn_weight,
+                        allen_cahn_weight))
                    if eff < full))
 
         # AFTER the ramp, not at epoch 1. During a warmup the imbalance is
@@ -920,9 +958,16 @@ def train_refinement(
                         # is weight*raw/scale, so the weights alone do not reproduce it.
                         "recon_predict_weight": recon_predict_weight,
                         "grad_predict_weight": grad_predict_weight,
+                        "allen_cahn_weight": allen_cahn_weight,
+                        "allen_cahn_all_steps": allen_cahn_all_steps,
+                        "allen_cahn_a0": allen_cahn_a0, "allen_cahn_b": allen_cahn_b,
+                        "allen_cahn_kappa": allen_cahn_kappa,
+                        "allen_cahn_mobility": allen_cahn_mobility,
+                        "allen_cahn_phi_max": allen_cahn_phi_max,
                         "rollout_scale": rollout_scale, "recon0_scale": recon0_scale,
                         "stats0_scale": stats0_scale, "recon_predict_scale": recon_predict_scale,
                         "grad_predict_scale": grad_predict_scale,
+                        "allen_cahn_scale": allen_cahn_scale,
                         "n_rollout_steps": n_rollout_steps,
                     },
                 },

@@ -30,6 +30,8 @@ import datetime
 import hashlib
 from pathlib import Path
 
+import numpy as np
+
 import torch
 
 
@@ -67,6 +69,9 @@ def write_cache_info(cache_root: Path, fingerprint: str, size: int | None,
         cache_dir.mkdir(parents=True, exist_ok=True)
         lines = [
             "Latent cache directory. Name = <size>x<size>-<encoder fingerprint>.",
+            "Per-run filenames also hash the theta VALUES fed to the encoder",
+            "(when condition_on_theta), so a change to how theta is computed",
+            "writes new files rather than serving stale ones.",
             "The fingerprint is a blake2b hash of the encoder's weights AND",
             "buffers (BatchNorm running stats included) -- nothing else. Same",
             "encoder => same directory, independent of WHEN it was built. Files",
@@ -91,7 +96,7 @@ def write_cache_info(cache_root: Path, fingerprint: str, size: int | None,
 
 def cache_path_for_run(cache_root: Path, fingerprint: str, run_dir: Path,
                         steps: list[int], encode_both_streams: bool,
-                        size: int | None = None) -> Path:
+                        size: int | None = None, theta=None) -> Path:
     """Where this run's latents live, for this encoder and this step list.
 
     `steps` is part of the key, not just the run: the max_dt truncation makes
@@ -113,7 +118,19 @@ def cache_path_for_run(cache_root: Path, fingerprint: str, run_dir: Path,
     step_digest = hashlib.blake2b(
         ",".join(str(s) for s in steps).encode("utf-8"), digest_size=8).hexdigest()
     suffix = "both" if encode_both_streams else "state"
-    return cache_root / directory / f"{run_dir.name}-{step_digest}-{suffix}.pt"
+    # theta is an ENCODER INPUT when condition_on_theta: the cached latent is
+    # E(x, theta), so theta belongs in the KEY. Hashing the actual theta VALUES
+    # (not a version stamp) content-addresses it: if theta_coordinates ever changes
+    # HOW theta is computed for a run -- a code change the weights-only encoder
+    # fingerprint cannot see -- the tag changes, a NEW file is written, and the old
+    # one is simply orphaned (old code still hits it). No version bumping, no
+    # update-in-place. theta=None (encoder ignores theta) -> no tag -> filenames are
+    # byte-identical to the pre-theta scheme, so those caches stay readable.
+    theta_tag = ""
+    if theta is not None:
+        theta_bytes = np.asarray(theta, dtype=np.float64).ravel().tobytes()
+        theta_tag = "-t" + hashlib.blake2b(theta_bytes, digest_size=6).hexdigest()
+    return cache_root / directory / f"{run_dir.name}-{step_digest}-{suffix}{theta_tag}.pt"
 
 
 def load_cached(path: Path) -> tuple[torch.Tensor, torch.Tensor | None] | None:

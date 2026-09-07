@@ -24,6 +24,8 @@ The convolutional autoencoder has a symmetric encoder–decoder architecture. Th
 
 
 ## Latent representation
+
+### How
 The latent representation is split into two streams: 
 - $z_0(t)$, the "state" (from which the decoder can recover $x(t)$ ), 
 - $z_1(t)$, an approximation of $\dot{z}_0(t)$ that exists purely in latent space and is never decoded. 
@@ -34,6 +36,10 @@ $$z_0(t + \delta t) = z_0(t) + [z_1(t) + f_\theta(z_0(t), z_1(t), \theta, \delta
 
 with $\theta$ physical parameters (e.g. temperature). $z_1(t) \delta t$ is the first-order (linear) term; $f_\theta$ is a correction on top of it. Since it takes $\delta t$ as input, it can account for second-order terms (curvature).
 
+If `derivative_source = previous_quotient` instead of `z1` then the derivative term is $[z_0(t) - z_0(t - \Delta t)] / \Delta t$ rather than $z_1(t)$.
+
+
+### Why
 As the LDS does not have the stability constraints of PDEs, inference is possible at coarser effective time resolution than the phase-field solver ($\delta t$ a multiple of the phase-field time step).
 
 Representing the microstructure in latent space rather than real space has two advantages:
@@ -91,13 +97,17 @@ $$x(0) \xrightarrow{E} z(0) \xrightarrow{f_\theta} z(\delta t) \xrightarrow{f_\t
 
 
 ## Workflow
-0.	Generate several thousands of  phase-field simulations. 
+0.	Generate several thousands of phase-field simulations. 
 1.	Train a CNN autoencoder on individual microstructures (no time evolution yet) to learn a latent representation that is reconstructive and physically descriptive.
 2.  Train a second latent stream, $z_1$, to represent $\dot{z}_0$ via a derivative loss.
 3.	Freeze the encoder and train the Latent Dynamics Surrogate (LDS) to predict future microstructures in latent space. (Two sub-steps: 3a and 3b.)
 4.	Fine-tune the encoder and the LDS for prediction, including a small input from reconstruction.
 5.	Fine-tune the latent representation and the LDS to both predict future microstructures and reconstruct the original microstructure.
 
+This is at heart a greedy workflow, training
+3. LDS, holding AE weights constant;
+4. AE and LDS in parallel, with minimal interaction (the loss function is a linear combination of them);
+5. AE and LDS together, with a loss function accounting for their interaction.
 
 
 ## Repository structure
@@ -143,6 +153,6 @@ For more details on the structure of the `python` directory, see [./docs/NN-code
 ### For those who prefer text
 - All five training stages are implemented and run end-to-end. The work currently underway is improving the accuracy of the surrogate, not making it run at all.
 - The initial development was carried out using 64×64 images (32×32 for testing the code end-to-end). They were serviceable but hit their limit, with finite-size artifacts eventually dominating the results. The focus is now on 128×128 microstructures.
-- There is a (physically plausible) difference of behavior above and below $T \approx 0.9 \times T_0$. Microstructures are now filtered with `min_normalized_stdev_phi` instead of `min_stdev_phi` (i.e. using the temperature-dependent ground-state value for `phi` as threshold, rather than a constant) to avoid a bias at `$T \approx T_0$.
+- There is a (physically plausible) difference of behavior above and below $T \approx 0.9 \times T_0$. 
 - Predicting $t + \delta t$ gives sensible results, $t + 10 \delta t$ initially did not. The introduction of `u = log10 t` helped.
-- Predicted microstructures are not smooth, they look moth-eaten. `L_grad_predict` introduces a gradient term in the loss functions of stages 4 and 5 in order to reduce the problem.
+- Predicted microstructures are not smooth, they look moth-eaten. `L_allen_cahn` accounts for expected patterns of time evolution (PINN) in the loss functions of stages 4 and 5 in order to reduce the problem.

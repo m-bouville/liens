@@ -30,9 +30,15 @@ def compute_stage45_loss(
     stats0_weight: float = 0.0,
     recon_predict_weight: float = 0.0,
     grad_predict_weight: float = 0.0,
+    allen_cahn_weight: float = 0.0,
     rollout_scale: float = 1.0, recon0_scale: float = 1.0, stats0_scale: float = 1.0,
     recon_predict_scale: float = 1.0,
     grad_predict_scale: float = 1.0,
+    allen_cahn_scale: float = 1.0,
+    allen_cahn_a0: float = 1.0, allen_cahn_b: float = 1.0,
+    allen_cahn_kappa: float = 0.2, allen_cahn_mobility: float = 0.05,
+    allen_cahn_all_steps: bool = True,
+    allen_cahn_phi_max: float = 1.5,   # ~1.5x the physical max |phi|=sqrt(a0*T0/b) (=1 here)
     stats_loss_fn: StatsLoss | None = None,
     true_stats: torch.Tensor | None = None, return_components: bool = False,
     recon_stream_name: str = DEFAULT_STREAM_NAME, deriv_stream_name: str = "deriv",
@@ -231,15 +237,71 @@ def compute_stage45_loss(
     else:
         l_grad_predict = torch.zeros((), device=x_window.device, dtype=x_window.dtype)
 
+    # Per-step: the residual holds between CONSECUTIVE frames. allen_cahn_all_steps
+    # selects the scope: True decodes the whole rollout (n+1 frames, one batched
+    # decoder call) and grades EVERY consecutive pair -- the full trajectory
+    # constraint, for stages 4/5 where the decoder is already in use. False decodes
+    # only the LAST pair (2 frames) and grades that single transition -- for keeping
+    # decoding to a minimum (e.g. stage 3, latent-focused). Both sides of each pair
+    # are decoded predictions (phi_0 = D(z0) in the all-steps case), so it grades the
+    # model's OWN trajectory. dphi/dt is the finite difference over each step's
+    # PHYSICAL gap (t_window is step*sim_dt; the only dt here). The RHS uses the
+    # TRAPEZOIDAL (Crank-Nicolson) average of the pair -- 2nd-order in dt, valid across
+    # the trajectory (log-spaced saves keep the per-interval CHANGE in phi modest as
+    # dt grows, since coarsening slows), so no dt cut. a(T)=a0*theta[0] (theta[0]=T-T0
+    # by the theta_coordinates contract; a0/kappa/mobility/b are sweep-constant
+    # PARAMETERS the caller sources from metadata). Laplacian = periodic 5-point
+    # stencil, dx=1, matching finite_differences.cpp.
+    if allen_cahn_weight != 0.0:
+        if t_window is None:
+            raise ValueError("allen_cahn_weight > 0 requires t_window (physical time) "
+                             "for dphi/dt; got None.")
+        z_sel = z_hat_full if allen_cahn_all_steps else z_hat_full[:, -2:]
+        t_sel = t_window if allen_cahn_all_steps else t_window[:, -2:]
+        _B, _nf = z_sel.shape[:2]                            # nf frames -> nf-1 pairs
+        phi = recon_pathway.decoder(
+            z_sel.reshape(_B * _nf, *z_sel.shape[2:])
+        ) * torch.exp(recon_pathway.log_output_scale)
+        phi = phi.reshape(_B, _nf, *phi.shape[1:])            # (B, nf, [C,] H, W)
+        # SOFT-BOUND to the physical order-parameter range before the residual. The
+        # decoder is an unclamped CNN; on the most-drifted endpoint latent (8 steps from a
+        # barely-refined encoder) it extrapolates to |phi_hat| ~ 15-40, and the CUBIC
+        # f'(phi)=a*phi+b*phi^3 turns that into residuals of 1e4-1e6 -- a run showed
+        # L_allen_cahn train=8e6 vs val=0.02 from exactly this. Allen-Cahn only holds for a
+        # physical phi (|phi| <= sqrt(a0*T0/b) ~ 1), so grade the residual on
+        # phi_max*tanh(phi/phi_max): identity for |phi| << phi_max (physical fields are
+        # untouched), saturating beyond it so the cube stays bounded. tanh keeps a (weak)
+        # gradient outside the range, gently pushing extremes back toward physical values;
+        # fixing the decode itself is recon_predict/recon0's job, not this term's.
+        phi = allen_cahn_phi_max * torch.tanh(phi / allen_cahn_phi_max)
+        _tail = (1,) * (phi.dim() - 2)                        # ones over the field dims
+        dt_phys = (t_sel[:, 1:] - t_sel[:, :-1]).reshape(_B, -1, *_tail)   # (B, nf-1, 1..)
+        a_T = (allen_cahn_a0 * theta[:, 0]).reshape(_B, 1, *_tail)         # (B, 1, 1..)
+
+        def _rhs(f):
+            lap = (torch.roll(f, 1, -2) + torch.roll(f, -1, -2)
+                   + torch.roll(f, 1, -1) + torch.roll(f, -1, -1) - 4.0 * f)
+            return allen_cahn_mobility * (allen_cahn_kappa * lap
+                                          - (a_T * f + allen_cahn_b * f ** 3))
+
+        rhs_all = _rhs(phi)                                   # RHS at every selected frame, once
+        residual = ((phi[:, 1:] - phi[:, :-1]) / dt_phys
+                    - 0.5 * (rhs_all[:, :-1] + rhs_all[:, 1:]))
+        l_allen_cahn = (residual ** 2).mean()
+    else:
+        l_allen_cahn = torch.zeros((), device=x_window.device, dtype=x_window.dtype)
+
     total = (rollout_weight * l_rollout / rollout_scale + recon0_weight * l_recon0 / recon0_scale
              + stats0_weight * l_stats0 / stats0_scale
              + recon_predict_weight * l_recon_predict / recon_predict_scale
-             + grad_predict_weight * l_grad_predict / grad_predict_scale)
+             + grad_predict_weight * l_grad_predict / grad_predict_scale
+             + allen_cahn_weight * l_allen_cahn / allen_cahn_scale)
 
     if return_components:
         components = {
             "rollout": l_rollout, "recon0": l_recon0, "stats0": l_stats0,
             "recon_predict": l_recon_predict, "grad_predict": l_grad_predict,
+            "allen_cahn": l_allen_cahn,
             "z0": z0, "z_true": z_true,
         }
         return total, components

@@ -12,22 +12,22 @@ Its local free-energy density is given by a temperature-dependent Landau potenti
 
 $$f(\phi,T) = \frac{a(T)}{2}\phi^2 + \frac{b}{4}\phi^4,$$
 
-where $a(T)=a_0(T-T_0)$. Its derivative is $\frac{\partial f}{\partial\phi} = a(T)\phi + b\phi^3$. 
+where 
 
-Above the critical temperature $T_0$, the potential has a single minimum at $\phi=0$. Below $T_0$, it becomes a symmetric double well: minima at $\pm \sqrt{a_0(T_0-T)/b}$ and a maximum at 0. The potential at the minima is $-a^2(T)/(4b)$.
+$$a(T) = a_0 (T-T_0).$$
+
+Its derivative is ${\partial f} / {\partial\phi} = [a(T) + b \phi^2] \phi$. 
+
+Above the critical temperature $T_0$, the potential has a single minimum at $\phi=0$. Below $T_0$, it becomes a symmetric double well: minima at $\pm \sqrt{a(T)/b}$ and a maximum at 0. The potential at the minima is $-a^2(T) / (4b)$.
 Dedimensionalization: $T_0$ and $b$ are typically set to 1 without loss of generality.
 
 A single non-conserved order parameter is evolved using the Allen–Cahn equation:
 
-$$\frac{\partial\phi}{\partial t} = M\left(\kappa\nabla^2\phi - \frac{\partial f}{\partial\phi}\right).$$
+$$\frac{\partial\phi}{\partial t} = -M \mu = M \left(\kappa\nabla^2\phi - \frac{\partial f}{\partial\phi}\right),$$
 
-Here $M$ is the mobility, it is (at least initially) temperature-independent. The Cahn–Hilliard equation (conserved) may be run later if and when a latent-space model is shown to learn phase-field evolution. 
+with $\mu$ the chemical potential. Here $M$ is the mobility, it is (at least initially) temperature-independent.The Cahn–Hilliard equation (conserved) may be run later if and when a latent-space model is shown to learn phase-field evolution. 
 
-Simulations are performed on two-dimensional periodic domains. The chemical potential is computed as 
-
-$$\mu = \frac{\partial f}{\partial \phi} - \kappa \nabla^2 \phi,$$
-
-after which the Allen–Cahn equation is integrated using an explicit forward-Euler time step. A Fourier pseudo-spectral discretization (FFTW) may be implemented later (but this is not a priority).
+Simulations are performed on two-dimensional periodic domains. The chemical potential is computed, then the Allen–Cahn equation is integrated using an explicit forward-Euler time step. A Fourier pseudo-spectral discretization (FFTW) may be implemented later (but this is not a priority).
 During simulation, total free energy is computed every saved timestep and should decrease monotonically.
 
 The parameter sweep is parallelized using `<future>`.
