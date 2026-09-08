@@ -6,6 +6,8 @@ drops one is caught."""
 import pathlib
 import re
 
+from _ast_helpers import parse_module, calls_to, multiplies
+
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
@@ -49,15 +51,26 @@ def test_write_epoch_figures_forwards_scale_ratios_to_the_curve():
 # ---------- lr_warmup_epochs: rename + epoch-units + default 0 ----------
 
 def test_lr_warmup_is_in_EPOCHS_not_batches_in_both_trainers():
+    # The epoch->optimiser-step conversion lives in ONE place, make_lr_warmup
+    # (training/_training_loop.py). Asserted STRUCTURALLY (AST), not as a source
+    # substring: multiplies() finds the `lr_warmup_epochs * len(train_loader)`
+    # BinOp however it is formatted, and returns False for a bare
+    # `total_iters=lr_warmup_epochs` (the batch-units bug) -- so the test survives
+    # a reformat but still catches the mistake.
+    helper_tree = parse_module(_ROOT / "training/_training_loop.py")
+    assert multiplies(helper_tree, "lr_warmup_epochs", "train_loader"), (
+        "make_lr_warmup must convert epochs to optimiser steps: "
+        "total_iters = lr_warmup_epochs * len(train_loader)")
+    # both trainers must ROUTE THROUGH make_lr_warmup (a real call), not inline LinearLR
     for rel in ("training/train_lds.py", "training/train_refinement.py"):
-        s = _src(rel)
-        assert "lr_warmup_steps" not in s, f"{rel} still uses the old name"
-        assert "lr_warmup_epochs" in s
-        # epoch-units: total_iters must be epochs * batches-per-epoch, never raw epochs
-        assert "lr_warmup_epochs * len(train_loader)" in s, (
-            f"{rel}: warmup must be converted to optimiser steps via len(train_loader)")
-        assert "total_iters=lr_warmup_epochs," not in s, (
-            f"{rel}: bare lr_warmup_epochs as total_iters means BATCH units (the bug)")
+        raw = _src(rel)
+        assert "lr_warmup_steps" not in raw, f"{rel} still uses the old name"
+        assert "lr_warmup_epochs" in raw
+        tree = parse_module(_ROOT / rel)
+        assert calls_to(tree, "make_lr_warmup"), (
+            f"{rel}: must build the lr warmup via the shared make_lr_warmup")
+        assert not calls_to(tree, "LinearLR"), (
+            f"{rel}: no inline LinearLR -- the conversion belongs in make_lr_warmup")
 
 
 def test_lr_warmup_epochs_defaults_to_zero_in_both_trainers():

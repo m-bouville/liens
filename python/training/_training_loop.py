@@ -28,6 +28,47 @@ from typing import Callable
 import torch
 
 
+def make_lr_warmup(optimizer, lr_warmup_epochs: int, train_loader):
+    """LinearLR that ramps the LR from 1% to full over the first
+    ``lr_warmup_epochs`` epochs, in optimiser-step units
+    (``lr_warmup_epochs * len(train_loader)``). Returns None when warmup is off or
+    there is no loader. Factored from three byte-identical copies (train_lds's fresh
+    and resume paths, and train_refinement); the caller steps the returned scheduler
+    only on a taken optimiser step, never on a skipped batch."""
+    if lr_warmup_epochs > 0 and train_loader is not None:
+        return torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01,
+            total_iters=lr_warmup_epochs * len(train_loader),   # epochs -> optimiser steps
+        )
+    return None
+
+
+def linear_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int) -> float:
+    """`full_weight` ramped LINEARLY as epoch/warmup_epochs over the warmup.
+
+    The weight-ramp sibling of make_lr_warmup (which ramps the LR); train_refinement
+    uses it to introduce rollout/recon_predict/grad_predict/allen_cahn without shocking
+    a decoder that (resuming) has only seen frame-0 latents.
+
+    A module-level function rather than an expression inline in the epoch loop, so a
+    test can exercise the ACTUAL formula. An inline version forced the test to
+    re-implement it, and an off-by-one mutation in the production copy then left every
+    endpoint assertion green -- the test was checking its own arithmetic.
+
+    epoch/warmup_epochs, NOT (epoch-1)/(warmup_epochs-1). The latter pinned epoch 1 to
+    exactly zero -- a wasted first epoch -- and only reached full at epoch warmup_epochs
+    by spending a level on zero. epoch/warmup_epochs starts at 1/warmup_epochs
+    immediately and still reaches full AT epoch warmup_epochs, so grace-on-completion
+    timing (epoch == max(1, warmup_epochs)) is unchanged. This is ALSO the convention
+    stage 2's deriv_weight warmup uses, so warmup_epochs=N means the same ramp in every
+    trainer. epoch is 1-based: epoch 1 gives full_weight/warmup_epochs, epoch
+    warmup_epochs and beyond give exactly full_weight.
+    """
+    if warmup_epochs <= 0 or epoch >= warmup_epochs:
+        return full_weight
+    return full_weight * (epoch / warmup_epochs)
+
+
 def accumulate_epoch(
     loader,
     forward_fn: Callable[[object], dict[str, torch.Tensor]],

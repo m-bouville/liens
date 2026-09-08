@@ -65,6 +65,24 @@ from utils.plots import _save_figure  # noqa: E402  (retry-safe, non-fatal figur
 
 
 def _load(lds_ckpt_path: Path, ae_ckpt_path: Path | None, device):
+    # Accept a stage-3 LDS checkpoint OR a stage-4/5 JOINT checkpoint. The joint
+    # format stores f_theta as f_theta_state / lds_config (not model_state / config),
+    # and carries the REFINED encoder -- the right one to pair with its co-trained
+    # f_theta. split_joint_checkpoint_for_evaluation is the designed adapter: it
+    # writes a stage-3-shaped LDS view and an AE view, so the stage-3 loading below
+    # runs unchanged (this is why it exists -- see its docstring).
+    _raw = torch.load(lds_ckpt_path, map_location=device, weights_only=True)
+    from orchestration.checkpoint_identification import identify_checkpoint_stage
+    _stage = identify_checkpoint_stage(_raw)
+    if _stage.startswith("stage 4") or _stage.startswith("stage 5"):
+        import tempfile
+        from training.checkpoint_components import split_joint_checkpoint_for_evaluation
+        _views = Path(tempfile.mkdtemp(prefix="stats_head_rollout_views_"))
+        _ae_view, _lds_view = split_joint_checkpoint_for_evaluation(lds_ckpt_path, _views)
+        print(f"  {_stage} joint checkpoint: split into LDS + (refined) AE views for evaluation")
+        lds_ckpt_path = _lds_view
+        if ae_ckpt_path is None:
+            ae_ckpt_path = _ae_view          # the refined encoder, not the stage-2 ancestor
     lds_checkpoint = torch.load(lds_ckpt_path, map_location=device, weights_only=True)
     lds_config = lds_checkpoint["config"]
     if ae_ckpt_path is None:
@@ -72,13 +90,17 @@ def _load(lds_ckpt_path: Path, ae_ckpt_path: Path | None, device):
     ae, ae_encoder, ae_checkpoint, _stream_configs, _recon = build_ae_from_checkpoint(
         ae_ckpt_path, device)
     ae_config = ae_checkpoint["config"]
+    # n_theta=N_THETA, NOT lds_config["n_theta"]: stage-4 checkpoints do not store the
+    # key (only train_lds writes it) and old 1-theta ancestors upgrade by zero-padding
+    # -- the same contract as model_assembly.build_models_from_components.
     f_theta = LatentDynamics(
-        latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
+        latent_channels=lds_config["latent_channels"], n_theta=N_THETA,
         latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
         **integration_kwargs_from_config(lds_config),
     ).to(device)
-    f_theta.load_state_dict(lds_checkpoint["model_state"])
+    from models.encoder import zero_pad_theta_columns
+    f_theta.load_state_dict(zero_pad_theta_columns(lds_checkpoint["model_state"], f_theta))
     f_theta.eval()
     stats_head, _stats_loss = _load_frozen_stats_head(ae_checkpoint, ae_config, device)
     if stats_head is None:

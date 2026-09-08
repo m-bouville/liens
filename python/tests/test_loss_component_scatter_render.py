@@ -13,6 +13,7 @@ matplotlib.use("Agg")
 import pytest  # noqa: E402
 
 from utils.plots import _iso_total_levels, loss_component_scatter, rollout_vs_1step_scatter  # noqa: E402
+from _figure_artifacts import capture_figure, FigureArtifacts  # noqa: E402
 
 
 def _histories(n_epochs=4, every_epoch_saves=True):
@@ -39,31 +40,32 @@ def test_best_so_far_is_dashed_so_a_coincident_val_stays_visible(tmp_path):
     happily while the real function drew a solid line: the test was verifying
     its own fixture, not the code.
     """
-    import inspect
-    from utils import plots
-    src = inspect.getsource(plots.loss_component_scatter)
-    row = [l for l in src.splitlines() if '"best_so_far"' in l and "tab:green" in l]
-    assert row, "could not find the best_so_far series row"
-    assert '"--"' in row[0], f"best_so_far must be dashed, got: {row[0].strip()}"
-    val_row = [l for l in src.splitlines() if '"val"' in l and "tab:orange" in l]
-    assert val_row and '"-"' in val_row[0]
-
-    # and it still renders
-    out = loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
-    assert out is not None and Path(out).exists()
+    from matplotlib.colors import to_hex
+    with capture_figure() as figs:
+        loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
+    assert figs, "loss_component_scatter did not render a figure"
+    art = FigureArtifacts(figs[0])
+    # the green (best_so_far) line must be DASHED; the orange (val) line SOLID -- so the
+    # coincident best_so_far does not hide val. Asserted on the drawn artists, not source.
+    green = [ln for ln in art.lines(0) if to_hex(ln.get_color()) == to_hex("tab:green")]
+    orange = [ln for ln in art.lines(0) if to_hex(ln.get_color()) == to_hex("tab:orange")]
+    assert green and all(art.is_dashed(ln) for ln in green), "best_so_far must be dashed"
+    assert orange and not any(art.is_dashed(ln) for ln in orange), "val must be solid"
 
 
 def test_all_three_series_are_drawn_even_when_two_coincide(tmp_path):
     """The legend promises three; all three must be plotted, not merely
     labelled."""
-    import inspect
-    from utils import plots
-    src = inspect.getsource(plots.loss_component_scatter)
-    for key in ("train", "val", "best_so_far"):
-        assert f'"{key}"' in src
+    with capture_figure() as figs:
+        loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
+    art = FigureArtifacts(figs[0])
+    # three series must be DRAWN (three Line2D artists on the first component cell), not
+    # merely named -- the bug was best_so_far labelled but hidden under val.
+    assert len(art.lines(0)) >= 3, f"expected >=3 drawn lines, got {len(art.lines(0))}"
+    assert len(art.legend_labels(0)) == 3, "legend must promise exactly three series"
 
 
-def test_legend_is_not_pinned_to_a_fixed_corner():
+def test_legend_is_not_pinned_to_a_fixed_corner(tmp_path):
     """
     GUARDS loc="upper right". These trajectories head toward the origin, so
     late in a run the upper right is empty -- but EARLY, when every point is
@@ -71,11 +73,14 @@ def test_legend_is_not_pinned_to_a_fixed_corner():
     while three quarters of the axes are empty. That is exactly what a short
     run produces.
     """
-    import inspect
-    from utils import plots
-    src = inspect.getsource(plots.loss_component_scatter)
-    assert 'loc="best"' in src
-    assert 'loc="upper right"' not in src
+    with capture_figure() as figs:
+        loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
+    art = FigureArtifacts(figs[0])
+    # loc code 0 == "best" (auto-placed); 1 == "upper right" (the pinned corner guarded
+    # against). Reads Legend._loc -- see _figure_artifacts' caveat; the alternative is a
+    # source grep, and this at least checks the rendered legend.
+    assert art.has_legend(0), "the component cell must have a legend"
+    assert art.legend_loc_code(0) == 0, "legend must be loc='best', not a fixed corner"
 
 
 @pytest.mark.parametrize("n_levels", [2, 4, 7])
@@ -115,13 +120,11 @@ def test_axes_are_log_log_when_every_value_is_positive(tmp_path):
     0.09 while recon0 went 8.5 -> 3.2). On linear axes the early large values
     compress the late trajectory -- the part worth reading -- into a corner.
     """
-    import inspect
-    from utils import plots
-    src = inspect.getsource(plots.loss_component_scatter)
-    assert 'ax.set_xscale("log")' in src and 'ax.set_yscale("log")' in src
-
-    out = loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
-    assert out is not None and Path(out).exists()
+    with capture_figure() as figs:
+        loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
+    art = FigureArtifacts(figs[0])
+    assert art.scales(0) == ("log", "log"), (
+        f"component cell must be log-log, got {art.scales(0)}")
 
 
 def test_iso_lines_are_sampled_not_drawn_as_straight_segments_on_log_axes():
@@ -707,20 +710,21 @@ def test_rollout_vs_1step_renders_train_and_valid(tmp_path):
     l_1step_v = [0.5 + 0.05 * i for i in range(n)]
     l_rollout_t = [14.0 / (i + 1) for i in range(n)]
     l_1step_t = [0.48 + 0.05 * i for i in range(n)]
-    out = rollout_vs_1step_scatter(
-        l_1step_v, l_rollout_v, tmp_path / "rv1.png",
-        title="s", saved_epochs=epochs,
-        l_1step_train=l_1step_t, l_rollout_train=l_rollout_t)
-    assert out is not None and Path(out).exists()
-
-    import inspect
-    from utils import plots
-    src = inspect.getsource(plots.rollout_vs_1step_scatter)
-    # log-log SQUARE axes are the whole point of the plot
-    assert 'set_xscale("log")' in src and 'set_yscale("log")' in src
-    assert 'set_aspect("equal")' in src
+    with capture_figure() as figs:
+        out = rollout_vs_1step_scatter(
+            l_1step_v, l_rollout_v, tmp_path / "rv1.png",
+            title="s", saved_epochs=epochs,
+            l_1step_train=l_1step_t, l_rollout_train=l_rollout_t)
+    assert out is not None, "rollout_vs_1step_scatter must return its path"
+    assert figs, "no figure rendered"
+    art = FigureArtifacts(figs[0])
+    # log-log SQUARE axes are the whole point of the plot -- checked on the drawn axis
+    assert art.scales(0) == ("log", "log"), f"must be log-log, got {art.scales(0)}"
+    assert art.axes[0].get_aspect() in ("equal", 1.0), "axes must be square (aspect equal)"
     # both series are labelled (train + valid), matching loss_curve's convention
-    assert '"train"' in src and '"valid"' in src
+    labels = art.legend_labels(0)
+    assert any("train" in lab for lab in labels) and any("valid" in lab for lab in labels), (
+        f"both train and valid series must be labelled, got {labels}")
 
 
 def test_rollout_vs_1step_valid_only_still_renders(tmp_path):

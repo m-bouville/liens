@@ -43,7 +43,8 @@ from training.losses import (RolloutLoss, compute_dt_decade_weights,
                              stats0_predict_loss, z0_growth_loss)
 from utils.naming import ae_checkpoint_name, lds_checkpoint_name
 from utils.plots import rollout_vs_1step_scatter
-from training._training_loop import accumulate_epoch, write_epoch_figures
+from training._training_loop import (accumulate_epoch, write_epoch_figures,
+                                     make_lr_warmup)
 
 # GENERAL POLICY (matches training/train_refinement.py's own
 # _PYTHON_ROOT): every checkpoint/output/dataset path is built from
@@ -1040,11 +1041,7 @@ def train_lds(
     optimizer = torch.optim.Adam(f_theta.parameters(), lr=lr)
 
     lr_scheduler = None
-    if lr_warmup_epochs > 0 and train_loader is not None:
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.01,
-            total_iters=lr_warmup_epochs * len(train_loader),   # epochs -> optimiser steps
-        )
+    lr_scheduler = make_lr_warmup(optimizer, lr_warmup_epochs, train_loader)
 
     def step(batch, train: bool) -> tuple[torch.Tensor, torch.Tensor]:
         if len(batch) == 5:
@@ -1673,11 +1670,7 @@ def train_lds(
             #
             # Restarting the warmup is deliberate, not incidental: re-entering
             # gently after a divergence is exactly what is wanted.
-            if lr_warmup_epochs > 0 and train_loader is not None:
-                lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-                    optimizer, start_factor=0.01,
-                    total_iters=lr_warmup_epochs * len(train_loader),   # epochs -> optimiser steps
-                )
+            lr_scheduler = make_lr_warmup(optimizer, lr_warmup_epochs, train_loader)
             _spike_guard.forget_history()
             grad_guard.forget_history()
             # THE CRITERION MUST BE RESET TOO. Restoring the weights is only

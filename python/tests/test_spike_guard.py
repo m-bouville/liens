@@ -14,6 +14,7 @@ those configurations can reach.
 val_loss spiking alongside train is what identifies it as WEIGHT damage
 rather than one bad forward pass: val runs under no_grad with no z0 noise.
 """
+from _ast_helpers import parse_fragment, calls_to
 import math
 from pathlib import Path
 
@@ -797,13 +798,16 @@ def test_the_scheduler_is_rebuilt_WITH_the_optimizer():
         "torch no longer binds a scheduler to its optimizer -- this test's premise is gone"
     )
 
+    # Parse ONLY the rollback block, then assert STRUCTURALLY that both the optimizer
+    # and the scheduler are rebuilt inside it. AST over substring: survives reformatting
+    # and the make_lr_warmup extraction, still catches a missing scheduler rebuild.
     src = source_without_comments(_ROOT / "training/train_lds.py")
     block = src[src.index("_n_rollbacks += 1"):]
     block = block[:block.index("print(")]
-    assert "torch.optim.Adam" in block, "the optimizer is not rebuilt"
-    assert "LinearLR" in block, (
-        "the optimizer is rebuilt but the scheduler is not -- it is now orphaned"
-    )
+    block_tree = parse_fragment(block)
+    assert calls_to(block_tree, "Adam"), "the optimizer is not rebuilt in the rollback"
+    assert (calls_to(block_tree, "make_lr_warmup") or calls_to(block_tree, "LinearLR")), (
+        "the optimizer is rebuilt but the scheduler is not -- it is now orphaned")
 
 
 def test_the_lr_schedule_does_not_advance_on_a_skipped_batch():

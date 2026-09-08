@@ -114,8 +114,10 @@ dict_key_imports_values = {
     },
     'evaluation/check_rollout.py': {
         'models/constants.py',
+        'models/encoder.py',
         'models/latent_dynamics.py',
         'models/latent_streams.py',
+        'orchestration/checkpoint_identification.py',
         'training/checkpoint_components.py',
         'training/datasets.py',
         'training/losses.py',
@@ -125,7 +127,9 @@ dict_key_imports_values = {
     },
     'evaluation/check_stats_head_rollout.py': {
         'models/constants.py',
+        'models/encoder.py',
         'models/latent_dynamics.py',
+        'orchestration/checkpoint_identification.py',
         'training/checkpoint_components.py',
         'training/datasets.py',
         'training/train_lds.py',
@@ -533,6 +537,8 @@ dict_key_imported_by_values = {
     'models/encoder.py': {
         'evaluation/check_latent_channels.py',
         'evaluation/check_reconstruction.py',
+        'evaluation/check_rollout.py',
+        'evaluation/check_stats_head_rollout.py',
         'evaluation/compare_f_theta.py',
         'evaluation/compare_rollout_training.py',
         'models/autoencoder.py',
@@ -576,6 +582,8 @@ dict_key_imported_by_values = {
     },
     'orchestration/checkpoint_identification.py': {
         'evaluation/_latent_eval.py',
+        'evaluation/check_rollout.py',
+        'evaluation/check_stats_head_rollout.py',
         'orchestration/pipeline.py',
     },
     'orchestration/checkpoint_registry.py': {

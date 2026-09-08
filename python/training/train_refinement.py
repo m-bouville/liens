@@ -22,7 +22,8 @@ from training._spike_guard import (
 )
 from utils.logging_utils import print_run_parameters, EpochProgress
 from training._training_loop import (accumulate_epoch, weighted_contributions,
-                                    write_epoch_figures, format_component_side)
+                                    write_epoch_figures, format_component_side,
+                                    make_lr_warmup, linear_warmup_weight)
 from training._checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, save_checkpoint,
     ramp_completion_grace, scale_balance_report,
@@ -33,49 +34,6 @@ from training.model_assembly import build_models_from_components
 from training._refinement_loss import compute_stage45_loss
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
-
-
-def linear_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int) -> float:
-    """`full_weight` ramped LINEARLY as epoch/warmup_epochs over the warmup.
-
-    A module-level function rather than an expression inline in the epoch
-    loop, so a test can exercise the ACTUAL formula. An inline version forced
-    the test to re-implement it, and an off-by-one mutation in the production
-    copy then left every endpoint assertion green -- the test was checking its
-    own arithmetic.
-
-    epoch/warmup_epochs, NOT (epoch-1)/(warmup_epochs-1). The latter pinned
-    epoch 1 to exactly zero -- a wasted first epoch where the warmed-in term
-    did nothing at all -- and only reached full at epoch warmup_epochs by
-    spending one of its levels on zero. epoch/warmup_epochs starts the
-    introduction immediately at 1/warmup_epochs (20% for a 5-epoch warmup) and
-    still reaches full AT epoch warmup_epochs, so the grace-on-completion timing
-    (epoch == max(1, warmup_epochs)) is unchanged. This is ALSO the convention
-    stage 2's deriv_weight warmup already uses (deriv_weight * min(1, epoch/N)),
-    so warmup_epochs=N now means the same ramp in every trainer.
-
-    No start_fraction: it was a holdover from the geometric era (a multiplicative
-    ramp cannot start at 0), and with two independent warmups in stage 4 plus one
-    in stage 5 the knob proliferated meaninglessly. epoch/warmup_epochs needs no
-    floor -- it starts at a real 1/warmup_epochs.
-
-    Linear, not geometric. This USED to be geometric, on the argument that
-    L_rollout collapsed ~6e9 over the first ten epochs (1.76e9 -> 0.29,
-    measured) so a linear weight ramp left epoch 1 eight decades above the
-    converged contribution. That collapse was itself an artefact of the
-    filter-manufactured large-dt windows (du_max=2.5e4): require_consecutive
-    now excludes those at the window definition, and with the scales
-    recalibrated L_rollout sits at O(1-10) from epoch 1, not O(1e9). Nothing
-    left to hold flat -- so the ramp is a plain linear introduction of the
-    term, and the same function serves any warmed-in weight (rollout,
-    recon_predict) rather than encoding one term's obsolete transient.
-
-    epoch is 1-based: epoch 1 gives full_weight/warmup_epochs, epoch
-    warmup_epochs and beyond give exactly full_weight.
-    """
-    if warmup_epochs <= 0 or epoch >= warmup_epochs:
-        return full_weight
-    return full_weight * (epoch / warmup_epochs)
 
 
 _REFINEMENT_PREAMBLE_PARAMS = (
@@ -394,10 +352,7 @@ def train_refinement(
     # skipped batch -- else it consumes the warmup without training and torch
     # warns. Default 0 = off, so runs that do not pass it are unchanged.
     lr_scheduler = None
-    if lr_warmup_epochs > 0 and train_loader is not None:
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.01,
-            total_iters=lr_warmup_epochs * len(train_loader))   # epochs -> optimiser steps
+    lr_scheduler = make_lr_warmup(optimizer, lr_warmup_epochs, train_loader)
 
     if checkpoint_path is None:
         stage_dir = "stage4" if freeze_decoder else "stage5"

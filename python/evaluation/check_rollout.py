@@ -53,6 +53,7 @@ import numpy as np
 import torch
 
 from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates
+from models.constants import N_THETA
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 from utils.window_parsing import parse_fixed_window
@@ -328,19 +329,35 @@ def check_rollout(
                        / f"{lds_checkpoint_path.stem}{suffix}.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Accept a stage-3 LDS checkpoint OR a stage-4/5 JOINT checkpoint (f_theta_state /
+    # lds_config layout, carrying the REFINED encoder). split_joint_checkpoint_for_
+    # evaluation is the designed adapter: a stage-3-shaped LDS view plus an AE view,
+    # so the loading below runs unchanged -- its docstring names check_rollout as the
+    # intended consumer. The AE view is used so the refined E pairs with its own f_theta.
+    _raw = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
+    from orchestration.checkpoint_identification import identify_checkpoint_stage
+    _stage = identify_checkpoint_stage(_raw)
+    _ae_view = None
+    if _stage.startswith("stage 4") or _stage.startswith("stage 5"):
+        import tempfile
+        from training.checkpoint_components import split_joint_checkpoint_for_evaluation
+        _views = Path(tempfile.mkdtemp(prefix="rollout_check_views_"))
+        _ae_view, lds_checkpoint_path = split_joint_checkpoint_for_evaluation(
+            lds_checkpoint_path, _views)
+        print(f"  {_stage} joint checkpoint: split into LDS + (refined) AE views for evaluation")
     lds_checkpoint = torch.load(lds_checkpoint_path, map_location=device, weights_only=True)
     lds_config = lds_checkpoint["config"]
     print(f"Loaded LDS checkpoint from epoch {lds_checkpoint['epoch']}, "
           f"val_loss={lds_checkpoint['val_loss']:.6f}, config={lds_config}")
 
-    ae_checkpoint_path = Path(lds_checkpoint["ae_checkpoint"])
+    ae_checkpoint_path = _ae_view if _ae_view is not None else Path(lds_checkpoint["ae_checkpoint"])
     ae, ae_encoder, ae_checkpoint, stream_configs, recon_stream_name = build_ae_from_checkpoint(
         ae_checkpoint_path, device,
     )
     ae_config = ae_checkpoint["config"]
 
     f_theta = LatentDynamics(
-        latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
+        latent_channels=lds_config["latent_channels"], n_theta=N_THETA,
         latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
         # EVERY meaning-changing field, from ONE list -- see
@@ -352,7 +369,8 @@ def check_rollout(
         # at dt=500. One list, one call, and a new field cannot miss a site.
         **integration_kwargs_from_config(lds_config),
     ).to(device)
-    f_theta.load_state_dict(lds_checkpoint["model_state"])
+    from models.encoder import zero_pad_theta_columns
+    f_theta.load_state_dict(zero_pad_theta_columns(lds_checkpoint["model_state"], f_theta))
     f_theta.eval()
 
     data_config = lds_checkpoint.get("data_config")
