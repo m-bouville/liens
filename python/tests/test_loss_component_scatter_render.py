@@ -13,7 +13,7 @@ matplotlib.use("Agg")
 import pytest  # noqa: E402
 
 from utils.plots import _iso_total_levels, loss_component_scatter, rollout_vs_1step_scatter  # noqa: E402
-from _figure_artifacts import capture_figure, FigureArtifacts  # noqa: E402
+from _figure_artifacts import capture_figure, FigureArtifacts, render_once  # noqa: E402
 
 
 def _histories(n_epochs=4, every_epoch_saves=True):
@@ -29,7 +29,20 @@ def _histories(n_epochs=4, every_epoch_saves=True):
     }
 
 
-def test_best_so_far_is_dashed_so_a_coincident_val_stays_visible(tmp_path):
+@pytest.fixture(scope="module")
+def component_art():
+    """Render loss_component_scatter ONCE (each render is ~0.7 s) with the standard
+    fixture data and share the drawn artifacts across every test that inspects it --
+    they all render identical args. No file is written (render_once intercepts
+    _save_figure); the figure is closed at teardown."""
+    import pathlib
+    art = render_once(lambda: loss_component_scatter(
+        [1, 2, 3, 4], _histories(), pathlib.Path("unused.png"), title="t"))
+    yield art
+    art.close()
+
+
+def test_best_so_far_is_dashed_so_a_coincident_val_stays_visible(component_art):
     """
     GUARDS drawing best_so_far solid. It equals val exactly on every saved
     epoch, and being drawn last at width 2.0 it hid the val line completely --
@@ -41,10 +54,7 @@ def test_best_so_far_is_dashed_so_a_coincident_val_stays_visible(tmp_path):
     its own fixture, not the code.
     """
     from matplotlib.colors import to_hex
-    with capture_figure() as figs:
-        loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
-    assert figs, "loss_component_scatter did not render a figure"
-    art = FigureArtifacts(figs[0])
+    art = component_art
     # the green (best_so_far) line must be DASHED; the orange (val) line SOLID -- so the
     # coincident best_so_far does not hide val. Asserted on the drawn artists, not source.
     green = [ln for ln in art.lines(0) if to_hex(ln.get_color()) == to_hex("tab:green")]
@@ -53,19 +63,17 @@ def test_best_so_far_is_dashed_so_a_coincident_val_stays_visible(tmp_path):
     assert orange and not any(art.is_dashed(ln) for ln in orange), "val must be solid"
 
 
-def test_all_three_series_are_drawn_even_when_two_coincide(tmp_path):
+def test_all_three_series_are_drawn_even_when_two_coincide(component_art):
     """The legend promises three; all three must be plotted, not merely
     labelled."""
-    with capture_figure() as figs:
-        loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
-    art = FigureArtifacts(figs[0])
+    art = component_art
     # three series must be DRAWN (three Line2D artists on the first component cell), not
     # merely named -- the bug was best_so_far labelled but hidden under val.
     assert len(art.lines(0)) >= 3, f"expected >=3 drawn lines, got {len(art.lines(0))}"
     assert len(art.legend_labels(0)) == 3, "legend must promise exactly three series"
 
 
-def test_legend_is_not_pinned_to_a_fixed_corner(tmp_path):
+def test_legend_is_not_pinned_to_a_fixed_corner(component_art):
     """
     GUARDS loc="upper right". These trajectories head toward the origin, so
     late in a run the upper right is empty -- but EARLY, when every point is
@@ -73,9 +81,7 @@ def test_legend_is_not_pinned_to_a_fixed_corner(tmp_path):
     while three quarters of the axes are empty. That is exactly what a short
     run produces.
     """
-    with capture_figure() as figs:
-        loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
-    art = FigureArtifacts(figs[0])
+    art = component_art
     # loc code 0 == "best" (auto-placed); 1 == "upper right" (the pinned corner guarded
     # against). Reads Legend._loc -- see _figure_artifacts' caveat; the alternative is a
     # source grep, and this at least checks the rendered legend.
@@ -114,15 +120,13 @@ def test_iso_levels_are_empty_rather_than_raising_on_no_data():
     assert _iso_total_levels([], []) == []
 
 
-def test_axes_are_log_log_when_every_value_is_positive(tmp_path):
+def test_axes_are_log_log_when_every_value_is_positive(component_art):
     """
     Components span more than a decade within a run (stage 2: deriv 0.79 ->
     0.09 while recon0 went 8.5 -> 3.2). On linear axes the early large values
     compress the late trajectory -- the part worth reading -- into a corner.
     """
-    with capture_figure() as figs:
-        loss_component_scatter([1, 2, 3, 4], _histories(), tmp_path / "s.png", title="t")
-    art = FigureArtifacts(figs[0])
+    art = component_art
     assert art.scales(0) == ("log", "log"), (
         f"component cell must be log-log, got {art.scales(0)}")
 

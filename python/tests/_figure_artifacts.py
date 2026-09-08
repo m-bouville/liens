@@ -60,6 +60,31 @@ def capture_figure():
             plt.close(fig)
 
 
+def render_once(render_callable):
+    """Run a zero-arg callable that draws via plots._save_figure, capture the Figure
+    WITHOUT closing it or writing a file, and restore _save_figure IMMEDIATELY -- so
+    this is safe to call from a module-scoped fixture (it does not leave _save_figure
+    patched for the whole module the way holding capture_figure() open would). Returns
+    FigureArtifacts; the caller closes the figure via .close() at fixture teardown.
+    Use this to render one figure once and share it across several assertions, instead
+    of re-rendering (each loss_component_scatter is ~0.7 s)."""
+    captured = []
+    original = plots._save_figure
+
+    def _cap(fig, *args, **kwargs):
+        captured.append(fig)
+        return True
+
+    plots._save_figure = _cap
+    try:
+        render_callable()
+    finally:
+        plots._save_figure = original
+    if not captured:
+        raise AssertionError("render_callable did not draw a figure via plots._save_figure")
+    return FigureArtifacts(captured[0])
+
+
 class FigureArtifacts:
     """Read-only view of what a captured Figure actually drew. Methods take an axis
     index (0 = first subplot); the figure may be an n x n grid (fig.axes is flat,
@@ -68,6 +93,11 @@ class FigureArtifacts:
     def __init__(self, fig):
         self.fig = fig
         self.axes = fig.axes
+
+    def close(self):
+        """Close the underlying figure -- call at teardown when the figure was kept
+        open (e.g. by render_once) for cross-test inspection."""
+        plt.close(self.fig)
 
     def n_axes(self):
         return len(self.axes)

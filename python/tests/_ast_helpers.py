@@ -77,18 +77,26 @@ def call_kwarg(call: ast.Call, name: str):
     return None
 
 
-def multiplies(tree: ast.AST, a_substr: str, b_substr: str) -> bool:
-    """True if some `X * Y` (either operand order) has `a_substr` in one operand's
-    unparsed source and `b_substr` in the other. Robust to whitespace, line-wrapping
-    and `len(...)` wrapping -- e.g. multiplies(t, 'lr_warmup_epochs', 'train_loader')
-    matches `lr_warmup_epochs * len(train_loader)` however it is formatted, and does
-    NOT match a bare `total_iters=lr_warmup_epochs` (no multiplication at all -- the
-    batch-units bug)."""
+def _operand_mentions(node: ast.AST, name: str) -> bool:
+    """True if `name` appears as an actual Name node anywhere in an operand's subtree
+    (so `train_loader` matches `len(train_loader)` but NOT the unrelated identifier
+    `train_loader_y`). Falls back to substring only for operands with no Name nodes
+    (e.g. a pure literal), which the callers here never rely on."""
+    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    return name in names
+
+
+def multiplies(tree: ast.AST, a_name: str, b_name: str) -> bool:
+    """True if some `X * Y` (either operand order) has the identifier `a_name` as a
+    Name in one operand and `b_name` in the other. Matches on AST Name nodes, NOT
+    source substrings -- so multiplies(t, 'lr_warmup_epochs', 'train_loader') matches
+    `lr_warmup_epochs * len(train_loader)` however it is formatted, does NOT match a
+    bare `total_iters=lr_warmup_epochs` (no multiplication -- the batch-units bug),
+    and does NOT false-match a similarly-named `lr_warmup_epochs_x * train_loader_y`."""
     for node in ast.walk(tree):
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
-            left, right = ast.unparse(node.left), ast.unparse(node.right)
-            if (a_substr in left and b_substr in right) or \
-               (a_substr in right and b_substr in left):
+            if (_operand_mentions(node.left, a_name) and _operand_mentions(node.right, b_name)) or \
+               (_operand_mentions(node.right, a_name) and _operand_mentions(node.left, b_name)):
                 return True
     return False
 

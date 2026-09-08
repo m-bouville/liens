@@ -339,9 +339,15 @@ def check_rollout(
     _stage = identify_checkpoint_stage(_raw)
     _ae_view = None
     if _stage.startswith("stage 4") or _stage.startswith("stage 5"):
+        import atexit
+        import shutil
         import tempfile
         from training.checkpoint_components import split_joint_checkpoint_for_evaluation
         _views = Path(tempfile.mkdtemp(prefix="rollout_check_views_"))
+        # remove the split-view tempdir at process exit -- one diagnostic run is one
+        # process, so nothing accumulates across invocations (the bare-mkdtemp leak);
+        # registered rather than inline so an early return can't skip it.
+        atexit.register(shutil.rmtree, str(_views), ignore_errors=True)
         _ae_view, lds_checkpoint_path = split_joint_checkpoint_for_evaluation(
             lds_checkpoint_path, _views)
         print(f"  {_stage} joint checkpoint: split into LDS + (refined) AE views for evaluation")

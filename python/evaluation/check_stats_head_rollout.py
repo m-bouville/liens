@@ -75,9 +75,16 @@ def _load(lds_ckpt_path: Path, ae_ckpt_path: Path | None, device):
     from orchestration.checkpoint_identification import identify_checkpoint_stage
     _stage = identify_checkpoint_stage(_raw)
     if _stage.startswith("stage 4") or _stage.startswith("stage 5"):
+        import atexit
+        import shutil
         import tempfile
         from training.checkpoint_components import split_joint_checkpoint_for_evaluation
         _views = Path(tempfile.mkdtemp(prefix="stats_head_rollout_views_"))
+        # remove the split-view tempdir at process exit -- a diagnostic run is one
+        # process, so this cleans up before it ends and nothing accumulates across
+        # invocations (the leak the bare mkdtemp had). Registered rather than cleaned
+        # inline so it survives any early return between here and the loads below.
+        atexit.register(shutil.rmtree, str(_views), ignore_errors=True)
         _ae_view, _lds_view = split_joint_checkpoint_for_evaluation(lds_ckpt_path, _views)
         print(f"  {_stage} joint checkpoint: split into LDS + (refined) AE views for evaluation")
         lds_ckpt_path = _lds_view
