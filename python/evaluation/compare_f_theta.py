@@ -837,7 +837,9 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
 
     # (0,4) and (1,4): the vs-steps medians NORMALIZED to expose the per-step
     # law, from n=1 (both are undefined at n=0: 1/n, and ln(1)/0).
-    #   [0,4] loss:  g(n) = ln[loss(n)/loss(0)] / n  -- the per-step log-growth
+    #   [0,4] loss:  g(n) = ln[loss(n)] / n  -- per-step mean log-loss (was
+#                ln[loss(n)/loss(0)]/n, dropped: loss(0) anchored it to a
+#                near-perfect first step, esp. stage 5)
     #                rate; FLAT across n => loss grows exponentially at rate g
     #                (the compounding signature), rising/falling => the rate
     #                itself changes with n.
@@ -850,9 +852,13 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     # different units, and inheriting either scale would make them unreadable.
     for key in step_keys:
         ml = step_med.get(("loss", key), {})
-        if ml and ml.get(0, 0.0) > 0.0:
+        if ml:
+            # ln[loss(n)]/n, NOT ln[loss(n)/loss(0)]/n: normalising by loss(0) let a
+            # near-perfect first step (esp. stage 5, tiny loss(0)) dominate the whole
+            # curve. Absolute per-step mean log-loss instead -- no loss(0) anchor.
+            # Still needs loss(n) > 0 for the log; loss(0) may be anything now.
             ks = sorted(n for n in ml if n >= 1 and ml.get(n, 0.0) > 0.0)
-            g = [np.log(ml[n] / ml[0]) / n for n in ks]
+            g = [np.log(ml[n]) / n for n in ks]
             if ks:
                 axes[0, 4].plot(ks, g, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
         mc = step_med.get(("corr", key), {})
@@ -862,8 +868,8 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
             if ks:
                 axes[1, 4].plot(ks, d, "o", color=colours[key], linestyle=linestyles[key], label=labels[key])
     axes[0, 4].set_xlabel("chained steps applied")
-    axes[0, 4].set_ylabel("ln[loss(n)/loss(0)] / n")
-    axes[0, 4].set_title("loss log-growth rate per step")
+    axes[0, 4].set_ylabel("ln[loss(n)] / n")
+    axes[0, 4].set_title("mean log-loss per step")
     axes[0, 4].grid(alpha=0.3, which="both")
     axes[0, 4].legend()
     axes[1, 4].set_xlabel("chained steps applied")

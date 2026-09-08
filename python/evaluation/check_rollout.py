@@ -174,6 +174,40 @@ def compute_sample(run_dir: Path, steps: list[int], ae, f_theta,
             model_dts = dt_per_step
         dts = torch.tensor([model_dts], dtype=torch.float32, device=device)
 
+        # derivative_source=previous_quotient: the model was TRAINED consuming the
+        # backward quotient of z0, q_i = (z0_i - z0_{i-1})/du_i, NOT the encoder's z1
+        # head. Feeding z1 here (a channel the model never learned to use as its
+        # derivative) rolls out a DIFFERENT trajectory from the one the model actually
+        # produces -- the exact reason this figure disagreed with compare_f_theta's
+        # own compute_trajectory, which does this. Rebuild z1_sequence as the quotient,
+        # in the SAME (already-scaled) coordinate as z1_sequence above so the units
+        # match. q_0 (the seed rollout() holds when z1_resync=False) comes from the
+        # window's real predecessor frame; only at a run's first saved frame, where no
+        # predecessor exists, fall back to the encoder z1 seed already in z1_sequence.
+        if getattr(f_theta, "derivative_source", "z1") == "previous_quotient":
+            _z0_seq = x_all_encoded[recon_stream_name]                       # (n, C, 8, 8)
+            _du = torch.tensor(model_dts, dtype=_z0_seq.dtype, device=device)
+            _q_rest = (_z0_seq[1:] - _z0_seq[:-1]) / _du[:, None, None, None]  # q_1..q_{n-1}
+            _saved = list(metadata.save_steps)
+            _q0 = None
+            if steps[0] in _saved and _saved.index(steps[0]) > 0:
+                _prev = _saved[_saved.index(steps[0]) - 1]
+                if getattr(f_theta, "time_coordinate", "t") == "log10_t":
+                    _du0 = _math.log10(steps[0] / _prev)
+                else:
+                    _du0 = (steps[0] - _prev) * metadata.dt
+                if _du0 > 0:
+                    _xp = torch.stack([
+                        torch.from_numpy(load.read_phi_half(
+                            run_dir / load.snapshot_filename(s), nx, ny))
+                        for s in (_prev, steps[0])]).unsqueeze(1).to(device)
+                    _tp = torch.tensor(theta_vec, dtype=torch.float32, device=device).expand(2, -1)
+                    _zp = ae_encoder(_xp, theta=_tp)[recon_stream_name]
+                    _q0 = (_zp[1:2] - _zp[0:1]) / _du0                        # (1, C, 8, 8)
+            if _q0 is None:
+                _q0 = z1_sequence[0, 0:1]                                     # run-start fallback
+            z1_sequence = torch.cat([_q0, _q_rest], dim=0).unsqueeze(0)       # (1, n, C, 8, 8)
+
         z0_hat_full = f_theta.rollout(z0_t, z1_sequence, dts, theta,
                                        z1_resync=z1_resync)
         z0_next_pred = z0_hat_full[:, -1]
@@ -339,15 +373,9 @@ def check_rollout(
     _stage = identify_checkpoint_stage(_raw)
     _ae_view = None
     if _stage.startswith("stage 4") or _stage.startswith("stage 5"):
-        import atexit
-        import shutil
         import tempfile
         from training.checkpoint_components import split_joint_checkpoint_for_evaluation
         _views = Path(tempfile.mkdtemp(prefix="rollout_check_views_"))
-        # remove the split-view tempdir at process exit -- one diagnostic run is one
-        # process, so nothing accumulates across invocations (the bare-mkdtemp leak);
-        # registered rather than inline so an early return can't skip it.
-        atexit.register(shutil.rmtree, str(_views), ignore_errors=True)
         _ae_view, lds_checkpoint_path = split_joint_checkpoint_for_evaluation(
             lds_checkpoint_path, _views)
         print(f"  {_stage} joint checkpoint: split into LDS + (refined) AE views for evaluation")
