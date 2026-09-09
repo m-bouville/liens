@@ -222,6 +222,63 @@ from training._dataset_filtering import (  # noqa: F401  (re-export)
 
 
 
+# --------------------------------------------------------------------------- #
+# Statistics under normalize_phi.
+#
+# Under phi -> psi = phi/phi_eq(T) each statistics.csv column transforms by a
+# power of phi_eq. When normalize_phi is on, the stats TARGETS are divided by
+# phi_eq**exponent so they live in the same normalized units as the field the
+# stats head sees -- otherwise the head must learn to undo the very T-amplitude
+# dependence the normalization exists to remove.
+#   0  scale-invariant by construction: anisotropy=(l1-l2)/trace and angle are
+#      ratios; autocorr_* is normalized by C(0) and its length is in pixels;
+#      phi_below_0's threshold at 0 is preserved by any positive scaling.
+#   1  linear in phi.
+#   2  quadratic. `energy` is a mix (gradient + phi^2 terms ~phi_eq^2, the phi^4
+#      term ~phi_eq^4): divided by phi_eq^2, the dominant factor, and the residual
+#      phi^4 T-dependence is left to the theta-conditioned head.
+# The raw +/-0.1 thresholds are NOT usable: in psi-space the cutoff is
+# +/-0.1/phi_eq(T), a T-dependent threshold with no clean transform -- they are
+# DROPPED from stat_names when normalize_phi is on (n_stats 12 -> 10).
+_STAT_PHI_EQ_EXPONENT: dict[str, int] = {
+    "anisotropy": 0, "angle": 0, "autocorr_correl": 0, "autocorr_length": 0,
+    "phi_below_0": 0,
+    "avg_phi": 1, "stdev_phi": 1, "avg_gradient": 1,
+    "gradient_sqr": 2, "energy": 2,
+}
+_STATS_DROPPED_WHEN_NORMALIZED: tuple[str, ...] = ("phi_above_10", "phi_below_-10")
+
+
+def normalized_stat_names(stat_names: list[str]) -> list[str]:
+    """stat_names with the normalization-hopeless columns removed (order kept)."""
+    return [n for n in stat_names if n not in _STATS_DROPPED_WHEN_NORMALIZED]
+
+
+def check_stat_names_normalizable(stat_names: list[str], where: str) -> None:
+    """Raise if a caller explicitly asks for a stat that cannot be normalized:
+    a dropped (+/-0.1 threshold) one, or one with no known phi_eq exponent --
+    an unknown stat must never be silently passed through un-normalized."""
+    bad = [n for n in stat_names if n in _STATS_DROPPED_WHEN_NORMALIZED]
+    if bad:
+        raise ValueError(
+            f"{where}: stat(s) {bad} cannot be used with normalize_phi=True -- their raw "
+            f"+/-0.1 thresholds have no clean transform under phi/phi_eq(T). Drop them "
+            f"(normalized_stat_names) or run with normalize_phi=False.")
+    unknown = [n for n in stat_names if n not in _STAT_PHI_EQ_EXPONENT]
+    if unknown:
+        raise ValueError(
+            f"{where}: stat(s) {unknown} have no phi_eq exponent in _STAT_PHI_EQ_EXPONENT; "
+            f"add the correct power (0 invariant, 1 linear, 2 quadratic) before using them "
+            f"with normalize_phi=True.")
+
+
+def normalize_stats_vector(stats: torch.Tensor, stat_names: list[str], phi_eq: float) -> torch.Tensor:
+    """Divide each stat by phi_eq**exponent (see _STAT_PHI_EQ_EXPONENT)."""
+    scale = torch.tensor([phi_eq ** _STAT_PHI_EQ_EXPONENT[n] for n in stat_names],
+                         dtype=stats.dtype)
+    return stats / scale
+
+
 class MicrostructureSnapshotDataset(Dataset):
     """
     Flat collection of individual microstructure snapshots x(t), pooled
@@ -286,7 +343,8 @@ class MicrostructureSnapshotDataset(Dataset):
                  min_stdev_phi: float | None = None, min_passing_steps: int | None = None,
                  include_stats: bool = False, stat_names: list[str] | None = None,
                  good_steps: dict[Path, list[int]] | None = None,
-                 split_label: str = "", min_normalized_stdev_phi: float | None = None):
+                 split_label: str = "", min_normalized_stdev_phi: float | None = None,
+                 normalize_phi: bool = False):
         """
         good_steps: a precomputed {run_dir: [kept_step, ...]} mapping
         from build_good_steps(), to skip re-scanning run_dirs when
@@ -345,6 +403,14 @@ class MicrostructureSnapshotDataset(Dataset):
         (pure shift, no rotation/reflection of content).
         """
         self._index: list[tuple[Path, int, int, int]] = []  # (run_dir, step, nx, ny)
+        # normalize_phi: divide each frame by phi_eq(T)=sqrt(a0(T0-T)/b) (a0=b=1 ->
+        # sqrt(T0-T)) so the AE trains on a field whose ground state is +/-1 at every
+        # T. phi_eq is per-run (constant across its frames); cached by run_dir here at
+        # index time (metadata is read below) and applied in _load. MUST match the
+        # normalize_phi used for the frozen encoder downstream, or stage 3+ feeds the
+        # encoder a differently-scaled field than it was trained on.
+        self.normalize_phi = normalize_phi
+        self._phi_eq_by_run: dict[Path, float] = {}
         self._stats_by_run = {}  # dict[Path, pd.DataFrame], populated below if include_stats
 
         run_dirs = [Path(d) for d in run_dirs]
@@ -370,6 +436,12 @@ class MicrostructureSnapshotDataset(Dataset):
                     f"({_progress_eta(_run_pos + 1, _n_runs, _t0)})   ")
                 sys.stdout.flush()
             metadata = load.read_metadata(run_dir / "metadata.txt")
+            if self.normalize_phi:
+                import math as _math
+                # sqrt(a0*(T0-T)/b) from the run's own metadata -- same formula as
+                # MicrostructureEvolutionDataset._phi_eq; never hardcode a0=b=1.
+                self._phi_eq_by_run[run_dir] = _math.sqrt(
+                    max(metadata.a0 * (metadata.T0 - metadata.temperature) / metadata.b, 1e-12))
             kept_steps = good_steps[run_dir]
 
             # Still needed here (independent of build_good_steps) when
@@ -381,6 +453,10 @@ class MicrostructureSnapshotDataset(Dataset):
                 stats_df = load.read_statistics_csv(run_dir / "statistics.csv")
                 if stat_names is None:
                     stat_names = sorted(stats_df.columns)
+                    if self.normalize_phi:
+                        stat_names = normalized_stat_names(stat_names)   # drop +/-0.1 thresholds
+                elif self.normalize_phi:
+                    check_stat_names_normalizable(stat_names, "MicrostructureSnapshotDataset")
                 missing = set(stat_names) - set(stats_df.columns)
                 if missing:
                     raise ValueError(
@@ -454,6 +530,8 @@ class MicrostructureSnapshotDataset(Dataset):
         run_dir, step, nx, ny = self._index[idx]
         path = run_dir / load.snapshot_filename(step)
         phi = load.read_phi_half(path, nx, ny)     # (ny, nx) float32 numpy
+        if self.normalize_phi:
+            phi = phi / self._phi_eq_by_run[run_dir]
         return torch.from_numpy(phi).unsqueeze(0)  # (1, ny, nx)
 
     def _load_stats(self, idx: int, k: int = 0, flip: bool = False) -> torch.Tensor:
@@ -467,6 +545,8 @@ class MicrostructureSnapshotDataset(Dataset):
             ) from None
         values = [row[name] for name in self.stat_names]
         stats = torch.tensor(values, dtype=torch.float32)
+        if self.normalize_phi:
+            stats = normalize_stats_vector(stats, self.stat_names, self._phi_eq_by_run[run_dir])
 
         if (k or flip) and "angle" in self.stat_names:
             angle_idx = self.stat_names.index("angle")
@@ -687,6 +767,7 @@ class MicrostructureEvolutionDataset(Dataset):
                  skip_bad: bool = True, min_step: int = 0,
                  min_stdev_phi: float | None = None, min_passing_steps: int | None = None,
                  min_normalized_stdev_phi: float | None = None,
+                 normalize_phi: bool = False,
                  encode_batch_size: int = 256,
                  good_steps: dict[Path, list[int]] | None = None,
                  stat_names: list[str] | None = None, augment: bool = False,
@@ -901,7 +982,23 @@ class MicrostructureEvolutionDataset(Dataset):
         self.window_length = window_length
         self.encoder_given = encoder is not None  # which mode __getitem__ operates in
         self.encode_both_streams = encode_both_streams
+        # normalize_phi: rescale each frame by 1/phi_eq(T) so the double-well
+        # ground state sits at +/-1 regardless of T (phi_eq = sqrt(a0(T0-T)/b),
+        # a0=b=1 for this sweep, so sqrt(T0-T)). Applied to EVERY frame read that
+        # feeds the encoder, BEFORE encoding, so the cached latent is E(phi/phi_eq);
+        # the cache dir is marked -norm so it never mixes with raw latents. Above
+        # T~0.99 phi_eq is tiny and the field legitimately has not reached +/-1
+        # (real incomplete evolution, not noise) -- min_stdev_phi guards the few
+        # runs where dividing by a small phi_eq would amplify read noise.
+        self.normalize_phi = normalize_phi
+        if normalize_phi and stat_names:
+            # stat_names here come from the caller (matching the checkpoint's stats
+            # head); a normalized run must not carry a threshold stat or an unknown one.
+            check_stat_names_normalizable(stat_names, "MicrostructureEvolutionDataset")
         self.stat_names = stat_names
+        # per-run phi_eq for normalizing true_stats in __getitem__; filled in
+        # _build_window_index from pending_meta (which carries each run's metadata).
+        self._phi_eq_by_run: dict[Path, float] = {}
         self.augment = augment
         # derivative_source: "z1" (default) serves the encoder's deriv stream as
         # window_deriv, exactly as before. "previous_quotient" instead serves the
@@ -1131,6 +1228,7 @@ class MicrostructureEvolutionDataset(Dataset):
             phi = load.read_phi_half(
                 run_dir / load.snapshot_filename(pred_step), metadata.nx, metadata.ny)
             frame = torch.from_numpy(phi).unsqueeze(0)          # (1, ny, nx)
+            frame = self._maybe_normalize(frame, metadata)
             theta = (torch.tensor(theta_coordinates(metadata.temperature, metadata.T0),
                                   dtype=torch.float32)
                      if encoder_accepts_theta else None)
@@ -1170,6 +1268,22 @@ class MicrostructureEvolutionDataset(Dataset):
                 q[0] = self._run_data_deriv[run_idx][0]                   # z1 fallback
             self._run_data_deriv[run_idx] = q
         self._quotient_precomputed = True
+
+    def _phi_eq(self, metadata) -> float:
+        """Double-well equilibrium |phi| = sqrt(a0*(T0 - T)/b), with a0, b, T0 read
+        from the run's OWN metadata (never hardcoded: the constants are per-sweep
+        facts the metadata records, and the Allen-Cahn loss un-normalizes with the
+        same a0/b -- train_refinement asserts they agree). T < T0 is guaranteed by
+        the physics (subcritical); the floor is a divide-by-zero guard for T==T0."""
+        import math
+        return math.sqrt(max(metadata.a0 * (metadata.T0 - metadata.temperature) / metadata.b, 1e-12))
+
+    def _maybe_normalize(self, frames, metadata):
+        """frames /= phi_eq(T) when normalize_phi, else unchanged. One place so the
+        main-buffer read and the predecessor read normalize identically."""
+        if not self.normalize_phi:
+            return frames
+        return frames / self._phi_eq(metadata)
 
     def _read_and_encode_all_runs(
         self, run_dirs: list[Path], good_steps: dict, encoder: torch.nn.Module | None,
@@ -1356,14 +1470,17 @@ class MicrostructureEvolutionDataset(Dataset):
                             info={"streams cached": ("z0 (state) + z1 (deriv)"
                                                      if self.encode_both_streams
                                                      else "z0 (state)"),
-                                  **self._cache_info})
+                                  "normalize_phi": self.normalize_phi,
+                                  **self._cache_info},
+                            normalize_phi=self.normalize_phi)
                     cached = latent_cache.load_cached(
                         latent_cache.cache_path_for_run(
                             self._latent_cache_root, self._encoder_fingerprint, run_dir,
                             kept_steps, self.encode_both_streams,
                             size=metadata.nx,
                             theta=(theta_coordinates(metadata.temperature, metadata.T0)
-                                   if encoder_accepts_theta else None)))
+                                   if encoder_accepts_theta else None),
+                            normalize_phi=self.normalize_phi))
                     if cached is not None:
                         # Skips the READ as well as the encode -- at 128x128 a
                         # frame is 32 KB against a 2 KB latent, so the disk
@@ -1380,6 +1497,7 @@ class MicrostructureEvolutionDataset(Dataset):
                         lambda p: load.read_phi_half(p, metadata.nx, metadata.ny), snapshot_paths
                     )
                 ])  # (n_kept, 1, ny, nx)
+                frames = self._maybe_normalize(frames, metadata)
                 pending_meta.append((run_dir, metadata, kept_steps))
                 buffer_run_indices.append(run_index)
 
@@ -1416,7 +1534,8 @@ class MicrostructureEvolutionDataset(Dataset):
                                         theta=(theta_coordinates(
                                             pending_meta[pos][1].temperature,
                                             pending_meta[pos][1].T0)
-                                            if encoder_accepts_theta else None)),
+                                            if encoder_accepts_theta else None),
+                                        normalize_phi=self.normalize_phi),
                                     latents, deriv)
                         buffer_run_indices = []
                 else:
@@ -1444,7 +1563,8 @@ class MicrostructureEvolutionDataset(Dataset):
                                 theta=(theta_coordinates(
                                     pending_meta[pos][1].temperature,
                                     pending_meta[pos][1].T0)
-                                    if encoder_accepts_theta else None)),
+                                    if encoder_accepts_theta else None),
+                                normalize_phi=self.normalize_phi),
                             latents, deriv)
                 buffer_run_indices = []
 
@@ -1520,6 +1640,8 @@ class MicrostructureEvolutionDataset(Dataset):
         ):
             run_idx = len(self._run_steps)
             self._run_dirs.append(run_dir)
+            if self.normalize_phi:
+                self._phi_eq_by_run[run_dir] = self._phi_eq(metadata)
             self._run_steps.append(kept_steps)
             self._run_data.append(run_data)
             # u-scheme (time_coordinate="log10_t"): the cached deriv stream is
@@ -1592,7 +1714,14 @@ class MicrostructureEvolutionDataset(Dataset):
                 if self.min_std_deriv is not None:
                     first_dt = (kept_steps[start + 1] - kept_steps[start]) * metadata.dt
                     first_deriv = (run_data[start + 1] - run_data[start]) / first_dt
-                    if first_deriv.std().item() < self.min_std_deriv:
+                    # run_data is NORMALIZED when normalize_phi, so this std is the raw
+                    # derivative std / phi_eq. Rescale to RAW units before comparing:
+                    # min_std_deriv is a raw-calibrated threshold and filtering must
+                    # keep its meaning independent of normalization (filter, THEN normalize).
+                    _deriv_std = first_deriv.std().item()
+                    if self.normalize_phi:
+                        _deriv_std *= self._phi_eq(metadata)
+                    if _deriv_std < self.min_std_deriv:
                         n_degenerate_deriv_windows += 1
                         continue
                 if self.max_dt is not None:
@@ -1833,6 +1962,9 @@ class MicrostructureEvolutionDataset(Dataset):
             self._stats_by_run[run_dir].loc[stats_step, self.stat_names].to_numpy(dtype=float),
             dtype=torch.float32,
         )
+        if self.normalize_phi:
+            true_stats = normalize_stats_vector(true_stats, self.stat_names,
+                                                self._phi_eq_by_run[run_dir])
         if aug_idx is not None and "angle" in self.stat_names:
             angle_idx = self.stat_names.index("angle")
             true_stats[angle_idx] = _transform_angle(true_stats[angle_idx], aug_k, aug_flip)

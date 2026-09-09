@@ -438,6 +438,22 @@ class DtDecadeWeights:
         return weights
 
 
+
+def z0_scale_loss(z0):
+    """Absolute latent-SCALE anchor for stage 1 (single snapshots, no time axis).
+
+    ``mean over batch of ||z0||^2 / (C*H*W)`` -- the mean squared latent element.
+    Distinct from z0_growth_loss, which penalises the CHANGE in norm ACROSS a
+    rollout and so is only meaningful once there is a time sequence; in stage 1
+    there is none, and NOTHING otherwise bounds the latent magnitude. Under
+    normalize_phi the encoder loses the pixel-amplitude cue it used to read T from,
+    and with no scale anchor it packs that information into an ever-growing latent
+    direction (observed: z0 std climbing ~20%/epoch with recon still falling). This
+    term supplies the missing anchor. Mean-per-element (not summed) so its scale is
+    independent of latent_channels/spatial size.
+    """
+    return z0.flatten(1).pow(2).mean()
+
 def compute_dt_decade_weights(all_dts: np.ndarray, all_losses: np.ndarray) -> DtDecadeWeights:
     """See DtDecadeWeights' own docstring, especially the "BUG THIS
     FIXES" section -- all_losses is not optional decoration, it's the

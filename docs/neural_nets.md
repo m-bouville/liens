@@ -63,6 +63,13 @@ Second, the loss weighting must stay in physical time: $f_\theta$ steps in $\Del
 
 ## The pipeline at a glance
 
+### Pre-processing
+The parameters `min_step`, `min_stdev_phi`, `min_normalized_stdev_phi`, `min_std_deriv` and `min_passing_steps` make it possible to filter out microstructures that are too early (pure noise) or late (single domain, or two domains with a straight interface).
+
+The Boolean `normalize_phi` rescales the order parameter `phi` to have ground states at ±1 regardless of temperature.
+
+
+### The stages
 The stages each build on the previous one(s).
 1. Stage 1 encodes the microstructure ($z_0$, order 0);
 2. Stage 2 encodes the time derivative ($z_1$, order 1);
@@ -89,16 +96,17 @@ Currently, the first type works more reliably than the other.
 
 ### Stages, losses and checkpoints
 
-There are ten losses, which can be mixed and matched at the different stages:
-- reconstruction loss: `L_recon0`,
-- statistics loss: `L_stats0`,
-- derivative loss: `L_deriv`,
-- one-step latent prediction loss: `L_1step`,
-- multi-step rollout loss (latent space): `L_rollout`,
+There are eleven losses, which can be mixed and matched at the different stages:
+- reconstruction: `L_recon0`,
+- statistics: `L_stats0`,
+- latent-norm scale (regularization): `L_z0_scale​`,
+- derivative: `L_deriv`,
+- one-step latent prediction: `L_1step`,
+- multi-step rollout (latent space): `L_rollout`,
 - reconstruction after multi-step rollout: `L_recon_predict` (state, real space) and `L_grad_predict` (gradient, real),
-- self-consistent stats-head loss: `L_stats0_predict`,
-- latent-norm growth penalty (regularization): `L_z0_growth`,
-- Physics-informed neural networks (PINN): residual from partial differential equations (PDE), `L_allen_cahn`.
+- self-consistent stats-head: `L_stats0_predict`,
+- latent-norm growth (regularization): `L_z0_growth`,
+- physics-informed neural networks (PINN): residual from partial differential equations (PDE), `L_allen_cahn`.
 
 For each loss `XX`:
 - `XX_scale` normalize the loss for it to be around 1 (objective),
@@ -112,7 +120,7 @@ Interpolation loss, $L_\mathrm{interp}$, is no longer used in loss function.
 
 | \#| Stage             | Trained | Frozen | Unused | Space | Snapshots | Loss                            |
 |---|-------------------|--------------|------|------|-------|-------|---------------------------------|
-| 1 a| autoencoder ($z_0$)|E, D, SH|   | f    | real  | 1    | `L_recon0 + λ L_stats0`           |
+| 1 a| autoencoder ($z_0$)|E, D, SH|   | f    | real  | 1    | `L_recon0 + λ L_stats0 + ε L_z0_scale`           |
 | 2 | derivative ($z_1$) |E*, D*| SH | f | both | 3 | `L_recon0 + λ L_stats0 + λ₁ L_deriv` |
 | 3a| LDS               | f       | E, SH | D | latent| 2    | `L_1step + λ₁ L_deriv + λ₂ L_stats0_predict + λ₃ L_z0_growth`           |
 | 3b| LDS               | f       | E, SH | D | latent| $n+1$  | `L_rollout + ε L_1step + λ₁ L_deriv + λ₂ L_stats0_predict + λ₃ L_z0_growth` |
@@ -151,6 +159,10 @@ Compare $x' = D(E(x))$, the microstructure recovered by the AE, to $x$: $L_\math
 This is done in real space. $L_1$ may be used if sharper interfaces are desired.
 
 
+### Latent-norm scale loss
+When input is normalized, the latent representation `z0` tends to grow always larger. `L_z0_scale` penalizes latent norm for regularization: $\|z_0\|^2$. 
+
+
 ### Physics-informed statistics loss
 Letting $s_i(x)$ denote the normalized _i_-th (out of $N_s$) microstructural statistic (measured, real), $g_i(z)$ the value of that normalized statistic in the `stats_head` (latent) and $w_i$ its weight,
 
@@ -159,15 +171,12 @@ $$L_\mathrm{stats} = \sum_{i=1}^{N_s} w_i \left[g_i(z) - s_i(x)\right]^2.$$
 (Currently, $w_i \forall i$.) 
 $g_i$ cannot be the statistics of $x$ in the real world, since this would say nothing about latent representation.
 
-
-
 #### Motivation
 The latent representation serves two purposes:
 - recover the microstructure in real space (decoder),
 - predict the microstructure at $t + \Delta t$.
 
 The reconstruction loss alone does not constrain the latent representation to preserve physically meaningful features. Auxiliary losses in the `stats_head`, based on microstructural statistics, nudge the encoder toward latent variables that capture characteristics such as phase fraction, interface density, anisotropy and characteristic length scales. This is expected to improve latent-space organization and, consequently, the accuracy and stability of the learned surrogate dynamics.
-
 
 #### Statistics
 - Overall metrics:
@@ -181,7 +190,6 @@ The reconstruction loss alone does not constrain the latent representation to pr
 - Length scale:
   - first peak in autocorrelation: length and strength.
 
-
 #### No live calculations
 I just have a small dense net (`stats_head`) with $N_s$ output cells and say: "the values of these must match the statistics calculated in real space", without recalculating the statistics on x' (let alone on $\hat{z}$). Statistics are auxiliary prediction targets rather than differentiable image-derived losses. The statistics head is trained in latent space, only from ground-truth statistics computed offline.
 
@@ -194,7 +202,6 @@ Linear(512 → 16)
 Linear(16 → Ns)
 ```
 
-
 #### Anisotropy
 Compute, pixel by pixel, 
 
@@ -205,6 +212,7 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
   - $A \approx 0$: isotropic,
   - $A \approx 1$: strong directional structure.
 - Local orientation (normal direction): $\arctan(v_{1y} / v_{1x})$.	
+
 
 
 ## Stage 2: latent geometry

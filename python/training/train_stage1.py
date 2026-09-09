@@ -28,7 +28,7 @@ from training._checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, atomic_torch_save, clamp_grace_epochs,
 )
 from training.datasets import MicrostructureSnapshotDataset, complete_run_dirs, split_run_dirs
-from training.losses import ReconLoss, StatsLoss
+from training.losses import ReconLoss, StatsLoss, z0_scale_loss
 from training.stats_head import StatsHead
 from utils.naming import ae_checkpoint_name
 from utils.plots import (loss_component_scatter, loss_curve, loss_scale_curve,
@@ -109,7 +109,7 @@ def _vram_report(tag: str) -> str:
 
 _STAGE1_PREAMBLE_PARAMS = (
     # See train_lds's _LDS_PREAMBLE_PARAMS for why these are excluded here.
-    "size", "epochs", "batch_size", "min_step", "min_stdev_phi", "min_passing_steps",
+    "size", "epochs", "batch_size", "min_step", "min_stdev_phi", "min_passing_steps", "normalize_phi",
     "stats0_weight", "recon0_scale", "stats0_scale", "early_stopping_patience",
 )
 
@@ -122,9 +122,10 @@ def train_autoencoder(
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     augment: bool = True, cache_in_memory: bool = True,
     min_step: int | None = None, min_stdev_phi: float | None = None,
-    min_passing_steps: int | None = None,
+    min_passing_steps: int | None = None, normalize_phi: bool = False,
     stat_names: list[str] | None = None, stats0_weight: float | None = None,
     recon0_scale: float = 1.0, stats0_scale: float = 1.0,
+    z0_scale_weight: float = 0.0, z0_scale_scale: float = 1.0,
     val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5, early_stopping_patience: int | None = None,
     seed: int = 0, checkpoint_path: Path | None = None,
     resume_from: Path | None = None, device: str | None = None,
@@ -270,7 +271,7 @@ def train_autoencoder(
         raise ValueError(f"train_autoencoder() requires {', '.join(missing)} to be given "
                           f"explicitly -- config.txt no longer provides ML training defaults.")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  min_passing_steps={min_passing_steps}  "
-          f"stats0_weight={stats0_weight}")
+          f"normalize_phi={normalize_phi}  stats0_weight={stats0_weight}")
     print_run_parameters(train_autoencoder, locals(), _STAGE1_PREAMBLE_PARAMS)
 
     include_stats = stats0_weight > 1e-6
@@ -344,6 +345,7 @@ def train_autoencoder(
         val_set = MicrostructureSnapshotDataset(
             val_dirs, cache_in_memory=cache_in_memory, augment=False,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            normalize_phi=normalize_phi,
             include_stats=include_stats, stat_names=stat_names,
             split_label="validation",
         )
@@ -353,6 +355,7 @@ def train_autoencoder(
         train_set = MicrostructureSnapshotDataset(
             train_dirs, cache_in_memory=cache_in_memory, augment=augment,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            normalize_phi=normalize_phi,
             include_stats=include_stats, stat_names=stat_names,
             split_label="training",
         )
@@ -363,6 +366,7 @@ def train_autoencoder(
         val_set = MicrostructureSnapshotDataset(
             val_dirs, cache_in_memory=cache_in_memory, augment=False,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
+            normalize_phi=normalize_phi,
             include_stats=include_stats, stat_names=val_stat_names,
             split_label="validation",
         )
@@ -427,11 +431,14 @@ def train_autoencoder(
         x_recon, z = ae(x)
         (z0_train_stats if train else z0_val_stats).update(z)
         recon0 = recon_loss(x_recon, x)
+        # absolute latent-scale anchor (see losses.z0_scale_loss). weight 0 => no-op.
+        z0_scale = z0_scale_loss(z)
 
         if include_stats:
             stats_pred = stats_head(z)
             stats0 = stats_loss_fn(stats_pred, stats_target)
-            total = recon0 / recon0_scale + stats0_weight * stats0 / stats0_scale
+            total = (recon0 / recon0_scale + stats0_weight * stats0 / stats0_scale
+                     + z0_scale_weight * z0_scale / z0_scale_scale)
         else:
             # device=device explicitly -- a bare torch.tensor(0.0)
             # defaults to CPU regardless of what device training is
@@ -444,7 +451,7 @@ def train_autoencoder(
             # CUDA-resident running sum, every time include_stats is
             # False.
             stats0 = torch.tensor(0.0, device=device)
-            total = recon0 / recon0_scale
+            total = recon0 / recon0_scale + z0_scale_weight * z0_scale / z0_scale_scale
 
         if train:
             optimizer.zero_grad()
@@ -462,7 +469,7 @@ def train_autoencoder(
         # (and keep growing) for the rest of the epoch if left
         # attached. Same fix as train_lds.py's/train_stage2.py's own
         # step() -- see either function's own identical comment.
-        return total.detach(), recon0.detach(), stats0.detach()
+        return total.detach(), recon0.detach(), stats0.detach(), z0_scale.detach()
 
     # clamp_grace_epochs, not the raw value: a grace period covering every
     # remaining epoch means NO checkpoint is written at all -- a missing file,
@@ -474,8 +481,9 @@ def train_autoencoder(
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
     heading = f"/{epochs:3d} "
-    heading += (f"train = recon0/{recon0_scale} +{stats0_weight:.3g}*stats0/{stats0_scale} | "
-                f"valid = ...  | ema") if include_stats else f"train = recon0/{recon0_scale} | valid | ema"
+    _z0s = f" +{z0_scale_weight:.3g}*z0_scale/{z0_scale_scale}" if z0_scale_weight else ""
+    heading += (f"train = recon0/{recon0_scale} +{stats0_weight:.3g}*stats0/{stats0_scale}{_z0s} | "
+                f"valid = ...  | ema") if include_stats else f"train = recon0/{recon0_scale}{_z0s} | valid | ema"
     print(heading)
 
     if epochs > 0 and resume_from is not None:
@@ -512,13 +520,15 @@ def train_autoencoder(
         _ref_total = torch.zeros((), device=device)
         _ref_recon0 = torch.zeros((), device=device)
         _ref_stats0 = torch.zeros((), device=device)
+        _ref_z0_scale = torch.zeros((), device=device)
         with torch.no_grad():
             for batch in val_loader:
                 bs = batch[0].size(0) if include_stats else batch.size(0)
-                total, recon0, stats0 = step(batch, train=False)
+                total, recon0, stats0, z0_scale = step(batch, train=False)
                 _ref_total += total * bs
                 _ref_recon0 += recon0 * bs
                 _ref_stats0 += stats0 * bs
+                _ref_z0_scale += z0_scale * bs
         _n = len(val_set)
         _r_total = (_ref_total / _n).item()
         # Same as stage 2's: this pass has just measured the ancestor's
@@ -529,6 +539,7 @@ def train_autoencoder(
         tracker.reference_val_loss = _r_total
         _r_recon0 = (_ref_recon0 / _n).item()
         _r_stats0 = (_ref_stats0 / _n).item()
+        _r_z0_scale = (_ref_z0_scale / _n).item()
         # SCALED exactly as the epoch rows are (see the msg built below):
         # step() returns RAW component values and the epoch line divides them
         # by recon0_scale / stats0_scale and applies stats0_weight, because
@@ -538,9 +549,10 @@ def train_autoencoder(
         # 6.9589 alongside 0.0003 + 0.0381 -- which reads as a broken total
         # rather than a units mismatch.
         if include_stats:
+            _z0r = f" +{z0_scale_weight * _r_z0_scale / z0_scale_scale:7.4f}" if z0_scale_weight else ""
             print(f"{'ref':>4}|    nan =    nan +    nan "
                   f"|{_r_total:7.4f} ={_r_recon0 / recon0_scale:7.4f} "
-                  f"+{stats0_weight * _r_stats0 / stats0_scale:7.4f} |(before this run)",
+                  f"+{stats0_weight * _r_stats0 / stats0_scale:7.4f}{_z0r} |(before this run)",
                   flush=True)
         else:
             print(f"{'ref':>4}|    nan |{_r_total:7.4f}  (before this run)", flush=True)
@@ -570,16 +582,18 @@ def train_autoencoder(
         train_total_sum = torch.zeros((), device=device)
         train_recon0_sum = torch.zeros((), device=device)
         train_stats0_sum = torch.zeros((), device=device)
+        train_z0_scale_sum = torch.zeros((), device=device)
         n_train = 0
         if epoch > 0:
             _epoch_progress = EpochProgress(len(train_loader))
             for batch_idx, batch in enumerate(train_loader):
                 _epoch_progress.tick()
                 bs = batch[0].size(0) if include_stats else batch.size(0)
-                total, recon0, stats0 = step(batch, train=True)
+                total, recon0, stats0, z0_scale = step(batch, train=True)
                 train_total_sum += total * bs
                 train_recon0_sum += recon0 * bs
                 train_stats0_sum += stats0 * bs
+                train_z0_scale_sum += z0_scale * bs
                 n_train += bs
                 if vram_log_every and batch_idx % vram_log_every == 0:
                     # Printed from INSIDE the batch loop on purpose: an epoch
@@ -590,12 +604,13 @@ def train_autoencoder(
             train_total = (train_total_sum / n_train).item()
             train_recon0 = (train_recon0_sum / n_train).item()
             train_stats0 = (train_stats0_sum / n_train).item()
+            train_z0_scale = (train_z0_scale_sum / n_train).item()
         else:
             # epoch 0 (epochs=0 ablation only): no training at all --
             # NaN honestly reflects that these metrics don't apply this
             # "epoch" (n_train stays 0, so dividing would also fail),
             # rather than a misleading 0.0.
-            train_total = train_recon0 = train_stats0 = float("nan")
+            train_total = train_recon0 = train_stats0 = train_z0_scale = float("nan")
 
         ae.eval()
         if stats_head is not None:
@@ -609,11 +624,12 @@ def train_autoencoder(
         with torch.no_grad():
             _val_means, _ = accumulate_epoch(
                 val_loader,
-                lambda b: dict(zip(("total", "recon0", "stats0"), step(b, train=False))),
+                lambda b: dict(zip(("total", "recon0", "stats0", "z0_scale"), step(b, train=False))),
                 len(val_set))
         val_total = _val_means["total"]
         val_recon0 = _val_means["recon0"]
         val_stats0 = _val_means["stats0"]
+        val_z0_scale = _val_means["z0_scale"]
 
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
@@ -655,10 +671,12 @@ def train_autoencoder(
 
         msg = f"{epoch:4d}|"
         if include_stats:
+            _z0t = f" +{z0_scale_weight*train_z0_scale/z0_scale_scale:7.4f}" if z0_scale_weight else ""
+            _z0v = f" +{z0_scale_weight*val_z0_scale/z0_scale_scale:7.4f}" if z0_scale_weight else ""
             msg += (f"{train_total:7.4f} ={train_recon0/recon0_scale:7.4f} "
-                    f"+{stats0_weight*train_stats0/stats0_scale:7.4f} |"
+                    f"+{stats0_weight*train_stats0/stats0_scale:7.4f}{_z0t} |"
                     f"{val_total:7.4f} ={val_recon0/recon0_scale:7.4f} "
-                    f"+{stats0_weight*val_stats0/stats0_scale:7.4f} |"
+                    f"+{stats0_weight*val_stats0/stats0_scale:7.4f}{_z0v} |"
                     f"{val_ema_str}")
         else:
             msg += f"{train_total:7.4f} |{val_total:7.4f}  {val_ema_str}"
@@ -676,6 +694,11 @@ def train_autoencoder(
                 "config": {
                     "size": size, "base_channels": base_channels,
                     "latent_channels": latent_channels,
+                    # normalize_phi is a DATA-preprocessing property, recorded on the
+                    # encoder so stages 3-5 (frozen encoder) and eval can assert they
+                    # feed it the same-scaled field it was trained on.
+                    "normalize_phi": normalize_phi,
+                    "z0_scale_weight": z0_scale_weight, "z0_scale_scale": z0_scale_scale,
                     "latent_spatial_size": latent_spatial_size,
                     "stats_weight": stats0_weight,
                     # Plain dicts/strings, not the LatentStreamConfig/

@@ -71,7 +71,14 @@ def check_reconstruction(
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     if output_path is None:
-        output_path = (_PYTHON_ROOT.parent / "output" / "reconstruction_check_png"
+        # Group by stage, mirroring the checkpoint layout: a checkpoint at
+        # checkpoints/stageN/<name>.pt writes its figure to output/stageN/<name>.png
+        # (was a flat output/reconstruction_check_png/, the recurring "output ended
+        # up in the wrong place" gripe). Fall back to the old dir if the checkpoint
+        # is not under a checkpoints/<stage>/ layout.
+        _stage = checkpoint_path.parent.name
+        _sub = _stage if _stage and _stage != "checkpoints" else "reconstruction_check_png"
+        output_path = (_PYTHON_ROOT.parent / "output" / _sub
                        / f"{checkpoint_path.stem}.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -217,8 +224,13 @@ def check_reconstruction(
     # encoder's own cached latents. Uses the checkpoint's own saved
     # test_dirs, so this is guaranteed to be the exact same held-out
     # set that training never touched.
+    # normalize_phi MUST match how the AE was trained (recorded on the checkpoint):
+    # feeding raw phi to a psi-trained encoder shows the raw field (bulk at phi_eq(T),
+    # not +/-1) and evaluates reconstruction on the wrong distribution.
+    normalize_phi = bool(model_cfg.get("normalize_phi", False))
     dataset = MicrostructureEvolutionDataset(
         test_dirs, encoder=None, window_length=2, min_step=min_step, min_stdev_phi=min_stdev_phi,
+        normalize_phi=normalize_phi,
     )
     if len(dataset) == 0:
         raise ValueError(f"No consecutive pairs found in the checkpoint's {len(test_dirs)} "
@@ -270,6 +282,13 @@ def check_reconstruction(
             # ALWAYS a tenth of it, so error structure is read on a fixed,
             # comparable-to-state scale rather than its own auto-range.
             scale = _scale(x_np, floor=0.05)
+            # normalize_phi: a saturated normalized field sits at +/-1, and an
+            # auto-scale to its exact max (e.g. +/-0.998) makes the colorbar stop
+            # just short of 1 and read awkwardly. Pin the state scale to a hair
+            # past 1 for clearly-saturated normalized frames so +/-1 is legible;
+            # near-noise normalized frames (max <= 0.8) keep their auto-scale.
+            if normalize_phi and max(abs(x_np.min()), abs(x_np.max())) > 0.8:
+                scale = 1.02
             diff_scale = scale / 10.0
             # pixel correlation of reconstruction vs real state (constant real
             # state -> undefined; report n/a rather than a NaN)
@@ -280,8 +299,18 @@ def check_reconstruction(
                 corr_str = "n/a"
 
             im_state = axes[row, 0].imshow(x_np, cmap="RdBu", vmin=-scale, vmax=scale)
-            axes[row, 0].set_title(f"real state (idx={idx}, scale=+-{scale:.3f})" if row == 0
-                                    else f"scale=+-{scale:.3f}")
+            # per-snapshot provenance (T, noise, seed, time) -- trace idx back to its
+            # source run/step so each row is identifiable and the amplitude can be
+            # read against the run's temperature and evolution time.
+            try:
+                _run_dir, _steps = dataset.window_info(idx)
+                _md = load.read_metadata(_run_dir / "metadata.txt")
+                _t_phys = _steps[0] * _md.dt
+                _prov = f"{_run_dir.name}  t={_t_phys:.3g}"
+            except Exception:
+                _prov = f"idx={idx}"
+            axes[row, 0].set_title(f"{_prov}\nreal state (scale=+-{scale:.3f})" if row == 0
+                                    else f"{_prov}\nscale=+-{scale:.3f}")
             axes[row, 1].imshow(x_recon_np, cmap="RdBu", vmin=-scale, vmax=scale)
             axes[row, 1].set_title(f"predicted state (loss={loss:.4f}, corr={corr_str})" if row == 0 else
                                     f"loss={loss:.4f}, corr={corr_str}")
@@ -361,7 +390,17 @@ def check_reconstruction(
                 ax.set_xticks([])
                 ax.set_yticks([])
 
-    fig.tight_layout()
+    # Parameter banner: the figure had no record of WHICH run produced it. Pull the
+    # identifying config off the checkpoint (normalize_phi especially -- it changes
+    # what "correct" reconstruction looks like). Best-effort: a missing key is just
+    # omitted rather than breaking the figure.
+    _p = [f"{checkpoint_path.stem}"]
+    for _k in ("size", "latent_channels", "base_channels", "normalize_phi",
+               "stats_weight", "z0_scale_weight"):
+        if _k in model_cfg:
+            _p.append(f"{_k}={model_cfg[_k]}")
+    fig.suptitle("  |  ".join(_p), fontsize=9)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))   # leave room for the suptitle
     fig.savefig(output_path, dpi=120)
     plt.close(fig)
     print(f"Saved comparison figure to {output_path} ({n_samples} samples from "

@@ -185,6 +185,7 @@ def _load_frozen_stats_head(ae_checkpoint: dict, ae_config: dict, device: torch.
 def _load_frozen_encoder(
     ae_checkpoint_path: Path | None, ae_latent_channels: int | None, ae_stats_weight: float,
     size: int, condition_on_theta: bool | None, device: torch.device,
+    normalize_phi: bool = False,
 ) -> tuple[torch.nn.Module, dict, dict, Path]:
     """
     Loads a frozen, already-trained autoencoder's encoder from a stage-
@@ -223,6 +224,21 @@ def _load_frozen_encoder(
     # the decoder is irrelevant to stage 3 training.
     ae_checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
     ae_config = ae_checkpoint["config"]
+    # normalize_phi CONSISTENCY GUARD. The encoder is frozen: it was trained on
+    # raw phi or on phi/phi_eq(T), and it must be fed at stage 3+ exactly what it
+    # saw in training. A mismatch silently feeds an out-of-distribution field and
+    # every downstream latent is wrong with no shape error -- so halt loudly. An
+    # encoder predating this flag has no key => trained raw => False.
+    _enc_norm = ae_config.get("normalize_phi", False)
+    if bool(_enc_norm) != bool(normalize_phi):
+        raise ValueError(
+            f"normalize_phi mismatch: this run has normalize_phi={normalize_phi}, but the "
+            f"frozen encoder at {ae_checkpoint_path} was trained with normalize_phi={_enc_norm}. "
+            f"The encoder must be fed the SAME field scaling it was trained on -- feeding "
+            f"{'normalized' if normalize_phi else 'raw'} phi to an encoder trained on "
+            f"{'normalized' if _enc_norm else 'raw'} phi produces silently-wrong latents. "
+            f"Retrain the encoder (stage 1/2) with matching normalize_phi, or set this run's "
+            f"normalize_phi={_enc_norm}.")
     stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
     stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
         stream_configs, recon_stream_name, ae_checkpoint["model_state"],
@@ -554,7 +570,7 @@ _LDS_PREAMBLE_PARAMS = (
     # they were measured from. Repeating them in the block below would make
     # it noisy enough to stop being read, which is how the old hand-rolled
     # preamble drifted in the first place.
-    "min_step", "min_stdev_phi", "min_normalized_stdev_phi", "min_passing_steps", "ae_stats_weight", "max_dt",
+    "min_step", "min_stdev_phi", "min_normalized_stdev_phi", "min_passing_steps", "normalize_phi", "ae_stats_weight", "max_dt",
     "n_rollout_steps", "one_step_weight", "grad_clip", "lr_warmup_epochs",
     "z0_noise_scale", "lr", "seed", "epochs", "batch_size", "early_stopping_patience",
     "use_dt_decade_weights", "n_substeps",
@@ -571,6 +587,7 @@ def train_lds(
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int = 1, min_step: int | None = None, min_stdev_phi: float | None = None,
     min_normalized_stdev_phi: float | None = None,
+    normalize_phi: bool = False,
     min_passing_steps: int | None = None, max_dt: float | None = None,
     condition_on_theta: bool | None = None,
     encode_batch_size: int = 256, val_ema_decay: float = 0.7, ema_warmup_epochs: int = 5,
@@ -778,7 +795,7 @@ def train_lds(
         raise ValueError(f"train_lds() requires {', '.join(missing)} to be given explicitly "
                           f"-- config.txt no longer provides ML training defaults.")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  "
-          f"min_normalized_stdev_phi={min_normalized_stdev_phi}  min_passing_steps={min_passing_steps}  "
+          f"min_normalized_stdev_phi={min_normalized_stdev_phi}  normalize_phi={normalize_phi}  min_passing_steps={min_passing_steps}  "
           f"ae_stats_weight={ae_stats_weight}")
     if max_dt is not None:
         # Motivation, from check_parameter_dependence.py's own oracle-z1
@@ -800,6 +817,7 @@ def train_lds(
 
     encoder, ae_checkpoint, ae_config, ae_checkpoint_path = _load_frozen_encoder(
         ae_checkpoint_path, ae_latent_channels, ae_stats_weight, size, condition_on_theta, device,
+        normalize_phi=normalize_phi,
     )
     # Frozen stats head for the self-consistent stats0_predict term (None if the
     # AE was trained without stats). Only built/used when stats0_predict_weight>0.
@@ -904,6 +922,7 @@ def train_lds(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             min_normalized_stdev_phi=min_normalized_stdev_phi,
+            normalize_phi=normalize_phi,
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
@@ -926,6 +945,7 @@ def train_lds(
             train_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             min_normalized_stdev_phi=min_normalized_stdev_phi,
+            normalize_phi=normalize_phi,
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
@@ -938,6 +958,7 @@ def train_lds(
             val_dirs, encoder=encoder, device=device, window_length=window_length,
             min_step=min_step, min_stdev_phi=min_stdev_phi, min_passing_steps=min_passing_steps,
             min_normalized_stdev_phi=min_normalized_stdev_phi,
+            normalize_phi=normalize_phi,
             max_dt=max_dt,
             encode_batch_size=encode_batch_size,
             encode_both_streams=True, latent_cache_dir=latent_cache_dir,
@@ -1814,6 +1835,7 @@ def train_lds(
                     "data_config": {
                         "min_step": min_step, "min_stdev_phi": min_stdev_phi,
                         "min_normalized_stdev_phi": min_normalized_stdev_phi,
+                        "normalize_phi": normalize_phi,
                         "min_passing_steps": min_passing_steps, "max_dt": max_dt,
                         "window_length": window_length, "n_rollout_steps": n_rollout_steps,
                         "z0_noise_scale": z0_noise_scale,

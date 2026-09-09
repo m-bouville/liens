@@ -187,6 +187,10 @@ def _select_windows(model: dict, n_samples: int, n_steps: int, seed: int,
         max_dt=max_dt if max_dt is not None else data_config.get("max_dt"),
         min_step=data_config.get("min_step", 0),
         min_stdev_phi=data_config.get("min_stdev_phi"),
+        # Feed the encoder the SAME field scaling it was trained on -- read from the
+        # ENCODER's own config (model["ae_config"]), not the LDS data_config. Absent
+        # key (pre-normalize_phi checkpoint) = raw = False, which is what it was.
+        normalize_phi=(model.get("ae_config") or {}).get("normalize_phi", False),
         # Apply the SAME window filters the anchor model trained under, so the
         # eval population matches training. Without threading the normalized
         # filter, a model trained with min_normalized_stdev_phi (and thus

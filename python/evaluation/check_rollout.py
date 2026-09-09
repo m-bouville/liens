@@ -491,6 +491,9 @@ def check_rollout(
             test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
             max_dt=max_dt,
             min_step=min_step, min_stdev_phi=min_stdev_phi,
+            # Feed the encoder the SAME field scaling it was trained on; absent key
+            # (pre-normalize_phi checkpoint) = raw = False, which is what it was.
+            normalize_phi=ae_config.get("normalize_phi", False),
             # Match the model's deriv stream: a previous_quotient f_theta is seeded with
             # the backward quotient q, not the z1 head (the dataset default). The
             # COORDINATE is handled below (t-mode build, converted to Delta-u/z~1 at

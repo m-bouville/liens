@@ -22,18 +22,62 @@ from training._spike_guard import (
 )
 from utils.logging_utils import print_run_parameters, EpochProgress
 from training._training_loop import (accumulate_epoch, weighted_contributions,
-                                    write_epoch_figures, format_component_side,
-                                    make_lr_warmup, linear_warmup_weight)
+                                      make_lr_warmup,
+                                    write_epoch_figures, format_component_side)
 from training._checkpoint_criterion import (
     CheckpointCriterionTracker, ComponentBestTracker, save_checkpoint,
     ramp_completion_grace, scale_balance_report,
 )
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs
+from utils import load_datasets as load
 from training.losses import StatsLoss
 from training.model_assembly import build_models_from_components
 from training._refinement_loss import compute_stage45_loss
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent  # python/training/train_refinement.py -> python/
+
+
+def linear_warmup_weight(epoch: int, full_weight: float, warmup_epochs: int) -> float:
+    """`full_weight` ramped LINEARLY as epoch/warmup_epochs over the warmup.
+
+    A module-level function rather than an expression inline in the epoch
+    loop, so a test can exercise the ACTUAL formula. An inline version forced
+    the test to re-implement it, and an off-by-one mutation in the production
+    copy then left every endpoint assertion green -- the test was checking its
+    own arithmetic.
+
+    epoch/warmup_epochs, NOT (epoch-1)/(warmup_epochs-1). The latter pinned
+    epoch 1 to exactly zero -- a wasted first epoch where the warmed-in term
+    did nothing at all -- and only reached full at epoch warmup_epochs by
+    spending one of its levels on zero. epoch/warmup_epochs starts the
+    introduction immediately at 1/warmup_epochs (20% for a 5-epoch warmup) and
+    still reaches full AT epoch warmup_epochs, so the grace-on-completion timing
+    (epoch == max(1, warmup_epochs)) is unchanged. This is ALSO the convention
+    stage 2's deriv_weight warmup already uses (deriv_weight * min(1, epoch/N)),
+    so warmup_epochs=N now means the same ramp in every trainer.
+
+    No start_fraction: it was a holdover from the geometric era (a multiplicative
+    ramp cannot start at 0), and with two independent warmups in stage 4 plus one
+    in stage 5 the knob proliferated meaninglessly. epoch/warmup_epochs needs no
+    floor -- it starts at a real 1/warmup_epochs.
+
+    Linear, not geometric. This USED to be geometric, on the argument that
+    L_rollout collapsed ~6e9 over the first ten epochs (1.76e9 -> 0.29,
+    measured) so a linear weight ramp left epoch 1 eight decades above the
+    converged contribution. That collapse was itself an artefact of the
+    filter-manufactured large-dt windows (du_max=2.5e4): require_consecutive
+    now excludes those at the window definition, and with the scales
+    recalibrated L_rollout sits at O(1-10) from epoch 1, not O(1e9). Nothing
+    left to hold flat -- so the ramp is a plain linear introduction of the
+    term, and the same function serves any warmed-in weight (rollout,
+    recon_predict) rather than encoding one term's obsolete transient.
+
+    epoch is 1-based: epoch 1 gives full_weight/warmup_epochs, epoch
+    warmup_epochs and beyond give exactly full_weight.
+    """
+    if warmup_epochs <= 0 or epoch >= warmup_epochs:
+        return full_weight
+    return full_weight * (epoch / warmup_epochs)
 
 
 _REFINEMENT_PREAMBLE_PARAMS = (
@@ -45,7 +89,7 @@ _REFINEMENT_PREAMBLE_PARAMS = (
     "grad_predict_weight", "grad_predict_scale",
     "allen_cahn_weight", "allen_cahn_scale", "allen_cahn_all_steps",
     "epochs", "batch_size", "n_rollout_steps",
-    "min_step", "min_stdev_phi", "min_normalized_stdev_phi", "early_stopping_patience",
+    "min_step", "min_stdev_phi", "min_normalized_stdev_phi", "normalize_phi", "early_stopping_patience",
 )
 
 
@@ -72,6 +116,7 @@ def train_refinement(
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 0,
     n_rollout_steps: int | None = None, min_step: int | None = None, min_stdev_phi: float | None = None,
     min_normalized_stdev_phi: float | None = None,
+    normalize_phi: bool | None = None,
     val_ema_decay: float = 0.7, ema_warmup_epochs: int = 0,
     early_stopping_patience: int | None = None, grad_clip: float = 1.0,
     lr_warmup_epochs: int = 0,
@@ -199,7 +244,7 @@ def train_refinement(
           f"all_steps={allen_cahn_all_steps}  (a0={allen_cahn_a0}, b={allen_cahn_b}, "
           f"kappa={allen_cahn_kappa}, M={allen_cahn_mobility}, phi_max={allen_cahn_phi_max})")
     print(f"min_step={min_step}  min_stdev_phi={min_stdev_phi}  "
-          f"min_normalized_stdev_phi={min_normalized_stdev_phi}  n_rollout_steps={n_rollout_steps}")
+          f"min_normalized_stdev_phi={min_normalized_stdev_phi}  normalize_phi={normalize_phi}  n_rollout_steps={n_rollout_steps}")
     print_run_parameters(train_refinement, locals(), _REFINEMENT_PREAMBLE_PARAMS)
     print()
 
@@ -221,6 +266,22 @@ def train_refinement(
         raise ValueError(f"No complete runs found under {base_path}/{size}x{size} -- "
                           f"check base_path/size, or that metadata.txt exists there")
     train_dirs, val_dirs, test_dirs = split_run_dirs(run_dirs, val_fraction, test_fraction, seed=seed)
+    # normalize_phi + Allen-Cahn: the dataset normalizes by phi_eq=sqrt(a0(T0-T)/b)
+    # from the run METADATA, and the AC loss un-normalizes with allen_cahn_a0/b.
+    # Those constants must be the same numbers or the residual is graded on a
+    # wrongly-scaled field. a0/b are sweep-constant, so one run's metadata speaks
+    # for all. Checked here (after normalize_phi is known) rather than in the loss,
+    # which sees theta, not metadata.
+    if allen_cahn_weight and allen_cahn_weight > 0 and run_dirs:
+        _md0 = load.read_metadata(run_dirs[0] / "metadata.txt")
+        if (abs(allen_cahn_a0 - _md0.a0) > 1e-9) or (abs(allen_cahn_b - _md0.b) > 1e-9):
+            raise ValueError(
+                f"Allen-Cahn constants disagree with the dataset metadata: "
+                f"allen_cahn_a0={allen_cahn_a0}, allen_cahn_b={allen_cahn_b} vs "
+                f"metadata a0={_md0.a0}, b={_md0.b} ({run_dirs[0].name}). The dataset "
+                f"normalizes phi with the METADATA a0/b and the AC loss un-normalizes "
+                f"with allen_cahn_a0/b -- they must match. Set allen_cahn_a0/b to the "
+                f"metadata values (or leave them at the sweep's constants).")
 
     # max_dt and min_passing_steps INHERITED from the f_theta being
     # refined, unless the caller states otherwise. A stage that consumes
@@ -275,6 +336,20 @@ def train_refinement(
     min_normalized_stdev_phi = (min_normalized_stdev_phi
                                 if min_normalized_stdev_phi is not None
                                 else lds_data_config.get("min_normalized_stdev_phi"))
+    # normalize_phi inherits from the ancestor unless overridden: the field scaling
+    # the frozen encoder was trained on is fixed by the lineage, not chosen here.
+    normalize_phi = (normalize_phi if normalize_phi is not None
+                     else bool(lds_data_config.get("normalize_phi", False)))
+    # Now that normalize_phi is RESOLVED (inherited or overridden), assert the
+    # encoder -- frozen in stage 4 -- was trained on the same field scaling. This
+    # must run AFTER the resolution above: before it, normalize_phi can be None
+    # (= "inherit"), and comparing None to the recorded bool would be a false
+    # mismatch. Inheritance from the guarded stage-3 lineage makes the default
+    # consistent; this catches an explicit override that diverges from the encoder.
+    cross_check_ancestor_config(components["encoder"].config,
+                                {"normalize_phi": normalize_phi},
+                                ae_checkpoint_path or resume_from,
+                                what="encoder ancestor (normalize_phi)")
     if max_dt is not None:
         print(f"max_dt={max_dt} inherited from f_theta's own training window "
               f"population (pass max_dt explicitly to override)")
@@ -305,6 +380,7 @@ def train_refinement(
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
             min_normalized_stdev_phi=min_normalized_stdev_phi,
+            normalize_phi=normalize_phi,
             split_label="validation", return_frame_t=_needs_frame_t,
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
@@ -318,6 +394,7 @@ def train_refinement(
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
             min_normalized_stdev_phi=min_normalized_stdev_phi,
+            normalize_phi=normalize_phi,
             split_label="training", return_frame_t=_needs_frame_t,
         )
         val_set = MicrostructureEvolutionDataset(
@@ -325,6 +402,7 @@ def train_refinement(
             min_step=min_step, min_stdev_phi=min_stdev_phi, stat_names=stat_names,
             max_dt=max_dt, min_passing_steps=min_passing_steps,
             min_normalized_stdev_phi=min_normalized_stdev_phi,
+            normalize_phi=normalize_phi,
             split_label="validation", return_frame_t=_needs_frame_t,
         )
         print(f"{len(run_dirs)} complete runs -> {len(train_dirs)} train / {len(val_dirs)} val / "
@@ -351,7 +429,9 @@ def train_refinement(
     # settles. Stepped ONLY on a taken step (see the guard block), never on a
     # skipped batch -- else it consumes the warmup without training and torch
     # warns. Default 0 = off, so runs that do not pass it are unchanged.
-    lr_scheduler = None
+    # Built via the shared make_lr_warmup (training/_training_loop.py) -- the ONE
+    # place the epochs->optimiser-steps conversion lives, so train_lds and
+    # train_refinement cannot drift. Returns None when lr_warmup_epochs==0.
     lr_scheduler = make_lr_warmup(optimizer, lr_warmup_epochs, train_loader)
 
     if checkpoint_path is None:
@@ -442,6 +522,7 @@ def train_refinement(
             allen_cahn_kappa=allen_cahn_kappa, allen_cahn_mobility=allen_cahn_mobility,
             allen_cahn_all_steps=allen_cahn_all_steps,
             allen_cahn_phi_max=allen_cahn_phi_max,
+            normalize_phi=normalize_phi,
             stats_loss_fn=stats_loss_fn, true_stats=true_stats,
             recon_stream_name=recon_stream_name, return_components=True,
             z1_resync=lds_z1_resync, t_window=t_window,
@@ -903,6 +984,7 @@ def train_refinement(
                     # since these may have come from f_theta's own data_config.
                     "data_config": {"min_step": min_step, "min_stdev_phi": min_stdev_phi,
                                     "min_normalized_stdev_phi": min_normalized_stdev_phi,
+                                    "normalize_phi": normalize_phi,
                                     "min_passing_steps": min_passing_steps, "max_dt": max_dt,
                                     "window_length": window_length, "n_rollout_steps": n_rollout_steps},
                     "stats_config": (

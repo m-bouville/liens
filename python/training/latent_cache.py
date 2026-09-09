@@ -54,7 +54,7 @@ def encoder_fingerprint(encoder: torch.nn.Module) -> str:
 
 
 def write_cache_info(cache_root: Path, fingerprint: str, size: int | None,
-                     info: dict | None = None) -> None:
+                     info: dict | None = None, normalize_phi: bool = False) -> None:
     """Drop a human-readable `_cache_info.txt` in the fingerprint's subdir, so a
     directory whose name is an opaque blake2b hash says WHAT produced it. The
     fingerprint is a hash of the encoder's weights+buffers; `info` carries the
@@ -63,6 +63,8 @@ def write_cache_info(cache_root: Path, fingerprint: str, size: int | None,
     once, the 'cache last accessed' timestamp is refreshed on every call, and
     failure is swallowed (a missing note must never break caching)."""
     directory = f"{size}x{size}-{fingerprint}" if size is not None else fingerprint
+    if normalize_phi:
+        directory = directory + "-norm"   # see cache_path_for_run: normalized latents, separate dir
     cache_dir = cache_root / directory
     info_path = cache_dir / "_cache_info.txt"
     try:
@@ -96,7 +98,8 @@ def write_cache_info(cache_root: Path, fingerprint: str, size: int | None,
 
 def cache_path_for_run(cache_root: Path, fingerprint: str, run_dir: Path,
                         steps: list[int], encode_both_streams: bool,
-                        size: int | None = None, theta=None) -> Path:
+                        size: int | None = None, theta=None,
+                        normalize_phi: bool = False) -> Path:
     """Where this run's latents live, for this encoder and this step list.
 
     `steps` is part of the key, not just the run: the max_dt truncation makes
@@ -115,6 +118,14 @@ def cache_path_for_run(cache_root: Path, fingerprint: str, run_dir: Path,
     stay readable.
     """
     directory = f"{size}x{size}-{fingerprint}" if size is not None else fingerprint
+    # normalize_phi rescales the field (phi -> phi/phi_eq(T)) BEFORE encoding, so
+    # the cached latent is E(phi/phi_eq), NOT E(phi) -- a different value from the
+    # SAME encoder (same fingerprint). Without a marker the two would collide in
+    # one directory and serve each other silently. Appended only when True, so
+    # normalize_phi=False dirs are byte-identical to the pre-normalization scheme
+    # and existing raw caches stay valid (back-compat).
+    if normalize_phi:
+        directory = directory + "-norm"
     step_digest = hashlib.blake2b(
         ",".join(str(s) for s in steps).encode("utf-8"), digest_size=8).hexdigest()
     suffix = "both" if encode_both_streams else "state"

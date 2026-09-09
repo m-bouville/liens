@@ -39,6 +39,7 @@ def compute_stage45_loss(
     allen_cahn_kappa: float = 0.2, allen_cahn_mobility: float = 0.05,
     allen_cahn_all_steps: bool = True,
     allen_cahn_phi_max: float = 1.5,   # ~1.5x the physical max |phi|=sqrt(a0*T0/b) (=1 here)
+    normalize_phi: bool = False,
     stats_loss_fn: StatsLoss | None = None,
     true_stats: torch.Tensor | None = None, return_components: bool = False,
     recon_stream_name: str = DEFAULT_STREAM_NAME, deriv_stream_name: str = "deriv",
@@ -263,6 +264,15 @@ def compute_stage45_loss(
             z_sel.reshape(_B * _nf, *z_sel.shape[2:])
         ) * torch.exp(recon_pathway.log_output_scale)
         phi = phi.reshape(_B, _nf, *phi.shape[1:])            # (B, nf, [C,] H, W)
+        if normalize_phi:
+            # The decoder outputs NORMALIZED psi (ground state +/-1 at every T),
+            # but Allen-Cahn is written in PHYSICAL phi (well minima at
+            # phi_eq(T)=sqrt(-a0*theta0/b), theta0=T-T0<0). Un-normalise here so the
+            # residual -- and the phi_max physical bound just below -- see physical
+            # phi: phi = psi * phi_eq(T). phi_eq comes from theta, no metadata needed.
+            _phi_eq = torch.sqrt(torch.clamp(
+                -allen_cahn_a0 * theta[:, 0] / allen_cahn_b, min=1e-12))
+            phi = phi * _phi_eq.reshape(_B, 1, *((1,) * (phi.dim() - 2)))
         # SOFT-BOUND to the physical order-parameter range before the residual. The
         # decoder is an unclamped CNN; on the most-drifted endpoint latent (8 steps from a
         # barely-refined encoder) it extrapolates to |phi_hat| ~ 15-40, and the CUBIC
