@@ -75,16 +75,9 @@ def _load(lds_ckpt_path: Path, ae_ckpt_path: Path | None, device):
     from orchestration.checkpoint_identification import identify_checkpoint_stage
     _stage = identify_checkpoint_stage(_raw)
     if _stage.startswith("stage 4") or _stage.startswith("stage 5"):
-        import atexit
-        import shutil
         import tempfile
         from training.checkpoint_components import split_joint_checkpoint_for_evaluation
         _views = Path(tempfile.mkdtemp(prefix="stats_head_rollout_views_"))
-        # remove the split-view tempdir at process exit -- a diagnostic run is one
-        # process, so this cleans up before it ends and nothing accumulates across
-        # invocations (the leak the bare mkdtemp had). Registered rather than cleaned
-        # inline so it survives any early return between here and the loads below.
-        atexit.register(shutil.rmtree, str(_views), ignore_errors=True)
         _ae_view, _lds_view = split_joint_checkpoint_for_evaluation(lds_ckpt_path, _views)
         print(f"  {_stage} joint checkpoint: split into LDS + (refined) AE views for evaluation")
         lds_ckpt_path = _lds_view
@@ -422,10 +415,15 @@ def main():
 
     _curves = ("green ||z_true|| / red ||z_hat||" if args.stat == "latent_norm"
                else "green z_true / red z_hat" + (" / black real" if _drew_real else ""))
+    # The energy-specific guidance (symlog axis, "should DECREASE", moth signature)
+    # applies ONLY when the plotted stat is energy; it was previously appended
+    # unconditionally, so a latent_norm/step_vs_dt figure carried an irrelevant
+    # energy caption. Stat-aware now.
+    _stat_note = ("; energy on SYMLOG (sign-preserving, linthresh=on-distribution scale). "
+                  "energy should DECREASE (phase_field.md l.31) — predicted RISING where "
+                  "real falls = moth signature" if args.stat == "energy" else "")
     fig.suptitle(f"stats head on predicted vs real rollout — {args.lds_checkpoint.name}\n"
-                 f"{_curves}; energy on SYMLOG (sign-preserving, linthresh=on-distribution scale). energy should "
-                 f"DECREASE (phase_field.md l.31) — predicted RISING where real falls = moth signature",
-                 fontsize=9)
+                 f"{_curves}{_stat_note}", fontsize=9)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     # Mirror the checkpoint's OWN stage subfolder (stage3a / stage3b), not a
     # hardcoded "stage3" -- otherwise 3a and 3b figures collide under one name.

@@ -597,6 +597,7 @@ def train_lds(
     derivative_time: str = "previous",
     time_coordinate: str = "t",
     max_substeps: int = 256, truncate_bptt: int | None = None,
+    include_2nd_order: bool = True,
     target_vram_gib: float | None = None,
     memory_cost_a_bytes: float | None = None,
     memory_cost_b_bytes: float | None = None,
@@ -984,6 +985,7 @@ def train_lds(
                               derivative_source=derivative_source,
                               derivative_time=derivative_time,
                               time_coordinate=time_coordinate,
+                              include_2nd_order=include_2nd_order,
                               truncate_bptt=truncate_bptt).to(device)
 
     # Global per-decade loss weights, computed ONCE from train_set's own
@@ -1806,6 +1808,7 @@ def train_lds(
                         # evaluates exactly as this run trained.
                         "truncate_bptt": truncate_bptt,
                         "max_substeps": max_substeps,
+                        "include_2nd_order": include_2nd_order,
                         "z1_resync": z1_resync,
                     },
                     "data_config": {

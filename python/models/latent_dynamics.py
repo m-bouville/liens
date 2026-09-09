@@ -35,6 +35,10 @@ _MEANING_FIELDS = {
     "n_substeps": 1,          # 1 is the historical default
     "alpha": None,            # None = fixed count, i.e. behaviour before alpha
     "max_substeps": 256,
+    "include_2nd_order": True,     # True = historical: f's correction is dt-conditioned
+                                   # (deriv_linear: f sees log(dt)) / the dt^2/2 term
+                                   # (other modes). False ablates the 2nd-order-ness with
+                                   # the SAME weights -- meaning-changing, so it round-trips.
     "dynamics_mode": "z1_taylor",  # historical form; "deriv_linear" changes the
                                    # update equation (f*dt, f sees dt) with the
                                    # SAME weights -- meaning-changing, so it must
@@ -192,10 +196,18 @@ class LatentDynamics(nn.Module):
                  dynamics_mode: str = "z1_taylor",
                  derivative_source: str = "z1",
                  derivative_time: str = "previous",
-                 time_coordinate: str = "t"):
+                 time_coordinate: str = "t",
+                 include_2nd_order: bool = True):
         super().__init__()
         self.latent_channels = latent_channels
         self.latent_spatial = latent_spatial
+        # include_2nd_order=False ablates f's dt-dependence to test whether the
+        # second-order term is the source of the rollout instability. In
+        # deriv_linear f is FED a neutral dt (so its correction stops depending on
+        # dt) but the f*dt structure and z1*dt term are untouched; in the other
+        # modes the explicit dt^2/2 term is dropped. The z1*dt (first-order) term
+        # and the integration step size are NOT affected either way.
+        self.include_2nd_order = include_2nd_order
         # n_substeps: how many integration steps rollout() takes BETWEEN two
         # real frames. 1 is the historical behaviour exactly -- one step of
         # the full dt, which is what forward() does and what stage 3a uses.
@@ -511,8 +523,17 @@ class LatentDynamics(nn.Module):
         if self.dynamics_mode == "deriv_linear":
             # f owns its dt-scaling: LINEAR prefactor, f conditioned on dt.
             # No dt_cap (forbidden in __init__), so no dt_capped term here.
-            f_val = self.f(z0, z1, theta, dt=dt_r)
+            # include_2nd_order=False: feed f a NEUTRAL dt so its correction is no
+            # longer dt-conditioned. f uses log(dt) as its order-selection feature,
+            # so the neutral value is dt=1 (log(1)=0), NOT dt=0 (log(0)=-inf, a NaN).
+            # The f*dt scaling and the z1*dt term are unchanged -- only f's INPUT
+            # dt-dependence is ablated.
+            f_dt = dt_r if self.include_2nd_order else torch.ones_like(dt_r)
+            f_val = self.f(z0, z1, theta, dt=f_dt)
             return z0 + z1 * dt_r + f_val * dt_r
+        if not self.include_2nd_order:
+            # drop the explicit second-order term entirely: pure first-order z0+z1*dt.
+            return z0 + z1 * dt_r
         f_val = self.f(z0, z1, theta)
         dt_capped = torch.clamp(dt_r, max=self.dt_cap)
         return z0 + z1 * dt_r + f_val * (dt_capped ** 2 / 2)

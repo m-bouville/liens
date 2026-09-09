@@ -485,10 +485,51 @@ def test_the_stats_figure_is_titled_with_the_model_names(monkeypatch, tmp_path):
                         output_path=tmp_path / "f.png", device="cpu")
     assert len(titles) == 2, "expected one title per figure"
     for t in titles:
-        assert t.startswith("128x128: stage 3a vs. stage 3b\n"
-                             "2 chained steps, derivative not resynced"), (
+        # First line must BEGIN with the model names (the shadowing bug put a panel
+        # caption here instead); anything after them on that line -- e.g. the
+        # "; z1 from stage 2 ..." provenance clause the stats title now carries --
+        # is allowed. The regime line must then follow on line 2.
+        first, _, rest = t.partition("\n")
+        assert first.startswith("128x128: stage 3a vs. stage 3b"), (
             f"figure titled {t!r} -- a panel caption has leaked into it"
         )
+        assert rest.startswith("2 chained steps, derivative not resynced"), (
+            f"figure titled {t!r} -- the regime line is missing or displaced"
+        )
+
+
+def test_the_stats_title_names_the_z1_provenance_and_comparability(monkeypatch, tmp_path):
+    """
+    The stats title carries the stage-2 z1 provenance and the comparability
+    status ("; z1 from stage 2[ (date)] is not comparable" at multi-step), in the
+    TITLE -- converged with --with-ancestors, which always put it there -- rather
+    than as a legend tag. The synthetic checkpoints here have no lineage, so the
+    date is absent (the dateless fallback), which is the correct degradation.
+    """
+    _stats_stub(monkeypatch)
+    monkeypatch.setattr(cf, "_load_model", lambda p, d: _model(str(p)))
+    titles = []
+    import matplotlib.figure
+    real_suptitle = matplotlib.figure.Figure.suptitle
+
+    def spy(self, t, *args, **kwargs):
+        titles.append(t)
+        return real_suptitle(self, t, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "suptitle", spy)
+    monkeypatch.setattr(cf, "_select_windows",
+                         lambda *a, **k: [(f"run{i}", [i, i + 1, i + 2])
+                                          for i in range(12)])
+    cf.compare_f_theta("128x128-stage3a", "128x128-stage3b",
+                        fixed_windows=["r:1:2:3"], n_stats=12,
+                        output_path=tmp_path / "f.png", device="cpu")
+    stats_titles = [t for t in titles if "z1 from stage 2" in t]
+    assert stats_titles, f"no title carries the z1 provenance clause: {titles!r}"
+    t = stats_titles[0].partition("\n")[0]
+    # multi-step (2 chained steps) -> the baseline is flagged not comparable
+    assert "z1 from stage 2 is not comparable" in t, t
+    # and it is on the FIRST line, after the model names, not a separate legend tag
+    assert t.startswith("128x128: stage 3a vs. stage 3b; z1 from stage 2"), t
 
 
 def test_undefined_correlations_do_not_become_zero():

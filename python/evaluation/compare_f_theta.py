@@ -557,6 +557,30 @@ def _ylim_from_medians(ax, medians) -> None:
         ax.set_ylim(values.min() / 3.0, values.max() * 3.0)
 
 
+def _stage2_z1_provenance(model: dict, device) -> str | None:
+    """Pretty label ("stage 2 (31/08 at 12:34)") of the STAGE-2 checkpoint whose z1
+    head the "stage 2" baseline (z0 + z1*dt) uses -- resolved by walking `model`'s
+    lineage to its stage-2 root with resolve_lineage, the SAME walk --with-ancestors
+    uses (so both paths report provenance identically). model["ae_path"] is NOT it for
+    a stage-4/5 model: that file holds the REFINED encoder, but z1 is untouched by
+    refinement, so the z1 head still comes from the stage-2 ancestor -- which only the
+    lineage knows. Returns None (caller shows a dateless "stage 2") if the lineage
+    cannot be resolved (no registry link, moved files); a broken lineage must never
+    break the figure."""
+    try:
+        chain = resolve_lineage(model.get("ae_path") or model.get("path"),
+                                 registry_resume=lambda pth: _registry_resume_of(pth),
+                                 device=device)
+        s2 = next((pth for lbl, pth in chain
+                   if str(lbl).replace("stage", "").strip() == "2"), None)
+        if s2 is None:
+            s2 = chain[0][1]
+        lbl = _parse_stem(Path(s2).stem)[1]
+        return _pretty_label(lbl, _labels_need_year([lbl]))
+    except Exception:
+        return None
+
+
 def _stats_figure(stats: dict, a: dict, b: dict, title: str,
                    output_path: Path, *, n_steps: int = 1,
                    extra: list | None = None, ancestors: bool = False) -> Path:
@@ -592,16 +616,15 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     # generic label that could be any stage-2 run.
     # tag with the stage-2 encoder's timestamp in the SAME "DD/MM at HH:MM"
     # style as every other label (via _pretty_label on its stem).
-    _enc_pretty = _pretty_label(Path(a.get("ae_path", "")).stem, include_year=False)
-    _es = re.search(r"\((.*?)\)", _enc_pretty)   # pull just the "26/08 at 14:55"
-    _enc = f"  ({_es.group(1)})" if _es else ""
-    # Keep the legend short: the "(z0 + z1 dt)" / "(frozen dz0/dt)" descriptors
-    # are already in the suptitle, and the encoder tag made these overflow.
-    # Drop the descriptor, keep the encoder provenance tag.
+    # Legend is bare "stage 2" in BOTH modes (converged): the z1 PROVENANCE
+    # ("z1 from stage 2 (date)") and the "not comparable" status now live in the
+    # TITLE (see compare_statistics), the same place --with-ancestors always put
+    # them -- so the legend no longer carries a per-run timestamp (which, for a
+    # stage-4/5 model, was read off the REFINED checkpoint and wrongly showed the
+    # stage-5 date) nor a "[not comparable]" tag.
     labels = {**{k: m["label"] for k, m in _model_items},
               "causal": "previous derivative",
-              "stage2": "stage 2" if ancestors else "stage 2" + _enc + (
-                  "" if _stage2_comparable else "  [not comparable]")}
+              "stage2": "stage 2"}
     linestyles = {**{k: "-" for k, _ in _model_items}, "causal": "-",
                   "stage2": "-" if _stage2_comparable else ":"}
     has_causal = bool(stats.get("step_loss_causal"))
@@ -843,8 +866,8 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     #                rate; FLAT across n => loss grows exponentially at rate g
     #                (the compounding signature), rising/falling => the rate
     #                itself changes with n.
-    #   [1,4] corr:  (1 - corr(n)) / n  (corr as a FRACTION, so _corr_axis's %
-    #                is divided by 100) -- the per-step decorrelation; FLAT =>
+    #   [1,4] corr:  (100 - corr(n)) / n  (corr is a PERCENT from _correlation_pct,
+    #                so this is directly % per step) -- the per-step decorrelation; FLAT =>
     #                correlation falls linearly (constant coherence lost per
     #                step), rising => accumulation accelerates.
     # OWN y-ranges, deliberately NOT joined to the loss-row (log loss) or the
@@ -873,7 +896,7 @@ def _stats_figure(stats: dict, a: dict, b: dict, title: str,
     axes[0, 4].grid(alpha=0.3, which="both")
     axes[0, 4].legend()
     axes[1, 4].set_xlabel("chained steps applied")
-    axes[1, 4].set_ylabel("(1 - corr(n)) / n  [% per step]")
+    axes[1, 4].set_ylabel("(100 - corr(n)) / n  [% per step]")
     axes[1, 4].set_title("decorrelation rate per step")
     axes[1, 4].grid(alpha=0.3, which="both")
     axes[1, 4].legend()
@@ -1072,7 +1095,10 @@ def scaled_f_theta(f_theta, scale: float):
     stay self-consistent.
     """
     original = f_theta.f
-    f_theta.f = lambda z0, z1, theta: original(z0, z1, theta) * scale
+    # forward *args/**kwargs so this works for deriv_linear too, whose forward()
+    # calls f(z0, z1, theta, dt=...); the old (z0, z1, theta) signature raised
+    # TypeError on the dt kwarg (never hit while the sweep ran only on z1_taylor).
+    f_theta.f = lambda *a_, **k_: original(*a_, **k_) * scale
     try:
         yield
     finally:
@@ -1512,27 +1538,39 @@ def _reconcile_data_config(models):
             m["ck"]["data_config"] = dc
         dcs.append(dc)
     for field in _RECONCILED_FIELDS:
+        # "recorded" == the KEY is present, NOT "the value is non-None": a
+        # deliberately-recorded None (e.g. min_passing_steps=None, meaning "no
+        # such filter") is a real, meaningful value and must NOT be treated as
+        # missing and overwritten from a sibling -- doing so silently changes the
+        # run's actual filter in the comparison (the bug this fixes). Only a
+        # genuinely ABSENT key (older checkpoint predating the field) is borrowed.
+        # `dc` was defaulted to {} above for a checkpoint with no data_config at
+        # all, so `field not in dc` catches that case too.
         present = [(m["label"], dc[field]) for m, dc in zip(models, dcs)
-                   if dc.get(field) is not None]
+                   if field in dc]
         if not present:
-            continue                       # nobody has it -> leave absent
+            continue                       # nobody recorded it -> leave absent
+        # Disagreement is on the RECORDED values (None is a value): two runs with
+        # different min_passing_steps -- including one None, one 12 -- are a real
+        # population mismatch worth warning about, not silently reconciled.
         if len({v for _, v in present}) > 1:
             print("WARNING: checkpoints disagree on " + field + ": "
                   + ", ".join(f"{lbl}={v}" for lbl, v in present)
                   + " -- trained on different window populations, so this "
                     "comparison is not like-for-like on that filter (not overridden).")
         fill, source = present[0][1], present[0][0]
-        borrowers = [m["label"] for m, dc in zip(models, dcs) if dc.get(field) is None]
+        borrowers = [m["label"] for m, dc in zip(models, dcs) if field not in dc]
         for dc in dcs:
-            if dc.get(field) is None:
+            if field not in dc:
                 dc[field] = fill
         if borrowers:
             print(f"NOTE: {field} not recorded in {', '.join(borrowers)}; "
-                  f"using {fill} from {source}.")
+                  f"using {fill!r} from {source}.")
 
 
 def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
-                       fixed_windows, max_dt, z1_resync, t0_range=None):
+                       fixed_windows, max_dt, z1_resync, t0_range=None,
+                       f_theta_scale=1.0):
     """Shared prologue for the panel and statistics tools: load both models,
     resolve the window set and the title/prefix, print the z1_resync banner.
 
@@ -1545,6 +1583,18 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     a = _load_model(path_a, device)
     b = _load_model(path_b, device)
+    if f_theta_scale != 1.0:
+        # INFERENCE-ONLY rescale of a FIXED trained f, applied to the whole
+        # comparison. Wrap f() (as scaled_f_theta does) so the integrator, the
+        # sub-stepping and the trapezoidal corrector all see the scaled value and
+        # stay self-consistent; persistent (no restore) because compare_f_theta is
+        # a one-shot process. scale=0 recovers stage 2 (f off).
+        for _m in (a, b):
+            _orig = _m["f_theta"].f
+            # forward *args/**kwargs: deriv_linear calls f(z0, z1, theta, dt=...),
+            # z1_taylor calls f(z0, z1, theta) -- the wrapper must accept both.
+            _m["f_theta"].f = (lambda o, sc:
+                               (lambda *a_, **k_: o(*a_, **k_) * sc))(_orig, f_theta_scale)
     # readable legend/row labels: 'stage 3a-20260826_17h09' -> 'stage 3a
     # (26/08 at 17:09)', same style as --stage2-compare; year only if the two
     # checkpoints span different years.
@@ -1612,6 +1662,8 @@ def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
                    else "derivative not resynced")
     if resolved_max_dt is not None and math.isfinite(resolved_max_dt):
         _regime.append(f"max_dt={resolved_max_dt:g}/transition")
+    if f_theta_scale != 1.0:
+        _regime.append(f"f_theta x {f_theta_scale:g}")
     regime = ", ".join(_regime)
     title = (f"{prefix}: {a['label']} vs. {b['label']}" if prefix
               else f"{a['label']} vs. {b['label']}")
@@ -1667,6 +1719,7 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
                     n_steps: int = 2, seed: int = 0,
                     fixed_windows: list[str] | None = None,
                     max_dt: float | None = None, z1_resync: bool = False,
+                    f_theta_scale: float = 1.0,
                     trajectory: bool = False, output_path: Path | None = None,
                     device: str | None = None) -> tuple[Path, list[str]]:
     """The IMAGE side: the 7-column per-window panel figure, and (with
@@ -1676,7 +1729,8 @@ def compare_panels(path_a: Path, path_b: Path, n_samples: int = 6,
     (device, a, b, windows, window_strings, prefix, title,
      n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device, n_samples,
                                          n_steps, seed, fixed_windows, max_dt,
-                                         z1_resync, t0_range=t0_range)
+                                         z1_resync, t0_range=t0_range,
+                                         f_theta_scale=f_theta_scale)
     recon_loss = ReconLoss()
     n_rows = len(windows)
     fig, axes = plt.subplots(n_rows, 8, figsize=(33, 3.2 * n_rows))
@@ -2101,7 +2155,7 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
                        t0_range=None,
                         n_steps: int = 2, seed: int = 0,
                         max_dt: float | None = None, z1_resync: bool = False,
-                        f_scale_sweep: bool = False, alpha_sweep: bool = False,
+                        f_scale_sweep: bool = False, f_theta_scale: float = 1.0, alpha_sweep: bool = False,
                         trajectory: bool = False,
                         output_path: Path | None = None,
                         device: str | None = None,
@@ -2118,7 +2172,8 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
     has no meaning here."""
     (device, a, b, windows, window_strings, prefix, title,
      n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device, n_traj, n_steps,
-                                         seed, None, max_dt, z1_resync, t0_range=t0_range)
+                                         seed, None, max_dt, z1_resync, t0_range=t0_range,
+                                         f_theta_scale=f_theta_scale)
     # --with-ancestors path: FURTHER models flow through the same machinery as
     # a and b (keys "c", "d", ...) rather than a parallel implementation.
     extras = [_load_model(Path(pth), device) for pth in (extra_paths or [])]
@@ -2134,20 +2189,29 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
         z1_resync = True
     model_items = [("a", a), ("b", b)] + [
         (chr(ord("c") + i), m) for i, m in enumerate(extras)]
+    # z1 provenance + comparability, built ONCE and used by BOTH modes (converged).
+    # The "stage 2" baseline is z0 + z1*dt; z1 comes from the stage-2 ancestor
+    # (untouched by refinement), resolved via lineage -- so the title names WHICH
+    # stage 2 was used. "not comparable" only at multi-step (n_steps>1), where stage 2
+    # re-encodes each step using info the models cannot; at 1 step it is a fair baseline.
+    _s2_pretty = _stage2_z1_provenance(a, device)
+    _s2_name = _s2_pretty if _s2_pretty else "stage 2"     # dateless fallback
+    _s2_clause = f"z1 from {_s2_name}" + ("" if n_steps == 1 else " is not comparable")
     if ancestors_mode:
-        from evaluation.lineage import _stage_label
         _mods = [m for _, m in model_items]        # pretty-labelled, oldest -> newest
         _anchor, _anc = _mods[-1], _mods[:-1]      # newest is the input checkpoint
-        _s2_label = _parse_stem(Path(a["ae_path"]).stem)[1]     # 'stage 2-2026...'
-        _s2_pretty = _pretty_label(_s2_label, _labels_need_year([_s2_label]))
         _line1 = (f"{prefix}: {_anchor['label']} and its ancestors: "
-                  f"{', '.join(m['label'] for m in _anc)}; "
-                  f"{_s2_pretty} is not comparable")
+                  f"{', '.join(m['label'] for m in _anc)}; {_s2_clause}")
         _parts = title.split("\n", 1)             # keep the "N chained steps..." line
         title = _line1 + (("\n" + _parts[1]) if len(_parts) > 1 else "")
         # NB: labels stay FULL (with timestamps) through the console table below;
         # they are simplified to bare stage names only for the figure legend
         # (just before the figure), since the title already carries full names.
+    else:
+        # non-ancestors: append the SAME clause to the title's first line, so both
+        # paths report the z1 provenance and comparability in the title identically.
+        _parts = title.split("\n", 1)
+        title = _parts[0] + f"; {_s2_clause}" + (("\n" + _parts[1]) if len(_parts) > 1 else "")
     if n_stats:
         stat_windows = _select_windows(a, n_stats, n_steps, seed, max_dt, device,
                                         t0_range=t0_range)
@@ -2245,7 +2309,7 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
                      n_steps: int = 2, seed: int = 0,
                      fixed_windows: list[str] | None = None,
                      max_dt: float | None = None, z1_resync: bool = False,
-                     f_scale_sweep: bool = False, alpha_sweep: bool = False,
+                     f_scale_sweep: bool = False, f_theta_scale: float = 1.0, alpha_sweep: bool = False,
                      n_stats: int = 0, trajectory: bool = False,
                      output_path: Path | None = None,
                      device: str | None = None) -> tuple[Path, list[str]]:
@@ -2268,6 +2332,7 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
         result = compare_panels(
             path_a, path_b, n_samples=n_samples, n_steps=n_steps, seed=seed,
             fixed_windows=fixed_windows, max_dt=max_dt, z1_resync=z1_resync,
+            f_theta_scale=f_theta_scale,
             trajectory=trajectory, output_path=output_path, device=device)
     elif not n_stats:
         print("\n--n-samples 0: no comparison panel drawn.")
@@ -2281,6 +2346,7 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
             path_a, path_b, n_stats=n_stats, n_steps=n_steps, seed=seed,
             t0_range=t0_range,
             max_dt=max_dt, z1_resync=z1_resync, f_scale_sweep=f_scale_sweep,
+            f_theta_scale=f_theta_scale,
             alpha_sweep=alpha_sweep, trajectory=want_traj_here,
             output_path=output_path, device=device)
         if result is None:
@@ -2291,7 +2357,8 @@ def compare_f_theta(path_a: Path, path_b: Path, n_samples: int = 6,
         (_d, a, b, _w, window_strings, prefix, _t,
          n_steps_used, z1_resync) = _setup_comparison(path_a, path_b, device_r, n_samples,
                                             n_steps, seed, fixed_windows,
-                                            max_dt, z1_resync, t0_range=t0_range)
+                                            max_dt, z1_resync, t0_range=t0_range,
+                                            f_theta_scale=f_theta_scale)
         out = output_path or _default_figure_path(prefix, a, b, seed,
                                                    n_steps_used, z1_resync,
                                                    fixed_windows)
@@ -2349,6 +2416,14 @@ def main() -> None:
                               "as h shrinks; an unstable learned field "
                               "persists. Substep-cap hits are reported -- a "
                               "clamped point does not probe a smaller step")
+    parser.add_argument("--f-theta-scale", type=float, default=1.0,
+                        dest="f_theta_scale",
+                        help="Scale f_theta's output for the WHOLE comparison at rollout "
+                             "(figure, stats, corr): the update becomes z0 + (z1 + "
+                             "scale*f)*dt. INFERENCE ONLY -- rescales a FIXED trained f "
+                             "(scaling f in training changes nothing). 1.0 = as trained; "
+                             "0 = f off (== stage 2). Shown in the title when != 1. "
+                             "Mutually exclusive with --f-scale-sweep.")
     parser.add_argument("--f-scale-sweep", action="store_true",
                          help="with --n-stats, also report end-to-end loss and "
                               "correlation with f_theta scaled by 0, 0.25, "
@@ -2381,6 +2456,11 @@ def main() -> None:
                          help="registry CSV, for --with-ancestors to resolve the "
                               "3b->3a link the checkpoint file does not store.")
     args = parser.parse_args()
+    if args.f_theta_scale != 1.0 and args.f_scale_sweep:
+        parser.error("--f-theta-scale (a single applied scale for the whole "
+                     "comparison) and --f-scale-sweep (a preset multi-scale "
+                     "diagnostic) would compound -- the sweep runs on the "
+                     "already-scaled f. Use one or the other.")
     if args.panels_only and args.stats_only:
         parser.error("--panels-only and --stats-only are mutually exclusive")
 
@@ -2459,7 +2539,8 @@ def main() -> None:
             checkpoint_a, checkpoint_b,
             n_stats=args.n_stats or 200, n_steps=args.steps, seed=args.seed,
             max_dt=args.max_dt, z1_resync=args.z1_resync,
-            f_scale_sweep=args.f_scale_sweep, alpha_sweep=args.alpha_sweep,
+            f_scale_sweep=args.f_scale_sweep, f_theta_scale=args.f_theta_scale,
+            alpha_sweep=args.alpha_sweep,
             t0_range=tuple(args.t0_range) if args.t0_range else None,
             trajectory=args.trajectory, output_path=args.output,
             device=args.device)
@@ -2477,6 +2558,7 @@ def main() -> None:
                          seed=args.seed, fixed_windows=args.fixed_windows,
                          max_dt=args.max_dt, z1_resync=args.z1_resync,
                          f_scale_sweep=args.f_scale_sweep,
+                         f_theta_scale=args.f_theta_scale,
                          alpha_sweep=args.alpha_sweep,
                          t0_range=tuple(args.t0_range) if args.t0_range else None,
                          n_stats=args.n_stats, trajectory=args.trajectory,
