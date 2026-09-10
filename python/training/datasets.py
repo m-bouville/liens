@@ -262,8 +262,13 @@ def check_stat_names_normalizable(stat_names: list[str], where: str) -> None:
     if bad:
         raise ValueError(
             f"{where}: stat(s) {bad} cannot be used with normalize_phi=True -- their raw "
-            f"+/-0.1 thresholds have no clean transform under phi/phi_eq(T). Drop them "
-            f"(normalized_stat_names) or run with normalize_phi=False.")
+            f"+/-0.1 thresholds have no clean transform under phi/phi_eq(T). If this "
+            f"stat_names list was INHERITED from an ancestor checkpoint, that checkpoint "
+            f"was trained before threshold-dropping existed (its stats head still has "
+            f"these outputs, trained on meaningless normalized targets) -- RE-TRAIN the "
+            f"ancestor (e.g. stage 1) with the current code, which drops them to a "
+            f"{len(_STAT_PHI_EQ_EXPONENT)}-stat head. If you passed them EXPLICITLY, drop "
+            f"them (normalized_stat_names) or run with normalize_phi=False.")
     unknown = [n for n in stat_names if n not in _STAT_PHI_EQ_EXPONENT]
     if unknown:
         raise ValueError(

@@ -35,6 +35,7 @@ import numpy as np
 import torch
 
 from evaluation.check_rollout import _format_small, _padded_bounds
+from utils.plot_helpers import moving_window as _moving_window, pretty_label as _pretty_label
 from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -170,9 +171,138 @@ def rank_channel_importance(
     return total_delta / n_samples
 
 
+def collect_channel_importance_by_condition(
+    ae, dataset, device, n_samples: int = 400, seed: int = 0,
+    recon_stream_name: str = DEFAULT_STREAM_NAME,
+):
+    """Per-SAMPLE ablation importance tagged with the sample's (T, physical time).
+
+    Same zero-ablation measure as rank_channel_importance, but instead of
+    averaging over all samples it returns the raw per-sample values so a
+    channel that matters ONLY in a corner of (T, time) space -- a specialist --
+    can be told apart from one that is globally redundant. A globally-low mean
+    importance hides that distinction; a per-condition curve reveals it (flat =
+    generalist, peaked = specialist). Larger n_samples than the ranking default
+    because we now need coverage ACROSS T and time, not just a global mean.
+
+    Returns (temps, times, deltas): temps (N,), times (N,), deltas (N, C).
+    """
+    recon_loss = ReconLoss(kind="l1")
+    n_samples = min(n_samples, len(dataset))
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator)[:n_samples].tolist()
+    ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
+    ae_decoder = (ae.pathways[recon_stream_name].decoder if hasattr(ae, "pathways")
+                  else ae.decoder)
+    temps, times, deltas = [], [], []
+    metadata_cache: dict[Path, object] = {}
+    with torch.no_grad():
+        for idx in indices:
+            x = dataset[idx].unsqueeze(0).to(device)
+            run_dir, step = dataset.frame_info(idx)
+            if run_dir not in metadata_cache:
+                metadata_cache[run_dir] = load.read_metadata(run_dir / "metadata.txt")
+            metadata = metadata_cache[run_dir]
+            theta = torch.tensor([theta_coordinates(metadata.temperature, metadata.T0)],
+                                  dtype=torch.float32, device=device)
+            z = ae_encoder(x, theta=theta)[recon_stream_name]
+            base_loss = recon_loss(ae_decoder(z), x).item()
+            row = []
+            for c in range(z.shape[1]):
+                z_ab = z.clone(); z_ab[:, c] = 0.0
+                row.append(recon_loss(ae_decoder(z_ab), x).item() - base_loss)
+            temps.append(metadata.temperature)
+            times.append(step * metadata.dt)
+            deltas.append(row)
+    return np.asarray(temps), np.asarray(times), np.asarray(deltas)
+
+
+def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int = 10,
+                                  min_bin_count: int = 10):
+    """Two figures: median per-channel ablation importance vs T, and vs physical
+    time, one curve per channel. FLAT = generalist (used everywhere); PEAKED =
+    specialist (matters only in that corner of parameter space -- a channel that
+    looks globally unimportant but is not redundant). Median (not mean) per bin,
+    robust to the heavy-tailed per-sample deltas.
+
+    Importance spans decades across channels, so the y-axis is LOG (a linear axis
+    lets the one dominant channel flatten every other curve into the floor).
+    Ablation delta is essentially non-negative (removing information hurts); the
+    rare <=0 median is clamped to a small positive floor for the log display.
+    """
+    import re as _re
+    C = deltas.shape[1]
+    cmap = plt.get_cmap("tab10")
+    # stage number for the title, parsed from the checkpoint stem (e.g. -stage3a-)
+    _m = _re.search(r"stage([0-9][a-z]?)", output_path.stem)
+    _stage = f"stage {_m.group(1)}" if _m else output_path.stem
+    # pretty checkpoint date, e.g. " (10/09 at 06:19)", parsed from the stem
+    _pl = _pretty_label(output_path.stem, include_year=False)
+    _dm = _re.search(r"\((.*?)\)", _pl)
+    _when = f" ({_dm.group(1)})" if _dm else ""
+    _FLOOR = 1e-6                       # log-display floor for near-zero medians
+
+
+
+    # --- vs TEMPERATURE: moving window over DISTINCT T (compare_f_theta._moving_window)
+    #     -- no arbitrary bins, per-point counts, smooth overlapping medians.
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for c in range(C):
+        cx, med, _lo, _hi, n = _moving_window(temps, deltas[:, c])
+        keep = n >= min_bin_count          # drop points resting on too few frames
+        if keep.any():
+            ax.plot(cx[keep], np.maximum(med[keep], _FLOOR), "o-",
+                    color=cmap(c % 10), label=f"ch{c}")
+    ax.set_yscale("log")
+    ax.set_xlabel(f"temperature T  [SMA over distinct T, half-width 2, "
+                  f">={min_bin_count} frames/point]")
+    ax.set_ylabel("median ablation importance (recon-loss increase)")
+    ax.set_title(f"{_stage}{_when}: per-channel importance vs temperature\n"
+                 f"flat = generalist, peaked = specialist")
+    ax.legend(ncol=2, fontsize=8)
+    ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    out = output_path.with_name(output_path.stem + "-importance_by_T.png")
+    fig.savefig(out, dpi=120); plt.close(fig)
+    print(f"Saved per-channel importance-vs-T figure to {out}")
+
+    # --- vs TIME: continuous over decades, so log-binned median (positive times only).
+    keep = times > 0
+    xk, dk = times[keep], deltas[keep]
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    if xk.size:
+        lx = np.log10(xk)
+        edges = np.linspace(lx.min(), lx.max(), n_bins + 1)
+        cx, med = [], []
+        for b in range(n_bins):
+            m = (lx >= edges[b]) & (lx <= edges[b + 1] if b == n_bins - 1 else lx < edges[b + 1])
+            if m.sum() >= min_bin_count:
+                cx.append(10 ** ((edges[b] + edges[b + 1]) / 2))
+                med.append(np.median(dk[m], axis=0))
+        cx, med = np.asarray(cx), np.asarray(med)
+        if cx.size:
+            med = np.maximum(med, _FLOOR)
+            for c in range(C):
+                ax.plot(cx, med[:, c], "o-", color=cmap(c % 10), label=f"ch{c}")
+        ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(f"physical time t  [log-binned median, {n_bins} bins, "
+                  f">={min_bin_count} frames/bin]")
+    ax.set_ylabel("median ablation importance (recon-loss increase)")
+    ax.set_title(f"{_stage}{_when}: per-channel importance vs physical time\n"
+                 f"flat = generalist, peaked = specialist")
+    ax.legend(ncol=2, fontsize=8)
+    ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    out = output_path.with_name(output_path.stem + "-importance_by_time.png")
+    fig.savefig(out, dpi=120); plt.close(fig)
+    print(f"Saved per-channel importance-vs-time figure to {out}")
+
+
 def check_latent_channels(
     ae_checkpoint_path: Path, fixed_frames: list[str] | None = None,
-    n_frames: int = 12, seed: int = 0, min_step: int = 0, min_stdev_phi: float | None = None,
+    n_frames: int = 12, seed: int = 0, min_step: int | None = None, min_stdev_phi: float | None = None,
+    min_normalized_stdev_phi: float | None = None, min_bin_count: int = 10,
     n_importance_samples: int = 200, skip_importance: bool = False,
     output_path: Path | None = None, device: str | None = None,
 ) -> Path:
@@ -182,12 +312,29 @@ def check_latent_channels(
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     if output_path is None:
-        output_path = (_PYTHON_ROOT.parent / "output" / "stage2"
+        # Group by stage from the checkpoint's own location (checkpoints/stageN/...
+        # -> output/stageN/...), instead of a hardcoded stage2. Falls back to a
+        # generic dir if the checkpoint is not under a checkpoints/<stage>/ layout.
+        _stage_dir = ae_checkpoint_path.parent.name
+        _sub = _stage_dir if _stage_dir and _stage_dir != "checkpoints" else "latent_channels"
+        output_path = (_PYTHON_ROOT.parent / "output" / _sub
                        / f"{ae_checkpoint_path.stem}-latent_channels.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
     ae_config = checkpoint["config"]
+    # Filter/preprocessing params default to the checkpoint's own recorded values
+    # (reproducing the training frame population), overridden only if passed
+    # explicitly. normalize_phi is NOT a CLI arg -- it MUST match how the encoder
+    # was trained (this tool feeds the AE for ablation), so it is always taken
+    # from the checkpoint; absent key = raw (old checkpoint).
+    if min_step is None:
+        min_step = ae_config.get("min_step", 0)
+    if min_stdev_phi is None:
+        min_stdev_phi = ae_config.get("min_stdev_phi")
+    if min_normalized_stdev_phi is None:
+        min_normalized_stdev_phi = ae_config.get("min_normalized_stdev_phi")
+    _normalize_phi = bool(ae_config.get("normalize_phi", False))
     stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
     stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
         stream_configs, recon_stream_name, checkpoint["model_state"],
@@ -263,7 +410,9 @@ def check_latent_channels(
             [Path(d) for d in test_dirs], source=str(ae_checkpoint_path),
             min_stdev_phi=min_stdev_phi)
         test_dataset = MicrostructureSnapshotDataset(test_dirs, augment=False, min_step=min_step,
-                                                       min_stdev_phi=min_stdev_phi)
+                                                       min_stdev_phi=min_stdev_phi,
+                                                       min_normalized_stdev_phi=min_normalized_stdev_phi,
+                                                       normalize_phi=_normalize_phi)
         if len(test_dataset) == 0:
             print(f"WARNING: no snapshots found in the checkpoint's {len(test_dirs)} "
                   f"test_dirs (after min_step={min_step}, min_stdev_phi={min_stdev_phi} "
@@ -379,6 +528,16 @@ def check_latent_channels(
             ae, test_dataset, device, n_samples=n_importance_samples, seed=seed,
             recon_stream_name=recon_stream_name,
         )
+        # Specialist vs generalist: is a globally-low-importance channel actually
+        # essential in some corner of (T, time)? Median importance per channel,
+        # binned by T and by time -- flat curve = generalist, peaked = specialist.
+        _temps, _times, _deltas = collect_channel_importance_by_condition(
+            ae, test_dataset, device,
+            n_samples=max(n_importance_samples, 400), seed=seed,
+            recon_stream_name=recon_stream_name,
+        )
+        plot_importance_by_condition(_temps, _times, _deltas, output_path,
+                                     min_bin_count=min_bin_count)
         print(f"\nChannel importance, stream '{recon_stream_name}' only (mean recon-loss "
               f"increase from zero-ablation, n={min(n_importance_samples, len(test_dataset))} "
               f"test frames, sorted descending):")
@@ -476,8 +635,15 @@ def main():
                  "the checkpoint's own held-out test_dirs.")
     parser.add_argument("--n-frames", type=int, default=12)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--min-step", type=int, default=0)
-    parser.add_argument("--min-stdev-phi", type=float, default=None)
+    parser.add_argument("--min-step", type=int, default=None,
+                        help="Frame filter; defaults to the checkpoint's recorded min_step.")
+    parser.add_argument("--min-stdev-phi", type=float, default=None,
+                        help="Frame filter; defaults to the checkpoint's recorded value.")
+    parser.add_argument("--min-normalized-stdev-phi", type=float, default=None,
+                        help="Frame filter (normalized std); defaults to the checkpoint's value.")
+    parser.add_argument("--min-bin-count", type=int, default=10,
+                        help="Minimum frames per SMA point / time bin in the importance-"
+                             "vs-condition plots; points resting on fewer are dropped.")
     parser.add_argument("--n-importance-samples", type=int, default=200,
             help="test frames used for ablation-based channel importance ranking "
                  "(separate from --n-frames, which only controls the figure)")
@@ -493,6 +659,7 @@ def main():
         ae_checkpoint_path=args.ae_checkpoint, fixed_frames=args.fixed_frames,
         n_frames=args.n_frames, seed=args.seed, min_step=args.min_step,
         min_stdev_phi=args.min_stdev_phi,
+        min_normalized_stdev_phi=args.min_normalized_stdev_phi, min_bin_count=args.min_bin_count,
         n_importance_samples=args.n_importance_samples, skip_importance=args.skip_importance,
         output_path=args.output, device=args.device,
     )

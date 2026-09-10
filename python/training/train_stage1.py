@@ -308,9 +308,12 @@ def train_autoencoder(
     # loss_component_scatter itself already returns None/writes nothing
     # for that case, but there's no point building the (empty) history
     # dict at all in that case either.
+    _component_names = ["recon0"] + (["stats0"] if include_stats else [])
+    if z0_scale_weight:
+        _component_names.append("z0_scale")   # anchored independently of stats
     component_histories: dict[str, dict[str, list[float]]] = (
-        {name: {"train": [], "val": [], "best_so_far": []} for name in ("recon0", "stats0")}
-        if include_stats else {}
+        {name: {"train": [], "val": [], "best_so_far": []} for name in _component_names}
+        if (include_stats or z0_scale_weight) else {}
     )
     component_best_tracker = ComponentBestTracker()
 
@@ -643,18 +646,26 @@ def train_autoencoder(
         scale_ratio_history.setdefault("recon0", []).append(val_recon0 / recon0_scale)
         if include_stats:
             scale_ratio_history.setdefault("stats0", []).append(val_stats0 / stats0_scale)
-        if include_stats:
-            current_val_components = {
-                "recon0": val_recon0 / recon0_scale,
-                "stats0": stats0_weight * val_stats0 / stats0_scale,
-            }
+        if z0_scale_weight:
+            scale_ratio_history.setdefault("z0_scale", []).append(val_z0_scale / z0_scale_scale)
+        if include_stats or z0_scale_weight:
+            current_val_components = {"recon0": val_recon0 / recon0_scale}
+            if include_stats:
+                current_val_components["stats0"] = stats0_weight * val_stats0 / stats0_scale
+            if z0_scale_weight:
+                current_val_components["z0_scale"] = z0_scale_weight * val_z0_scale / z0_scale_scale
             best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
             component_histories["recon0"]["train"].append(train_recon0 / recon0_scale)
             component_histories["recon0"]["val"].append(current_val_components["recon0"])
             component_histories["recon0"]["best_so_far"].append(best_components["recon0"])
-            component_histories["stats0"]["train"].append(stats0_weight * train_stats0 / stats0_scale)
-            component_histories["stats0"]["val"].append(current_val_components["stats0"])
-            component_histories["stats0"]["best_so_far"].append(best_components["stats0"])
+            if include_stats:
+                component_histories["stats0"]["train"].append(stats0_weight * train_stats0 / stats0_scale)
+                component_histories["stats0"]["val"].append(current_val_components["stats0"])
+                component_histories["stats0"]["best_so_far"].append(best_components["stats0"])
+            if z0_scale_weight:
+                component_histories["z0_scale"]["train"].append(z0_scale_weight * train_z0_scale / z0_scale_scale)
+                component_histories["z0_scale"]["val"].append(current_val_components["z0_scale"])
+                component_histories["z0_scale"]["best_so_far"].append(best_components["z0_scale"])
         # Figures via the shared writer (throttled + component/scale gating). The
         # data-collection appends above happen every epoch; only the figure writes
         # are gated. component_histories is `or None` so an empty dict (no stats)
@@ -698,6 +709,10 @@ def train_autoencoder(
                     # encoder so stages 3-5 (frozen encoder) and eval can assert they
                     # feed it the same-scaled field it was trained on.
                     "normalize_phi": normalize_phi,
+                    # filter params recorded so eval tools can reproduce the exact
+                    # training frame population by default (min_passing_steps has no
+                    # meaning for single-frame snapshots, so it is not saved here).
+                    "min_step": min_step, "min_stdev_phi": min_stdev_phi,
                     "z0_scale_weight": z0_scale_weight, "z0_scale_scale": z0_scale_scale,
                     "latent_spatial_size": latent_spatial_size,
                     "stats_weight": stats0_weight,

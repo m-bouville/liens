@@ -80,6 +80,7 @@ dict_key_imports_values = {
         'training/datasets.py',
         'training/losses.py',
         'utils/load_datasets.py',
+        'utils/plot_helpers.py',
     },
     'evaluation/check_memory.py': {
         'evaluation/_latent_eval.py',
@@ -171,6 +172,7 @@ dict_key_imports_values = {
         'utils/load_datasets.py',
         'utils/logging_utils.py',
         'utils/paths.py',
+        'utils/plot_helpers.py',
         'utils/window_parsing.py',
     },
     'evaluation/compare_integrators.py': {
@@ -788,7 +790,9 @@ dict_key_imported_by_values = {
     },
     'utils/plot_helpers.py': {
         'evaluation/check_f_theta.py',
+        'evaluation/check_latent_channels.py',
         'evaluation/check_parameter_dependence.py',
+        'evaluation/compare_f_theta.py',
     },
     'utils/plots.py': {
         'evaluation/check_alpha.py',

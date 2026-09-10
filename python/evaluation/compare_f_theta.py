@@ -57,6 +57,7 @@ import torch
 from evaluation.lineage import (
     resolve_lineage, _stage_label, _ancestor_pointers, _registry_resume_of)
 
+from utils.plot_helpers import moving_window as _moving_window, pretty_label as _pretty_label
 from utils.window_parsing import parse_fixed_window
 from evaluation.check_rollout import (
     _correlation_pct, _format_small, _padded_bounds, compute_sample,
@@ -400,60 +401,6 @@ def _binned(dt: np.ndarray, values: np.ndarray, n_bins: int = 8):
     return (np.array(centres), np.array(med), np.array(lo), np.array(hi))
 
 
-def _moving_window(x: np.ndarray, values: np.ndarray, half_width: int = 2):
-    """Moving window over the DISTINCT x values -- no binning.
-
-    For each distinct temperature T, the reported set is every window whose
-    temperature is T or one of the `half_width` distinct values either side
-    of it. Bins would impose arbitrary edges on a narrow, densely-sampled
-    range and let a bin's population change discontinuously; a window that
-    slides one sweep value at a time keeps every point on a real temperature
-    and makes neighbouring points overlap smoothly.
-
-    Returns (x, MEDIAN, q25, q75, N) -- N being how many windows each point
-    rests on, so a quartile band computed from two or three windows can be
-    told apart from one computed from fifty. MEDIAN, not mean: the loss distribution
-    is heavy-tailed enough that one diverged window in six drags the mean
-    ~17 decades above the 75th percentile, so a mean would be plotted
-    outside its own quartile band. The median is bracketed by the band by
-    construction, and matches the reduction every other panel uses.
-    """
-    good = np.isfinite(x) & np.isfinite(values)
-    x, values = x[good], values[good]
-    empty = np.array([])
-    if x.size == 0:
-        # FIVE values on every path -- the count array is part of the
-        # contract, and returning four here raised only when a panel had no
-        # finite data at all.
-        return empty, empty, empty, empty, empty
-    counts = []
-    uniq = np.unique(x)
-    centres, med, lo, hi = [], [], [], []
-    # ONLY FULL WINDOWS. The first and last `half_width` values can only draw
-    # on a truncated set (3 temperatures instead of 5), so their point is a
-    # different, noisier statistic plotted on the same line -- exactly at the
-    # ends of the range where the interesting behaviour is. Dropped rather
-    # than shown alongside full-window points.
-    # If trimming would leave nothing (fewer than 2*half_width+1 distinct
-    # values -- e.g. a single-temperature sweep), fall back to every value
-    # with whatever window it has: an empty panel hides the data entirely,
-    # which is worse than a partial window honestly labelled.
-    trim = half_width if len(uniq) > 2 * half_width else 0
-    for i in range(trim, len(uniq) - trim):
-        v = uniq[i]
-        window = uniq[max(0, i - half_width):i + half_width + 1]
-        sel = np.isin(x, window)
-        if not sel.any():
-            continue
-        vals = values[sel]
-        centres.append(float(v))
-        counts.append(int(vals.size))
-        med.append(float(np.median(vals)))
-        lo.append(float(np.percentile(vals, 25)))
-        hi.append(float(np.percentile(vals, 75)))
-    return (np.array(centres), np.array(med), np.array(lo), np.array(hi),
-            np.array(counts))
-
 
 def _label_dt_axis(ax) -> None:
     """Number the dt axis at 2/3/5 x each decade, not once per decade.
@@ -515,22 +462,6 @@ def _temperature_axis(ax) -> None:
     lo, hi = ax.get_xlim()
     ax.set_xlim(lo, max(hi, 1.0))
 
-
-def _pretty_label(label: str, include_year: bool) -> str:
-    """'stage 2-20260812_20h08' -> 'stage 2 (12/08 at 20:08)', adding the year
-    ('12/08/2026') only when include_year is True (i.e. the compared
-    checkpoints do not all share the current year). Labels without a
-    -YYYYMMDD_HHhMM timestamp are returned unchanged."""
-    m = re.search(r"(?P<stage>.*?)-?(?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})"
-                  r"_(?P<h>\d{2})h(?P<min>\d{2})", label)
-    if not m:
-        return label
-    stage = m.group("stage").rstrip("-").strip()
-    date = f"{m.group('D')}/{m.group('M')}"
-    if include_year:
-        date += f"/{m.group('Y')}"
-    stamp = f"{date} at {m.group('h')}:{m.group('min')}"
-    return f"{stage} ({stamp})" if stage else f"({stamp})"
 
 
 def _labels_need_year(labels: list[str]) -> bool:

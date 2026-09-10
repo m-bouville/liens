@@ -9,6 +9,8 @@ helper here is the single source of truth; the per-file copies are gone.
 """
 from __future__ import annotations
 
+import re
+
 import numpy as np
 
 
@@ -85,3 +87,58 @@ def fmt_corr(c: float | None) -> str:
     other would touch compare_f_theta's whole data flow for zero gain.
     """
     return "N/A (zero variance)" if c is None else f"{c * 100:.1f}%"
+
+
+
+def moving_window(x: "np.ndarray", values: "np.ndarray", half_width: int = 2):
+    """Moving window (SMA) over the DISTINCT x values -- no binning.
+
+    For each distinct x value, the reported set is every sample whose x is that
+    value or one of the `half_width` distinct values either side. Bins would
+    impose arbitrary edges on a narrow, densely-sampled range and let a bin's
+    population change discontinuously; a window that slides one distinct value
+    at a time keeps every point on a real x and makes neighbours overlap
+    smoothly. Returns (x, MEDIAN, q25, q75, N) -- N = how many samples each
+    point rests on. MEDIAN not mean: heavy-tailed distributions put the mean
+    outside its own quartile band. Shared home (was compare_f_theta._moving_window
+    and check_latent_channels' temperature axis); one contract, one source.
+    """
+    good = np.isfinite(x) & np.isfinite(values)
+    x, values = x[good], values[good]
+    empty = np.array([])
+    if x.size == 0:
+        return empty, empty, empty, empty, empty
+    counts = []
+    uniq = np.unique(x)
+    centres, med, lo, hi = [], [], [], []
+    trim = half_width if len(uniq) > 2 * half_width else 0
+    for i in range(trim, len(uniq) - trim):
+        v = uniq[i]
+        window = uniq[max(0, i - half_width):i + half_width + 1]
+        sel = np.isin(x, window)
+        if not sel.any():
+            continue
+        vals = values[sel]
+        centres.append(float(v))
+        counts.append(int(vals.size))
+        med.append(float(np.median(vals)))
+        lo.append(float(np.percentile(vals, 25)))
+        hi.append(float(np.percentile(vals, 75)))
+    return (np.array(centres), np.array(med), np.array(lo), np.array(hi),
+            np.array(counts))
+
+
+def pretty_label(label: str, include_year: bool = False) -> str:
+    """'stage 2-20260812_20h08' -> 'stage 2 (12/08 at 20:08)', adding the year
+    only when include_year. Labels without a -YYYYMMDD_HHhMM timestamp are
+    returned unchanged. Shared home (was compare_f_theta._pretty_label)."""
+    m = re.search(r"(?P<stage>.*?)-?(?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})"
+                  r"_(?P<h>\d{2})h(?P<min>\d{2})", label)
+    if not m:
+        return label
+    stage = m.group("stage").rstrip("-").strip()
+    date = f"{m.group('D')}/{m.group('M')}"
+    if include_year:
+        date += f"/{m.group('Y')}"
+    stamp = f"{date} at {m.group('h')}:{m.group('min')}"
+    return f"{stage} ({stamp})" if stage else f"({stamp})"

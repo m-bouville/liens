@@ -59,6 +59,10 @@ Generates several plots: one for $\delta t$ and one for other parameters (temper
 `python -m evaluation.check_parameter_dependence --lds-checkpoint checkpoints/stage4/128x128-stage4.pt --base-path ../datasets --min-step 1500 --min-stdev-phi 0.01 --min-passing-steps 12`
 
 
+### latent_channels
+`python -m evaluation.check_latent_channels --ae-checkpoint checkpoints/stage2/128x128-stage2.pt`
+Produces images of the channels and statistics (`latent_channels-importance_by_T.png` and `latent_channels-importance_by_time.png`).
+
 ### dt_vs_time (returns tables, not figures)
 `python -m evaluation.check_dt_vs_time --lds-checkpoint checkpoints/stage3b/128x128-stage3b.pt --min-step 2000 --min-stdev-phi 0.01 --min-passing-steps 12  --max-dt 1e9`
 
