@@ -198,6 +198,7 @@ dict_key_imports_values = {
     'evaluation/lineage.py': {
         'orchestration/checkpoint_registry.py',
     },
+    'evaluation/select_latent_channels.py': set(),
     'evaluation/sweep_min_passing_steps.py': {
         'training/datasets.py',
         'utils/sweep_filters_common.py',
@@ -481,6 +482,7 @@ dict_key_imported_by_values = {
     'evaluation/lineage.py': {
         'evaluation/compare_f_theta.py',
     },
+    'evaluation/select_latent_channels.py': set(),
     'evaluation/sweep_min_passing_steps.py': set(),
     'evaluation/sweep_min_std_deriv.py': set(),
     'evaluation/sweep_min_stdev_phi.py': set(),

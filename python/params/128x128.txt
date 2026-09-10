@@ -13,7 +13,7 @@ min_std_deriv = 1.e-7		# was 1.5e-4, then 1.e-6; TARGET: 1.e-8; skip time deriva
 min_passing_steps= None		# was 12 (causing too much trouble). any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
 recon0_scale  = 0.07e-3		# was 0.17e-3 then 0.1e-3
-stats0_scale  = 0.3 		# was 0.018   then 0.18
+stats0_scale  = 0.1 		# was 0.3
 
 deriv_scale   = 0.07e-6		# was 0.7e-6  then 0.2e-6
 interp_scale  = 0.01		# was 5.e-3
@@ -30,26 +30,27 @@ normalize_phi = True		# was implicitly False
 #############################################################
 
 latent_spatial_size= 8
-latent_channels = 8  		# 8 * 8x8 = 512 DoF  [64x64 = 4096]
-
-min_passing_steps = None	# irrelevant: stage 1 handles microstructures individually
+latent_channels =    8 		# 8 * 8x8 = 512 DoF  [128x128 = 16'384]
 
 # resume_from	  = checkpoints/stage1/128x128-stage2-as-stage1.pt
 
-stats0_weight  = 0.25     	# weight of L_stats relative to L_recon
-z0_scale_weight= 5.
-z0_scale_scale = 0.1
+# loss weights and scales
+stats0_weight  =  0.25     	# weight of L_stats relative to L_recon
+z0_scale_weight=  0.1
+z0_scale_scale =  1.0
 
-epochs 		  =  80
+epochs 		  =  50
 patience 	  =  10       	# renamed to early_stopping_patience internally
 ema_warmup_epochs=10
+
+lr			  =	  0.001
 
 batches		  =  64
 
 cache_in_memory= False
 augment       = False		# takes hours per epoch otherwise
 
-force 	      = True
+# force 	      = True
 
 
 
@@ -57,29 +58,34 @@ force 	      = True
 #   latent-space structure: z1 approximates d z0 / dt
 #############################################################
 
-# resume_from = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
+resume_from = checkpoints/stage2/128x128-stage2-4ch.pt
 
 ## Stage 2a (trains only z1 head, not z0: faster)
-stage2a	  	= True
-batches   	= 256		# can be larger for `stage2a`
-lr 		 	= 2.5e-4  	# was 5.e-4, then 1. and 2. (3. unstable?); can be larger for `stage2a`: 5.e-4, instead of 1.e-4
-augment     = False		# True is possible (but of course slower)
+# stage2a	  	= True
+# batches   	= 256		# can be larger for `stage2a`
+# lr 		 	= 2.5e-4  	# was 5.e-4, then 1. and 2. (3. unstable?); can be larger for `stage2a`: 5.e-4, instead of 1.e-4
+# augment     = False		# True is possible (but of course slower)
 
 ## or
 
 ## Stage 2b (trains both z0 and z1 heads)
-# stage2a	    	= False
-# batches 	  	= 32
-# lr 		    	= 1.e-4  	# was 1.e-4, then 0.4e-4 (which did not help)
-# augment      	= False		# takes hours per epoch otherwise
+stage2a	    	= False
+batches 	  	= 48
+lr 		    	= 0.4e-4  	# was 1.e-4, then 0.4e-4 (which did not help) then 1.e-4
+augment      	= False		# takes hours per epoch otherwise
 ## the following are used only if `stage2a == False`:
-# trunk_from_deriv_weight=0.2
-# z0_from_deriv_weight=0.05  # was 0.	# in [0, 1]: 0 means z0 is trained on reconstruction alone, not `L_deriv`
+trunk_from_deriv_weight=0.2
+z0_from_deriv_weight=0.05  # was 0.	# in [0, 1]: 0 means z0 is trained on reconstruction alone, not `L_deriv`
 
-
+# loss weights
 stats0_weight   = 0.25     	# weight of L_stats0 relative to L_recon0
 deriv_weight    = 0.5		# was 4. (with scale * 10)
 interp_weight   = 0.		# was 0.1
+
+# loss scales
+recon0_scale  	= 0.7e-3	# was 0.07e-3
+stats0_scale  	= 1.	 	# was 0.1
+deriv_scale   	= 0.07e-6 
 
 val_ema_decay   = 0.7		# was 0.7 (default)
 

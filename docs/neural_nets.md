@@ -132,7 +132,6 @@ Notes:
 - ${}^\ast$: outter layers frozen;
 - ${}^\dagger$: mostly.
 
-
 ![structure of stages and checkpoints](./liens_stage_checkpoint_flow.png "structure of stages and checkpoints")
 
 
@@ -216,6 +215,13 @@ with $G_\sigma$ Gaussian kernel. Compute eigenvalues $\lambda_1 \ge \lambda_2$ a
 
 
 ## Stage 2: latent geometry
+
+### Stage 2a
+Stage 2 can bee run in two different ways, based on Boolean `stage2a`. The faster stage 2a trains only the `z1` stream's own head. Consequently,
+- `z0` does not change at all;
+- `L_recon0` and `L_stats0` are inert, only `L_deriv` is effective;
+- the diagnostic plot about components is not generated.
+Stage 2a can be used as a stepping stone (resumed from) for a more complete stage-2 training.
 
 
 ### Derivative loss

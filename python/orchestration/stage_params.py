@@ -329,6 +329,19 @@ def _find_existing_backup(source: Path, backup_name: str) -> Path | None:
     """
     candidates = [source.with_name(backup_name)]
     candidates += [source.parent / d / backup_name for d in _ARCHIVE_DIR_NAMES]
+    # A stage-2 checkpoint may already be archived under the SIBLING stem
+    # (stage2 <-> stage2a): the two modes share the checkpoint lineage, and a
+    # run's existing backup often got renamed across that pair. Same identity
+    # test as above -- the timestamp in backup_name plus the size check below is
+    # unique per (stem, mtime), so a stem-swapped name with a matching size is
+    # the same file, not a different one. Only the stage2/stage2a pair, nothing
+    # fuzzier. (No-op for every other stem, where the swap leaves the name as-is.)
+    _swapped = (backup_name.replace("-stage2a-", "-stage2-") if "-stage2a-" in backup_name
+                else backup_name.replace("-stage2-", "-stage2a-") if "-stage2-" in backup_name
+                else None)
+    if _swapped and _swapped != backup_name:
+        candidates.append(source.with_name(_swapped))
+        candidates += [source.parent / d / _swapped for d in _ARCHIVE_DIR_NAMES]
     source_size = source.stat().st_size
     for candidate in candidates:
         if not candidate.exists():

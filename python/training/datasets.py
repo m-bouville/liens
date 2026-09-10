@@ -1640,9 +1640,21 @@ class MicrostructureEvolutionDataset(Dataset):
         n_nonconsecutive_windows = 0
         n_candidate_windows = 0
 
-        for (run_dir, metadata, kept_steps), run_data, run_data_deriv in zip(
+        # Progress bar for the window-filtering scan (consecutive + min_std_deriv
+        # per candidate window) -- same idiom/throttle as the encoding bar above,
+        # since a large sweep spends real time here with no other output until the
+        # summary skip-counts print at the end. Gated on run count like encoding.
+        _n_bwi = len(pending_meta)
+        _bwi_show = _n_bwi >= 20
+        _bwi_t0 = time.monotonic()
+        for _bwi_pos, ((run_dir, metadata, kept_steps), run_data, run_data_deriv) in enumerate(zip(
             pending_meta, run_data_list, run_data_deriv_list
-        ):
+        )):
+            if _bwi_show and (_bwi_pos % 25 == 0 or _bwi_pos == _n_bwi - 1):
+                sys.stdout.write(
+                    f"\r  building windows: {format_progress_count(_bwi_pos + 1, _n_bwi)}  "
+                    f"({_progress_eta(_bwi_pos + 1, _n_bwi, _bwi_t0)})   ")
+                sys.stdout.flush()
             run_idx = len(self._run_steps)
             self._run_dirs.append(run_dir)
             if self.normalize_phi:
@@ -1744,6 +1756,9 @@ class MicrostructureEvolutionDataset(Dataset):
                         continue
                 self._index.append((run_idx, start))
 
+        if _bwi_show:
+            sys.stdout.write("\r  building windows: done" + " " * 30 + "\n")
+            sys.stdout.flush()
         _split_suffix = f" in {self._split_label} runs" if self._split_label else ""
         if n_nonconsecutive_windows:
             _pct = 100.0 * n_nonconsecutive_windows / n_candidate_windows if n_candidate_windows else 0.0

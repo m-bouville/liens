@@ -218,7 +218,7 @@ def collect_channel_importance_by_condition(
 
 
 def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int = 10,
-                                  min_bin_count: int = 10):
+                                  min_bin_count: int = 10, stream_name: str = "state"):
     """Two figures: median per-channel ablation importance vs T, and vs physical
     time, one curve per channel. FLAT = generalist (used everywhere); PEAKED =
     specialist (matters only in that corner of parameter space -- a channel that
@@ -240,6 +240,10 @@ def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int 
     _pl = _pretty_label(output_path.stem, include_year=False)
     _dm = _re.search(r"\((.*?)\)", _pl)
     _when = f" ({_dm.group(1)})" if _dm else ""
+    # z0 == the "state" (recon) stream, z1 == "deriv"; name it so a stage-2
+    # checkpoint (which has BOTH) is not ambiguous about which was analysed.
+    _zname = {"state": "z0 (state)", "deriv": "z1 (deriv)"}.get(stream_name, stream_name)
+
     _FLOOR = 1e-6                       # log-display floor for near-zero medians
 
 
@@ -256,10 +260,11 @@ def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int 
     ax.set_yscale("log")
     ax.set_xlabel(f"temperature T  [SMA over distinct T, half-width 2, "
                   f">={min_bin_count} frames/point]")
-    ax.set_ylabel("median ablation importance (recon-loss increase)")
-    ax.set_title(f"{_stage}{_when}: per-channel importance vs temperature\n"
+    ax.set_ylabel(f"median ablation importance of {_zname} (recon-loss increase)")
+    ax.set_title(f"{_stage}{_when}: per-channel {_zname} importance vs temperature\n"
                  f"flat = generalist, peaked = specialist")
-    ax.legend(ncol=2, fontsize=8)
+    if ax.get_legend_handles_labels()[0]:   # skip empty legend (no channel cleared min_bin_count)
+        ax.legend(ncol=2, fontsize=8)
     ax.grid(alpha=0.3, which="both")
     fig.tight_layout()
     out = output_path.with_name(output_path.stem + "-importance_by_T.png")
@@ -288,10 +293,11 @@ def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int 
     ax.set_yscale("log")
     ax.set_xlabel(f"physical time t  [log-binned median, {n_bins} bins, "
                   f">={min_bin_count} frames/bin]")
-    ax.set_ylabel("median ablation importance (recon-loss increase)")
-    ax.set_title(f"{_stage}{_when}: per-channel importance vs physical time\n"
+    ax.set_ylabel(f"median ablation importance of {_zname} (recon-loss increase)")
+    ax.set_title(f"{_stage}{_when}: per-channel {_zname} importance vs physical time\n"
                  f"flat = generalist, peaked = specialist")
-    ax.legend(ncol=2, fontsize=8)
+    if ax.get_legend_handles_labels()[0]:   # skip empty legend (no channel cleared min_bin_count)
+        ax.legend(ncol=2, fontsize=8)
     ax.grid(alpha=0.3, which="both")
     fig.tight_layout()
     out = output_path.with_name(output_path.stem + "-importance_by_time.png")
@@ -537,7 +543,8 @@ def check_latent_channels(
             recon_stream_name=recon_stream_name,
         )
         plot_importance_by_condition(_temps, _times, _deltas, output_path,
-                                     min_bin_count=min_bin_count)
+                                     min_bin_count=min_bin_count,
+                                     stream_name=recon_stream_name)
         print(f"\nChannel importance, stream '{recon_stream_name}' only (mean recon-loss "
               f"increase from zero-ablation, n={min(n_importance_samples, len(test_dataset))} "
               f"test frames, sorted descending):")

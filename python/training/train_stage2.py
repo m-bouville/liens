@@ -99,7 +99,7 @@ def train_stage2(
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     min_step: int | None = None, min_stdev_phi: float | None = None,
-    min_passing_steps: int | None = None, normalize_phi: bool = False,
+    min_passing_steps: int | None = None,
     min_std_deriv: float | None = None, augment: bool = False,
     condition_on_theta: bool | None = None,
     val_ema_decay: float = 0.7, early_stopping_patience: int | None = None,
@@ -428,12 +428,7 @@ def train_stage2(
     # dataset is read, while the output filename comes from the params file --
     # so a mistyped resume_from trains the wrong model into the right name,
     # silently. See cross_check_ancestor_config for the incident.
-    # normalize_phi: the stage-1 ancestor's field scaling must match this run's.
-    # Softer than stage 3's frozen-encoder guard (the AE keeps training here and
-    # can adapt), but a mismatch is still a wrong starting point and must be
-    # spotted, not silent. Absent key (pre-normalize_phi ancestor) = raw = passes
-    # only when this run is raw too, per cross_check's own absent-key rule.
-    cross_check_ancestor_config(model_cfg, {"size": size, "normalize_phi": normalize_phi}, resume_from,
+    cross_check_ancestor_config(model_cfg, {"size": size}, resume_from,
                                  what="stage-2 ancestor")
     size = model_cfg["size"]
     print(f"Resuming from {resume_from} (stat_names={stat_names}, "
@@ -803,7 +798,7 @@ def train_stage2(
                                                   stats_frame_index=1 if deriv_target_centered else 0,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
-                                                  min_passing_steps=min_passing_steps, normalize_phi=normalize_phi,
+                                                  min_passing_steps=min_passing_steps,
                                                   fixed_aug_indices=(VAL_DECORRELATED_AUG_INDICES
                                                                       if val_aug_averaging else None),
                                                   split_label="validation")
@@ -816,14 +811,14 @@ def train_stage2(
                                                     stats_frame_index=1 if deriv_target_centered else 0,
                                                     stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                     min_step=min_step, min_stdev_phi=min_stdev_phi,
-                                                    min_passing_steps=min_passing_steps, normalize_phi=normalize_phi,
+                                                    min_passing_steps=min_passing_steps,
                                                     augment=augment, split_label="training")
         val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None,
                                                   window_length=3 if deriv_target_centered else 2,
                                                   stats_frame_index=1 if deriv_target_centered else 0,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
-                                                  min_passing_steps=min_passing_steps, normalize_phi=normalize_phi,
+                                                  min_passing_steps=min_passing_steps,
                                                   fixed_aug_indices=(VAL_DECORRELATED_AUG_INDICES
                                                                       if val_aug_averaging else None),
                                                   split_label="validation")
@@ -850,6 +845,21 @@ def train_stage2(
     print("=" * 70)
     print("Baseline (pre-stage-2): latent geometry of the stage 1 checkpoint")
     print("=" * 70)
+    # RNG-neutral baseline diagnostics: capture the global RNG state now and
+    # restore it after the block, so running vs skipping the (stochastic) checks
+    # leaves training's RNG identical. Otherwise a skipped check (PNG already
+    # exists, or stage2a) changes downstream training -- breaking the
+    # "interp_weight=0 twice is bit-identical" contract.
+    _rng_state_cpu = torch.get_rng_state()
+    _rng_state_cuda = (torch.cuda.get_rng_state_all()
+                       if torch.cuda.is_available() else None)
+    # These baseline diagnostics depend ONLY on resume_from (they run pre-training
+    # on that checkpoint), so their output is deterministic per resume_from -- if
+    # both PNGs already exist for it, re-running is pure repeated cost.
+    _interp_png = (_PYTHON_ROOT.parent / "output" / "stage1"
+                   / f"{resume_from.stem}-pre_stage2-interpolation.png")
+    _perturb_png = (_PYTHON_ROOT.parent / "output" / "stage1"
+                    / f"{resume_from.stem}-pre_stage2-perturbation.png")
     if stage2a and interp_weight == 0:
         # These measure z0-space geometry (stats of interpolated z0 vs encoded
         # z2). stage2a freezes trunk/decoder/z0 and the stats head, so with no
@@ -861,19 +871,30 @@ def train_stage2(
               " these measure cannot change this run;\n   the ancestor's numbers"
               " stand)")
         print()
+    elif _interp_png.exists() and _perturb_png.exists():
+        # Deterministic per resume_from and already computed: skip the minutes of
+        # recompute. (Delete the PNGs to force a refresh.)
+        print(f"  (skipping check_interpolation/check_perturbation: baseline PNGs"
+              f" already exist for {resume_from.stem};\n   they depend only on the"
+              f" resumed checkpoint, so they are unchanged -- delete them to refresh)")
+        print()
     else:
         check_interpolation(
             checkpoint_path=resume_from, min_step=min_step, device=device,
-            output_path=(_PYTHON_ROOT.parent / "output" / "stage1"
-                         / f"{resume_from.stem}-pre_stage2-interpolation.png"),
+            output_path=_interp_png,
         )
         print()
         check_perturbation(
             checkpoint_path=resume_from, min_step=min_step, device=device,
-            output_path=(_PYTHON_ROOT.parent / "output" / "stage1"
-                         / f"{resume_from.stem}-pre_stage2-perturbation.png"),
+            output_path=_perturb_png,
         )
         print()
+
+    # Restore the RNG so the baseline diagnostics above (whether run or skipped)
+    # did not perturb the state training starts from -- see the capture above.
+    torch.set_rng_state(_rng_state_cpu)
+    if _rng_state_cuda is not None:
+        torch.cuda.set_rng_state_all(_rng_state_cuda)
 
     # stats_head frozen (not optimized here); ae itself may also have
     # frozen outer layers (see freeze_outer_layers/n_frozen_stages) --
@@ -1764,9 +1785,6 @@ def train_stage2(
                     "config": {
                         "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],
                         "latent_channels": recon_stream.channels,
-                        # canonical location for the guard: train_lds reads ae_checkpoint["config"]
-                        # as ae_config, so the frozen-encoder normalize_phi check finds it here.
-                        "normalize_phi": normalize_phi,
                         "latent_spatial_size": recon_stream.spatial_size,
                         "stats_weight": ancestor_stats_weight,
                         "stream_configs": {
@@ -1809,7 +1827,6 @@ def train_stage2(
                     # training's -- it does not, and cannot, match it.
                     "data_config": {
                         "min_step": min_step, "min_stdev_phi": min_stdev_phi,
-                        "normalize_phi": normalize_phi,
                         "min_passing_steps": min_passing_steps, "min_std_deriv": min_std_deriv,
                         "window_length": 3 if deriv_target_centered else 2,
                         "augment": augment,
