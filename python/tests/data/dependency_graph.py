@@ -36,6 +36,7 @@ dict_key_imports_values = {
         'training/datasets.py',
         'utils/load_datasets.py',
     },
+    'evaluation/backfill_eval_components.py': set(),
     'evaluation/check_alpha.py': {
         'evaluation/_latent_eval.py',
         'utils/fits.py',
@@ -79,6 +80,7 @@ dict_key_imports_values = {
         'models/latent_streams.py',
         'training/datasets.py',
         'training/losses.py',
+        'utils/eval_log.py',
         'utils/load_datasets.py',
         'utils/plot_helpers.py',
     },
@@ -169,6 +171,7 @@ dict_key_imports_values = {
         'training/datasets.py',
         'training/losses.py',
         'training/model_assembly.py',
+        'utils/eval_log.py',
         'utils/load_datasets.py',
         'utils/logging_utils.py',
         'utils/paths.py',
@@ -408,6 +411,7 @@ dict_key_imports_values = {
         'utils/naming.py',
         'utils/plots.py',
     },
+    'utils/eval_log.py': set(),
     'utils/fits.py': set(),
     'utils/load_datasets.py': set(),
     'utils/logging_utils.py': set(),
@@ -438,6 +442,7 @@ dict_key_imported_by_values = {
         'evaluation/check_parameter_dependence.py',
         'evaluation/check_substep_convergence.py',
     },
+    'evaluation/backfill_eval_components.py': set(),
     'evaluation/check_alpha.py': set(),
     'evaluation/check_deriv_temperature.py': set(),
     'evaluation/check_dt_vs_time.py': set(),
@@ -732,6 +737,10 @@ dict_key_imported_by_values = {
     },
     'training/train_stage2.py': {
         'orchestration/pipeline.py',
+    },
+    'utils/eval_log.py': {
+        'evaluation/check_latent_channels.py',
+        'evaluation/compare_f_theta.py',
     },
     'utils/fits.py': {
         'evaluation/check_alpha.py',

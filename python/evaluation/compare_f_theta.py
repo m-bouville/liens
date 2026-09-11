@@ -58,6 +58,7 @@ from evaluation.lineage import (
     resolve_lineage, _stage_label, _ancestor_pointers, _registry_resume_of)
 
 from utils.plot_helpers import moving_window as _moving_window, pretty_label as _pretty_label
+from utils.eval_log import upsert_eval_row, eval_csv_for_checkpoint
 from utils.window_parsing import parse_fixed_window
 from evaluation.check_rollout import (
     _correlation_pct, _format_small, _padded_bounds, compute_sample,
@@ -512,6 +513,21 @@ def _stage2_z1_provenance(model: dict, device) -> str | None:
             s2 = chain[0][1]
         lbl = _parse_stem(Path(s2).stem)[1]
         return _pretty_label(lbl, _labels_need_year([lbl]))
+    except Exception:
+        return None
+
+
+def _stage2_z1_checkpoint_path(model: dict, device):
+    """The stage-2 checkpoint PATH whose z1 head the "stage 2 (z0+z1*dt)" baseline
+    uses -- same lineage walk as _stage2_z1_provenance, but returns the Path (for
+    keying the eval-log row on the real stage-2 model), or None if unresolved."""
+    try:
+        chain = resolve_lineage(model.get("ae_path") or model.get("path"),
+                                 registry_resume=lambda pth: _registry_resume_of(pth),
+                                 device=device)
+        s2 = next((pth for lbl, pth in chain
+                   if str(lbl).replace("stage", "").strip() == "2"), None)
+        return Path(s2) if s2 is not None else (Path(chain[0][1]) if chain else None)
     except Exception:
         return None
 
@@ -2170,16 +2186,39 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
         losses_k = np.array(stats[f"loss_{key}"], dtype=float)
         corrs_k = np.array([c for c in stats[f"corr_{key}"]
                              if c is not None], dtype=float)
-        print(f"  {m['label']}: median loss {np.median(losses_k):.5g}, "
-              f"median corr dx {np.median(corrs_k):.1f}%")
+        _med_loss, _med_corr = float(np.median(losses_k)), float(np.median(corrs_k))
+        print(f"  {m['label']}: median loss {_med_loss:.5g}, "
+              f"median corr dx {_med_corr:.1f}%")
+        try:
+            upsert_eval_row(
+                eval_csv_for_checkpoint(m["path"]),
+                m["path"], m["ck"].get("epoch"),
+                {"median_loss": _med_loss, "median_corr_dx": _med_corr / 100.0,
+                 "n_steps": n_steps},
+                eval_variant="")
+        except Exception as _e:
+            print(f"    (eval-log skipped: {_e})")
     if stats is not None:
         # Causal (frozen dz0/dt extrapolation) never re-encodes -- same rollout
         # methodology as the models -- so it is comparable at every step count.
         _cl = np.array([x for x in stats["loss_causal"] if np.isfinite(x)], dtype=float)
         _cc = np.array([c for c in stats["corr_causal"] if c is not None], dtype=float)
         if _cl.size:
-            print(f"  previous derivative: median loss {np.median(_cl):.5g}, "
-                  f"median corr dx {np.median(_cc):.1f}%")
+            _med_cl, _med_cc = float(np.median(_cl)), float(np.median(_cc))
+            print(f"  previous derivative: median loss {_med_cl:.5g}, "
+                  f"median corr dx {_med_cc:.1f}%")
+            # NOT a model: a methodology baseline (frozen backward-quotient over the
+            # windows). One row, keyed on a synthetic "baseline:previous_derivative"
+            # identity -- never under a model checkpoint's path. Written to the SAME
+            # stage dir as the compared models.
+            try:
+                _base_dir = eval_csv_for_checkpoint(model_items[0][1]["path"])
+                upsert_eval_row(
+                    _base_dir, "baseline:previous_derivative", None,
+                    {"median_loss": _med_cl, "median_corr_dx": _med_cc / 100.0,
+                     "n_steps": n_steps}, eval_variant="previous_derivative")
+            except Exception as _e:
+                print(f"    (eval-log skipped: {_e})")
         # Stage 2 (z0+z1*dt) RE-ENCODES the predicted state every step -- the
         # models never do -- so it is a fair, same-methodology baseline ONLY at
         # 1 step (no re-encode yet). At multi-step it uses information the models
@@ -2189,12 +2228,31 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
         _sl = np.array([x for x in stats["loss_stage2"] if np.isfinite(x)], dtype=float)
         _sc = np.array([c for c in stats["corr_stage2"] if c is not None], dtype=float)
         if _sl.size and n_steps == 1:
-            print(f"  stage 2 (z0+z1*dt): median loss {np.median(_sl):.5g}, "
-                  f"median corr dx {np.median(_sc):.1f}%  [comparable: 1 step]")
+            _med_sl, _med_sc = float(np.median(_sl)), float(np.median(_sc))
+            print(f"  stage 2 (z0+z1*dt): median loss {_med_sl:.5g}, "
+                  f"median corr dx {_med_sc:.1f}%  [comparable: 1 step]")
+            _s2_metrics = {"median_loss": _med_sl, "median_corr_dx": _med_sc / 100.0,
+                          "n_steps": n_steps, "comparable": True}
         elif _sl.size:
-            print(f"  stage 2 (z0+z1*dt): median corr dx {np.median(_sc):.1f}% "
+            _med_sc = float(np.median(_sc))
+            print(f"  stage 2 (z0+z1*dt): median corr dx {_med_sc:.1f}% "
                   f"-- NOT comparable at {n_steps} steps (re-encodes each step; "
                   f"dotted in the figure), reference only")
+            _s2_metrics = {"median_corr_dx": _med_sc / 100.0, "n_steps": n_steps,
+                          "comparable": False}
+        else:
+            _s2_metrics = None
+        if _s2_metrics is not None:
+            # The stage-2 baseline IS a model: the stage-2 checkpoint (z0+z1*dt).
+            # Key on ITS path (resolved via lineage from model a), not the 3a models.
+            _s2_path = _stage2_z1_checkpoint_path(a, device)
+            if _s2_path is not None:
+                try:
+                    upsert_eval_row(
+                        eval_csv_for_checkpoint(_s2_path), _s2_path, None,
+                        _s2_metrics, eval_variant="stage2_z0z1dt")
+                except Exception as _e:
+                    print(f"    (eval-log skipped: {_e})")
     for key, m in (model_items if stats is not None else ()):
         per_step = stats["n_corr_undefined_per_step"][key]
         flagged = [k for k, n in enumerate(per_step)

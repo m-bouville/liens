@@ -36,6 +36,7 @@ import torch
 
 from evaluation.check_rollout import _format_small, _padded_bounds
 from utils.plot_helpers import moving_window as _moving_window, pretty_label as _pretty_label
+from utils.eval_log import upsert_eval_row, eval_csv_for_checkpoint
 from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -650,6 +651,21 @@ def check_latent_channels(
               f"test frames, sorted descending):")
         for c in np.argsort(channel_importance)[::-1]:
             print(f"  channel {c:2d}: delta_loss={_format_small(channel_importance[c])}")
+        # Auto-log to eval-<stage>.csv: epoch + total/component val losses come from
+        # the checkpoint (self-describing, no .log parsing); channel importances are
+        # this tool's contribution. Upsert on (checkpoint, epoch) so re-runs update
+        # in place and a companion diagnostic (compare_f_theta) merges into the row.
+        try:
+            _metrics = {f"ch{c}_imp": float(channel_importance[c])
+                        for c in range(len(channel_importance))}
+            _metrics["val_loss"] = checkpoint.get("val_loss")
+            for _k, _v in (checkpoint.get("val_components") or {}).items():
+                _metrics[f"val_{_k}"] = float(_v)
+            upsert_eval_row(
+                eval_csv_for_checkpoint(ae_checkpoint_path, _PYTHON_ROOT.parent / "output"),
+                ae_checkpoint_path, checkpoint.get("epoch"), _metrics)
+        except Exception as _e:      # logging must never break the diagnostic
+            print(f"  (eval-log skipped: {_e})")
         if other_stream_names:
             print(f"  (no importance ranking for {other_stream_names} -- would need "
                   f"averaging over many paired-frame samples across the whole test set, "
