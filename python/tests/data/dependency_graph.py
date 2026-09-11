@@ -288,6 +288,7 @@ dict_key_imports_values = {
         'models/decoder.py',
         'models/encoder.py',
         'models/latent_streams.py',
+        'orchestration/checkpoint_identification.py',
         'training/_checkpoint_criterion.py',
     },
     'training/datasets.py': {
@@ -590,6 +591,7 @@ dict_key_imported_by_values = {
         'evaluation/check_rollout.py',
         'evaluation/check_stats_head_rollout.py',
         'orchestration/pipeline.py',
+        'training/checkpoint_components.py',
     },
     'orchestration/checkpoint_registry.py': {
         'evaluation/lineage.py',

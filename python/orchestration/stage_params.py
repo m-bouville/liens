@@ -250,12 +250,26 @@ def _strip_unrecognized_params(func, kwargs: dict, label: str,
     to warn about everything, which is the right behavior for a caller
     that has no globals to inherit from.
     """
-    accepted = set(inspect.signature(func).parameters)
+    sig = inspect.signature(func)
+    accepted = set(sig.parameters)
     unrecognized = set(kwargs) - accepted
     to_warn = sorted(unrecognized if own_keys is None else (unrecognized & own_keys))
     if to_warn:
         print(f"WARNING: {label}'s OWN section has parameter(s) not recognized by its "
               f"training function -- IGNORED, not used: {to_warn}")
+
+    # NOTE (retracted): an earlier version of this function logged every
+    # signature param left at its default. That is wrong -- most stage functions
+    # have many params whose default is the INTENDED, normal value for a minimal
+    # params file (epochs, augment, seed, ...); logging all of them buries the one
+    # signal worth seeing (a param that changes model MEANING silently reverting)
+    # under routine noise, and test_global_param_valid_for_ANY_stage_is_not_reported
+    # is explicit that a merely-unset param must stay silent. The real fix for
+    # "a meaning-changing param silently drifts" is a MISMATCH guard at the point
+    # that actually matters -- e.g. train_stage2's cross_check_ancestor_config and
+    # train_lds's _load_frozen_encoder guard compare the resolved value against the
+    # ancestor's and raise on disagreement, which is what catches a real drift
+    # (as opposed to "this param merely wasn't mentioned," which is not an error).
     return {k: v for k, v in kwargs.items() if k in accepted}
 
 

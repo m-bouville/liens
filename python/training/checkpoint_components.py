@@ -15,6 +15,7 @@ checkpoint format, or the evaluation scripts that already read it
 directly, needs to change.
 """
 from dataclasses import dataclass
+import tempfile
 from pathlib import Path
 
 import torch
@@ -49,6 +50,21 @@ class ComponentCheckpoint:
     state_dict: dict
     config: dict
     provenance: dict
+
+
+def resolve_normalize_phi(config: dict, checkpoint: dict | None = None) -> bool:
+    """The ONE place that reads a checkpoint's normalize_phi. Canonical location
+    is config["normalize_phi"] (where stage 1/2 write it and every guard reads);
+    falls back to checkpoint["data_config"]["normalize_phi"] for checkpoints that
+    recorded it only there (older stage-3/4 saves); absent in both => False (raw),
+    the pre-feature default. Making the READ location-agnostic is what stops a
+    consumer silently defaulting to raw because a trainer wrote to the other block
+    -- the failure mode that cost a full pipeline run.
+    """
+    v = config.get("normalize_phi")
+    if v is None and checkpoint is not None:
+        v = checkpoint.get("data_config", {}).get("normalize_phi")
+    return bool(v) if v is not None else False
 
 
 def _strip_prefix(state_dict: dict, prefix: str) -> dict:
@@ -490,6 +506,37 @@ def split_joint_checkpoint_for_evaluation(
     atomic_torch_save(lds_view, lds_view_path)
 
     return ae_view_path, lds_view_path
+
+
+
+def resolve_evaluation_views(checkpoint_path):
+    """Resolve a checkpoint to the (lds_view, ae_view) an LDS-only evaluation should
+    load, handling BOTH a plain stage-3 LDS checkpoint and a stage-4/5 JOINT checkpoint.
+
+    Stage 3: returns (checkpoint_path, None) -- load it directly; the AE comes from its
+    recorded ae_checkpoint as before.
+
+    Stage 4/5: the joint format stores f_theta as f_theta_state/lds_config and carries
+    the REFINED encoder, so it is split (via split_joint_checkpoint_for_evaluation) into
+    a stage-3-shaped LDS view and an AE view. The AE view is returned so the refined E
+    pairs with its co-trained f_theta, not the stage-2 ancestor.
+
+    Returns (lds_view_path, ae_view_path_or_None, cleanup). The two views live in a
+    TemporaryDirectory; the caller MUST keep `cleanup` alive until done loading and call
+    cleanup() (or let it fall out of scope) to remove them -- this is what stops the
+    per-invocation tempdir leak the two diagnostics previously had. For a stage-3
+    checkpoint there is nothing to clean up and cleanup() is a harmless no-op.
+    """
+    # imported here (not at module top) to avoid a training<-orchestration import cycle
+    from orchestration.checkpoint_identification import identify_checkpoint_stage
+    raw = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    stage = identify_checkpoint_stage(raw)
+    if not (stage.startswith("stage 4") or stage.startswith("stage 5")):
+        return Path(checkpoint_path), None, (lambda: None)
+    tmp = tempfile.TemporaryDirectory(prefix="eval_views_")
+    ae_view, lds_view = split_joint_checkpoint_for_evaluation(checkpoint_path, tmp.name)
+    print(f"  {stage} joint checkpoint: split into LDS + (refined) AE views for evaluation")
+    return Path(lds_view), Path(ae_view), tmp.cleanup
 
 
 def build_ae_from_checkpoint(

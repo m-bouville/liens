@@ -131,6 +131,21 @@ def select_latent_channels(in_path: Path, out_path: Path,
     # 3. config: latent_channels / stream_configs / decoder count.
     _update_config(config, new_channels)
 
+    # 3b. PRESERVE normalize_phi in the output CONFIG (where stage 3's encoder guard
+    # reads it), sourcing from config or data_config. A pruned checkpoint must carry
+    # its field-scaling provenance forward, or the downstream guard defaults it to
+    # raw and silently mismatches the (normalized) sliced encoder.
+    _np = config.get("normalize_phi")
+    if _np is None:
+        _np = ckpt.get("data_config", {}).get("normalize_phi")
+    if _np is not None:
+        config["normalize_phi"] = bool(_np)
+        print(f"  preserved normalize_phi={bool(_np)} in the output config")
+    else:
+        print("  NOTE: source has no normalize_phi recorded -- output has none either "
+              "(treated as raw downstream). If the encoder was trained normalized, "
+              "set normalize_phi in the config or re-prune from a checkpoint that records it.")
+
     # 4. the stored val_loss is for the OLD (larger) model -- it is not a fair bar
     #    for the pruned model's resume to clear. Blank it so the resuming stage
     #    treats this as a fresh baseline (its grace/comparability logic then applies)

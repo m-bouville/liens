@@ -965,6 +965,10 @@ def train_refinement(
                 provenance={
                     "config": {
                         **{k: v for k, v in components["encoder"].config.items() if k != "decoder_for_stream"},
+                        # explicit (not just spread-inherited): guards read config,
+                        # and the resolved normalize_phi must be here regardless of
+                        # whether the encoder config happened to carry it.
+                        "normalize_phi": normalize_phi,
                         "stream_configs": {
                             name: {"channels": cfg.channels, "spatial_size": cfg.spatial_size,
                                    "mode": cfg.mode.value, "condition_on_theta": cfg.condition_on_theta,

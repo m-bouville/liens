@@ -1811,6 +1811,10 @@ def train_lds(
                     "config": {
                         "latent_channels": ae_config["latent_channels"], "n_theta": N_THETA,
                         "latent_spatial_size": ae_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
+                        # canonical location (guards read config, not data_config) --
+                        # a stage-3 checkpoint used as an AE reference by an eval tool
+                        # must carry it here or the tool silently defaults to raw.
+                        "normalize_phi": normalize_phi,
                         "hidden_dim": hidden_dim, "n_hidden_layers": n_hidden_layers,
                         "dt_cap": dt_cap,
                         "n_substeps": n_substeps,

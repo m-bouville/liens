@@ -19,11 +19,15 @@ torch = pytest.importorskip("torch")
 from evaluation.select_latent_channels import select_latent_channels
 
 
-def _make_checkpoint(C=8, S=8, trunk=32, hidden=64, Ns=10, include_stats1=False):
+def _make_checkpoint(C=8, S=8, trunk=32, hidden=64, Ns=10, include_stats1=False,
+                     normalize_phi_in_config=None, normalize_phi_in_data_config=None):
+    config = {"latent_channels": C, "latent_spatial_size": S,
+             "latent_channels_decoder": C,
+             "stream_configs": {"state": {"channels": C}, "deriv": {"channels": C}}}
+    if normalize_phi_in_config is not None:
+        config["normalize_phi"] = normalize_phi_in_config
     ck = {
-        "config": {"latent_channels": C, "latent_spatial_size": S,
-                   "latent_channels_decoder": C,
-                   "stream_configs": {"state": {"channels": C}, "deriv": {"channels": C}}},
+        "config": config,
         "model_state": {
             "encoder.proj_state.weight": torch.randn(C, trunk, 1, 1),   # OUT = channels
             "encoder.proj_state.bias":   torch.randn(C),
@@ -40,6 +44,8 @@ def _make_checkpoint(C=8, S=8, trunk=32, hidden=64, Ns=10, include_stats1=False)
         },
         "epoch": 6, "val_loss": 2.9, "val_loss_ema": 3.4, "test_dirs": ["/x"],
     }
+    if normalize_phi_in_data_config is not None:
+        ck["data_config"] = {"normalize_phi": normalize_phi_in_data_config}
     if include_stats1:
         ck["stats_head1_state"] = {"net.0.weight": torch.randn(hidden, C * S * S),
                                    "net.0.bias": torch.randn(hidden)}
@@ -129,3 +135,27 @@ def test_kept_indices_normalised_sorted_unique(tmp_path):
     assert r["model_state"]["encoder.proj_state.weight"].shape == (4, 32, 1, 1)
     assert torch.allclose(r["model_state"]["encoder.proj_state.weight"],
                           src["model_state"]["encoder.proj_state.weight"][[1, 2, 5, 6]])
+
+def test_normalize_phi_preserved_from_config(tmp_path):
+    """Source records normalize_phi in config (the canonical location stage 3's
+    encoder guard reads) -- the output config keeps it."""
+    _src, r = _roundtrip(tmp_path, [1, 2, 5, 6], normalize_phi_in_config=True)
+    assert r["config"]["normalize_phi"] is True
+
+
+def test_normalize_phi_promoted_from_data_config_to_config(tmp_path):
+    """Source records normalize_phi ONLY in data_config (not the canonical config
+    location) -- it must still land in the OUTPUT config, or stage 3's guard
+    (which reads config only) silently treats the pruned checkpoint as raw. This
+    is the exact gap that let a normalized lineage produce a checkpoint stage 3
+    flagged as raw."""
+    _src, r = _roundtrip(tmp_path, [1, 2, 5, 6], normalize_phi_in_data_config=True)
+    assert r["config"].get("normalize_phi") is True
+
+
+def test_normalize_phi_absent_stays_absent_not_defaulted_to_false(tmp_path):
+    """Source has no normalize_phi recorded anywhere (a pre-feature checkpoint) --
+    the output must NOT fabricate a value; it stays absent, so downstream readers
+    apply their own historical-default (raw) rather than the tool asserting one."""
+    _src, r = _roundtrip(tmp_path, [1, 2, 5, 6])
+    assert "normalize_phi" not in r["config"]

@@ -99,6 +99,7 @@ def train_stage2(
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
     val_fraction: float = 0.2, test_fraction: float = 0.1, num_workers: int = 4,
     min_step: int | None = None, min_stdev_phi: float | None = None,
+    normalize_phi: bool | None = None,
     min_passing_steps: int | None = None,
     min_std_deriv: float | None = None, augment: bool = False,
     condition_on_theta: bool | None = None,
@@ -428,8 +429,18 @@ def train_stage2(
     # dataset is read, while the output filename comes from the params file --
     # so a mistyped resume_from trains the wrong model into the right name,
     # silently. See cross_check_ancestor_config for the incident.
-    cross_check_ancestor_config(model_cfg, {"size": size}, resume_from,
-                                 what="stage-2 ancestor")
+    # normalize_phi: field scaling the frozen/ancestor encoder was trained on.
+    # None => inherit the ancestor's (from its config, then its data_config;
+    # absent in both => False = raw, the pre-feature default). An explicit value
+    # overrides. This must match the ancestor or the encoder is fed a differently-
+    # scaled field -- so it is part of the cross-check below.
+    _anc_norm = model_cfg.get("normalize_phi")
+    if _anc_norm is None:
+        _anc_norm = prev.get("data_config", {}).get("normalize_phi")
+    if normalize_phi is None:
+        normalize_phi = bool(_anc_norm) if _anc_norm is not None else False
+    cross_check_ancestor_config(model_cfg, {"size": size, "normalize_phi": normalize_phi},
+                                 resume_from, what="stage-2 ancestor")
     size = model_cfg["size"]
     print(f"Resuming from {resume_from} (stat_names={stat_names}, "
           f"ancestor_stats_weight={ancestor_stats_weight}, this stage's stats0_weight={stats0_weight})")
@@ -798,7 +809,7 @@ def train_stage2(
                                                   stats_frame_index=1 if deriv_target_centered else 0,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
-                                                  min_passing_steps=min_passing_steps,
+                                                  min_passing_steps=min_passing_steps, normalize_phi=normalize_phi,
                                                   fixed_aug_indices=(VAL_DECORRELATED_AUG_INDICES
                                                                       if val_aug_averaging else None),
                                                   split_label="validation")
@@ -811,14 +822,14 @@ def train_stage2(
                                                     stats_frame_index=1 if deriv_target_centered else 0,
                                                     stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                     min_step=min_step, min_stdev_phi=min_stdev_phi,
-                                                    min_passing_steps=min_passing_steps,
+                                                    min_passing_steps=min_passing_steps, normalize_phi=normalize_phi,
                                                     augment=augment, split_label="training")
         val_set = MicrostructureEvolutionDataset(val_dirs, encoder=None,
                                                   window_length=3 if deriv_target_centered else 2,
                                                   stats_frame_index=1 if deriv_target_centered else 0,
                                                   stat_names=stat_names, min_std_deriv=min_std_deriv,
                                                   min_step=min_step, min_stdev_phi=min_stdev_phi,
-                                                  min_passing_steps=min_passing_steps,
+                                                  min_passing_steps=min_passing_steps, normalize_phi=normalize_phi,
                                                   fixed_aug_indices=(VAL_DECORRELATED_AUG_INDICES
                                                                       if val_aug_averaging else None),
                                                   split_label="validation")
@@ -1785,6 +1796,9 @@ def train_stage2(
                     "config": {
                         "size": model_cfg["size"], "base_channels": model_cfg["base_channels"],
                         "latent_channels": recon_stream.channels,
+                        # canonical location: stage 3's _load_frozen_encoder reads
+                        # ae_checkpoint["config"]["normalize_phi"] to guard the field scaling.
+                        "normalize_phi": normalize_phi,
                         "latent_spatial_size": recon_stream.spatial_size,
                         "stats_weight": ancestor_stats_weight,
                         "stream_configs": {
@@ -1827,6 +1841,7 @@ def train_stage2(
                     # training's -- it does not, and cannot, match it.
                     "data_config": {
                         "min_step": min_step, "min_stdev_phi": min_stdev_phi,
+                        "normalize_phi": normalize_phi,
                         "min_passing_steps": min_passing_steps, "min_std_deriv": min_std_deriv,
                         "window_length": 3 if deriv_target_centered else 2,
                         "augment": augment,
