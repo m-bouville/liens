@@ -108,6 +108,22 @@ def _find_paired_step(step: int, save_steps: list[int]) -> int | None:
     return None
 
 
+def _save_figure_or_warn(fig, path, dpi: int = 120) -> None:
+    """Save the figure, or WARN and continue if the file can't be written.
+
+    A locked/unwritable target (open in a viewer, permission denied, or a bad
+    path) must not throw away a diagnostic whose analysis already ran and printed.
+    Closes the figure either way (no leaked figures on the error path)."""
+    try:
+        fig.savefig(path, dpi=dpi)
+        print(f"Saved figure to {path}")
+    except OSError as e:
+        print(f"WARNING: could not save figure to {path} ({e.strerror or e}); "
+              f"skipping -- is it open in a viewer / locked / the path writable?")
+    finally:
+        plt.close(fig)
+
+
 def rank_channel_importance(
     ae, dataset, device, n_samples: int = 200, seed: int = 0,
     recon_stream_name: str = DEFAULT_STREAM_NAME,
@@ -217,6 +233,59 @@ def collect_channel_importance_by_condition(
     return np.asarray(temps), np.asarray(times), np.asarray(deltas)
 
 
+def print_importance_tables(temps, times, deltas, min_bin_count: int = 20,
+                            stream_name: str = "state") -> None:
+    """Compact per-bin console tables of median ablation importance per channel --
+    the textual companion to the by-T / by-time plots. TIME binned by quartiles
+    (data-driven edges), TEMPERATURE by fixed physical bands (<=0.7, 0.7-0.9,
+    0.9-0.97, >0.97). A bin with fewer than min_bin_count frames is shown as '-'
+    (too few for a stable median). Rows = channels, so a value that is high only
+    in one bin (a specialist) stands out against a flat row (a generalist)."""
+    _zname = {"state": "z0 (state)", "deriv": "z1 (deriv)"}.get(stream_name, stream_name)
+    C = deltas.shape[1]
+
+    def _emit(title, edges, labels, xvals):
+        # edges: list of (lo, hi] tests as callables over xvals -> bool mask
+        print(f"\n  median {_zname} importance by {title} "
+              f"(>= {min_bin_count} frames/bin; '-' = too few):")
+        header = "    channel  " + "  ".join(f"{l:>12}" for l in labels)
+        print(header)
+        counts = [int(m.sum()) for m in (mask(xvals) for mask in edges)]
+        print("    (n)      " + "  ".join(f"{n:>12}" for n in counts))
+        for c in range(C):
+            cells = []
+            for mask in edges:
+                m = mask(xvals)
+                if m.sum() >= min_bin_count:
+                    cells.append(f"{np.median(deltas[m, c]) * 1e3:>10.1f}e-3")
+                else:
+                    cells.append(f"{'-':>12}")
+            print(f"    {c:>7}  " + "  ".join(cells))
+
+    # TIME: quartile edges (data-driven), positive times only (as the plot).
+    tpos = times[times > 0]
+    if tpos.size:
+        q = np.percentile(tpos, [25, 50, 75])
+        t_edges = [
+            (lambda x, hi=q[0]: (x > 0) & (x <= hi)),
+            (lambda x, lo=q[0], hi=q[1]: (x > lo) & (x <= hi)),
+            (lambda x, lo=q[1], hi=q[2]: (x > lo) & (x <= hi)),
+            (lambda x, lo=q[2]: x > lo),
+        ]
+        t_labels = [f"<={q[0]:.2g}", f"..{q[1]:.2g}", f"..{q[2]:.2g}", f">{q[2]:.2g}"]
+        _emit("time t (quartiles)", t_edges, t_labels, times)
+
+    # TEMPERATURE: fixed physical bands.
+    T_edges = [
+        (lambda x: x <= 0.7),
+        (lambda x: (x > 0.7) & (x <= 0.9)),
+        (lambda x: (x > 0.9) & (x <= 0.97)),
+        (lambda x: x > 0.97),
+    ]
+    T_labels = ["<=0.7", "0.7-0.9", "0.9-0.97", ">0.97"]
+    _emit("temperature T", T_edges, T_labels, temps)
+
+
 def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int = 10,
                                   min_bin_count: int = 10, stream_name: str = "state"):
     """Two figures: median per-channel ablation importance vs T, and vs physical
@@ -268,8 +337,7 @@ def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int 
     ax.grid(alpha=0.3, which="both")
     fig.tight_layout()
     out = output_path.with_name(output_path.stem + "-importance_by_T.png")
-    fig.savefig(out, dpi=120); plt.close(fig)
-    print(f"Saved per-channel importance-vs-T figure to {out}")
+    _save_figure_or_warn(fig, out)
 
     # --- vs TIME: continuous over decades, so log-binned median (positive times only).
     keep = times > 0
@@ -301,8 +369,7 @@ def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int 
     ax.grid(alpha=0.3, which="both")
     fig.tight_layout()
     out = output_path.with_name(output_path.stem + "-importance_by_time.png")
-    fig.savefig(out, dpi=120); plt.close(fig)
-    print(f"Saved per-channel importance-vs-time figure to {out}")
+    _save_figure_or_warn(fig, out)
 
 
 def check_latent_channels(
@@ -542,6 +609,9 @@ def check_latent_channels(
             n_samples=max(n_importance_samples, 400), seed=seed,
             recon_stream_name=recon_stream_name,
         )
+        print_importance_tables(_temps, _times, _deltas,
+                                min_bin_count=min_bin_count,
+                                stream_name=recon_stream_name)
         plot_importance_by_condition(_temps, _times, _deltas, output_path,
                                      min_bin_count=min_bin_count,
                                      stream_name=recon_stream_name)
@@ -626,8 +696,7 @@ def check_latent_channels(
             ax.set_yticks([])
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=120)
-    plt.close(fig)
+    _save_figure_or_warn(fig, output_path)
     print(f"\nSaved latent channel visualization to {output_path} "
           f"({len(frames)} frames, {total_channels} channels across {len(stream_order)} "
           f"stream(s): {stream_order})")

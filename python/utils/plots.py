@@ -252,8 +252,15 @@ def loss_curve(
     # the identical post-ramp tail. DASHED, not dotted -- dotted is reserved for
     # the vertical event lines, so a different meaning gets a different style.
     if train_full_weight is not None and len(train_full_weight) == len(epochs):
+        # RELATIVE tolerance, not 1e-9: train_loss is a running sum of per-batch
+        # weighted losses while train_full_weight is RECOMPUTED from aggregated
+        # component means x full weight, so the two drift at fp-accumulation level
+        # (~1e-6) even with NO warmup -- an absolute 1e-9 gate drew a spurious
+        # "train (full weights)" curve identical to "train". A real warmup gap is
+        # percent-level (the ramped weight is a fraction of full early on), far
+        # above this, so only a genuine warmup difference draws the overlay.
         _diff = [i for i, (a, b) in enumerate(zip(train_loss, train_full_weight))
-                 if abs(a - b) > 1e-9]
+                 if abs(a - b) > 1e-4 * max(1.0, abs(a), abs(b))]
         if _diff:
             _last = min(_diff[-1] + 1, len(epochs) - 1)   # include the meeting point
             _e = epochs[: _last + 1]
