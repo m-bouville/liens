@@ -233,6 +233,48 @@ def collect_channel_importance_by_condition(
     return np.asarray(temps), np.asarray(times), np.asarray(deltas)
 
 
+def _pretty_t(v):
+    """Compact scientific label for a physical time, e.g. 5.0e4 -> "5e4"."""
+    if v <= 0:
+        return "0"
+    e = int(np.floor(np.log10(v)))
+    m = v / 10 ** e
+    return f"{m:.0f}e{e}" if abs(m - round(m)) < 0.05 else f"{m:.1f}e{e}"
+
+
+def _quantile_bin_medians(x, deltas, n_bins):
+    """Median importance per bin, binning by DISTINCT x value (equal number of
+    distinct values per bin), NOT by sorted-index count.
+
+    Time here is discrete with heavy ties: ~70-75 distinct save-times, each shared
+    by many frames (dt is constant across runs, so physical time is just the step
+    index rescaled). Splitting by index count (np.array_split) puts a bin boundary
+    INSIDE a group of tied times, so adjacent bins share a center or land on a time
+    no frame has -- an artifact, and the plot (n_bins) and table (4 bins) split the
+    ties differently and disagree. Binning by distinct VALUE keeps every tied group
+    whole: each bin spans a contiguous set of distinct times, its center is a REAL
+    median time, and the plot and table are the same grid at different resolutions,
+    so they agree. (Same principle as the T axis's moving window over distinct T.)
+
+    Returns (centers, medians(n_bins,C), counts); positive x only.
+    """
+    keep = x > 0
+    xk, dk = x[keep], deltas[keep]
+    if xk.size == 0:
+        return np.array([]), np.zeros((0, deltas.shape[1])), np.array([], dtype=int)
+    uniq = np.unique(xk)                       # the distinct times, sorted
+    n_bins = min(n_bins, uniq.size)            # never more bins than distinct values
+    centers, meds, counts = [], [], []
+    for grp in np.array_split(uniq, n_bins):   # contiguous distinct-value groups
+        if grp.size == 0:
+            continue
+        m = np.isin(xk, grp)                   # all frames whose time is in this group
+        centers.append(float(np.median(xk[m])))
+        meds.append(np.median(dk[m], axis=0))
+        counts.append(int(m.sum()))
+    return np.asarray(centers), np.asarray(meds), np.asarray(counts)
+
+
 def print_importance_tables(temps, times, deltas, min_bin_count: int = 20,
                             stream_name: str = "state") -> None:
     """Compact per-bin console tables of median ablation importance per channel --
@@ -262,18 +304,17 @@ def print_importance_tables(temps, times, deltas, min_bin_count: int = 20,
                     cells.append(f"{'-':>12}")
             print(f"    {c:>7}  " + "  ".join(cells))
 
-    # TIME: quartile edges (data-driven), positive times only (as the plot).
-    tpos = times[times > 0]
-    if tpos.size:
-        q = np.percentile(tpos, [25, 50, 75])
-        t_edges = [
-            (lambda x, hi=q[0]: (x > 0) & (x <= hi)),
-            (lambda x, lo=q[0], hi=q[1]: (x > lo) & (x <= hi)),
-            (lambda x, lo=q[1], hi=q[2]: (x > lo) & (x <= hi)),
-            (lambda x, lo=q[2]: x > lo),
-        ]
-        t_labels = [f"<={q[0]:.2g}", f"..{q[1]:.2g}", f"..{q[2]:.2g}", f">{q[2]:.2g}"]
-        _emit("time t (quartiles)", t_edges, t_labels, times)
+    # TIME: EQUAL-COUNT quartiles via the SAME helper the plot uses (n_bins=4),
+    # so the table and the by-time plot are consistent aggregations of one binning.
+    _tc, _tm, _tn = _quantile_bin_medians(times, deltas, 4)
+    if _tc.size:
+        print(f"\n  median {_zname} importance by time t "
+              f"(4 equal-count quantile bins):")
+        print("    channel  " + "  ".join(f"{_pretty_t(c):>12}" for c in _tc))
+        print("    (n)      " + "  ".join(f"{n:>12}" for n in _tn))
+        for c in range(C):
+            print(f"    {c:>7}  " + "  ".join(f"{_tm[b, c] * 1e3:>10.1f}e-3"
+                                              for b in range(_tc.size)))
 
     # TEMPERATURE: fixed physical bands.
     T_edges = [
@@ -339,28 +380,17 @@ def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int 
     out = output_path.with_name(output_path.stem + "-importance_by_T.png")
     _save_figure_or_warn(fig, out)
 
-    # --- vs TIME: continuous over decades, so log-binned median (positive times only).
-    keep = times > 0
-    xk, dk = times[keep], deltas[keep]
+    # --- vs TIME: EQUAL-COUNT (quantile) bins, same method as the table -> the two
+    # agree, and no bin is under-populated (min_bin_count not needed for time).
+    cx, med, _n = _quantile_bin_medians(times, deltas, n_bins)
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    if xk.size:
-        lx = np.log10(xk)
-        edges = np.linspace(lx.min(), lx.max(), n_bins + 1)
-        cx, med = [], []
-        for b in range(n_bins):
-            m = (lx >= edges[b]) & (lx <= edges[b + 1] if b == n_bins - 1 else lx < edges[b + 1])
-            if m.sum() >= min_bin_count:
-                cx.append(10 ** ((edges[b] + edges[b + 1]) / 2))
-                med.append(np.median(dk[m], axis=0))
-        cx, med = np.asarray(cx), np.asarray(med)
-        if cx.size:
-            med = np.maximum(med, _FLOOR)
-            for c in range(C):
-                ax.plot(cx, med[:, c], "o-", color=cmap(c % 10), label=f"ch{c}")
+    if cx.size:
+        med = np.maximum(med, _FLOOR)
+        for c in range(C):
+            ax.plot(cx, med[:, c], "o-", color=cmap(c % 10), label=f"ch{c}")
         ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel(f"physical time t  [log-binned median, {n_bins} bins, "
-                  f">={min_bin_count} frames/bin]")
+    ax.set_xlabel(f"physical time t  [equal-count median, {n_bins} quantile bins]")
     ax.set_ylabel(f"median ablation importance of {_zname} (recon-loss increase)")
     ax.set_title(f"{_stage}{_when}: per-channel {_zname} importance vs physical time\n"
                  f"flat = generalist, peaked = specialist")
