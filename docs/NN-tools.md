@@ -103,6 +103,10 @@ Use results from the previous to select channels (e.g. drop latent channels from
 Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` prints just: 0.15
 
 
+### backfill_eval_components
+`evaluation.check_reconstruction` and `evaluation.check_latent_channels` add measurements to `checkpoints/stageN/eval-stageN.csv` automatically. To fill input parameters: `python -m evaluation.backfill_eval_components checkpoints/stage<N>`.
+
+
 ### Sweep over `min_stdev_phi`, `min_std_deriv` and `min_passing_steps`
 `python -m evaluation.sweep_min_stdev_phi --base-path ../datasets --size 128 --max-runs 1000`
 Variant: `--normalized` for `min_normalized_stdev_phi`, i.e. as fraction of temperature-dependent ground-state value for `phi`.

@@ -1861,6 +1861,7 @@ def train_stage2(
                                        "n_frozen_stages": n_frozen_stages, "resumed_from": str(resume_from)},
                 },
                 epoch=epoch, val_loss=val_total, val_loss_ema=val_ema,
+                val_components=current_val_components,
                 test_dirs=test_dirs, on_saved=on_checkpoint_saved)
         elif not was_in_grace_period:
             epochs_since_improvement += 1

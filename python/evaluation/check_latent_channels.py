@@ -36,7 +36,7 @@ import torch
 
 from evaluation.check_rollout import _format_small, _padded_bounds
 from utils.plot_helpers import moving_window as _moving_window, pretty_label as _pretty_label
-from utils.eval_log import upsert_eval_row, eval_csv_for_checkpoint
+from utils.eval_log import upsert_eval_row, eval_csv_for_checkpoint, params_from_checkpoint
 from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -656,9 +656,9 @@ def check_latent_channels(
         # this tool's contribution. Upsert on (checkpoint, epoch) so re-runs update
         # in place and a companion diagnostic (compare_f_theta) merges into the row.
         try:
-            _metrics = {f"ch{c}_imp": float(channel_importance[c])
-                        for c in range(len(channel_importance))}
-            _metrics["val_loss"] = checkpoint.get("val_loss")
+            _metrics = params_from_checkpoint(checkpoint)   # input params from the checkpoint
+            _metrics.update({f"ch{c}_imp": float(channel_importance[c])
+                             for c in range(len(channel_importance))})
             for _k, _v in (checkpoint.get("val_components") or {}).items():
                 _metrics[f"val_{_k}"] = float(_v)
             upsert_eval_row(

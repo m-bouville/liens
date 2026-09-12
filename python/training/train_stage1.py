@@ -700,6 +700,15 @@ def train_autoencoder(
                 "epoch": epoch,
                 "val_loss": val_total,
                 "val_loss_ema": val_ema,
+                # per-component val losses so an eval tool loading this checkpoint gets
+                # the breakdown from the checkpoint itself (no .log parsing). Built
+                # here unconditionally: recon0 always exists; the others only when
+                # their term is active.
+                "val_components": {
+                    "recon0": val_recon0 / recon0_scale,
+                    **({"stats0": stats0_weight * val_stats0 / stats0_scale} if include_stats else {}),
+                    **({"z0_scale": z0_scale_weight * val_z0_scale / z0_scale_scale} if z0_scale_weight else {}),
+                },
                 "normalized": False,
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {

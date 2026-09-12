@@ -1019,6 +1019,7 @@ def train_refinement(
                     },
                 },
                 epoch=epoch, val_loss=val_loss, val_loss_ema=tracker.val_ema,
+                val_components=current_val_components,
                 test_dirs=test_dirs, on_saved=on_checkpoint_saved)
         else:
             epochs_since_improvement += 1

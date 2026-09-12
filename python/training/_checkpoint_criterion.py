@@ -331,7 +331,7 @@ def atomic_torch_save(obj, path: Path) -> None:
 
 
 def save_checkpoint(path, *, model_states, provenance, epoch, val_loss,
-                    val_loss_ema, test_dirs, on_saved=None) -> str:
+                    val_loss_ema, test_dirs, val_components=None, on_saved=None) -> str:
     """Atomically write a stage checkpoint and return the "  -> saved at HH:MM"
     suffix for the epoch line.
 
@@ -349,6 +349,10 @@ def save_checkpoint(path, *, model_states, provenance, epoch, val_loss,
         **model_states,
         "epoch": epoch,
         "val_loss": val_loss,
+        # per-component val losses at this epoch, so an eval tool that loads this
+        # checkpoint mid-training gets the breakdown from the checkpoint itself --
+        # no .log parsing. {} when the stage tracks no separate components.
+        "val_components": dict(val_components) if val_components else {},
         "val_loss_ema": val_loss_ema,
         "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
         **provenance,

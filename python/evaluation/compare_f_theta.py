@@ -58,7 +58,7 @@ from evaluation.lineage import (
     resolve_lineage, _stage_label, _ancestor_pointers, _registry_resume_of)
 
 from utils.plot_helpers import moving_window as _moving_window, pretty_label as _pretty_label
-from utils.eval_log import upsert_eval_row, eval_csv_for_checkpoint
+from utils.eval_log import upsert_eval_row, eval_csv_for_checkpoint, params_from_checkpoint
 from utils.window_parsing import parse_fixed_window
 from evaluation.check_rollout import (
     _correlation_pct, _format_small, _padded_bounds, compute_sample,
@@ -2190,12 +2190,14 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
         print(f"  {m['label']}: median loss {_med_loss:.5g}, "
               f"median corr dx {_med_corr:.1f}%")
         try:
+            _row = params_from_checkpoint(m["ck"])
+            _row.update({"rollout_median_loss": _med_loss,
+                         "rollout_median_corr_dx": _med_corr / 100.0,
+                         "rollout_n_steps": n_steps, "rollout_n_samples": int(len(losses_k))})
             upsert_eval_row(
                 eval_csv_for_checkpoint(m["path"]),
-                m["path"], m["ck"].get("epoch"),
-                {"median_loss": _med_loss, "median_corr_dx": _med_corr / 100.0,
-                 "n_steps": n_steps},
-                eval_variant="")
+                m["path"], m["ck"].get("epoch"), _row,
+                eval_variant=f"rollout{n_steps}")
         except Exception as _e:
             print(f"    (eval-log skipped: {_e})")
     if stats is not None:
@@ -2208,15 +2210,22 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
             print(f"  previous derivative: median loss {_med_cl:.5g}, "
                   f"median corr dx {_med_cc:.1f}%")
             # NOT a model: a methodology baseline (frozen backward-quotient over the
-            # windows). One row, keyed on a synthetic "baseline:previous_derivative"
-            # identity -- never under a model checkpoint's path. Written to the SAME
-            # stage dir as the compared models.
+            # The previous-derivative baseline is NOT unique: it is the frozen
+            # backward-quotient extrapolation of THIS AE's latents, so it depends on
+            # the AE. Key it per-AE (baseline:previous_derivative:<AE stem>) and carry
+            # the AE's identity params (size, normalize_phi, latent_channels, ...), so
+            # two AEs' baselines don't collide and the row says which AE it belongs to.
             try:
-                _base_dir = eval_csv_for_checkpoint(model_items[0][1]["path"])
+                _ae = model_items[0][1]
+                _ae_stem = Path(_ae.get("ae_path") or _ae["path"]).stem
+                _brow = params_from_checkpoint(_ae["ck"])   # AE identity params
+                _brow.update({"rollout_median_loss": _med_cl,
+                              "rollout_median_corr_dx": _med_cc / 100.0,
+                              "rollout_n_steps": n_steps, "rollout_n_samples": int(_cl.size)})
                 upsert_eval_row(
-                    _base_dir, "baseline:previous_derivative", None,
-                    {"median_loss": _med_cl, "median_corr_dx": _med_cc / 100.0,
-                     "n_steps": n_steps}, eval_variant="previous_derivative")
+                    eval_csv_for_checkpoint(_ae["path"]),
+                    f"baseline:previous_derivative:{_ae_stem}", None, _brow,
+                    eval_variant=f"previous_derivative_rollout{n_steps}")
             except Exception as _e:
                 print(f"    (eval-log skipped: {_e})")
         # Stage 2 (z0+z1*dt) RE-ENCODES the predicted state every step -- the
@@ -2231,15 +2240,16 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
             _med_sl, _med_sc = float(np.median(_sl)), float(np.median(_sc))
             print(f"  stage 2 (z0+z1*dt): median loss {_med_sl:.5g}, "
                   f"median corr dx {_med_sc:.1f}%  [comparable: 1 step]")
-            _s2_metrics = {"median_loss": _med_sl, "median_corr_dx": _med_sc / 100.0,
-                          "n_steps": n_steps, "comparable": True}
+            _s2_metrics = {"rollout_median_loss": _med_sl,
+                          "rollout_median_corr_dx": _med_sc / 100.0,
+                          "rollout_n_steps": n_steps, "rollout_n_samples": int(_sl.size), "comparable": True}
         elif _sl.size:
             _med_sc = float(np.median(_sc))
             print(f"  stage 2 (z0+z1*dt): median corr dx {_med_sc:.1f}% "
                   f"-- NOT comparable at {n_steps} steps (re-encodes each step; "
                   f"dotted in the figure), reference only")
-            _s2_metrics = {"median_corr_dx": _med_sc / 100.0, "n_steps": n_steps,
-                          "comparable": False}
+            _s2_metrics = {"rollout_median_corr_dx": _med_sc / 100.0, "rollout_n_steps": n_steps,
+                          "rollout_n_samples": int(_sc.size), "comparable": False}
         else:
             _s2_metrics = None
         if _s2_metrics is not None:
@@ -2250,7 +2260,7 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
                 try:
                     upsert_eval_row(
                         eval_csv_for_checkpoint(_s2_path), _s2_path, None,
-                        _s2_metrics, eval_variant="stage2_z0z1dt")
+                        _s2_metrics, eval_variant=f"stage2_z0z1dt_rollout{n_steps}")
                 except Exception as _e:
                     print(f"    (eval-log skipped: {_e})")
     for key, m in (model_items if stats is not None else ()):

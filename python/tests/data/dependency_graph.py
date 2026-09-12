@@ -36,7 +36,9 @@ dict_key_imports_values = {
         'training/datasets.py',
         'utils/load_datasets.py',
     },
-    'evaluation/backfill_eval_components.py': set(),
+    'evaluation/backfill_eval_components.py': {
+        'utils/eval_log.py',
+    },
     'evaluation/check_alpha.py': {
         'evaluation/_latent_eval.py',
         'utils/fits.py',
@@ -739,6 +741,7 @@ dict_key_imported_by_values = {
         'orchestration/pipeline.py',
     },
     'utils/eval_log.py': {
+        'evaluation/backfill_eval_components.py',
         'evaluation/check_latent_channels.py',
         'evaluation/compare_f_theta.py',
     },
