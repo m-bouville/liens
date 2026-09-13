@@ -1735,10 +1735,12 @@ def train_stage2(
         # uses, so the two never show a different set of components.
         current_train_components = {"recon0": train_recon / recon0_scale}
         current_val_components = {"recon0": val_recon / recon0_scale}
+        current_val_components_raw = {"recon0": val_recon}      # raw, before weight/scale
         for _, lbl, _ in active_terms:
             tw, vw, s, tv, vv = term_values[lbl]
             current_train_components[lbl] = tw * tv / s
             current_val_components[lbl] = vw * vv / s
+            current_val_components_raw[lbl] = vv
         best_components = component_best_tracker.update(current_val_components, saved_this_epoch)
         # Full-weight train overlay (see loss_curve): the train loss line is
         # displayed with the RAMPED effective_deriv_weight, so during the deriv
@@ -1862,6 +1864,7 @@ def train_stage2(
                 },
                 epoch=epoch, val_loss=val_total, val_loss_ema=val_ema,
                 val_components=current_val_components,
+                val_components_raw=current_val_components_raw,
                 test_dirs=test_dirs, on_saved=on_checkpoint_saved)
         elif not was_in_grace_period:
             epochs_since_improvement += 1

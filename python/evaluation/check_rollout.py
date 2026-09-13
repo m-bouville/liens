@@ -499,6 +499,10 @@ def check_rollout(
             # COORDINATE is handled below (t-mode build, converted to Delta-u/z~1 at
             # rollout), but the derivative stream must be chosen at construction.
             derivative_source=getattr(f_theta, "derivative_source", "z1"),
+            # previous_quotient reads BOTH streams (z0 for the quotient, z1 for the
+            # run-start fallback), so both must be encoded -- same as train_lds does.
+            encode_both_streams=(getattr(f_theta, "derivative_source", "z1")
+                                 == "previous_quotient"),
         )
         if len(dataset) == 0:
             raise ValueError(f"No windows found in the checkpoint's {len(test_dirs)} "

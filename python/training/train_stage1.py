@@ -709,6 +709,12 @@ def train_autoencoder(
                     **({"stats0": stats0_weight * val_stats0 / stats0_scale} if include_stats else {}),
                     **({"z0_scale": z0_scale_weight * val_z0_scale / z0_scale_scale} if z0_scale_weight else {}),
                 },
+                # RAW (before weight/scale) -- comparable across runs; the eval ledger uses these
+                "val_components_raw": {
+                    "recon0": val_recon0,
+                    **({"stats0": val_stats0} if include_stats else {}),
+                    **({"z0_scale": val_z0_scale} if z0_scale_weight else {}),
+                },
                 "normalized": False,
                 "test_dirs": [str(Path(d).resolve()) for d in test_dirs],
                 "config": {

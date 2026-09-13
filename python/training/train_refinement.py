@@ -194,8 +194,24 @@ def train_refinement(
         lds_checkpoint_str = components["lds"].provenance.get("lds_checkpoint")
     else:
         components = assemble_joint_checkpoint(ae_checkpoint_path, lds_checkpoint_path, device=device)
-        ancestor_note = f"E/D{'/stats_head' if 'stats_head' in components else ''} from " \
-                         f"{ae_checkpoint_path}, f_theta from {lds_checkpoint_path}"
+
+        def _pin(path, comp_key):
+            # The load path is the GENERIC, overwritten name (128x128-stage2.pt), so the
+            # path alone does not say WHICH checkpoint this was. Pin identity with the
+            # source's own epoch/val_loss (from its provenance), so the log stays
+            # traceable after the generic file is overwritten.
+            prov = components[comp_key].provenance if comp_key in components else {}
+            ep, vl = prov.get("epoch"), prov.get("val_loss")
+            tag = ""
+            if ep is not None and vl is not None:
+                tag = f" (epoch {ep}, val_loss={vl:.6g})"
+            elif ep is not None:
+                tag = f" (epoch {ep})"
+            return f"{path}{tag}"
+
+        ancestor_note = (f"E/D{'/stats_head' if 'stats_head' in components else ''} from "
+                         f"{_pin(ae_checkpoint_path, 'encoder')}, "
+                         f"f_theta from {_pin(lds_checkpoint_path, 'lds')}")
         ae_checkpoint_str = str(Path(ae_checkpoint_path).resolve())
         lds_checkpoint_str = str(Path(lds_checkpoint_path).resolve())
     ae, stats_head, f_theta, frozen_modules, stream_configs, recon_stream_name = build_models_from_components(
@@ -1020,6 +1036,7 @@ def train_refinement(
                 },
                 epoch=epoch, val_loss=val_loss, val_loss_ema=tracker.val_ema,
                 val_components=current_val_components,
+                val_components_raw=dict(_val_raw),
                 test_dirs=test_dirs, on_saved=on_checkpoint_saved)
         else:
             epochs_since_improvement += 1

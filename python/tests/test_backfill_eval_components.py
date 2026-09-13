@@ -257,3 +257,142 @@ def test_provenance_paths_strip_trailing_prose_punctuation(tmp_path):
     assert pp["resume_from"] == "checkpoints/stage1/128x128-stage1.pt"   # no trailing ':'
     assert not pp["resume_from"].endswith((":", ",", ";", ")"))
     assert not pp["source_stage2"].endswith((":", ",", ";", ")"))
+
+
+def test_exact_stem_match_confirms_epoch_present(tmp_path):
+    """The real incident: an exact-stem-matching log that does NOT yet contain the
+    requested epoch (e.g. queried at an epoch beyond what the log has logged so
+    far) must be REFUSED, not returned -- returning it caused a KeyError at the
+    call site when the fill loop indexed per_epoch[epoch]."""
+    stem = "128x128-stage2-20260912_15h34"
+    lg = _mklog(tmp_path, stem, [(1, "3.38", "15h34"), (4, "2.69", "15h34")])  # only up to epoch 4
+    parsed = lambda p: bf.parse_log(p)[1:]
+    # exact stem match exists, but epoch 20 was never logged
+    assert bf.confident_log_for(stem, [lg], 20, parsed) is None
+    # an epoch that IS present still matches via exact stem
+    assert bf.confident_log_for(stem, [lg], 4, parsed) == lg
+
+
+def test_backfill_never_raises_on_a_matched_log_missing_the_epoch(tmp_path):
+    """End-to-end: even if confident_log_for's guarantee were ever violated, the
+    call site must not KeyError -- it should report and leave the row blank."""
+    sd = tmp_path / "stage2"; sd.mkdir()
+    stem = "128x128-stage2-20260912_15h34"
+    _write_ckpt(sd / (stem + ".pt"), {"latent_channels": 8}, 20)   # epoch 20 on the checkpoint
+    _mklog(sd, stem, [(1, "3.38", "15h34"), (4, "2.69", "15h34")])  # log only reaches epoch 4
+    ev = sd / "eval-stage2.csv"
+    _eval_csv(ev, [(f"checkpoints/stage2/{stem}.pt", 20)])
+    bf.backfill(sd, ev, dry_run=False)     # must not raise
+    r = _read(ev)[0]
+    assert not (r.get("val_rollout") or r.get("val_recon0") or "").strip()
+
+
+def test_prose_head_hidden_does_not_leak_but_param_block_kept(tmp_path):
+    """The 'upgrading ... residual head (head_hidden=64); H is zero-init.' PROSE line
+    must NOT leak a bare 'head_hidden' param, while the param-BLOCK's deriv_head_hidden
+    is kept. (Prose with parens + sentence punctuation is not a param line.)"""
+    lg = tmp_path / "128x128-stage2-20260913_15h10.log"
+    lg.write_text(
+        "upgrading the 'deriv' stream to a residual head (head_hidden=64); H is zero-init.\n"
+        "other parameters:\n"
+        "  size=128  deriv_head_hidden=64  dynamics_mode=deriv_linear  lr=2.5e-05\n"
+        "/100 train = recon0/7e-05 | valid | ema\n"
+        " 13  1 =1(0.5)| 2 =1+0.1(0.5)| 2 -> saved at 15:10\n")
+    pp = bf.parse_log_params(lg)
+    assert pp.get("deriv_head_hidden") == "64"     # from the param block -> p_deriv_head_hidden
+    assert "head_hidden" not in pp                  # the bare prose one must not leak
+    # clean scalars on the real param line still captured
+    assert pp["size"] == "128" and pp["lr"] == "2.5e-05" and pp["dynamics_mode"] == "deriv_linear"
+
+
+def test_prune_stale_baseline_rows(tmp_path):
+    """A baseline row that carries a MODEL epoch is pre-fix residue (baselines are
+    model-independent and now key with a blank epoch). prune removes exactly those,
+    leaving blank-epoch baselines and all model rows untouched."""
+    ev = tmp_path / "eval-stage3b.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "eval_variant", "rollout_median_corr_dx"])
+        w.writerow(["checkpoints/stage3b/m.pt", "500", "rollout6", "0.61"])          # model row -- keep
+        w.writerow(["baseline:previous_derivative:enc", "387", "previous_derivative_rollout6", "0.65"])  # stale -- drop
+        w.writerow(["baseline:previous_derivative:enc", "2466", "previous_derivative_rollout6", "0.63"]) # stale -- drop
+        w.writerow(["baseline:previous_derivative:enc", "", "previous_derivative_rollout6", "0.64"])     # correct -- keep
+        w.writerow(["checkpoints/stage2/s2.pt", "20", "stage2_z0z1dt_rollout6", "0.22"])                 # stale stage2 -- drop
+    removed = bf.prune_stale_baseline_rows(ev, dry_run=False)
+    assert removed == 3
+    rows = _read(ev)
+    assert len(rows) == 2
+    kinds = {(r["checkpoint_path"].startswith("baseline"), (r["epoch"] or "").strip()) for r in rows}
+    # remaining: the model row, and the blank-epoch baseline
+    assert ("checkpoints/stage3b/m.pt", ) or True
+    assert any(r["checkpoint_path"] == "checkpoints/stage3b/m.pt" for r in rows)
+    assert any(r["checkpoint_path"].startswith("baseline") and not (r["epoch"] or "").strip() for r in rows)
+
+
+def test_prune_dry_run_changes_nothing(tmp_path):
+    ev = tmp_path / "eval-stage3b.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "eval_variant"])
+        w.writerow(["baseline:previous_derivative:enc", "387", "previous_derivative_rollout6"])
+    before = ev.read_text()
+    bf.prune_stale_baseline_rows(ev, dry_run=True)
+    assert ev.read_text() == before      # dry run must not write
+
+
+# --------------------------------------------------------------------------- #
+# components are stored RAW (before weight/scale), not as printed contributions
+# --------------------------------------------------------------------------- #
+def test_components_are_unweighted_to_raw_using_header_weight_and_scale(tmp_path):
+    """The log's breakdown prints weight*raw/scale (contributions that sum to the
+    total). The ledger must store the RAW loss, recovered as contribution*scale/weight
+    from the header's "[w*]name/scale" terms -- otherwise a change of rollout_scale
+    alters the stored 'rollout' with no change in the model. Hand-checked against a
+    real stage-3a line."""
+    lg = tmp_path / "128x128-stage3a-20260911_21h32.log"
+    lg.write_text(
+        "/2000 train = 1*rollout/1e-08 +0.2*stats0_predict/0.001 +0.1*z0_growth/0.005 | valid | ema\n"
+        "1046  3.147 = 2.803 + 0.206 + 0.138 ( 1.428) |  2.433 = 2.022 + 0.273 + 0.139 ( 0.830) | 2.456  -> saved at 22:25\n")
+    _n, pe, _sv = bf.parse_log(lg)
+    r = pe[1046]
+    assert r["rollout"] == pytest.approx(2.022 * 1e-8 / 1.0)
+    assert r["stats0_predict"] == pytest.approx(0.273 * 0.001 / 0.2)
+    assert r["z0_growth"] == pytest.approx(0.139 * 0.005 / 0.1)
+
+
+def test_implicit_weight_one_when_header_term_has_no_multiplier(tmp_path):
+    """'recon0/7e-05' (no 'w*') means weight 1: raw = contribution*scale."""
+    lg = tmp_path / "128x128-stage2-20260827_06h59.log"
+    lg.write_text(
+        "/100 train = recon0/7e-05 +0.25*stats0/0.3 +0.5*deriv/7e-08 | valid | ema\n"
+        " 14| 3.0 = 2.0 + 0.5 + 0.5 | 3.7900 = 3.6463 + 0.1473 + 2.5771 | 3.79\n")
+    _n, pe, _sv = bf.parse_log(lg)
+    r = pe[14]
+    assert r["recon0"] == pytest.approx(3.6463 * 7e-05 / 1.0)      # implicit weight 1
+    assert r["stats0"] == pytest.approx(0.1473 * 0.3 / 0.25)
+    assert r["deriv"] == pytest.approx(2.5771 * 7e-08 / 0.5)
+
+
+def test_single_component_log_without_header_terms_is_left_as_is(tmp_path):
+    """An old single-component log has no '[w*]name/scale' header, so there is
+    nothing to un-weight with: the lone value is stored unchanged (as comp0)."""
+    lg = tmp_path / "128x128-stage3a-20260831_04h36.log"
+    lg.write_text("/6000  train  (1step)   valid  (1step)     ema\n"
+                  "5460   1.342 ( 0.685),  1.229 ( 0.589) | 1.251234  -> saved at 04:18\n")
+    _n, pe, _sv = bf.parse_log(lg)
+    assert pe[5460]["comp0"] == pytest.approx(1.229)
+
+
+def test_backfill_marks_log_filled_components_as_raw(tmp_path):
+    sd = tmp_path / "stage3a"; sd.mkdir()
+    stem = "128x128-stage3a-20260911_21h29"
+    _write_ckpt(sd / (stem + ".pt"), {"latent_channels": 4}, 1118)
+    (sd / "128x128-stage3a-20260911_21h32.log").write_text(
+        "/2000 train = 1*rollout/1e-08 +0.2*stats0_predict/0.001 | valid | ema\n"
+        " 1118  2 =1+1(0.5)| 2.41 =2.0 + 0.27 ( 0.8) | 2.5  -> saved at 21:29\n")
+    ev = sd / "eval-stage3a.csv"
+    _eval_csv(ev, [(f"checkpoints/stage3a/{stem}.pt", 1118)])
+    bf.backfill(sd, ev, dry_run=False)
+    r = _read(ev)[0]
+    assert r["val_components_kind"] == "raw"
+    assert float(r["val_rollout"]) == pytest.approx(2.0 * 1e-8)   # raw, not the printed 2.0

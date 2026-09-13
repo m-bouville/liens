@@ -20,7 +20,7 @@ interp_scale  = 0.01		# was 5.e-3
 
 augment       = True		# False: speed things up for quick tests
 condition_on_theta= True
-normalize_phi = True		# was implicitly False
+normalize_phi = False		# True works less well
 
 
 
@@ -30,7 +30,7 @@ normalize_phi = True		# was implicitly False
 #############################################################
 
 latent_spatial_size= 8
-latent_channels =    8 		# 8 * 8x8 = 512 DoF  [128x128 = 16'384]
+latent_channels =    4 		# 8 * 8x8 = 512 DoF  [128x128 = 16'384]
 
 # resume_from	  = checkpoints/stage1/128x128-stage2-as-stage1.pt
 
@@ -58,7 +58,7 @@ augment       = False		# takes hours per epoch otherwise
 #   latent-space structure: z1 approximates d z0 / dt
 #############################################################
 
-resume_from = checkpoints/stage2/128x128-stage2-4ch.pt
+# resume_from = checkpoints/stage2/128x128-stage2a-20260910_10h35.pt
 
 ## Stage 2a (trains only z1 head, not z0: faster)
 # stage2a	  	= True
@@ -71,7 +71,7 @@ resume_from = checkpoints/stage2/128x128-stage2-4ch.pt
 ## Stage 2b (trains both z0 and z1 heads)
 stage2a	    	= False
 batches 	  	= 48
-lr 		    	= 0.4e-4  	# was 1.e-4, then 0.4e-4 (which did not help) then 1.e-4
+lr 		    	= 0.25e-4  	# was 1.e-4, then 0.4e-4 (which did not help) then 1.e-4
 augment      	= False		# takes hours per epoch otherwise
 ## the following are used only if `stage2a == False`:
 trunk_from_deriv_weight=0.2
@@ -83,7 +83,7 @@ deriv_weight    = 0.5		# was 4. (with scale * 10)
 interp_weight   = 0.		# was 0.1
 
 # loss scales
-recon0_scale  	= 0.7e-3	# was 0.07e-3
+recon0_scale  	= 7.e-3		# was 0.07e-3, then 0.7e-3
 stats0_scale  	= 1.	 	# was 0.1
 deriv_scale   	= 0.07e-6 
 
@@ -105,7 +105,7 @@ grad_clip		= 1.0		# was by default 0.
 
 val_aug_averaging= True
 
-force 	      = True
+# force 	      = True
 
 
 
@@ -116,20 +116,20 @@ force 	      = True
 n_rollout_steps	= 2			# (was always 1 for 3a)
 z1_resync       = False		# must be `False` for `derivative_time=previous` (was always `True` for 3a)
 
-n_substeps		= 1			# must be 1 with `deriv_linear`
-target_vram_gib = 6.5		# leave 1 GB as headroom for driver/context
-truncate_bptt 	=  16
+n_substeps		=  1		# must be 1 with `deriv_linear`
+target_vram_gib =  6.5		# leave 1 GB as headroom for driver/context
+truncate_bptt 	= 16
 bucket_refresh_epochs=0
 
 time_coordinate = log10_t
 
 # derivative
-derivative_source= previous_quotient
+derivative_source=previous_quotient
 derivative_time	= previous
 
 # `f_theta`
 dynamics_mode	= deriv_linear
-include_2nd_order= False	# was True by default
+include_2nd_order=False		# was True by default
 
 ae_stats_weight	= 1.
 
@@ -139,9 +139,9 @@ stats0_predict_weight= 0.2
 z0_growth_weight= 0.1
 
 # loss scales
-rollout_scale 	= 0.1e-6	# 0.05e-6 * n_rollout_steps
-stats0_predict_scale= 1.e-3
-z0_growth_scale = 0.8e-3	# statistics: |ln ratio|: median 0.00373, 90th pct 0.0303, max 0.138 (from 50*8 = 400 steps)
+rollout_scale 	= 	 0.01e-6 # was 0.1e-6; 0.05e-6 * n_rollout_steps
+stats0_predict_scale=1.e-3
+z0_growth_scale = 	 5.e-3	# was 0.8e-3, then 2.5e-3; statistics: |ln ratio|: median 0.00373, 90th pct 0.0303, max 0.138 (from 50*8 = 400 steps)
 
 use_dt_decade_weights=False	# incompatible with `deriv_linear`
 
@@ -153,7 +153,7 @@ num_workers	  	=   4 		# was 4, then 0
 batches		  	=4096
 
 spike_skip_factor= 10
-grad_clip		=   1.0		# was by default 0.
+grad_clip		=   1.0
 
 lr 			  	=   2.e-3 	# was 5.e-3, then 10.e-3
 z0_noise_scale	=   0.1
@@ -161,8 +161,8 @@ z0_noise_scale	=   0.1
 dt_cap		  	= inf		# must be `inf` with `deriv_linear`
 max_dt        	= inf   	# possible with `deriv_linear`
 
-force 	      	= True
-# ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260827_02h22.pt
+# force 	      	= True
+# ae_checkpoint_path= checkpoints/stage2/128x128-stage2-20260912_20h34.pt
 # resume_from   = checkpoints/stage3a/128x128-stage3a-20260906_22h23.pt
 
 
@@ -204,9 +204,9 @@ stats0_predict_weight= same
 z0_growth_weight= same
 
 # loss scales
-rollout_scale  	= 0.2e-6	# 0.05e-6 * n_rollout_steps; was 1e-6, then 0.25e-6
-stats0_predict_scale= 2.e-3
-z0_growth_scale = 0.8e-3	# statistics: |ln ratio|: median 0.00373, 90th pct 0.0303, max 0.138 (50*8 = 400 steps)
+rollout_scale  	= 0.02e-6	# 0.05e-6 * n_rollout_steps; was 1e-6, then 0.25e-6
+stats0_predict_scale= 1.e-3
+z0_growth_scale = 3.e-3	# statistics: |ln ratio|: median 0.00373, 90th pct 0.0303, max 0.138 (50*8 = 400 steps)
 
 use_dt_decade_weights= False # incompatible with `deriv_linear`
 
@@ -228,8 +228,8 @@ dt_cap		  	= inf		# must be `inf` with `deriv_linear`
 max_dt        	= inf 		# possible with `deriv_linear`
 
 
-force 	      = True
-# ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260827_02h22.pt
+# force 	      = True
+# ae_checkpoint_path = checkpoints/stage2/128x128-stage2-20260911_19h07.pt
 # resume_from = checkpoints/stage3b/128x128-stage3b-20260829_22h39.pt
 
 
@@ -250,12 +250,12 @@ grad_predict_weight= 0.1 	# was implicitly 0
 allen_cahn_weight= 0.25
 
 # loss scales
-rollout_scale   =   0.15 	# was 0.25
-recon0_scale    =   0.1e-3 	# was 0.04e-3, then 0.2e-3 
-stats0_scale    =   0.15 
-recon_predict_scale=20.e-3	# was 0.05,  then 2.e-3
-grad_predict_scale=	 5.e-3	# was 0.001, then 0.5e-3
-allen_cahn_scale=    10.e-6	# was 20.e-6
+rollout_scale   =   0.5 	# was 0.15
+recon0_scale    =   0.2e-3 	# was 0.1e-3 
+stats0_scale    =   0.3 	# was 0.15
+recon_predict_scale=200.e-3	# was 20.e-3
+grad_predict_scale=	50.e-3	# was 5.e-3
+allen_cahn_scale=   100.e-6	# was 10.e-6
 
 allen_cahn_all_steps= False	# True eats VRAM: reduce `batches`
 val_ema_decay   =   0.8		# was 0.7 (default)
@@ -276,7 +276,7 @@ batches		  	=  42		# was 48 before adding `L_allen_cahn`
 max_dt        	= inf
 
 force 	      	= True
-ae_checkpoint_path=checkpoints/stage2/128x128-stage2-20260827_02h22.pt
+# ae_checkpoint_path=checkpoints/stage2/128x128-stage2-20260911_19h07.pt
 # resume_from 	=  checkpoints/stage4/128x128-stage4-20260904_23h45.pt
 
 

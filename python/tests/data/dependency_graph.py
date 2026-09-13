@@ -90,6 +90,10 @@ dict_key_imports_values = {
         'evaluation/_latent_eval.py',
         'training/dt_bucketing.py',
     },
+    'evaluation/check_normalization_factor.py': {
+        'training/datasets.py',
+        'utils/load_datasets.py',
+    },
     'evaluation/check_parameter_dependence.py': {
         'evaluation/_latent_eval.py',
         'evaluation/check_stdev_phi_time.py',
@@ -458,6 +462,7 @@ dict_key_imported_by_values = {
         'orchestration/pipeline.py',
     },
     'evaluation/check_memory.py': set(),
+    'evaluation/check_normalization_factor.py': set(),
     'evaluation/check_parameter_dependence.py': {
         'orchestration/pipeline.py',
     },
@@ -666,6 +671,7 @@ dict_key_imported_by_values = {
         'evaluation/check_deriv_temperature.py',
         'evaluation/check_f_theta.py',
         'evaluation/check_latent_channels.py',
+        'evaluation/check_normalization_factor.py',
         'evaluation/check_reconstruction.py',
         'evaluation/check_rollout.py',
         'evaluation/check_stats_head_rollout.py',
@@ -756,6 +762,7 @@ dict_key_imported_by_values = {
         'evaluation/check_deriv_temperature.py',
         'evaluation/check_interpolation.py',
         'evaluation/check_latent_channels.py',
+        'evaluation/check_normalization_factor.py',
         'evaluation/check_parameter_dependence.py',
         'evaluation/check_perturbation.py',
         'evaluation/check_reconstruction.py',

@@ -51,7 +51,10 @@ PARAM_COLUMNS = [
 
 # Fixed loss columns. Per-COMPONENT losses (val_rollout, val_recon0, ...) are
 # stage-dependent and therefore variable -- matched by pattern below, not listed.
-LOSS_COLUMNS = ["val_loss"]
+# val_components_kind: "raw" (before weight/scale -- comparable across runs) or
+# "weighted_scaled" (a legacy checkpoint's contributions, which depend on the run's
+# weight/scale hyperparameters). Recorded so a mixed column is never misread.
+LOSS_COLUMNS = ["val_loss", "val_components_kind"]
 
 # compare_f_theta rollout-eval outputs (prefixed so they're unambiguous standalone)
 # + n_samples (windows the medians were computed over).

@@ -659,8 +659,21 @@ def check_latent_channels(
             _metrics = params_from_checkpoint(checkpoint)   # input params from the checkpoint
             _metrics.update({f"ch{c}_imp": float(channel_importance[c])
                              for c in range(len(channel_importance))})
-            for _k, _v in (checkpoint.get("val_components") or {}).items():
-                _metrics[f"val_{_k}"] = float(_v)
+            # Prefer RAW components (before weight/scale): comparable across runs.
+            # The weighted/scaled "val_components" depend on the run's weight/scale
+            # hyperparameters, so they mostly measure those, not the model. Old
+            # checkpoints predating val_components_raw fall back to the contributions
+            # and are marked so a mixed column is never read as homogeneous.
+            _raw = checkpoint.get("val_components_raw") or {}
+            if _raw:
+                for _k, _v in _raw.items():
+                    _metrics[f"val_{_k}"] = float(_v)
+                _metrics["val_components_kind"] = "raw"
+            else:
+                for _k, _v in (checkpoint.get("val_components") or {}).items():
+                    _metrics[f"val_{_k}"] = float(_v)
+                if checkpoint.get("val_components"):
+                    _metrics["val_components_kind"] = "weighted_scaled"
             upsert_eval_row(
                 eval_csv_for_checkpoint(ae_checkpoint_path, _PYTHON_ROOT.parent / "output"),
                 ae_checkpoint_path, checkpoint.get("epoch"), _metrics)

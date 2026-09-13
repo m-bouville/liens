@@ -35,6 +35,10 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent   # python/evaluation/X.py
 # header:  "/N train = [w*]name/scale +[w*]name/scale ... | valid ..."
 _HEADER_RE = re.compile(r"train\s*=\s*(.+?)\s*\|")
 _COMPONENT_RE = re.compile(r"([A-Za-z0-9_]+)\s*/\s*[0-9eE.+\-]+")
+# full term: optional "weight*", then name/scale. Captures weight (None -> 1.0) and scale,
+# so a contribution (weight*raw/scale, what the breakdown prints) can be UN-weighted to
+# the raw loss: raw = contribution * scale / weight.
+_TERM_RE = re.compile(r"(?:([0-9eE.+\-]+)\s*\*\s*)?([A-Za-z0-9_]+)\s*/\s*([0-9eE.+\-]+)")
 # epoch line: leading int, then "... | <valid section> | <ema>"
 _EPOCH_RE = re.compile(r"^\s*(\d+)[|\s]")     # epoch is "N|" (format A) or "N " (format B)
 # a "total = a + b + c" breakdown
@@ -69,6 +73,7 @@ def parse_log(path: Path):
     valid total to the first (only) component name.
     """
     names: list[str] = []
+    ws: dict[str, tuple[float, float]] = {}   # name -> (weight, scale) from the header
     per_epoch: dict[int, dict] = {}
     saved_at: dict[int, str] = {}    # epoch -> "HH:MM" from the "-> saved at HH:MM" annotation
     for raw in path.read_text(errors="replace").splitlines():
@@ -77,6 +82,8 @@ def parse_log(path: Path):
             h = _HEADER_RE.search(line)
             if h and ("/" in h.group(1)):
                 names = _COMPONENT_RE.findall(h.group(1))
+                for w, n, sc in _TERM_RE.findall(h.group(1)):
+                    ws[n] = (float(w) if w else 1.0, float(sc))
                 continue
         if line.lstrip().startswith("ref"):            # pre-run reference line
             continue
@@ -96,7 +103,18 @@ def parse_log(path: Path):
         if not vals:
             continue
         use_names = names if len(names) == len(vals) else [f"comp{i}" for i in range(len(vals))]
-        per_epoch[epoch] = {n: v for n, v in zip(use_names, vals)}
+        # The breakdown prints weight*raw/scale (contributions summing to the total).
+        # Store the RAW loss (contribution * scale / weight) so the ledger's components
+        # are comparable across runs with different weight/scale hyperparameters. A
+        # component with no header term (single-component old logs) is left as-is.
+        comps = {}
+        for n, v in zip(use_names, vals):
+            if n in ws:
+                w, sc = ws[n]
+                comps[n] = v * sc / w if w else v
+            else:
+                comps[n] = v
+        per_epoch[epoch] = comps
         _sv = re.search(r"saved at (\d{2}):(\d{2})", line)
         if _sv:
             saved_at[epoch] = f"{_sv.group(1)}h{_sv.group(2)}"   # normalise to HHhMM
@@ -143,7 +161,12 @@ def parse_log_params(path: Path) -> dict:
         # "key=value: sentence"): they corrupt the scan (e.g. stat_names=['angle',
         # head_hidden=64), key=value: explanation). A genuine param line is only
         # key=value tokens; prose has quotes/brackets or a ': ' explanation tail.
-        if "[" in head or re.search(r"=\S+:\s", head):   # a list, or "key=value: sentence" prose
+        # Skip PROSE: a genuine param-block line is only "key=value" tokens joined by
+        # whitespace. Prose that happens to contain "key=value" also has brackets,
+        # parens, or sentence punctuation (';', ', ', ': ', '.') around it -- e.g.
+        # "...residual head (head_hidden=64); H is zero-init." Any of those markers on
+        # the line means it is prose, not the param block.
+        if any(ch in head for ch in "[(") or re.search(r"[;:.]\s|,\s", head):
             continue
         # clean scalar OR quoted scalar: dynamics_mode='deriv_linear', lr=0.002.
         # (Quotes are allowed for the VALUE; a stray "'" mid-word in prose is excluded
@@ -183,7 +206,14 @@ def confident_log_for(ck_stem: str, logs, epoch: int, parsed):
     """
     exact = [lg for lg in logs if lg.stem == ck_stem]
     if len(exact) == 1:
-        return exact[0]
+        # Exact stem match is a strong identity signal, but NOT a guarantee this
+        # log reached the requested epoch (e.g. a live/unbackuped file queried at
+        # an epoch later than what got logged) -- confirm before returning, or the
+        # caller's per_epoch[epoch] lookup raises KeyError on a log that matched by
+        # name but doesn't have that epoch.
+        if epoch in parsed(exact[0])[0]:
+            return exact[0]
+        return None
     cs = _stamp(ck_stem)
     if cs is None:
         return None
@@ -231,6 +261,47 @@ def _row_missing_components(row: dict) -> bool:
     columns that are NOT the fixed total(s) in LOSS_COLUMNS (val_loss)."""
     comp_cols = [k for k in row if k.startswith("val_") and k not in LOSS_COLUMNS]
     return not comp_cols or all(not (row.get(c) or "").strip() for c in comp_cols)
+
+
+def prune_stale_baseline_rows(eval_csv: Path, dry_run: bool = False) -> int:
+    """Remove stale baseline rows: a 'baseline:*' row (or a stage2_z0z1dt variant)
+    that carries a model epoch. Baselines are independent of the dynamics model, so
+    the current code keys them with a BLANK epoch; any baseline row WITH an epoch was
+    written by an older version that wrongly keyed on the model's epoch, so the same
+    baseline appears once per evaluated model instead of once per encoder. Dropping
+    them lets the next compare_f_theta run rewrite the single correct (blank-epoch)
+    row. Returns the number removed."""
+    if not eval_csv.exists():
+        return 0
+    with open(eval_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [dict(r) for r in reader]
+
+    def _is_stale_baseline(r):
+        is_baseline = (r.get("checkpoint_path", "").startswith("baseline:")
+                       or "stage2_z0z1dt" in (r.get("eval_variant", "") or ""))
+        has_epoch = bool((r.get("epoch", "") or "").strip())
+        return is_baseline and has_epoch
+
+    kept = [r for r in rows if not _is_stale_baseline(r)]
+    removed = len(rows) - len(kept)
+    if removed:
+        print(f"prune-baselines: removing {removed} stale baseline row(s) "
+              f"(baseline rows that carry a model epoch)"
+              + (" (dry run -- not written)" if dry_run else ""))
+    else:
+        print("prune-baselines: no stale baseline rows found.")
+    if removed and not dry_run:
+        tmp = eval_csv.with_suffix(".csv.tmp")
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            for r in kept:
+                w.writerow({c: r.get(c, "") for c in fieldnames})
+        tmp.replace(eval_csv)
+        print(f"Wrote {eval_csv}")
+    return removed
 
 
 def backfill(stage_dir: Path, eval_csv: Path, dry_run: bool = False, debug: bool = False,
@@ -327,7 +398,15 @@ def backfill(stage_dir: Path, eval_csv: Path, dry_run: bool = False, debug: bool
                      f"checkpoint's mtime that reaches epoch {epoch})")
             print(f"  {_tag}: NOT filled -- no confident log match{_hint}")
             continue
-        comps, src = _parsed(match)[0][epoch], match.name
+        _pe_match, _ = _parsed(match)
+        if epoch not in _pe_match:
+            # Defense in depth: confident_log_for is supposed to guarantee this, but
+            # never trust a single-sited guarantee -- report and skip rather than
+            # KeyError if it's ever violated (e.g. by a future edit to the matcher).
+            print(f"  {_tag}: matched {match.name} but it lacks epoch {epoch} -- "
+                  f"left blank (this indicates a matcher bug; please report)")
+            continue
+        comps, src = _pe_match[epoch], match.name
         for name, val in comps.items():
             col = f"val_{name}"
             if col not in fieldnames:
@@ -336,6 +415,11 @@ def backfill(stage_dir: Path, eval_csv: Path, dry_run: bool = False, debug: bool
         if "log" not in fieldnames:
             fieldnames.append("log")
         row["log"] = src
+        # components recovered from the log are un-weighted to RAW (see parse_log)
+        if "val_components_kind" not in fieldnames:
+            fieldnames.append("val_components_kind")
+        if not (row.get("val_components_kind") or "").strip():
+            row["val_components_kind"] = "raw"
         filled += 1
         print(f"  {_tag}: found in {src} -> {comps}")
 
@@ -412,6 +496,8 @@ def main():
     ap.add_argument("--eval-csv", type=Path, default=None,
                     help="defaults to output/eval-<stage>.csv from the stage dir name")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--prune-baselines", action="store_true",
+                    help="remove stale baseline rows that carry a model epoch, then exit")
     ap.add_argument("--all", dest="all_pts", action="store_true",
                     help="seed a row for every .pt in the stage dir (create the "
                          "CSV if absent), then fill -- for initial population.")
@@ -432,6 +518,9 @@ def main():
     print(f"Stage dir: {args.stage_dir}\nEval CSV:  {eval_csv}"
           + ("" if eval_csv.exists() else "  (NOT FOUND -- pass --eval-csv <path>; searched: "
              + ", ".join(str(c) for c in (candidates if args.eval_csv is None else [])) + ")"))
+    if args.prune_baselines:
+        prune_stale_baseline_rows(eval_csv, dry_run=args.dry_run)
+        return
     backfill(args.stage_dir, eval_csv, dry_run=args.dry_run, debug=args.debug,
              all_pts=args.all_pts)
 

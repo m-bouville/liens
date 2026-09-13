@@ -172,8 +172,18 @@ def run_from_params_file(params_path: Path, default_base: Path,
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def stage_output_path(stage_num: int) -> Path:
-        return stage_dir(stage_num) / f"{stem}-stage{stage_num}.pt"
+    def stage_output_path(stage_num: int, sub: str | None = None) -> Path:
+        # `sub` overrides the numeric stage tag in the FILENAME (dir stays the
+        # stage's own): stage 2 run in 2a mode writes "-stage2a.pt" so it never
+        # overwrites the joint "-stage2.pt" (2a is a stepping stone into 2).
+        tag = sub if sub is not None else str(stage_num)
+        return stage_dir(stage_num) / f"{stem}-stage{tag}.pt"
+
+    def _stage2_candidate_paths() -> list[Path]:
+        # Stage 3 resumes from EITHER a joint stage-2 or a 2a checkpoint (both
+        # carry the deriv stream). Joint "-stage2.pt" FIRST = preferred when both
+        # exist, since it is the more complete training 2a is a stepping stone to.
+        return [stage_output_path(2), stage_output_path(2, "2a")]
 
     def resolve_checkpoint(stage_num: int, force: bool, signature: dict,
                            target_epochs: int | None) -> Path | None:
@@ -184,11 +194,14 @@ def run_from_params_file(params_path: Path, default_base: Path,
         catches a mismatched/mislabeled file before wasting time
         training on top of it -- and reports the epoch it was actually
         saved at against the target, to flag likely-killed-early runs."""
-        own_path = stage_output_path(stage_num)
-        if own_path.exists():
-            if force:
-                print(f"WARNING: {own_path} already exists and will be OVERWRITTEN (force=True)")
-            else:
+        # Stage 2 may exist under EITHER "-stage2.pt" or "-stage2a.pt"; every other
+        # stage has a single expected name.
+        candidates = _stage2_candidate_paths() if stage_num == 2 else [stage_output_path(stage_num)]
+        for own_path in candidates:
+            if own_path.exists():
+                if force:
+                    print(f"WARNING: {own_path} already exists and will be OVERWRITTEN (force=True)")
+                    break   # force: fall through to (re)training below, don't reuse
                 _validate_checkpoint_stage(own_path, stage_num, device)
                 print(f"Stage {stage_num}: found existing {own_path}, reusing.")
                 _report_checkpoint_epoch(own_path, target_epochs, device)
@@ -311,6 +324,10 @@ def run_from_params_file(params_path: Path, default_base: Path,
                    **({"resumed_from": str(stage2_resume_from)} if stage2_overridden else {}),
                    **extra_signature, **_signature_kwargs(stage2_kwargs)}
     stage2_checkpoint = resolve_checkpoint(2, force2, signature2, stage2_kwargs.get("epochs"))
+    # Name this run by its mode: 2a (deriv-head-only) vs joint. So a 2a pass writes
+    # "-stage2a.pt" and does not clobber a joint "-stage2.pt" (and vice versa).
+    _s2sub = "2a" if stage2_kwargs.get("stage2a") else None
+    _s2_out = stage_output_path(2, _s2sub)
     if stage2_checkpoint is None:
         if stage2_overridden:
             # Only here, not for the ordinary stage1->stage2 default
@@ -323,17 +340,17 @@ def run_from_params_file(params_path: Path, default_base: Path,
             # force=True is about to overwrite in place -- see
             # _backup_before_overwrite's own docstring for why the
             # .log file matters here just as much as the .pt one.
-            _backup_before_overwrite(stage_output_path(2))
-            _backup_before_overwrite(stage_output_path(2).with_suffix(".log"))
-        with _log_to_file(stage_output_path(2).with_suffix(".log")):
+            _backup_before_overwrite(_s2_out)
+            _backup_before_overwrite(_s2_out.with_suffix(".log"))
+        with _log_to_file(_s2_out.with_suffix(".log")):
             print("=" * 70)
             print("STAGE 2: latent-space validation (L_deriv fine-tuning)")
             print("=" * 70)
             registry2_path = stage_dir(2) / "registry-stage2.csv"
             stage2_checkpoint = train_stage2(
                 size=size, base_path=base_path, resume_from=stage2_resume_from,
-                checkpoint_path=stage_output_path(2), device=device,
-                loss_curve_path=_PYTHON_ROOT.parent / "output" / f"stage2/{stage_output_path(2).stem}-loss_curve.png",
+                checkpoint_path=_s2_out, device=device,
+                loss_curve_path=_PYTHON_ROOT.parent / "output" / f"stage2/{_s2_out.stem}-loss_curve.png",
                 on_checkpoint_saved=_make_checkpoint_callback(registry2_path, signature2),
                 **stage2_kwargs,
             )
@@ -561,10 +578,14 @@ def run_from_params_file(params_path: Path, default_base: Path,
             print("=" * 70)
             print("Sanity check: rollout quality (stage 3b checkpoint)")
             print("=" * 70)
-            _, shared_windows = check_rollout(
+            _rollout_result = check_rollout(
                 lds_checkpoint_path=stage3_checkpoint, device=device,
                 output_path=_PYTHON_ROOT.parent / "output" / f"stage3b/{stage3_checkpoint.stem}-rollout.png",
             )
+            # check_rollout is a non-fatal sanity check: it returns None if it failed
+            # (the wrapper already printed the banner). Don't unpack None -- carry on
+            # with no shared windows rather than crashing the whole pipeline.
+            shared_windows = _rollout_result[1] if _rollout_result is not None else None
             print()
 
             print("=" * 70)
@@ -625,17 +646,6 @@ def run_from_params_file(params_path: Path, default_base: Path,
                                             own_keys=renamed_keys(stages.get(stage_key, {})))
         kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
             kwargs, resume_from, f"Stage {stage_key}")
-        if resume_from is not None:
-            # A resume (stage 5 <- stage 4) is defined ENTIRELY by resume_from:
-            # the ae/lds ancestor paths don't apply and, if a shared params
-            # section supplied one, would trip train_refinement's
-            # exactly-one-of(ae+lds | resume_from) guard. Drop them so
-            # resume_from stays authoritative.
-            _stray = [k for k in ("ae_checkpoint_path", "lds_checkpoint_path")
-                      if kwargs.pop(k, None) is not None]
-            if _stray:
-                print(f"  Stage {stage_key}: ignoring {_stray} from params -- "
-                      f"this is a resume (resume_from is authoritative).")
         if resume_from is not None and not overridden:
             # Auto-chained ancestor (3a -> 3b, 3b -> 4): pin its timestamped
             # identity so the log and cache signature name the ACTUAL ancestor,
@@ -646,33 +656,13 @@ def run_from_params_file(params_path: Path, default_base: Path,
             signature = {"base_path": str(base_path), "resumed_from": str(resume_from),
                           **extra_signature, **_signature_kwargs(kwargs)}
         else:
-            # Pin BOTH auto-chained ancestors (stage-2 encoder + stage-3b
-            # f_theta) to their timestamped identity, exactly as run_lds_stage
-            # does -- otherwise the log/registry name the rotating canonical
-            # (128x128-stage3b.pt) the next run of that stage overwrites, and
-            # the record of WHICH 3b this stage-4 was built on is lost.
-            # Resolve BOTH ancestors through the same helper run_lds_stage uses
-            # for its encoder: it POPS the key from kwargs (so a params-file
-            # ae_checkpoint_path / lds_checkpoint_path is not ALSO passed via
-            # **kwargs below, which is the "multiple values for keyword argument
-            # 'ae_checkpoint_path'" crash), and honours an explicit same-stage
-            # override. Not overridden -> pin the auto-chained ancestor to its
-            # timestamped identity, exactly as before.
-            kwargs, ae_ancestor, ae_overridden = _resolve_stage_specific_ancestor(
-                kwargs, stage2_checkpoint, f"Stage {stage_key}", key="ae_checkpoint_path")
-            if not ae_overridden:
-                ae_ancestor = _archive_ancestor(Path(ae_ancestor))
-            kwargs, lds_ancestor, lds_overridden = _resolve_stage_specific_ancestor(
-                kwargs, stage3_checkpoint, f"Stage {stage_key}", key="lds_checkpoint_path")
-            if not lds_overridden:
-                lds_ancestor = _archive_ancestor(Path(lds_ancestor))
             # Both ancestors recorded explicitly, same rationale as
             # run_lds_stage: full ancestry visible from this one
             # registry, without following stage2_checkpoint into ITS
             # own registry to find stage1_checkpoint, etc.
             signature = {"base_path": str(base_path),
-                          "stage2_checkpoint": str(ae_ancestor),
-                          "stage3_checkpoint": str(lds_ancestor),
+                          "stage2_checkpoint": str(stage2_checkpoint),
+                          "stage3_checkpoint": str(stage3_checkpoint),
                           **extra_signature, **_signature_kwargs(kwargs)}
         checkpoint = resolve_checkpoint(stage_key, force, signature, kwargs.get("epochs"))
         if checkpoint is None:
@@ -703,8 +693,20 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 if resume_from is not None:
                     checkpoint = train_refinement(resume_from=resume_from, **common_args)
                 else:
+                    # Preserve the INPUTS at consume time. stage2_checkpoint /
+                    # stage3_checkpoint are the GENERIC, overwritten names; the
+                    # startup log now pins them by (epoch, val_loss), but the file
+                    # itself is only lazily archived by a FUTURE stage-2/3b run that
+                    # overwrites it -- a window in which it can be lost (a manual
+                    # rerun, an interrupt). Archive them now (idempotent, mtime-named)
+                    # so the exact checkpoints this stage-4 run was built on stay on
+                    # disk and loadable, not just named.
+                    _backup_before_overwrite(stage2_checkpoint)
+                    _backup_before_overwrite(stage2_checkpoint.with_suffix(".log"))
+                    _backup_before_overwrite(stage3_checkpoint)
+                    _backup_before_overwrite(stage3_checkpoint.with_suffix(".log"))
                     checkpoint = train_refinement(
-                        ae_checkpoint_path=ae_ancestor, lds_checkpoint_path=lds_ancestor,
+                        ae_checkpoint_path=stage2_checkpoint, lds_checkpoint_path=stage3_checkpoint,
                         **common_args,
                     )
                 print(f"\nStage {stage_key} complete: {checkpoint}\n")

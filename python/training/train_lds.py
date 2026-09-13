@@ -1284,7 +1284,15 @@ def train_lds(
                 "z0_growth": (z0_growth_weight * l_z0_growth / z0_growth_scale).detach(),
                 "rollout_ratio": (z0_loss / rollout_scale).detach(),
                 "stats0_predict_ratio": (l_stats0_predict / stats0_predict_scale).detach(),
-                "z0_growth_ratio": (l_z0_growth / z0_growth_scale).detach()}
+                "z0_growth_ratio": (l_z0_growth / z0_growth_scale).detach(),
+                # RAW per-component losses, BEFORE weight and scale. The entries above
+                # are weight*raw/scale so they sum to the total for the training display,
+                # but that makes them depend on the weight/scale hyperparameters -- a
+                # change of rollout_scale alters "rollout" with no change in the model.
+                # The eval ledger records THESE, which are comparable across runs.
+                "rollout_raw": (z0_loss + one_step_weight * l_1step).detach(),
+                "stats0_predict_raw": l_stats0_predict.detach(),
+                "z0_growth_raw": l_z0_growth.detach()}
 
     # Clamped against how many epoch iterations this run ACTUALLY makes
     # -- see clamp_grace_epochs' own docstring. The loop below is
@@ -1732,6 +1740,9 @@ def train_lds(
             train_1step_history.append(train_1step)
             val_1step_history.append(val_1step)
         _cur_val_components = {c: _val_means[c] for c in _active_components}
+        # raw (un-weighted, un-scaled) counterparts for the eval ledger
+        _cur_val_components_raw = {c: _val_means[c + "_raw"] for c in _active_components
+                                   if (c + "_raw") in _val_means}
         _best_components = component_best_tracker.update(_cur_val_components, saved_this_epoch)
         for c in _active_components:
             component_histories[c]["train"].append(
@@ -1845,7 +1856,8 @@ def train_lds(
                         "z0_noise_scale": z0_noise_scale,
                     },
                 },
-                epoch=epoch, val_loss=val_loss, val_loss_ema=tracker.val_ema,
+                epoch=epoch, val_loss=val_loss, val_loss_ema=tracker.val_ema, val_components=_cur_val_components,
+                val_components_raw=_cur_val_components_raw,
                 test_dirs=test_dirs, on_saved=on_checkpoint_saved)
         else:
             epochs_since_improvement += 1
