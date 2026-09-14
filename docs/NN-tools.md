@@ -104,7 +104,11 @@ Variant: `python -m evaluation.inspect_checkpoint <ckpt> --key z0_noise_scale` p
 
 
 ### backfill_eval_components
-`evaluation.check_reconstruction` and `evaluation.check_latent_channels` add measurements to `checkpoints/stageN/eval-stageN.csv` automatically. To fill input parameters: `python -m evaluation.backfill_eval_components checkpoints/stage<N>`.
+`evaluation.check_reconstruction`, `evaluation.check_reconstruction` and `evaluation.check_latent_channels` add measurements to `checkpoints/stageN/eval-stageN.csv` automatically. To fill input parameters: `python -m evaluation.backfill_eval_components checkpoints/stage<N>`.
+
+Common options:
+- `--all` — seed a row for every `.pt` in the stage dir (creating the CSV if absent), then fill; for initial population.
+- `--dry-run` — report what would change without writing.
 
 
 ### Sweep over `min_stdev_phi`, `min_std_deriv` and `min_passing_steps`

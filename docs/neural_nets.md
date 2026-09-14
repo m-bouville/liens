@@ -33,6 +33,8 @@ $$z_0(t + \delta t) = z_0(t) + \dot{z}_0(t) \delta t + \ddot{z}_0(t) (\delta t^2
 
 The idea is to replace $\dot{z}_0$ with $z_1$ by training in stage 2, and $\ddot{z}_0$ with $f_\theta$ (stage 3).
 
+Note: `z1` is disappointing, and training is now rather based on `derivative_source = previous_quotient`. The deriv head for `z1` must encode sparse interface curves, whereas `z0` encodes bulk areas. A blurred microstructure still looks like blobs of two colors, whereas a blurred image of interfaces has little information left.
+
 
 ### A tale of two time steps
 Notations:
@@ -66,7 +68,7 @@ Second, the loss weighting must stay in physical time: $f_\theta$ steps in $\Del
 ### Pre-processing
 The parameters `min_step`, `min_stdev_phi`, `min_normalized_stdev_phi`, `min_std_deriv` and `min_passing_steps` make it possible to filter out microstructures that are too early (pure noise) or late (single domain, or two domains with a straight interface).
 
-The Boolean `normalize_phi` rescales the order parameter `phi` to have ground states at ±1 regardless of temperature.
+The Boolean `normalize_phi` rescales the order parameter `phi` to have ground states at ±1 regardless of temperature. (Results are disappointing, and the latest runs do not normalize `phi`.)
 
 
 ### The stages
@@ -142,7 +144,7 @@ Notes:
 ### Architecture
 The convolutional autoencoder has a symmetric encoder–decoder architecture. The encoder depth scales with the (square) system size so that the spatial bottleneck remains 8×8: three downsampling stages for 64×64 inputs (64→32→16→8), five for 256×256, and so on. Each resolution level consists of two 3×3 convolutions (circular padding to match periodic boundaries) with ReLU activations, followed by a stride-2 convolution for downsampling (mirrored by learned upsampling in the decoder), with BatchNorm/LayerNorm.
 
-The encoder terminates with a 1×1 convolution reducing the feature dimension to 8 channels, yielding an 8×8×8 latent representation. This bottleneck retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. Initial runs will use a larger latent space, to ensure that sufficient information is available for reconstruction, before shrinking it to find the lower bound for accuracy.
+The encoder terminates with a 1×1 convolution reducing the feature dimension to 4 channels, yielding an 4×8×8 latent representation. This bottleneck retains coarse spatial organization while reducing the dimensionality sufficiently for efficient latent-space dynamics. Initial runs will use a larger latent space, to ensure that sufficient information is available for reconstruction, before shrinking it to find the lower bound for accuracy.
  
 
 ### Dataset expansion
@@ -192,13 +194,13 @@ The reconstruction loss alone does not constrain the latent representation to pr
 #### No live calculations
 I just have a small dense net (`stats_head`) with $N_s$ output cells and say: "the values of these must match the statistics calculated in real space", without recalculating the statistics on x' (let alone on $\hat{z}$). Statistics are auxiliary prediction targets rather than differentiable image-derived losses. The statistics head is trained in latent space, only from ground-truth statistics computed offline.
 
-With `latent_channels` == 8 and `hidden_dim` == 16:
+With `latent_channels` == 4 and `hidden_dim` == 16:
 ```text
   latent (512)
       ↓
-Linear(512 → 16)
+Linear(512 → 8)
     ReLU
-Linear(16 → Ns)
+Linear(8 → Ns)
 ```
 
 #### Anisotropy

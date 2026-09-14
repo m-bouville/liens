@@ -30,7 +30,7 @@ with $\mu$ the chemical potential. Here $M$ is the mobility, it is (at least ini
 Simulations are performed on two-dimensional periodic domains. The chemical potential is computed, then the Allen–Cahn equation is integrated using an explicit forward-Euler time step. A Fourier pseudo-spectral discretization (FFTW) may be implemented later (but this is not a priority).
 During simulation, total free energy is computed every saved timestep and should decrease monotonically.
 
-The parameter sweep is parallelized using `<future>`.
+The code is meant to run on the CPU, so the training of the neural network can be on the GPU at the same time. The parameter sweep is parallelized using `<future>`.
 
 
 

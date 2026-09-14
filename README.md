@@ -2,7 +2,7 @@
 ## A latent-space neural emulator for Allen–Cahn phase-field microstructure evolution
 
 
-This project investigates neural-network surrogate models for phase-field microstructure evolution in materials science and engineering (MSE). Instead of repeatedly solving the governing partial differential equations (PDE), a neural network (NN) learns a reduced-order representation of the phase-field state together with a surrogate evolution operator acting in that latent space. The objective is to use this mapping between successive microstructures to accelerate phase-field simulations while preserving the underlying physics.
+This project investigates neural-network surrogate models for two-dimensional phase-field microstructure evolution in materials science and engineering (MSE). Instead of repeatedly solving the governing partial differential equations (PDE), a neural network (NN) learns a reduced-order representation of the phase-field state together with a surrogate evolution operator acting in that latent space. The objective is to use this mapping between successive microstructures to accelerate phase-field simulations while preserving the underlying physics.
 
 
 
@@ -144,15 +144,16 @@ For more details on the structure of the `python` directory, see [./docs/NN-code
 - [X] 2. Derivative `C1`
 - [X] 3. Latent dynamics surrogate
 - [X] 4-5. End-to-end training
-- [X] Obtaining satisfactory results for short times
-- [X] Obtaining satisfactory results for long times
-- [X] Obtaining satisfactory results at all temperatures
-- [ ] Obtaining smooth results (not moth-eaten)
-- [ ] Obtaining satisfying results overall
+- [X] Satisfactory results for short times
+- [X] Satisfactory results for long times
+- [X] Satisfactory results at all temperatures
+- [ ] Smooth results (not moth-eaten)
+- [ ] Curvature is not created
+- [ ] Satisfying results overall
 
 ### For those who prefer text
 - All five training stages are implemented and run end-to-end. The work currently underway is improving the accuracy of the surrogate, not making it run at all.
 - The initial development was carried out using 64×64 images (32×32 for testing the code end-to-end). They were serviceable but hit their limit, with finite-size artifacts eventually dominating the results. The focus is now on 128×128 microstructures.
 - There is a (physically plausible) difference of behavior above and below $T \approx 0.9 \times T_0$. 
-- Predicting $t + \delta t$ gives sensible results, $t + 10 \delta t$ initially did not. The introduction of `u = log10 t` helped.
+- A curve to the left is straightened (correctly), but then it may turn into a curve to the right (unphysical). This looks like some sort of inertia.
 - Predicted microstructures are not smooth, they look moth-eaten. `L_allen_cahn` accounts for expected patterns of time evolution (PINN) in the loss functions of stages 4 and 5 in order to reduce the problem.
