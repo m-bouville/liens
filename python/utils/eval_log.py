@@ -44,9 +44,19 @@ _KEY = ("checkpoint_path", "epoch", "eval_variant")
 # hint for the common ones so the header reads sensibly; any other p_* config key
 # is appended after. Loss-WEIGHT params (p_stats0_predict_weight, p_rollout_scale,
 # ...) live here too -- they are inputs, unlike measured losses in LOSS_COLUMNS.
+# Params that exist only for the DYNAMICS stages (3a/3b): stage 4/5 (encoder
+# refinement) has no dynamics_mode/derivative_source/derivative_time of its own --
+# it consumes a frozen f_theta but does not choose these. Listing them unconditionally
+# in PARAM_COLUMNS made reconcile_fieldnames add them to every stage's header (the
+# "add missing canonical columns" step doesn't know they're stage-specific), so a
+# stage-4 CSV got empty p_dynamics_mode/p_derivative_source/p_derivative_time columns
+# that can never be filled. Scoped the same way source_stage2 already is.
+_DYNAMICS_ONLY_PARAMS = ("p_dynamics_mode", "p_derivative_source", "p_derivative_time")
+_DYNAMICS_PARAM_STAGES = ("stage3a", "stage3b", "stage3")
+
 PARAM_COLUMNS = [
     "p_size", "p_latent_channels", "p_normalize_phi", "p_lr", "p_n_rollout_steps",
-    "p_dynamics_mode", "p_derivative_source", "p_derivative_time",
+    *_DYNAMICS_ONLY_PARAMS,
 ]
 
 # Fixed loss columns. Per-COMPONENT losses (val_rollout, val_recon0, ...) are
@@ -62,7 +72,7 @@ OUTPUT_COLUMNS = ["rollout_median_loss", "rollout_median_corr_dx", "rollout_n_st
                   "rollout_n_samples", "comparable", "log"]
 
 # source-checkpoint provenance columns (the .pt this run built on)
-SOURCE_COLUMNS = ["source_stage2", "resume_from"]
+SOURCE_COLUMNS = ["source_stage2", "source_stage3", "resume_from"]
 
 # Full canonical order = key + params + losses + outputs (composed, not flat).
 EVAL_COLUMNS = list(_KEY) + SOURCE_COLUMNS + PARAM_COLUMNS + LOSS_COLUMNS + OUTPUT_COLUMNS
@@ -72,6 +82,31 @@ EVAL_COLUMNS = list(_KEY) + SOURCE_COLUMNS + PARAM_COLUMNS + LOSS_COLUMNS + OUTP
 # to any stage. _stage_of() derives the stage from the CSV name so the schema is
 # stage-specific -- a file never carries a header that can't exist for its stage.
 _SOURCE_STAGE2_STAGES = ("stage3a", "stage3b", "stage3", "stage4", "stage5")
+_SOURCE_STAGE3_STAGES = ("stage4", "stage5")   # only refinement consumes a frozen f_theta
+
+
+def is_column_in_scope(column: str, stage: str) -> bool:
+    """The single source of truth for stage-specific columns. A column that a
+    stage structurally cannot have (source_stage2 on stage 1/2, source_stage3
+    outside refinement, dynamics params outside the dynamics stages) is OUT of
+    scope there and must never be added to that stage's header, demanded by the
+    missing-params check, or reported as unfilled. Every stage-scoping decision
+    -- schema reconcile, column ordering, backfill's missing-check -- routes
+    through here so they can't drift apart (they did: reconcile scoped these
+    but _row_missing_params still demanded them, looping on columns that can
+    never be filled)."""
+    if column == "source_stage2":
+        return stage in _SOURCE_STAGE2_STAGES
+    if column == "source_stage3":
+        return stage in _SOURCE_STAGE3_STAGES
+    if column in _DYNAMICS_ONLY_PARAMS:
+        return stage in _DYNAMICS_PARAM_STAGES
+    return True
+
+
+def columns_in_scope(columns, stage: str) -> list:
+    """`columns` filtered to those in scope for `stage` (order preserved)."""
+    return [c for c in columns if is_column_in_scope(c, stage)]
 
 
 def _stage_of(csv_name: str) -> str:
@@ -96,8 +131,7 @@ def _ordered_columns(cols, csv_name: str) -> list[str]:
     placed in their group, so the file reads params, then losses, then channels."""
     import re as _re
     stage = _stage_of(csv_name)
-    allow_src2 = stage in _SOURCE_STAGE2_STAGES
-    present = [c for c in cols if not (c == "source_stage2" and not allow_src2)]
+    present = [c for c in cols if is_column_in_scope(c, stage)]
     seen = set()
 
     def take(pred, preferred=()):
@@ -138,8 +172,7 @@ def reconcile_fieldnames(fieldnames: list[str], csv_name: str) -> list[str]:
     # unknown) preserved in original order
     # canonical columns for THIS stage (source_stage2 excluded where it can't exist)
     stage = _stage_of(csv_name)
-    canon = [c for c in EVAL_COLUMNS
-             if not (c == "source_stage2" and stage not in _SOURCE_STAGE2_STAGES)]
+    canon = columns_in_scope(EVAL_COLUMNS, stage)
     # union canonical + existing, then order by group (params -> losses -> channels)
     union = list(dict.fromkeys(canon + list(fieldnames)))
     return _ordered_columns(union, csv_name)
@@ -158,8 +191,92 @@ def canonical_checkpoint_key(checkpoint_path) -> str:
     if s.startswith("baseline:"):
         return s
     s = s.replace("\\", "/")
+    s = re.sub(r"/+", "/", s)             # collapse any doubled slashes
     i = s.rfind("checkpoints/")
     return s[i:] if i >= 0 else s
+
+
+# The cells compare_f_theta owns. The eval-variant fill rule keys on
+# (checkpoint, epoch) and branches on whether THESE are already occupied.
+# The eval-metric cells compare_f_theta owns, DERIVED from OUTPUT_COLUMNS so the
+# two can't drift: OUTPUT_COLUMNS minus non-metric bookkeeping columns ("log" is
+# a provenance column, not a metric). A new eval metric added to OUTPUT_COLUMNS is
+# automatically recognized by upsert_eval_metrics' fill-or-branch check.
+_NON_METRIC_OUTPUT_COLUMNS = ("log",)
+_EVAL_METRIC_COLUMNS = tuple(c for c in OUTPUT_COLUMNS
+                             if c not in _NON_METRIC_OUTPUT_COLUMNS)
+
+
+def upsert_eval_metrics(csv_path: Path, checkpoint_path, epoch, metrics: dict,
+                        eval_variant: str = "") -> None:
+    """Write compare_f_theta's eval metrics with fill-or-branch semantics.
+
+    compare_f_theta owns only a handful of cells (_EVAL_METRIC_COLUMNS + eval_variant).
+    Per (checkpoint, epoch):
+      - if a row exists whose eval-metric cells are ALL empty (e.g. a params/
+        components row from backfill/check_latent_channels), FILL them in place and
+        set its eval_variant -- do NOT spawn a redundant twin;
+      - else if a row already holds these metrics under the SAME eval_variant, do
+        nothing (already recorded);
+      - else (metrics present under a DIFFERENT variant) add a NEW row for the new
+        variant.
+    This is distinct from upsert_eval_row (which keys on eval_variant unconditionally
+    and is right for params/components that any tool merges): here the metric cells,
+    not the whole key, decide fill-vs-branch.
+    """
+    csv_path = Path(csv_path)
+    ck = canonical_checkpoint_key(checkpoint_path)
+    ep = "" if epoch is None else str(int(epoch))
+    ev = eval_variant or ""
+
+    rows: list[dict] = []
+    fieldnames: list[str] = list(_KEY)
+    if csv_path.exists():
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or _KEY)
+            rows = [dict(r) for r in reader]
+    for col in list(_KEY) + list(metrics):
+        if col not in fieldnames:
+            fieldnames.append(col)
+    fieldnames = reconcile_fieldnames(fieldnames, csv_path.name)
+
+    same_ck_ep = [r for r in rows
+                  if r.get("checkpoint_path") == ck and (r.get("epoch") or "") == ep]
+
+    def _has_metrics(r):
+        return any((r.get(c) or "").strip() for c in _EVAL_METRIC_COLUMNS)
+
+    # 1) a row for this variant already has metrics -> nothing to do
+    for r in same_ck_ep:
+        if (r.get("eval_variant") or "") == ev and _has_metrics(r):
+            return
+    # 2) an existing row (any variant, typically the "" params row) with EMPTY
+    #    metric cells -> fill it in place and stamp the variant
+    target = None
+    for r in same_ck_ep:
+        if not _has_metrics(r):
+            target = r
+            break
+    if target is not None:
+        target["eval_variant"] = ev
+        for col, val in metrics.items():
+            target[col] = "" if val is None else str(val)
+    else:
+        # 3) metrics already present under a different variant -> new row
+        new_row = {"checkpoint_path": ck, "epoch": ep, "eval_variant": ev}
+        for col, val in metrics.items():
+            new_row[col] = "" if val is None else str(val)
+        rows.append(new_row)
+
+    tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({c: r.get(c, "") for c in fieldnames})
+    tmp.replace(csv_path)
 
 
 def upsert_eval_row(csv_path: Path, checkpoint_path, epoch, metrics: dict,

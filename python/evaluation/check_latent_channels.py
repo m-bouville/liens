@@ -667,7 +667,10 @@ def check_latent_channels(
             _raw = checkpoint.get("val_components_raw") or {}
             if _raw:
                 for _k, _v in _raw.items():
-                    _metrics[f"val_{_k}"] = float(_v)
+                    # exactly-0 raw component == inactive term -> unknown (blank),
+                    # never 0 (a stored 0 reads as a perfect loss). Same rule the
+                    # log-parsing path in backfill uses.
+                    _metrics[f"val_{_k}"] = "" if float(_v) == 0.0 else float(_v)
                 _metrics["val_components_kind"] = "raw"
             else:
                 for _k, _v in (checkpoint.get("val_components") or {}).items():

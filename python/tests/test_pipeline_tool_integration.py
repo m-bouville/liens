@@ -176,3 +176,16 @@ def test_trainer_excludes_grace_epochs_from_patience(module):
         f"{module}: patience counter does not exclude grace epochs"
     assert not re.search(r"else:\s*\n\s*epochs_since_improvement \+= 1", src), \
         f"{module}: still has a bare else-increment of the patience counter"
+
+
+def test_compare_f_theta_drops_orphaned_min_passing_steps():
+    """An old checkpoint can record min_passing_steps but predate the stdev
+    fields, leaving min_passing_steps set with no threshold to count against --
+    which build_good_steps rejects. compare_f_theta's reconcile must detect that
+    invalid combination and drop the (no-op) min_passing_steps rather than fail
+    with an opaque dataset error."""
+    src = _find("compare_f_theta.py")
+    assert 'dc.get("min_passing_steps")' in src
+    assert 'dc["min_passing_steps"] = None' in src
+    # gated on there being no stdev threshold
+    assert 'min_stdev_phi") is not None' in src and 'min_normalized_stdev_phi") is not None' in src

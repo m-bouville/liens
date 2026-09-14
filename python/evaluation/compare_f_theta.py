@@ -58,7 +58,8 @@ from evaluation.lineage import (
     resolve_lineage, _stage_label, _ancestor_pointers, _registry_resume_of)
 
 from utils.plot_helpers import moving_window as _moving_window, pretty_label as _pretty_label
-from utils.eval_log import upsert_eval_row, eval_csv_for_checkpoint, params_from_checkpoint
+from utils.eval_log import (upsert_eval_row, upsert_eval_metrics,
+                            eval_csv_for_checkpoint, params_from_checkpoint)
 from utils.window_parsing import parse_fixed_window
 from evaluation.check_rollout import (
     _correlation_pct, _format_small, _padded_bounds, compute_sample,
@@ -1518,6 +1519,23 @@ def _reconcile_data_config(models):
             print(f"NOTE: {field} not recorded in {', '.join(borrowers)}; "
                   f"using {fill!r} from {source}.")
 
+    # Consistency guard: min_passing_steps is a COUNT of steps that pass a stdev
+    # threshold, so it is meaningless -- and rejected by build_good_steps -- when
+    # NEITHER min_stdev_phi nor min_normalized_stdev_phi is set. Old checkpoints can
+    # record min_passing_steps but predate the stdev fields being saved, leaving this
+    # invalid partial spec after reconcile. A passing-count with no threshold is a
+    # no-op, so drop it (per config) rather than fail with an opaque dataset error.
+    for m, dc in zip(models, dcs):
+        mps = dc.get("min_passing_steps")
+        has_threshold = (dc.get("min_stdev_phi") is not None
+                         or dc.get("min_normalized_stdev_phi") is not None)
+        if mps is not None and not has_threshold:
+            print(f"NOTE: {m['label']} records min_passing_steps={mps!r} but no stdev "
+                  f"threshold (an older checkpoint predating those fields) -- dropping "
+                  f"min_passing_steps for this comparison; it is a no-op without a "
+                  f"threshold to count against.")
+            dc["min_passing_steps"] = None
+
 
 def _setup_comparison(path_a, path_b, device, n_samples, n_steps, seed,
                        fixed_windows, max_dt, z1_resync, t0_range=None,
@@ -2190,13 +2208,16 @@ def compare_statistics(path_a: Path, path_b: Path, n_stats: int = 200,
         print(f"  {m['label']}: median loss {_med_loss:.5g}, "
               f"median corr dx {_med_corr:.1f}%")
         try:
-            _row = params_from_checkpoint(m["ck"])
-            _row.update({"rollout_median_loss": _med_loss,
-                         "rollout_median_corr_dx": _med_corr / 100.0,
-                         "rollout_n_steps": n_steps, "rollout_n_samples": int(len(losses_k))})
-            upsert_eval_row(
+            # Write ONLY the eval-metric cells, with fill-or-branch semantics: fill an
+            # existing params/components row whose metric cells are empty (no twin),
+            # skip if this variant's metrics are already there, else add a new-variant
+            # row. Params/components are backfill's / check_latent_channels' job.
+            upsert_eval_metrics(
                 eval_csv_for_checkpoint(m["path"]),
-                m["path"], m["ck"].get("epoch"), _row,
+                m["path"], m["ck"].get("epoch"),
+                {"rollout_median_loss": _med_loss,
+                 "rollout_median_corr_dx": _med_corr / 100.0,
+                 "rollout_n_steps": n_steps, "rollout_n_samples": int(len(losses_k))},
                 eval_variant=f"rollout{n_steps}")
         except Exception as _e:
             print(f"    (eval-log skipped: {_e})")

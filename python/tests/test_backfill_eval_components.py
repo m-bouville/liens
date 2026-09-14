@@ -396,3 +396,212 @@ def test_backfill_marks_log_filled_components_as_raw(tmp_path):
     r = _read(ev)[0]
     assert r["val_components_kind"] == "raw"
     assert float(r["val_rollout"]) == pytest.approx(2.0 * 1e-8)   # raw, not the printed 2.0
+
+
+def test_inactive_term_is_stored_blank_not_zero(tmp_path):
+    """A term with weight 0 (inactive) prints a contribution of 0 in the breakdown,
+    which says NOTHING about its raw loss. It must be stored as unknown (blank),
+    never as 0 -- a stored 0 reads as a perfect loss. Same for a contribution of
+    exactly 0 under a nonzero weight (the term was off that epoch)."""
+    lg = tmp_path / "128x128-stage4-20260830_15h01.log"
+    lg.write_text(
+        "/30 train = 0*rollout/0.5 +0.2*recon0/0.0002 +0.05*stats0/0.3 | valid | ema\n"
+        " 15| 1.0 = 0 + 0.5 + 0.5 | 0.4046 = 0 + 0.1955 + 0.0435 | 0.40  -> saved at 15:01\n")
+    _n, pe, _sv = bf.parse_log(lg)
+    r = pe[15]
+    assert r["rollout"] is None                                   # weight 0 -> unknown
+    assert r["recon0"] == pytest.approx(0.1955 * 0.0002 / 0.2)     # active terms still raw
+    assert r["stats0"] == pytest.approx(0.0435 * 0.3 / 0.05)
+
+
+def test_zero_contribution_under_nonzero_weight_is_blank(tmp_path):
+    lg = tmp_path / "128x128-stage4-20260901_07h29.log"
+    lg.write_text(
+        "/30 train = 1*rollout/0.5 +0.2*recon_predict/0.2 | valid | ema\n"
+        " 32| 1.0 = 0.5 + 0.5 | 0.8968 = 0.3261 + 0 | 0.90  -> saved at 07:29\n")
+    _n, pe, _sv = bf.parse_log(lg)
+    assert pe[32]["recon_predict"] is None     # printed 0 -> term off -> unknown
+    assert pe[32]["rollout"] == pytest.approx(0.3261 * 0.5 / 1.0)
+
+
+def test_backfill_writes_blank_cell_for_inactive_term(tmp_path):
+    sd = tmp_path / "stage4"; sd.mkdir()
+    stem = "128x128-stage4-20260830_15h01"
+    _write_ckpt(sd / (stem + ".pt"), {"latent_channels": 4}, 15)
+    (sd / (stem + ".log")).write_text(
+        "/30 train = 0*rollout/0.5 +0.2*recon0/0.0002 | valid | ema\n"
+        " 15| 1 = 0 + 1 | 0.4 = 0 + 0.1955 | 0.4  -> saved at 15:01\n")
+    ev = sd / "eval-stage4.csv"
+    _eval_csv(ev, [(f"checkpoints/stage4/{stem}.pt", 15)])
+    bf.backfill(sd, ev, dry_run=False)
+    r = _read(ev)[0]
+    assert (r.get("val_rollout") or "").strip() == ""      # blank, NOT "0" and NOT "None"
+    assert float(r["val_recon0"]) == pytest.approx(0.1955 * 0.0002 / 0.2)
+
+
+def test_collapse_redundant_empty_variant_row(tmp_path):
+    """An empty-variant row whose data is a subset of a tagged sibling (float
+    formatting aside) is redundant and dropped; a tagged row and unique empty
+    rows are kept."""
+    ev = tmp_path / "eval-stage4.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "eval_variant", "val_loss",
+                    "rollout_median_corr_dx"])
+        # redundant empty twin (rounded val_loss) + its tagged superset
+        w.writerow(["checkpoints/stage4/a.pt", "35", "", "7.357999802", ""])
+        w.writerow(["checkpoints/stage4/a.pt", "35", "rollout6", "7.357999801635742", "0.699"])
+        # a unique empty row with NO tagged sibling -> keep
+        w.writerow(["checkpoints/stage4/b.pt", "20", "", "0.39", ""])
+    removed = bf.collapse_redundant_empty_variant_rows(ev, dry_run=False)
+    assert removed == 1
+    rows = _read(ev)
+    assert len(rows) == 2
+    a_rows = [r for r in rows if "a.pt" in r["checkpoint_path"]]
+    assert len(a_rows) == 1 and a_rows[0]["eval_variant"] == "rollout6"   # kept the tagged one
+    assert any("b.pt" in r["checkpoint_path"] for r in rows)              # unique empty kept
+
+
+def test_legitimate_parenthetical_param_group_is_not_treated_as_prose(tmp_path):
+    """'(a0=1.0, b=1.0, kappa=0.2, M=0.05, phi_max=1.5)' is a clean comma-separated
+    key=value group, not prose -- it must be scanned, not dropped wholesale just
+    because it has '(' and ', '. Real prose ('(head_hidden=64); H is zero-init.')
+    must still be rejected."""
+    lg = tmp_path / "128x128-stage4-20260908_08h25.log"
+    lg.write_text(
+        "allen_cahn_weight=0.25  allen_cahn_scale=0.0001  all_steps=False  "
+        "(a0=1.0, b=1.0, kappa=0.2, M=0.05, phi_max=1.5)\n"
+        "other parameters:\n  min_step=2000  normalize_phi=False\n"
+        "/30 train = x | valid | ema\n"
+        " 8  1 =1(0.5)| 2 =1(0.5)| 2  -> saved at 08:25\n")
+    pp = bf.parse_log_params(lg)
+    assert pp["allen_cahn_weight"] == "0.25"
+    assert pp["all_steps"] == "False"
+    assert pp["normalize_phi"] == "False"       # not shadowed by the paren-group fix
+
+
+def test_bare_alias_suppressed_when_qualified_name_present(tmp_path):
+    """A bare 'a0' inside a '(a0=1.0, b=1.0, kappa=0.2)' summary group must not
+    create p_a0 when 'allen_cahn_a0=1.0' is also printed in the same block --
+    same physical parameter, two names; keep only the qualified one."""
+    lg = tmp_path / "x.log"
+    lg.write_text(
+        "  allen_cahn_weight=0.25  all_steps=False  (a0=1.0, b=1.0, kappa=0.2, M=0.05, phi_max=1.5)\n"
+        "other parameters:\n"
+        "  allen_cahn_a0=1.0  allen_cahn_b=1.0  allen_cahn_kappa=0.2  allen_cahn_mobility=0.05\n"
+        "  allen_cahn_phi_max=1.5  lr=2e-07\n"
+        "/30 train = x | valid | ema\n 8  1 =1(0.5)| 2 =1(0.5)| 2  -> saved at 04:25\n")
+    pp = bf.parse_log_params(lg)
+    for bare in ("a0", "b", "kappa", "M", "phi_max"):
+        assert bare not in pp, f"bare {bare!r} leaked despite a qualified counterpart"
+    assert pp["allen_cahn_a0"] == "1.0" and pp["allen_cahn_kappa"] == "0.2"
+    assert pp["allen_cahn_weight"] == "0.25"        # unrelated key unaffected
+
+
+def test_drop_aliased_param_columns(tmp_path):
+    ev = tmp_path / "eval-stage4.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "p_a0", "p_allen_cahn_a0", "p_lr"])
+        w.writerow(["checkpoints/stage4/x.pt", "8", "1", "1", "2e-07"])
+        w.writerow(["checkpoints/stage4/y.pt", "9", "", "1", "1e-07"])   # blank alias, fine to drop
+    n = bf.drop_aliased_param_columns(ev, dry_run=False)
+    assert n == 1
+    hdr = list(_read(ev)[0].keys())
+    assert "p_a0" not in hdr and "p_allen_cahn_a0" in hdr and "p_lr" in hdr
+
+
+def test_drop_aliased_param_columns_keeps_bare_when_values_disagree(tmp_path):
+    """If the bare and qualified columns ever hold DIFFERENT values for the same
+    row, they are not safely aliased -- do not drop (data integrity over tidiness)."""
+    ev = tmp_path / "eval-stage4.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "p_a0", "p_allen_cahn_a0"])
+        w.writerow(["checkpoints/stage4/x.pt", "8", "1", "2"])   # disagree
+    n = bf.drop_aliased_param_columns(ev, dry_run=False)
+    assert n == 0
+    assert "p_a0" in list(_read(ev)[0].keys())
+
+
+def test_stage4_provenance_prose_fills_both_sources(tmp_path):
+    """Stage-4/5 prints a DIFFERENT provenance line than stage-3
+    ('Stage 4: loaded E/D/stats_head from <path> (...), f_theta from <path2> (...)')
+    -- both the stage-2 encoder and the stage-3 f_theta it refines must be captured."""
+    lg = tmp_path / "x.log"
+    lg.write_text(
+        "Stage 4: loaded E/D/stats_head from checkpoints/stage2/128x128-stage2.pt "
+        "(epoch 12, val_loss=3.29466), f_theta from checkpoints/stage3b/128x128-stage3b.pt "
+        "(epoch 5671, val_loss=1.43711)\n"
+        "/30 train = x | valid | ema\n 8  1 =1(0.5)| 2 =1(0.5)| 2  -> saved at 04:25\n")
+    pp = bf.parse_log_params(lg)
+    assert pp["source_stage2"].endswith("128x128-stage2.pt")
+    assert pp["source_stage3"].endswith("128x128-stage3b.pt")
+
+
+def test_drop_out_of_scope_columns_removes_empty_dynamics_params_from_stage4(tmp_path):
+    sd = tmp_path / "stage4"; sd.mkdir()
+    ev = sd / "eval-stage4.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "p_lr", "p_dynamics_mode",
+                    "p_derivative_source", "p_derivative_time"])
+        w.writerow(["checkpoints/stage4/x.pt", "8", "2e-07", "", "", ""])
+    n = bf.drop_out_of_scope_columns(ev, dry_run=False)
+    assert n == 3
+    hdr = list(_read(ev)[0].keys())
+    assert "p_dynamics_mode" not in hdr and "p_lr" in hdr
+
+
+def test_drop_out_of_scope_columns_never_drops_a_column_holding_data(tmp_path):
+    """Even if out of scope, a column with real data must never be silently removed."""
+    ev = tmp_path / "eval-stage4.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "p_dynamics_mode"])
+        w.writerow(["checkpoints/stage4/x.pt", "8", "deriv_linear"])   # has data
+    n = bf.drop_out_of_scope_columns(ev, dry_run=False)
+    assert n == 0
+    assert "p_dynamics_mode" in list(_read(ev)[0].keys())
+
+
+def test_drop_out_of_scope_columns_is_noop_for_a_dynamics_stage(tmp_path):
+    ev = tmp_path / "eval-stage3a.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "p_dynamics_mode"])
+        w.writerow(["checkpoints/stage3a/x.pt", "8", ""])
+    n = bf.drop_out_of_scope_columns(ev, dry_run=False)
+    assert n == 0    # stage3a IS a dynamics stage -- nothing out of scope
+
+
+def test_row_missing_params_ignores_out_of_scope_columns():
+    """A stage-4 row must NOT be flagged as needing backfill just because its
+    out-of-scope dynamics columns are blank (they can never be filled). But an
+    in-scope source_stage2 still counts."""
+    filled = {"p_size": "128", "p_latent_channels": "4", "p_normalize_phi": "False",
+              "p_lr": "2e-7", "p_n_rollout_steps": "6",
+              "source_stage2": "a", "source_stage3": "b", "resume_from": "c",
+              "p_dynamics_mode": "", "p_derivative_source": "", "p_derivative_time": ""}
+    assert bf._row_missing_params(filled, "stage4") is False   # only OOS blanks remain
+    # for stage3a the dynamics params ARE in scope (must be filled), and
+    # source_stage3 is OUT of scope (its blank must not flag)
+    stage3a = dict(filled, p_dynamics_mode="d", p_derivative_source="s",
+                   p_derivative_time="t", source_stage3="")
+    assert bf._row_missing_params(stage3a, "stage3a") is False
+    # and a stage3a row with a dynamics param blank IS flagged
+    assert bf._row_missing_params(dict(stage3a, p_dynamics_mode=""), "stage3a") is True
+
+
+def test_collapse_uses_canonical_key_across_path_spellings(tmp_path):
+    """collapse groups the empty twin and its tagged superset even when their
+    checkpoint_path is spelled differently (absolute vs relative)."""
+    ev = tmp_path / "eval-stage4.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "eval_variant", "val_loss", "rollout_median_corr_dx"])
+        w.writerow([r"D:\\work\\checkpoints\\stage4\\a.pt", "35", "", "7.36", ""])       # empty twin, absolute
+        w.writerow(["checkpoints/stage4/a.pt", "35", "rollout6", "7.36", "0.70"])   # tagged, relative
+    removed = bf.collapse_redundant_empty_variant_rows(ev, dry_run=False)
+    assert removed == 1
+    assert len(_read(ev)) == 1 and _read(ev)[0]["eval_variant"] == "rollout6"

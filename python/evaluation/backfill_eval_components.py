@@ -25,7 +25,8 @@ import torch
 
 from utils.eval_log import (params_from_checkpoint, reconcile_fieldnames,
                             PARAM_COLUMNS, LOSS_COLUMNS, SOURCE_COLUMNS,
-                            canonical_checkpoint_key)
+                            canonical_checkpoint_key, _DYNAMICS_ONLY_PARAMS,
+                            _DYNAMICS_PARAM_STAGES, _stage_of, columns_in_scope)
 
 # Path anchor (policy: default checkpoint/output paths resolve from the repo
 # root, never the process CWD). backfill's inputs are CLI args, but the
@@ -111,9 +112,16 @@ def parse_log(path: Path):
         for n, v in zip(use_names, vals):
             if n in ws:
                 w, sc = ws[n]
-                comps[n] = v * sc / w if w else v
+                # An INACTIVE term (weight 0, or a printed contribution of exactly 0)
+                # gives no information about its raw loss: the breakdown prints 0
+                # regardless of what the raw value was. Storing 0 would read as a
+                # perfect (zero) loss -- false. Leave it unknown (None -> blank cell).
+                if w == 0.0 or v == 0.0:
+                    comps[n] = None
+                else:
+                    comps[n] = v * sc / w
             else:
-                comps[n] = v
+                comps[n] = v if v != 0.0 else None   # single/unnamed: same zero rule
         per_epoch[epoch] = comps
         _sv = re.search(r"saved at (\d{2}):(\d{2})", line)
         if _sv:
@@ -147,12 +155,19 @@ def parse_log_params(path: Path) -> dict:
         # prose provenance lines (not key=value): the frozen encoder (stage-2 source,
         # with its latent_channels) and the resume checkpoint. These carry the source
         # .pt paths, which are NOT in the checkpoint config nor the param block.
-        _enc = re.search(r"Loaded frozen encoder from (\S+)", line)
+        # stage-3: "Loaded frozen encoder from <path> (epoch N, val_loss=X, latent_channels=C)"
+        # stage-4/5: "Stage 4: loaded E/D/stats_head from <path> (...), f_theta from <path2> (...)"
+        # Both name the stage-2 source; only the wording differs.
+        _enc = (re.search(r"Loaded frozen encoder from (\S+)", line)
+               or re.search(r"loaded E/D(?:/stats_head)? from (\S+)", line))
         if _enc:
             out["source_stage2"] = _enc.group(1).rstrip(":,;)")
             _lc = re.search(r"latent_channels=(\d+)", line)
             if _lc:
                 out["latent_channels"] = _lc.group(1)   # -> p_latent_channels (authoritative for the run)
+        _f_theta = re.search(r"f_theta from (\S+)", line)   # stage-4/5's second source
+        if _f_theta:
+            out["source_stage3"] = _f_theta.group(1).rstrip(":,;)")
         _res = re.search(r"Resuming from (\S+)", line)
         if _res:
             out["resume_from"] = _res.group(1).rstrip(":,;)")
@@ -166,7 +181,17 @@ def parse_log_params(path: Path) -> dict:
         # parens, or sentence punctuation (';', ', ', ': ', '.') around it -- e.g.
         # "...residual head (head_hidden=64); H is zero-init." Any of those markers on
         # the line means it is prose, not the param block.
-        if any(ch in head for ch in "[(") or re.search(r"[;:.]\s|,\s", head):
+        # Skip PROSE, but do not blanket-reject every '(' or ',' -- a legitimate
+        # parenthetical parameter group like "(a0=1.0, b=1.0, kappa=0.2)" must still
+        # be scanned (it was being dropped wholesale, losing allen_cahn_a0 etc.).
+        # Prose is: a list ('['), or sentence punctuation (';'/':'/'.') followed by a
+        # space, UNLESS every '(...)' span on the line is itself a clean
+        # comma-separated key=value list -- in which case commas/parens inside it
+        # don't count as prose markers.
+        _stripped = re.sub(r"\(([^()]*)\)", lambda m: "" if
+                           re.fullmatch(r"\s*\w+\s*=\s*\S+?\s*(,\s*\w+\s*=\s*\S+?\s*)*",
+                                        m.group(1)) else m.group(0), head)
+        if "[" in _stripped or re.search(r"[;:.]\s", _stripped) or "(" in _stripped:
             continue
         # clean scalar OR quoted scalar: dynamics_mode='deriv_linear', lr=0.002.
         # (Quotes are allowed for the VALUE; a stray "'" mid-word in prose is excluded
@@ -175,6 +200,19 @@ def parse_log_params(path: Path) -> dict:
             if k == "latent_channels" and "latent_channels" in out:
                 continue                               # keep the prose-captured clean value
             out[k] = v.strip("'\"")
+
+    # De-alias: a bare name from a parenthetical summary group (e.g. "(a0=1.0,
+    # b=1.0, kappa=0.2, M=0.05, phi_max=1.5)") duplicates a fully-qualified name
+    # printed elsewhere in the SAME block (e.g. "allen_cahn_a0=1.0" in "other
+    # parameters:") -- same physical parameter, two names, which produced BOTH
+    # p_a0 and p_allen_cahn_a0 in the ledger. Prefer the qualified name (it is
+    # self-describing) and drop the bare alias when its qualified counterpart is
+    # also present in this block.
+    for bare, prefixed in (("a0", "allen_cahn_a0"), ("b", "allen_cahn_b"),
+                           ("kappa", "allen_cahn_kappa"), ("M", "allen_cahn_mobility"),
+                           ("phi_max", "allen_cahn_phi_max")):
+        if bare in out and prefixed in out:
+            del out[bare]
     return out
 
 
@@ -230,14 +268,15 @@ def confident_log_for(ck_stem: str, logs, epoch: int, parsed):
     return matches[0] if len(matches) == 1 else None
 
 
-def _row_missing_params(row: dict) -> bool:
-    """A row needs param backfill if any PARAM_COLUMNS cell is empty -- the columns
-    backfill fills from the checkpoint, so "missing" is defined against that list,
-    not guessed from a name prefix."""
-    # "missing" = any param OR source column blank. Source columns
-    # (source_stage2/resume_from) come from the log too, so a row with p_* filled
-    # but source blank still needs the log pass -- else it is wrongly skipped.
-    return any(not (row.get(c) or "").strip() for c in PARAM_COLUMNS + SOURCE_COLUMNS)
+def _row_missing_params(row: dict, stage: str = "") -> bool:
+    """A row needs param backfill if any IN-SCOPE param or source column is empty.
+    Scoped to the CSV's stage via columns_in_scope: a column a stage cannot have
+    (dynamics params on stage 4/5, source_stage3 on stage 3) is NOT demanded --
+    else the row is reported unfilled every run, chasing a column that can never
+    be filled. Source columns come from the log too, so a row with p_* filled but
+    a source blank still needs the log pass."""
+    wanted = columns_in_scope(list(PARAM_COLUMNS) + list(SOURCE_COLUMNS), stage)
+    return any(not (row.get(c) or "").strip() for c in wanted)
 
 
 def _params_from_row_checkpoint(row: dict, stage_dir: Path):
@@ -261,6 +300,204 @@ def _row_missing_components(row: dict) -> bool:
     columns that are NOT the fixed total(s) in LOSS_COLUMNS (val_loss)."""
     comp_cols = [k for k in row if k.startswith("val_") and k not in LOSS_COLUMNS]
     return not comp_cols or all(not (row.get(c) or "").strip() for c in comp_cols)
+
+
+def collapse_redundant_empty_variant_rows(eval_csv: Path, dry_run: bool = False) -> int:
+    """Legacy cleanup for the pre-fill-rule split: an empty-variant row whose data
+    is entirely a subset of a tagged (eval-metric) row for the SAME checkpoint+epoch
+    is redundant -- compare_f_theta used to spawn a variant twin instead of filling
+    the existing row. Drop such empty-variant rows. An empty-variant row with NO
+    tagged sibling (its own unique params/components) is KEPT. Returns rows removed."""
+    if not eval_csv.exists():
+        return 0
+    with open(eval_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [dict(r) for r in reader]
+
+    def _key(r):
+        # canonical key, not a partial .replace -- so absolute vs relative path
+        # spellings of the same checkpoint group together (matches upsert_eval_row).
+        return (canonical_checkpoint_key(r.get("checkpoint_path", "")),
+                (r.get("epoch") or "").strip())
+
+    def _data(r):
+        return {k: v for k, v in r.items()
+                if (v or "").strip() and k not in ("checkpoint_path", "epoch", "eval_variant")}
+
+    drop = set()
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for i, r in enumerate(rows):
+        groups[_key(r)].append(i)
+    for idxs in groups.values():
+        empt = [i for i in idxs if not (rows[i].get("eval_variant") or "").strip()]
+        tagged = [i for i in idxs if (rows[i].get("eval_variant") or "").strip()]
+        def _cell_matches(a, b):
+            # numeric cells written by different code paths can differ only in
+            # float formatting (7.357999802 vs 7.357999801635742) -- compare with
+            # tolerance; fall back to exact string match for non-numeric cells.
+            a, b = (a or "").strip(), (b or "").strip()
+            if a == b:
+                return True
+            try:
+                fa, fb = float(a), float(b)
+                return abs(fa - fb) <= 1e-6 * max(1.0, abs(fa), abs(fb))
+            except ValueError:
+                return False
+
+        for e in empt:
+            edata = _data(rows[e])
+            if tagged and any(all(_cell_matches(rows[t].get(k, ""), v)
+                                  for k, v in edata.items()) for t in tagged):
+                drop.add(e)
+
+    if not drop:
+        print("collapse-empty-variant: no redundant empty-variant rows found.")
+        return 0
+    print(f"collapse-empty-variant: removing {len(drop)} redundant empty-variant row(s) "
+          f"(subsumed by a tagged sibling)" + (" (dry run -- not written)" if dry_run else ""))
+    if not dry_run:
+        kept = [r for i, r in enumerate(rows) if i not in drop]
+        tmp = eval_csv.with_suffix(".csv.tmp")
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            for r in kept:
+                w.writerow({c: r.get(c, "") for c in fieldnames})
+        tmp.replace(eval_csv)
+        print(f"Wrote {eval_csv}")
+    return len(drop)
+
+
+_ALIAS_PAIRS = (("p_a0", "p_allen_cahn_a0"), ("p_b", "p_allen_cahn_b"),
+               ("p_kappa", "p_allen_cahn_kappa"), ("p_M", "p_allen_cahn_mobility"),
+               ("p_phi_max", "p_allen_cahn_phi_max"))
+
+
+def drop_out_of_scope_columns(eval_csv: Path, dry_run: bool = False) -> int:
+    """Legacy cleanup: drop stage-scoped columns (currently the dynamics-only
+    p_dynamics_mode/p_derivative_source/p_derivative_time) that reconcile_fieldnames
+    used to add to every stage's header before it became stage-aware. Only drops a
+    column that is EMPTY on every row -- a column with real data is never removed
+    even if it is out of scope for the stage (that would be silent data loss)."""
+    if not eval_csv.exists():
+        return 0
+    with open(eval_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [dict(r) for r in reader]
+    stage = _stage_of(eval_csv.name)
+    if stage in _DYNAMICS_PARAM_STAGES:
+        print(f"drop-out-of-scope-columns: {eval_csv.name} is a dynamics stage -- nothing to drop.")
+        return 0
+    candidates = [c for c in _DYNAMICS_ONLY_PARAMS if c in fieldnames]
+    dropped = [c for c in candidates if all(not (r.get(c) or "").strip() for r in rows)]
+    kept_with_data = [c for c in candidates if c not in dropped]
+    if kept_with_data:
+        print(f"drop-out-of-scope-columns: {kept_with_data} are out of scope for "
+              f"{stage} but hold data -- NOT dropped (would lose it).")
+    if not dropped:
+        print("drop-out-of-scope-columns: nothing to drop.")
+        return 0
+    print(f"drop-out-of-scope-columns: removing empty out-of-scope column(s) {dropped}"
+          + (" (dry run -- not written)" if dry_run else ""))
+    if not dry_run:
+        new_fields = [c for c in fieldnames if c not in dropped]
+        tmp = eval_csv.with_suffix(".csv.tmp")
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=new_fields, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow({c: r.get(c, "") for c in new_fields})
+        tmp.replace(eval_csv)
+        print(f"Wrote {eval_csv}")
+    return len(dropped)
+
+
+def drop_aliased_param_columns(eval_csv: Path, dry_run: bool = False) -> int:
+    """Legacy cleanup: a bare-name column (p_a0, p_b, p_kappa, ...) duplicates a
+    fully-qualified column (p_allen_cahn_a0, ...) written before the parser's
+    de-alias fix -- same physical parameter parsed twice from a parenthetical
+    summary group and the flat param block. Drop the bare-name COLUMN entirely
+    (not per-row) once every row's value in it either matches the qualified
+    column or is blank. Returns the number of columns dropped."""
+    if not eval_csv.exists():
+        return 0
+    with open(eval_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [dict(r) for r in reader]
+
+    def _matches(a, b):
+        a, b = (a or "").strip(), (b or "").strip()
+        if not a:
+            return True                # blank bare cell is always fine to drop
+        if a == b:
+            return True
+        try:
+            return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)))
+        except ValueError:
+            return False
+
+    dropped = []
+    for bare, qualified in _ALIAS_PAIRS:
+        if bare not in fieldnames or qualified not in fieldnames:
+            continue
+        if all(_matches(r.get(bare, ""), r.get(qualified, "")) for r in rows):
+            dropped.append(bare)
+
+    if not dropped:
+        print("drop-aliased-params: no aliased columns found.")
+        return 0
+    print(f"drop-aliased-params: removing column(s) {dropped} (duplicate of their "
+          f"p_allen_cahn_* counterpart)" + (" (dry run -- not written)" if dry_run else ""))
+    if not dry_run:
+        new_fields = [c for c in fieldnames if c not in dropped]
+        tmp = eval_csv.with_suffix(".csv.tmp")
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=new_fields, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow({c: r.get(c, "") for c in new_fields})
+        tmp.replace(eval_csv)
+        print(f"Wrote {eval_csv}")
+    return len(dropped)
+
+
+def blank_zero_components(eval_csv: Path, dry_run: bool = False) -> int:
+    """Legacy cleanup: a component cell stored as exactly 0 came from an INACTIVE
+    term (weight 0 / zero printed contribution) under the old un-weighting, which
+    wrongly recorded 0 instead of unknown. No real loss is exactly 0. Blank those
+    cells so they read as unknown. Returns the number of cells blanked."""
+    if not eval_csv.exists():
+        return 0
+    with open(eval_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [dict(r) for r in reader]
+    n = 0
+    for r in rows:
+        for c in list(r):
+            if c.startswith("val_") and c not in LOSS_COLUMNS:
+                v = (r.get(c) or "").strip()
+                try:
+                    if v and float(v) == 0.0:
+                        r[c] = ""; n += 1
+                except ValueError:
+                    pass
+    print(f"blank-zero-components: {n} exact-zero component cell(s) blanked"
+          + (" (dry run -- not written)" if dry_run else ""))
+    if n and not dry_run:
+        tmp = eval_csv.with_suffix(".csv.tmp")
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow({c: r.get(c, "") for c in fieldnames})
+        tmp.replace(eval_csv)
+        print(f"Wrote {eval_csv}")
+    return n
 
 
 def prune_stale_baseline_rows(eval_csv: Path, dry_run: bool = False) -> int:
@@ -359,7 +596,8 @@ def backfill(stage_dir: Path, eval_csv: Path, dry_run: bool = False, debug: bool
     # match a log line); params only need the checkpoint file (no epoch required).
     todo = [r for r in rows if _is_checkpoint_row(r) and _row_missing_components(r)
             and (r.get("epoch") or "").strip()]
-    param_todo = [r for r in rows if _is_checkpoint_row(r) and _row_missing_params(r)]
+    _stage = _stage_of(eval_csv.name)   # scope the missing-check to this CSV's stage
+    param_todo = [r for r in rows if _is_checkpoint_row(r) and _row_missing_params(r, _stage)]
     skipped_no_epoch = sum(1 for r in rows if _row_missing_components(r)
                            and not (r.get("epoch") or "").strip())
     if not todo and not param_todo:
@@ -411,7 +649,7 @@ def backfill(stage_dir: Path, eval_csv: Path, dry_run: bool = False, debug: bool
             col = f"val_{name}"
             if col not in fieldnames:
                 fieldnames.append(col)
-            row[col] = str(val)
+            row[col] = "" if val is None else str(val)   # inactive term -> blank, not "None"
         if "log" not in fieldnames:
             fieldnames.append("log")
         row["log"] = src
@@ -439,7 +677,7 @@ def backfill(stage_dir: Path, eval_csv: Path, dry_run: bool = False, debug: bool
             if _match is not None:
                 _lp = parse_log_params(_match)
                 for k, v in _lp.items():
-                    if k in ("source_stage2", "resume_from"):
+                    if k in ("source_stage2", "source_stage3", "resume_from"):
                         pr.setdefault(k, v)            # provenance columns (not p_)
                     else:
                         pr.setdefault(f"p_{k}", v)     # config wins on overlap
@@ -496,6 +734,14 @@ def main():
     ap.add_argument("--eval-csv", type=Path, default=None,
                     help="defaults to output/eval-<stage>.csv from the stage dir name")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--drop-out-of-scope-columns", action="store_true",
+                    help="drop empty stage-out-of-scope columns (e.g. dynamics params on stage 4/5), then exit")
+    ap.add_argument("--drop-aliased-params", action="store_true",
+                    help="drop bare-name param columns duplicating a p_allen_cahn_* counterpart, then exit")
+    ap.add_argument("--collapse-empty-variant", action="store_true",
+                    help="drop empty-variant rows subsumed by a tagged eval row, then exit")
+    ap.add_argument("--blank-zero-components", action="store_true",
+                    help="legacy cleanup: blank component cells stored as exactly 0 (inactive terms), then exit")
     ap.add_argument("--prune-baselines", action="store_true",
                     help="remove stale baseline rows that carry a model epoch, then exit")
     ap.add_argument("--all", dest="all_pts", action="store_true",
@@ -520,6 +766,18 @@ def main():
              + ", ".join(str(c) for c in (candidates if args.eval_csv is None else [])) + ")"))
     if args.prune_baselines:
         prune_stale_baseline_rows(eval_csv, dry_run=args.dry_run)
+        return
+    if args.drop_out_of_scope_columns:
+        drop_out_of_scope_columns(eval_csv, dry_run=args.dry_run)
+        return
+    if args.drop_aliased_params:
+        drop_aliased_param_columns(eval_csv, dry_run=args.dry_run)
+        return
+    if args.collapse_empty_variant:
+        collapse_redundant_empty_variant_rows(eval_csv, dry_run=args.dry_run)
+        return
+    if args.blank_zero_components:
+        blank_zero_components(eval_csv, dry_run=args.dry_run)
         return
     backfill(args.stage_dir, eval_csv, dry_run=args.dry_run, debug=args.debug,
              all_pts=args.all_pts)

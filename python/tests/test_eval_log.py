@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 
 from utils.eval_log import (
-    upsert_eval_row, params_from_checkpoint, reconcile_fieldnames, canonical_checkpoint_key,
+    upsert_eval_row, upsert_eval_metrics, params_from_checkpoint, reconcile_fieldnames, canonical_checkpoint_key,
+    is_column_in_scope, columns_in_scope, _EVAL_METRIC_COLUMNS, OUTPUT_COLUMNS,
     EVAL_COLUMNS, PARAM_COLUMNS, LOSS_COLUMNS, OUTPUT_COLUMNS, SOURCE_COLUMNS,
 )
 
@@ -118,8 +119,20 @@ def test_params_surfaces_source_columns_when_present():
 # reconcile_fieldnames
 # --------------------------------------------------------------------------- #
 def test_reconcile_adds_missing_canonical_columns():
-    out = reconcile_fieldnames(["checkpoint_path", "epoch"], "eval-stage3a.csv")
+    """stage4 is used because it is in-scope for every non-dynamics-stage-scoped
+    canonical column EXCEPT source_stage2/source_stage3-for-non-refinement-stages
+    trade-offs -- stage3a is used for stage3-scoped ones and stage4 covers the
+    rest, so between the two tests every EVAL_COLUMNS entry is checked somewhere."""
+    out = reconcile_fieldnames(["checkpoint_path", "epoch"], "eval-stage4.csv")
     for c in EVAL_COLUMNS:
+        if c in ("p_dynamics_mode", "p_derivative_source", "p_derivative_time"):
+            continue    # dynamics-only, correctly absent from stage4
+        assert c in out, f"{c} missing from stage4 reconcile"
+
+
+def test_reconcile_adds_dynamics_only_columns_for_dynamics_stages():
+    out = reconcile_fieldnames(["checkpoint_path", "epoch"], "eval-stage3a.csv")
+    for c in ("p_dynamics_mode", "p_derivative_source", "p_derivative_time"):
         assert c in out
 
 
@@ -209,3 +222,64 @@ def test_different_rollout_horizons_do_not_overwrite(tmp_path):
     assert len(rows) == 2
     by = {r["eval_variant"]: r["rollout_median_corr_dx"] for r in rows}
     assert by["rollout2"] == "0.6" and by["rollout6"] == "0.51"
+
+
+# --------------------------------------------------------------------------- #
+# upsert_eval_metrics: fill-or-branch (compare_f_theta's handful of cells)
+# --------------------------------------------------------------------------- #
+def test_eval_metrics_fill_empty_cells_in_place_no_twin(tmp_path):
+    """A params/components row exists with empty eval-metric cells; writing metrics
+    fills them in place (sets eval_variant), no redundant twin row."""
+    f = tmp_path / "eval-stage4.csv"
+    ck = "checkpoints/stage4/x.pt"
+    upsert_eval_row(f, ck, 35, {"p_lr": "2e-7", "val_rollout": "0.25"})   # params row, "" variant
+    upsert_eval_metrics(f, ck, 35, {"rollout_median_corr_dx": 0.699, "rollout_n_steps": 6},
+                        eval_variant="rollout6")
+    rows = _read(f)
+    assert len(rows) == 1
+    assert rows[0]["eval_variant"] == "rollout6"
+    assert rows[0]["rollout_median_corr_dx"] == "0.699"
+    assert rows[0]["p_lr"] == "2e-7" and rows[0]["val_rollout"] == "0.25"   # preserved
+
+
+def test_eval_metrics_same_variant_is_noop(tmp_path):
+    f = tmp_path / "eval-stage4.csv"; ck = "checkpoints/stage4/x.pt"
+    upsert_eval_metrics(f, ck, 35, {"rollout_median_corr_dx": 0.699, "rollout_n_steps": 6},
+                        eval_variant="rollout6")
+    upsert_eval_metrics(f, ck, 35, {"rollout_median_corr_dx": 0.699, "rollout_n_steps": 6},
+                        eval_variant="rollout6")   # re-run
+    assert len(_read(f)) == 1
+
+
+def test_eval_metrics_different_variant_adds_row(tmp_path):
+    f = tmp_path / "eval-stage4.csv"; ck = "checkpoints/stage4/x.pt"
+    upsert_eval_metrics(f, ck, 35, {"rollout_median_corr_dx": 0.699, "rollout_n_steps": 6},
+                        eval_variant="rollout6")
+    upsert_eval_metrics(f, ck, 35, {"rollout_median_corr_dx": 0.60, "rollout_n_steps": 2},
+                        eval_variant="rollout2")   # different horizon
+    rows = _read(f)
+    assert len(rows) == 2
+    assert {r["eval_variant"] for r in rows} == {"rollout6", "rollout2"}
+
+
+def test_eval_metrics_creates_row_when_none_exists(tmp_path):
+    f = tmp_path / "eval-stage4.csv"; ck = "checkpoints/stage4/x.pt"
+    upsert_eval_metrics(f, ck, 35, {"rollout_median_corr_dx": 0.7}, eval_variant="rollout6")
+    rows = _read(f)
+    assert len(rows) == 1 and rows[0]["eval_variant"] == "rollout6"
+
+
+# --------------------------------------------------------------------------- #
+# single scope predicate + derived metric list (anti-drift)
+# --------------------------------------------------------------------------- #
+def test_is_column_in_scope_matches_all_three_scoped_categories():
+    assert is_column_in_scope("source_stage2", "stage4") and not is_column_in_scope("source_stage2", "stage2")
+    assert is_column_in_scope("source_stage3", "stage4") and not is_column_in_scope("source_stage3", "stage3a")
+    assert is_column_in_scope("p_dynamics_mode", "stage3a") and not is_column_in_scope("p_dynamics_mode", "stage4")
+    assert is_column_in_scope("p_lr", "stage4")           # unscoped column is always in scope
+
+
+def test_eval_metric_columns_derived_from_output_columns_no_drift():
+    """_EVAL_METRIC_COLUMNS must stay OUTPUT_COLUMNS minus non-metric bookkeeping,
+    so a new metric added to OUTPUT_COLUMNS is auto-recognized by fill-or-branch."""
+    assert set(_EVAL_METRIC_COLUMNS) == set(OUTPUT_COLUMNS) - {"log"}
