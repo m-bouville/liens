@@ -157,3 +157,22 @@ def test_check_latent_channels_prefers_raw_components():
     src = _find("check_latent_channels.py")
     assert 'checkpoint.get("val_components_raw")' in src
     assert "val_components_kind" in src
+
+
+# --------------------------------------------------------------------------- #
+# grace epochs must not count against early-stopping patience
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("module", ["train_refinement.py", "train_lds.py", "train_stage2.py"])
+def test_trainer_excludes_grace_epochs_from_patience(module):
+    """Every trainer that uses reset_with_grace must (a) capture in_grace_period
+    BEFORE tracker.update() (the flag flips inside update() on the last grace
+    epoch) and (b) skip the patience increment for grace epochs. A bare
+    `else: epochs_since_improvement += 1` counts forced non-saves as stagnation
+    and early-stops unconditionally when grace >= patience-1."""
+    src = _find(module)
+    assert "was_in_grace_period = tracker.in_grace_period" in src, \
+        f"{module}: grace flag not captured before update()"
+    assert "elif not was_in_grace_period:" in src, \
+        f"{module}: patience counter does not exclude grace epochs"
+    assert not re.search(r"else:\s*\n\s*epochs_since_improvement \+= 1", src), \
+        f"{module}: still has a bare else-increment of the patience counter"

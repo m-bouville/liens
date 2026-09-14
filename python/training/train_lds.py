@@ -1727,6 +1727,8 @@ def train_lds(
                   f"reset too. Rollback {_n_rollbacks} of {max_spike_rollbacks}.]")
 
         _ema_before = tracker.val_ema
+        was_in_grace_period = tracker.in_grace_period   # BEFORE update() (flag flips
+        # inside update() on the last grace epoch -- see train_stage2)
         criterion, saved_this_epoch = tracker.update(epoch, val_loss)
         _excursion = (val_excursion_factor > 0 and _ema_before is not None
                        and (not math.isfinite(val_loss)
@@ -1859,7 +1861,9 @@ def train_lds(
                 epoch=epoch, val_loss=val_loss, val_loss_ema=tracker.val_ema, val_components=_cur_val_components,
                 val_components_raw=_cur_val_components_raw,
                 test_dirs=test_dirs, on_saved=on_checkpoint_saved)
-        else:
+        elif not was_in_grace_period:
+            # grace epochs are FORCED non-saves, not stagnation -- don't count them
+            # against patience (else grace >= patience-1 early-stops unconditionally)
             epochs_since_improvement += 1
 
         # AN EXCURSION PRINTS EVEN WHEN NOTHING SAVED.

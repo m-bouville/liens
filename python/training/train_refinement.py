@@ -850,6 +850,9 @@ def train_refinement(
                   f"spike_skip_factor only lets the damaging batches through.\n")
             break
 
+        was_in_grace_period = tracker.in_grace_period   # BEFORE update(): the flag flips
+        # inside update() on the last grace epoch, so the post-update value would
+        # wrongly count that final forced-no-save epoch against patience.
         criterion, saved_this_epoch = tracker.update(epoch, val_loss)
 
         epoch_history.append(epoch)
@@ -1038,7 +1041,14 @@ def train_refinement(
                 val_components=current_val_components,
                 val_components_raw=dict(_val_raw),
                 test_dirs=test_dirs, on_saved=on_checkpoint_saved)
-        else:
+        elif not was_in_grace_period:
+            # A grace epoch CANNOT save by design (should_save is forced False so
+            # no single epoch plants a flag the EMA hasn't absorbed) -- it is not
+            # evidence of stagnation and must not count against patience. Counting
+            # it meant one genuine no-improvement epoch + a grace period >= patience-1
+            # early-stopped the run unconditionally, even while val was improving
+            # (observed: counter 1 -> 6 across a 5-epoch grace, stop at epoch 14 with
+            # val 5.49 vs last-saved 7.47).
             epochs_since_improvement += 1
 
         if log_every_epoch or saved_this_epoch:
