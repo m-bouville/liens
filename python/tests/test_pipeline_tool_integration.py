@@ -91,11 +91,19 @@ def test_compare_f_theta_stores_corr_as_fraction():
 # check_rollout: encode_both_streams for previous_quotient
 # --------------------------------------------------------------------------- #
 def test_check_rollout_passes_encode_both_streams_for_previous_quotient():
+    """encode_both_streams must be GATED on derivative_source == "previous_quotient"
+    (both streams needed then), not set unconditionally or to False. The assertion
+    pins the actual gating expression -- an earlier version had an OR fallback that
+    passed on any file merely mentioning previous_quotient, so it would have passed
+    even if the flag were wired wrong."""
     src = _find("check_rollout.py")
-    assert "encode_both_streams=" in src, "check_rollout never sets encode_both_streams"
-    # it must be gated on the previous_quotient deriv source (both streams needed)
-    assert re.search(r'encode_both_streams=\(?\s*getattr\(f_theta,\s*"derivative_source"',
-                     src) or ('encode_both_streams=' in src and 'previous_quotient' in src)
+    # the exact gating: encode_both_streams=(getattr(f_theta,"derivative_source",...) == "previous_quotient")
+    assert re.search(
+        r'encode_both_streams\s*=\s*\(?\s*getattr\(\s*f_theta\s*,\s*"derivative_source".*?'
+        r'==\s*"previous_quotient"',
+        src, re.S), "encode_both_streams is not gated on derivative_source == previous_quotient"
+    # and it must NOT be hard-wired False
+    assert "encode_both_streams=False" not in src
 
 
 # --------------------------------------------------------------------------- #
@@ -110,11 +118,30 @@ def test_pipeline_does_not_unpack_check_rollout_result_blindly():
     assert "_rollout_result" in src and "is not None" in src
 
 
-def test_pipeline_archives_stage4_inputs_before_consuming():
+def test_pipeline_pins_stage4_ancestors_to_timestamped_names():
+    """Stage 4/5 must pin BOTH its ancestors -- the stage-2 encoder and the
+    stage-3b f_theta -- to timestamped names via _archive_ancestor (which archives
+    the file AND returns the timestamped path to record), so --with-ancestors
+    resolves 3b to a timestamped identity instead of the overwritten generic name.
+    This supersedes the earlier _backup_before_overwrite calls (which archived the
+    file but left the recorded pointer generic)."""
     src = _find("pipeline.py")
-    # both inputs (stage-2 encoder + stage-3 f_theta) archived at consume time
-    assert "_backup_before_overwrite(stage2_checkpoint)" in src
-    assert "_backup_before_overwrite(stage3_checkpoint)" in src
+    assert "_ae_ancestor = _archive_ancestor(stage2_checkpoint)" in src
+    assert "_f_theta_ancestor = _archive_ancestor(stage3_checkpoint)" in src
+    # the recorded signature and the trainer call must use the PINNED paths
+    assert 'str(_ae_ancestor)' in src and 'str(_f_theta_ancestor)' in src
+    assert "lds_checkpoint_path=_f_theta_ancestor" in src
+
+
+def test_pipeline_does_not_archive_stage3_ancestor_in_lds_stage():
+    """Regression for the misplaced-edit NameError: the _archive_ancestor calls for
+    stage2/stage3 belong in run_refinement_stage, NOT run_lds_stage (where
+    stage3_checkpoint does not yet exist). Guard that run_lds_stage never references
+    the refinement-only ancestor locals."""
+    src = _find("pipeline.py")
+    # crude but effective: the archive-of-stage3_checkpoint must appear exactly once
+    # (in run_refinement_stage), never duplicated into run_lds_stage.
+    assert src.count("_archive_ancestor(stage3_checkpoint)") == 1
 
 
 def test_pipeline_imports_paths_from_utils_not_orchestration():
@@ -189,3 +216,17 @@ def test_compare_f_theta_drops_orphaned_min_passing_steps():
     assert 'dc["min_passing_steps"] = None' in src
     # gated on there being no stdev threshold
     assert 'min_stdev_phi") is not None' in src and 'min_normalized_stdev_phi") is not None' in src
+
+
+def test_check_latent_channels_resolves_ae_state_for_all_checkpoint_kinds():
+    """check_latent_channels must read the AE state from 'model_state' (AE
+    checkpoint), 'ae_state', OR 'model_states[ae_state]' (refinement checkpoint),
+    and raise a CLEAR error (not a bare KeyError) when there is no AE state --
+    so pointing it at a stage-4 checkpoint analyses the refined encoder instead
+    of crashing on KeyError('model_state')."""
+    src = _find("check_latent_channels.py")
+    assert 'checkpoint.get("model_state")' in src
+    assert 'checkpoint["model_states"].get("ae_state")' in src
+    assert "has no autoencoder state to analyse" in src   # the clear error
+    # no bare checkpoint["model_state"] indexing left (would KeyError on stage 4)
+    assert 'checkpoint["model_state"]' not in src

@@ -20,6 +20,7 @@ import pytest
 from utils.eval_log import (
     upsert_eval_row, upsert_eval_metrics, params_from_checkpoint, reconcile_fieldnames, canonical_checkpoint_key,
     is_column_in_scope, columns_in_scope, _EVAL_METRIC_COLUMNS, OUTPUT_COLUMNS,
+    strip_to_checkpoints,
     EVAL_COLUMNS, PARAM_COLUMNS, LOSS_COLUMNS, OUTPUT_COLUMNS, SOURCE_COLUMNS,
 )
 
@@ -158,13 +159,16 @@ def test_reconcile_accepts_variable_columns_silently():
 # --------------------------------------------------------------------------- #
 # stage-specific schema + column ordering
 # --------------------------------------------------------------------------- #
-def test_source_stage2_excluded_for_stage2():
-    """source_stage2 is a stage-3+ concept (frozen stage-2 encoder). A stage-2 CSV
-    must never carry it -- a file should not have a header that can't exist there."""
-    out = reconcile_fieldnames(["checkpoint_path", "epoch", "source_stage2", "resume_from"],
-                               "eval-stage2.csv")
-    assert "source_stage2" not in out
-    assert "resume_from" in out            # resume_from applies to any stage
+def test_source_stage2_not_added_to_stage2():
+    """source_stage2 is a stage-3+ concept. reconcile must not ADD it to a stage-2
+    file that lacks it (append-only never introduces an out-of-scope column). An
+    EXISTING out-of-scope column is kept, not removed -- that is what
+    --drop-out-of-scope-columns is for."""
+    added = reconcile_fieldnames(["checkpoint_path", "epoch"], "eval-stage2.csv")
+    assert "source_stage2" not in added
+    kept = reconcile_fieldnames(["checkpoint_path", "epoch", "source_stage2"], "eval-stage2.csv")
+    assert "source_stage2" in kept          # existing column kept (append-only, no removal)
+    assert "resume_from" in added           # resume_from applies to any stage -> added
 
 
 def test_source_stage2_present_for_stage3():
@@ -172,20 +176,25 @@ def test_source_stage2_present_for_stage3():
     assert "source_stage2" in out
 
 
-def test_column_order_is_params_then_losses_then_channels():
-    cols = ["checkpoint_path", "ch0_imp", "val_loss", "p_lr", "rollout_median_corr_dx",
-            "val_deriv", "p_size", "epoch"]
+def test_reconcile_is_append_only_existing_order_preserved():
+    """reconcile must NOT reorder an existing file -- it keeps existing columns
+    exactly where they are and appends only the in-scope canonical columns the
+    file is missing."""
+    cols = ["checkpoint_path", "ch0_imp", "val_loss", "p_lr", "epoch"]   # deliberately odd order
     out = reconcile_fieldnames(cols, "eval-stage2.csv")
-    i = out.index
-    assert i("p_size") < i("p_lr") < i("val_loss"), "params before losses"
-    assert i("val_loss") < i("rollout_median_corr_dx"), "val_loss leads losses"
-    assert i("rollout_median_corr_dx") < i("ch0_imp"), "losses before channels"
-    assert i("val_deriv") < i("ch0_imp"), "component losses before channels"
+    assert out[:len(cols)] == cols          # existing columns unmoved, in place
+    for extra in out[len(cols):]:           # anything appended is a missing canonical column
+        assert extra not in cols
 
 
-def test_stage1_also_excludes_source_stage2():
-    out = reconcile_fieldnames(["checkpoint_path", "source_stage2"], "eval-stage1.csv")
-    assert "source_stage2" not in out
+def test_reconcile_new_file_gets_canonical_order():
+    out = reconcile_fieldnames([], "eval-stage3a.csv")
+    assert out[:3] == ["checkpoint_path", "epoch", "eval_variant"]
+
+
+def test_stage1_does_not_gain_source_stage2():
+    out = reconcile_fieldnames(["checkpoint_path", "epoch"], "eval-stage1.csv")
+    assert "source_stage2" not in out       # not added; scoping prevents introducing it
 
 
 # --------------------------------------------------------------------------- #
@@ -283,3 +292,54 @@ def test_eval_metric_columns_derived_from_output_columns_no_drift():
     """_EVAL_METRIC_COLUMNS must stay OUTPUT_COLUMNS minus non-metric bookkeeping,
     so a new metric added to OUTPUT_COLUMNS is auto-recognized by fill-or-branch."""
     assert set(_EVAL_METRIC_COLUMNS) == set(OUTPUT_COLUMNS) - {"log"}
+
+
+def test_eval_metrics_fills_on_caller_owned_cells_not_shared_params(tmp_path):
+    """A tool checks only ITS cells: check_latent_channels (owned=ch*_imp) must
+    FILL its importances into an existing rollout row (whose shared params are
+    already present) rather than branch to a twin -- the shared params are not the
+    discriminator."""
+    f = tmp_path / "eval-stage4.csv"; ck = "checkpoints/stage4/x.pt"
+    upsert_eval_metrics(f, ck, 8, {"rollout_median_corr_dx": 0.692, "rollout_n_steps": 6,
+                                   "p_lr": "2e-7", "p_latent_channels": "4"})
+    imp = {"ch0_imp": 0.6, "ch1_imp": 0.06, "p_latent_channels": "4"}   # shares p_latent_channels
+    upsert_eval_metrics(f, ck, 8, imp, owned_cols=["ch0_imp", "ch1_imp"])
+    rows = _read(f)
+    assert len(rows) == 1                       # filled, not twinned
+    assert rows[0]["ch0_imp"] == "0.6" and rows[0]["rollout_median_corr_dx"] == "0.692"
+
+
+def test_fill_does_not_downgrade_existing_eval_variant(tmp_path):
+    """Filling a row that already has a variant (rollout6) with a blank-variant
+    write must NOT overwrite the tag -- the metrics on the row came from rollout6."""
+    f = tmp_path / "eval-stage4.csv"; ck = "checkpoints/stage4/x.pt"
+    upsert_eval_metrics(f, ck, 8, {"rollout_median_corr_dx": 0.7}, eval_variant="rollout6")
+    upsert_eval_metrics(f, ck, 8, {"ch0_imp": 0.6}, owned_cols=["ch0_imp"])   # variant ""
+    assert _read(f)[0]["eval_variant"] == "rollout6"
+
+
+# --------------------------------------------------------------------------- #
+# strip_to_checkpoints: real-space path shortening (separator-preserving)
+# --------------------------------------------------------------------------- #
+def test_strip_to_checkpoints_shortens_absolute_backslash_path():
+    got = strip_to_checkpoints(r"D:\\work\\NN\\phase_field\\python\\checkpoints\\stage2\\128x128-stage2-20260827_11h24.pt")
+    assert got == r"checkpoints\\stage2\\128x128-stage2-20260827_11h24.pt"
+
+
+def test_strip_to_checkpoints_preserves_forward_slash_separator():
+    got = strip_to_checkpoints("/abs/checkpoints/stage2/x.pt")
+    assert got == "checkpoints/stage2/x.pt"          # forward slash kept, not converted
+
+
+def test_strip_to_checkpoints_keeps_the_epoch_pin():
+    got = strip_to_checkpoints(r"D:\\w\\checkpoints\\stage3b\\b.pt (epoch 5671, val_loss=1.44)")
+    assert got == r"checkpoints\\stage3b\\b.pt (epoch 5671, val_loss=1.44)"
+
+
+def test_strip_to_checkpoints_noop_when_already_relative():
+    assert strip_to_checkpoints("checkpoints/stage2/x.pt") == "checkpoints/stage2/x.pt"
+    assert strip_to_checkpoints(r"checkpoints\\stage2\\x.pt") == r"checkpoints\\stage2\\x.pt"
+
+
+def test_strip_to_checkpoints_returns_input_when_no_checkpoints_segment():
+    assert strip_to_checkpoints("D:/random/path/file.pt") == "D:/random/path/file.pt"

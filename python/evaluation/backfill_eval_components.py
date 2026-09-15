@@ -26,7 +26,8 @@ import torch
 from utils.eval_log import (params_from_checkpoint, reconcile_fieldnames,
                             PARAM_COLUMNS, LOSS_COLUMNS, SOURCE_COLUMNS,
                             canonical_checkpoint_key, _DYNAMICS_ONLY_PARAMS,
-                            _DYNAMICS_PARAM_STAGES, _stage_of, columns_in_scope)
+                            _DYNAMICS_PARAM_STAGES, _stage_of, columns_in_scope,
+                            strip_to_checkpoints)
 
 # Path anchor (policy: default checkpoint/output paths resolve from the repo
 # root, never the process CWD). backfill's inputs are CLI args, but the
@@ -150,7 +151,23 @@ def parse_log_params(path: Path) -> dict:
     out = {}
     for raw in path.read_text(errors="replace").splitlines():
         line = raw.rstrip("\r")
-        if re.match(r"^\s*/\d|^\s*\d+[\s|]", line):   # epoch header (/N ...) or epoch line -> stop
+        # The loss-term HEADER ("/N train = w*name/scale +...") carries the per-term
+        # WEIGHT and SCALE. The SCALES are printed ONLY here (except allen_cahn_scale),
+        # so without this eval-stageN.csv gets p_*_weight but not p_*_scale. Parse it
+        # via _HEADER_RE (NOT the epoch-break regex -- the header can be "/ 80 train ="
+        # with a space after '/', which the break pattern misses). Emit *_scale and
+        # *_weight; the flat block's values win on overlap (out already has them, and
+        # these use setdefault). Then stop: the header is the last pre-epoch line.
+        _h = _HEADER_RE.search(line)
+        if _h and "/" in _h.group(1):
+            for _w, _n, _sc in _TERM_RE.findall(_h.group(1)):
+                out.setdefault(f"{_n}_scale", _sc)
+                if _w:
+                    out.setdefault(f"{_n}_weight", _w)
+            break
+        # an actual epoch line: "<int>|..." or "<int>  <float>..." (NOT "4114 runs ...",
+        # a save-schedule report line, which also starts with digits).
+        if re.match(r"^\s*\d+\s*\|", line) or re.match(r"^\s*\d+\s+[0-9.]", line):
             break
         # prose provenance lines (not key=value): the frozen encoder (stage-2 source,
         # with its latent_channels) and the resume checkpoint. These carry the source
@@ -158,19 +175,40 @@ def parse_log_params(path: Path) -> dict:
         # stage-3: "Loaded frozen encoder from <path> (epoch N, val_loss=X, latent_channels=C)"
         # stage-4/5: "Stage 4: loaded E/D/stats_head from <path> (...), f_theta from <path2> (...)"
         # Both name the stage-2 source; only the wording differs.
-        _enc = (re.search(r"Loaded frozen encoder from (\S+)", line)
-               or re.search(r"loaded E/D(?:/stats_head)? from (\S+)", line))
+        def _pin_source(path, pin_group):
+            # A generic (overwritten) source path like "...\\128x128-stage3b.pt" does
+            # not say WHICH checkpoint it was. The log prints the pin right after it as
+            # "(epoch N, val_loss=X, ...)"; append it so the CSV column is traceable to
+            # the exact source even after the generic file is overwritten:
+            # "...\\128x128-stage3b.pt (epoch 5671, val_loss=1.43711)".
+            path = strip_to_checkpoints(path.rstrip(":,;)"))   # drop the absolute prefix
+            m = re.search(r"epoch\s*(\d+)(?:,\s*val_loss=([0-9eE.+\-]+))?", pin_group or "")
+            if m:
+                if m.group(2):
+                    return f"{path} (epoch {m.group(1)}, val_loss={m.group(2)})"
+                return f"{path} (epoch {m.group(1)})"
+            return path
+
+        # stage-2 source: "<verb> from <path> (epoch N, val_loss=X, latent_channels=C)"
+        _enc = (re.search(r"Loaded frozen encoder from (\S+)\s*(\([^)]*\))?", line)
+               or re.search(r"loaded E/D(?:/stats_head)? from (\S+)\s*(\([^)]*\))?", line))
         if _enc:
-            out["source_stage2"] = _enc.group(1).rstrip(":,;)")
+            out["source_stage2"] = _pin_source(_enc.group(1), _enc.group(2))
             _lc = re.search(r"latent_channels=(\d+)", line)
             if _lc:
                 out["latent_channels"] = _lc.group(1)   # -> p_latent_channels (authoritative for the run)
-        _f_theta = re.search(r"f_theta from (\S+)", line)   # stage-4/5's second source
+        # stage-4/5 f_theta source: "f_theta from <path> (epoch N, val_loss=X)"
+        _f_theta = re.search(r"f_theta from (\S+)\s*(\([^)]*\))?", line)
         if _f_theta:
-            out["source_stage3"] = _f_theta.group(1).rstrip(":,;)")
-        _res = re.search(r"Resuming from (\S+)", line)
-        if _res:
-            out["resume_from"] = _res.group(1).rstrip(":,;)")
+            out["source_stage3"] = _pin_source(_f_theta.group(1), _f_theta.group(2))
+        # resume source, across wordings: stage-2/3 print "Resuming from <path>";
+        # stage-4/5 print "(resuming from <path>)" and "Stage N: loaded resumed from
+        # <path>". Match all three (case-insensitive "resum...from"), and pin any
+        # trailing "(epoch N, val_loss=X)" like the other sources.
+        _res = re.search(r"(?:resuming from|resumed from)\s+(\S+)\s*(\([^)]*\))?",
+                         line, re.IGNORECASE)
+        if _res and "resume_from" not in out:
+            out["resume_from"] = _pin_source(_res.group(1), _res.group(2))
         head = line.split("--")[0]                     # drop '-- comment' tails
         # Skip PROSE lines that merely contain '=' (lists, embedded parens, or
         # "key=value: sentence"): they corrupt the scan (e.g. stat_names=['angle',
@@ -334,28 +372,48 @@ def collapse_redundant_empty_variant_rows(eval_csv: Path, dry_run: bool = False)
         empt = [i for i in idxs if not (rows[i].get("eval_variant") or "").strip()]
         tagged = [i for i in idxs if (rows[i].get("eval_variant") or "").strip()]
         def _cell_matches(a, b):
-            # numeric cells written by different code paths can differ only in
-            # float formatting (7.357999802 vs 7.357999801635742) -- compare with
-            # tolerance; fall back to exact string match for non-numeric cells.
+            # The same value written by two code paths can differ only in FORMATTING,
+            # which must not count as a conflict when merging: booleans by case
+            # ("False" vs "FALSE") and floats by DISPLAY ROUNDING ("0.9741" vs
+            # "0.97408..."). Use a relative tolerance (1e-3) that absorbs rounding to
+            # ~4 sig figs while still catching a real >0.1% difference.
             a, b = (a or "").strip(), (b or "").strip()
-            if a == b:
+            if a == b or a.lower() == b.lower():
                 return True
             try:
                 fa, fb = float(a), float(b)
-                return abs(fa - fb) <= 1e-6 * max(1.0, abs(fa), abs(fb))
+                return abs(fa - fb) <= 1e-3 * max(1.0, abs(fa), abs(fb))
             except ValueError:
                 return False
 
         for e in empt:
             edata = _data(rows[e])
-            if tagged and any(all(_cell_matches(rows[t].get(k, ""), v)
-                                  for k, v in edata.items()) for t in tagged):
+            if not tagged:
+                continue
+            # find a tagged sibling whose cells don't CONFLICT with the empty row
+            # (matching or blank on the tagged side). Then MERGE the empty row's
+            # cells the tagged one lacks (e.g. ch*_imp importances that
+            # check_latent_channels wrote on the empty twin) into the tagged row,
+            # and drop the now-redundant empty row.
+            for t in tagged:
+                conflict = any(
+                    (rows[t].get(k, "") or "").strip()
+                    and not _cell_matches(rows[t].get(k, ""), v)
+                    for k, v in edata.items())
+                if conflict:
+                    continue
+                for k, v in edata.items():
+                    if not (rows[t].get(k, "") or "").strip():
+                        rows[t][k] = v          # fill the tagged row's blank cell
+                        if k not in fieldnames:
+                            fieldnames.append(k)
                 drop.add(e)
+                break
 
     if not drop:
         print("collapse-empty-variant: no redundant empty-variant rows found.")
         return 0
-    print(f"collapse-empty-variant: removing {len(drop)} redundant empty-variant row(s) "
+    print(f"collapse-empty-variant: merged+removed {len(drop)} empty-variant row(s) "
           f"(subsumed by a tagged sibling)" + (" (dry run -- not written)" if dry_run else ""))
     if not dry_run:
         kept = [r for i, r in enumerate(rows) if i not in drop]
@@ -373,6 +431,39 @@ def collapse_redundant_empty_variant_rows(eval_csv: Path, dry_run: bool = False)
 _ALIAS_PAIRS = (("p_a0", "p_allen_cahn_a0"), ("p_b", "p_allen_cahn_b"),
                ("p_kappa", "p_allen_cahn_kappa"), ("p_M", "p_allen_cahn_mobility"),
                ("p_phi_max", "p_allen_cahn_phi_max"))
+
+
+def strip_source_path_prefixes(eval_csv: Path, dry_run: bool = False) -> int:
+    """Legacy cleanup: strip the absolute prefix from existing source_stage2 /
+    source_stage3 / resume_from cells (e.g. 'D:\\work\\...\\checkpoints\\stage2\\x.pt'
+    -> 'checkpoints\\stage2\\x.pt'), preserving the separator and any '(epoch...)'
+    pin. Returns the number of cells changed."""
+    if not eval_csv.exists():
+        return 0
+    with open(eval_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [dict(r) for r in reader]
+    n = 0
+    for r in rows:
+        for col in ("source_stage2", "source_stage3", "resume_from"):
+            v = (r.get(col) or "").strip()
+            if v:
+                stripped = strip_to_checkpoints(v)
+                if stripped != v:
+                    r[col] = stripped; n += 1
+    print(f"strip-source-paths: {n} source path cell(s) shortened"
+          + (" (dry run -- not written)" if dry_run else ""))
+    if n and not dry_run:
+        tmp = eval_csv.with_suffix(".csv.tmp")
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow({c: r.get(c, "") for c in fieldnames})
+        tmp.replace(eval_csv)
+        print(f"Wrote {eval_csv}")
+    return n
 
 
 def drop_out_of_scope_columns(eval_csv: Path, dry_run: bool = False) -> int:
@@ -734,6 +825,8 @@ def main():
     ap.add_argument("--eval-csv", type=Path, default=None,
                     help="defaults to output/eval-<stage>.csv from the stage dir name")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--strip-source-paths", action="store_true",
+                    help="shorten absolute source_* / resume_from paths to checkpoints/..., then exit")
     ap.add_argument("--drop-out-of-scope-columns", action="store_true",
                     help="drop empty stage-out-of-scope columns (e.g. dynamics params on stage 4/5), then exit")
     ap.add_argument("--drop-aliased-params", action="store_true",
@@ -766,6 +859,9 @@ def main():
              + ", ".join(str(c) for c in (candidates if args.eval_csv is None else [])) + ")"))
     if args.prune_baselines:
         prune_stale_baseline_rows(eval_csv, dry_run=args.dry_run)
+        return
+    if args.strip_source_paths:
+        strip_source_path_prefixes(eval_csv, dry_run=args.dry_run)
         return
     if args.drop_out_of_scope_columns:
         drop_out_of_scope_columns(eval_csv, dry_run=args.dry_run)

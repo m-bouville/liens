@@ -59,7 +59,7 @@ def test_parse_log_params_extracts_training_params_and_source(tmp_path):
     pp = bf.parse_log_params(lg)
     assert pp["n_rollout_steps"] == "2" and pp["lr"] == "0.002"
     assert pp["dynamics_mode"] == "deriv_linear"
-    assert pp["source_stage2"].endswith("s2.pt")
+    assert "s2.pt (epoch 20, val_loss=1.0)" == pp["source_stage2"].split("\\")[-1]
     assert pp["latent_channels"] == "4"           # clean, no trailing paren
 
 
@@ -132,7 +132,7 @@ def test_backfill_fills_components_and_params_from_correct_sources(tmp_path):
     r = _read(ev)[0]
     assert r["p_n_rollout_steps"] == "2" and r["p_lr"] == "0.002"     # training params from log
     assert r["p_latent_channels"] == "4"                              # architecture from config
-    assert r["source_stage2"].endswith("s2.pt")                       # provenance from log prose
+    assert "s2.pt (epoch 20, val_loss=1.0)" in r["source_stage2"]     # path + pin from log prose
     assert r["val_loss"] == str(2.41)                                 # total from checkpoint
 
 
@@ -256,7 +256,9 @@ def test_provenance_paths_strip_trailing_prose_punctuation(tmp_path):
     pp = bf.parse_log_params(lg)
     assert pp["resume_from"] == "checkpoints/stage1/128x128-stage1.pt"   # no trailing ':'
     assert not pp["resume_from"].endswith((":", ",", ";", ")"))
-    assert not pp["source_stage2"].endswith((":", ",", ";", ")"))
+    # the PATH part (before any " (epoch...)" pin) must not keep stray punctuation
+    _path = pp["source_stage2"].split(" (epoch")[0]
+    assert not _path.endswith((":", ",", ";", ")"))
 
 
 def test_exact_stem_match_confirms_epoch_present(tmp_path):
@@ -535,8 +537,9 @@ def test_stage4_provenance_prose_fills_both_sources(tmp_path):
         "(epoch 5671, val_loss=1.43711)\n"
         "/30 train = x | valid | ema\n 8  1 =1(0.5)| 2 =1(0.5)| 2  -> saved at 04:25\n")
     pp = bf.parse_log_params(lg)
-    assert pp["source_stage2"].endswith("128x128-stage2.pt")
-    assert pp["source_stage3"].endswith("128x128-stage3b.pt")
+    # sources are PINNED with (epoch, val_loss) so the generic overwritten path stays traceable
+    assert "128x128-stage2.pt (epoch 12, val_loss=3.29466)" in pp["source_stage2"]
+    assert "128x128-stage3b.pt (epoch 5671, val_loss=1.43711)" in pp["source_stage3"]
 
 
 def test_drop_out_of_scope_columns_removes_empty_dynamics_params_from_stage4(tmp_path):
@@ -605,3 +608,135 @@ def test_collapse_uses_canonical_key_across_path_spellings(tmp_path):
     removed = bf.collapse_redundant_empty_variant_rows(ev, dry_run=False)
     assert removed == 1
     assert len(_read(ev)) == 1 and _read(ev)[0]["eval_variant"] == "rollout6"
+
+
+def test_source_paths_stripped_to_checkpoints_preserving_separator_and_pin(tmp_path):
+    """Absolute source paths from the log are shortened to 'checkpoints...' with the
+    original separator kept and any (epoch...) pin preserved."""
+    lg = tmp_path / "x.log"
+    lg.write_text(
+        "Stage 4: loaded E/D/stats_head from D:\\work\\NN\\phase_field\\python\\checkpoints\\stage2\\128x128-stage2.pt "
+        "(epoch 12, val_loss=3.29), f_theta from D:\\work\\checkpoints\\stage3b\\128x128-stage3b.pt (epoch 5671, val_loss=1.44)\n"
+        "/30 train = x | valid | ema\n 8  1 =1(0.5)| 2 =1(0.5)| 2  -> saved at 04:25\n")
+    pp = bf.parse_log_params(lg)
+    assert pp["source_stage2"] == "checkpoints\\stage2\\128x128-stage2.pt (epoch 12, val_loss=3.29)"
+    assert pp["source_stage3"] == "checkpoints\\stage3b\\128x128-stage3b.pt (epoch 5671, val_loss=1.44)"
+
+
+def test_strip_source_path_prefixes_cleanup(tmp_path):
+    ev = tmp_path / "eval-stage4.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "source_stage2", "source_stage3"])
+        w.writerow(["checkpoints/stage4/x.pt", "8",
+                    "D:\\work\\checkpoints\\stage2\\a.pt (epoch 1, val_loss=2)",
+                    "D:\\work\\checkpoints\\stage3b\\b.pt"])
+    n = bf.strip_source_path_prefixes(ev, dry_run=False)
+    assert n == 2
+    r = _read(ev)[0]
+    assert r["source_stage2"] == "checkpoints\\stage2\\a.pt (epoch 1, val_loss=2)"
+    assert r["source_stage3"] == "checkpoints\\stage3b\\b.pt"
+
+
+def test_collapse_merges_unique_cells_before_dropping_empty_twin(tmp_path):
+    """An empty-variant row carrying ch*_imp (not on the tagged sibling) is not a
+    pure subset -- collapse must MERGE the importances into the tagged rollout row
+    and drop the empty one, treating formatting-only differences (case, display
+    rounding) as non-conflicts."""
+    ev = tmp_path / "eval-stage4.csv"
+    with open(ev, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["checkpoint_path", "epoch", "eval_variant",
+                    "rollout_median_corr_dx", "val_rollout", "p_normalize_phi", "ch0_imp"])
+        # empty twin: has ch0_imp + full-precision val_rollout + "False"
+        w.writerow(["checkpoints/stage4/a.pt", "8", "", "", "0.9740859270", "False", "0.007"])
+        # tagged: has the metric + ROUNDED val_rollout + "FALSE", no ch0_imp
+        w.writerow(["checkpoints/stage4/a.pt", "8", "rollout6", "0.692", "0.9741", "FALSE", ""])
+    removed = bf.collapse_redundant_empty_variant_rows(ev, dry_run=False)
+    assert removed == 1
+    rows = _read(ev)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["eval_variant"] == "rollout6"          # tag preserved
+    assert r["rollout_median_corr_dx"] == "0.692"   # metric kept
+    assert r["ch0_imp"] == "0.007"                  # importance MERGED in
+
+
+def test_scales_captured_from_loss_term_header(tmp_path):
+    """The per-term SCALES live only in the loss-term header ("/N train = w*name/scale
+    +..."), not the flat key=value block -- so eval-stageN.csv had weights but not
+    scales. parse_log_params must emit p_*_scale from the header. Also guards the
+    early-break bug: a save-schedule report line ("4114 runs (94%):") must NOT stop
+    parsing before the header is reached."""
+    lg = tmp_path / "128x128-stage5-20260915_02h07.log"
+    lg.write_text(
+        "82028 train windows, 31768 val windows\n"
+        "     4114 runs (94.3%):  71 saved steps, last at 6,000,000\n"   # must NOT break here
+        "rollout_weight=0.2  lr=6e-06\n"
+        "/ 80 train = 0.2*rollout/10.0 +0.2*recon0/0.08 +0.5*allen_cahn/1e-06 | valid | ema\n"
+        "   1| 12.6 = 1(0.5) | 13.8 = 1(0.6) | 13.8  -> saved at 02:07\n")
+    pp = bf.parse_log_params(lg)
+    assert pp["rollout_scale"] == "10.0"          # from the header, previously lost
+    assert pp["recon0_scale"] == "0.08"
+    assert pp["allen_cahn_scale"] == "1e-06"
+    assert pp["lr"] == "6e-06"                     # flat-block param still captured
+    assert pp["rollout_weight"] == "0.2"
+
+
+def test_save_schedule_report_line_does_not_stop_param_parsing(tmp_path):
+    """Regression: '<int> runs (...)' matched the epoch-line break and stopped
+    parsing before the header/flat block -- masking scales for stage 4/5 logs."""
+    lg = tmp_path / "x.log"
+    lg.write_text(
+        "      236 runs ( 5.4%):  73 saved steps\n"
+        "lr=2e-07  n_rollout_steps=6\n"
+        "/6000 train = 1*rollout/1e-08 | valid | ema\n"
+        " 1| 1=1(0.5)|2=1(0.6)|2 -> saved at 00:00\n")
+    pp = bf.parse_log_params(lg)
+    assert pp["lr"] == "2e-07" and pp["n_rollout_steps"] == "6"   # reached, not cut off
+    assert pp["rollout_scale"] == "1e-08"
+
+
+def test_stage5_resume_from_stage4_is_captured(tmp_path):
+    """Stage 5 prints its stage-4 source as '(resuming from <path>)' and
+    'Stage 5: loaded resumed from <path>' -- lowercase / different wording than
+    stage-2/3's 'Resuming from'. All must be captured into resume_from, else
+    eval-stage5.csv has no stage-4 provenance."""
+    lg = tmp_path / "128x128-stage5-20260915_02h07.log"
+    lg.write_text(
+        "STAGE 5: end-to-end refinement (resuming from D:\\w\\checkpoints\\stage4\\128x128-stage4-20260914_17h02.pt)\n"
+        "Stage 5: loaded resumed from D:\\w\\checkpoints\\stage4\\128x128-stage4-20260914_17h02.pt\n"
+        "lr=6e-06\n/80 train = 1*rollout/10 | valid | ema\n 1| 1=1(0.5)|2=1(0.6)|2 -> saved at 02:07\n")
+    pp = bf.parse_log_params(lg)
+    assert pp["resume_from"].endswith("128x128-stage4-20260914_17h02.pt")
+
+
+def test_stage23_resume_wording_still_captured(tmp_path):
+    """Regression: the stage-2/3 'Resuming from <path>' wording must still match
+    after broadening the pattern for stage-4/5."""
+    lg = tmp_path / "128x128-stage3b-x.log"
+    lg.write_text(
+        "Resuming from checkpoints/stage3a/128x128-stage3a-20260831_04h18.pt\n"
+        "lr=0.002\n/6000 train = 1*rollout/1e-08 | valid | ema\n"
+        " 1| 1=1(0.5)|2=1(0.6)|2 -> saved at 04:18\n")
+    pp = bf.parse_log_params(lg)
+    assert pp["resume_from"].endswith("128x128-stage3a-20260831_04h18.pt")
+
+
+def test_importances_broadcast_to_all_horizon_rows(tmp_path):
+    """Channel importances are checkpoint-level (identical across rollout horizons),
+    so a checkpoint with rollout6 AND rollout8 rows must get the importances on
+    BOTH -- not just the first (which left the other's ch*_imp empty)."""
+    from utils.eval_log import upsert_eval_metrics
+    f = tmp_path / "eval-stage5.csv"; ck = "checkpoints/stage5/x.pt"
+    upsert_eval_metrics(f, ck, 8, {"rollout_median_corr_dx": 0.7, "rollout_n_steps": 6},
+                        eval_variant="rollout6")
+    upsert_eval_metrics(f, ck, 8, {"rollout_median_corr_dx": 0.6, "rollout_n_steps": 8},
+                        eval_variant="rollout8")
+    upsert_eval_metrics(f, ck, 8, {"ch0_imp": 0.6, "ch1_imp": 0.06},
+                        owned_cols=["ch0_imp", "ch1_imp"], broadcast=True)
+    rows = _read(f)
+    assert len(rows) == 2                                  # no new row
+    assert all((r.get("ch0_imp") or "").strip() == "0.6" for r in rows)   # BOTH filled
+    # rollout metrics stay per-variant
+    assert {r["rollout_n_steps"] for r in rows} == {"6", "8"}

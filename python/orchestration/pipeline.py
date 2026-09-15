@@ -646,6 +646,14 @@ def run_from_params_file(params_path: Path, default_base: Path,
                                             own_keys=renamed_keys(stages.get(stage_key, {})))
         kwargs, resume_from, overridden = _resolve_stage_specific_ancestor(
             kwargs, resume_from, f"Stage {stage_key}")
+        # Pin the stage-2 encoder and stage-3b f_theta ancestors to timestamped names
+        # NOW -- before they are recorded in the signature or passed to train_refinement
+        # -- the same _archive_ancestor treatment the resume_from / ae_ancestor / 3b->3a
+        # edges already get. This f_theta edge was the lone omission: it recorded the
+        # GENERIC lds_checkpoint, so --with-ancestors resolved 3b to the overwritten
+        # generic name (bare) while 3a was timestamped.
+        _ae_ancestor = _archive_ancestor(stage2_checkpoint)
+        _f_theta_ancestor = _archive_ancestor(stage3_checkpoint)
         if resume_from is not None and not overridden:
             # Auto-chained ancestor (3a -> 3b, 3b -> 4): pin its timestamped
             # identity so the log and cache signature name the ACTUAL ancestor,
@@ -661,8 +669,8 @@ def run_from_params_file(params_path: Path, default_base: Path,
             # registry, without following stage2_checkpoint into ITS
             # own registry to find stage1_checkpoint, etc.
             signature = {"base_path": str(base_path),
-                          "stage2_checkpoint": str(stage2_checkpoint),
-                          "stage3_checkpoint": str(stage3_checkpoint),
+                          "stage2_checkpoint": str(_ae_ancestor),
+                          "stage3_checkpoint": str(_f_theta_ancestor),
                           **extra_signature, **_signature_kwargs(kwargs)}
         checkpoint = resolve_checkpoint(stage_key, force, signature, kwargs.get("epochs"))
         if checkpoint is None:
@@ -693,20 +701,8 @@ def run_from_params_file(params_path: Path, default_base: Path,
                 if resume_from is not None:
                     checkpoint = train_refinement(resume_from=resume_from, **common_args)
                 else:
-                    # Preserve the INPUTS at consume time. stage2_checkpoint /
-                    # stage3_checkpoint are the GENERIC, overwritten names; the
-                    # startup log now pins them by (epoch, val_loss), but the file
-                    # itself is only lazily archived by a FUTURE stage-2/3b run that
-                    # overwrites it -- a window in which it can be lost (a manual
-                    # rerun, an interrupt). Archive them now (idempotent, mtime-named)
-                    # so the exact checkpoints this stage-4 run was built on stay on
-                    # disk and loadable, not just named.
-                    _backup_before_overwrite(stage2_checkpoint)
-                    _backup_before_overwrite(stage2_checkpoint.with_suffix(".log"))
-                    _backup_before_overwrite(stage3_checkpoint)
-                    _backup_before_overwrite(stage3_checkpoint.with_suffix(".log"))
                     checkpoint = train_refinement(
-                        ae_checkpoint_path=stage2_checkpoint, lds_checkpoint_path=stage3_checkpoint,
+                        ae_checkpoint_path=_ae_ancestor, lds_checkpoint_path=_f_theta_ancestor,
                         **common_args,
                     )
                 print(f"\nStage {stage_key} complete: {checkpoint}\n")

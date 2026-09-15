@@ -168,14 +168,45 @@ def reconcile_fieldnames(fieldnames: list[str], csv_name: str) -> list[str]:
         print(f"  eval-log NOTE: {csv_name} has unexpected column(s) {unknown} "
               f"-- kept, but not written by any current tool (renamed/legacy?). "
               f"Reconcile or add to EVAL_COLUMNS.")
-    # canonical first (added if missing), then any extra columns (known-variable or
-    # unknown) preserved in original order
-    # canonical columns for THIS stage (source_stage2 excluded where it can't exist)
+    # APPEND-ONLY: keep existing columns exactly where they are (do not reorder an
+    # already-written file), and append any in-scope canonical column the file is
+    # missing, at the END. A brand-new file (no existing columns) gets the canonical
+    # order; an existing file keeps its layout and only grows.
     stage = _stage_of(csv_name)
     canon = columns_in_scope(EVAL_COLUMNS, stage)
-    # union canonical + existing, then order by group (params -> losses -> channels)
-    union = list(dict.fromkeys(canon + list(fieldnames)))
-    return _ordered_columns(union, csv_name)
+    if not fieldnames:
+        return list(canon)                         # new file: canonical order
+    out = list(fieldnames)                          # existing columns, order untouched
+    for c in canon:
+        if c not in out:
+            out.append(c)                           # append missing canonical columns
+    return out
+
+
+def strip_to_checkpoints(path: str) -> str:
+    """Strip an absolute prefix down to the 'checkpoints...' tail, PRESERVING the
+    original separator (unlike canonical_checkpoint_key, which normalises to '/'
+    for use as a dict key). For DISPLAY path columns (source_stage2/source_stage3/
+    resume_from) so 'D:\\work\\...\\checkpoints\\stage2\\x.pt' -> 'checkpoints\\stage2\\x.pt'
+    and the forward-slash form is left as forward-slash. Any trailing ' (epoch...)'
+    pin is left untouched. Returns the input unchanged if 'checkpoints' is absent."""
+    if not path:
+        return path
+    # split off a trailing " (epoch ...)" pin if present, strip the path part only
+    pin = ""
+    _m = re.search(r"\s*\(epoch\b.*\)\s*$", path)
+    if _m:
+        pin = path[_m.start():]
+        path = path[:_m.start()]
+    for sep in ("\\checkpoints\\", "/checkpoints/"):
+        i = path.rfind(sep)
+        if i >= 0:
+            return path[i + 1:] + pin      # +1 drops the leading separator
+    # bare "checkpoints..." already, or no match
+    for lead in ("checkpoints\\", "checkpoints/"):
+        if path.startswith(lead):
+            return path + pin
+    return path + pin
 
 
 def canonical_checkpoint_key(checkpoint_path) -> str:
@@ -208,7 +239,8 @@ _EVAL_METRIC_COLUMNS = tuple(c for c in OUTPUT_COLUMNS
 
 
 def upsert_eval_metrics(csv_path: Path, checkpoint_path, epoch, metrics: dict,
-                        eval_variant: str = "") -> None:
+                        eval_variant: str = "", owned_cols=None,
+                        broadcast: bool = False) -> None:
     """Write compare_f_theta's eval metrics with fill-or-branch semantics.
 
     compare_f_theta owns only a handful of cells (_EVAL_METRIC_COLUMNS + eval_variant).
@@ -244,24 +276,38 @@ def upsert_eval_metrics(csv_path: Path, checkpoint_path, epoch, metrics: dict,
     same_ck_ep = [r for r in rows
                   if r.get("checkpoint_path") == ck and (r.get("epoch") or "") == ep]
 
+    # The cells THIS diagnostic writes ARE the discriminator: a tool checks only its
+    # own cells (compare_f_theta -> the rollout metrics; check_latent_channels -> the
+    # ch*_imp importances), never another tool's. By default the owned cells are the
+    # keys in `metrics` (definitionally "the cells I intend to write"); pass
+    # owned_cols to override (e.g. exclude shared params a tool also writes).
+    _owned = set(owned_cols) if owned_cols is not None else set(metrics.keys())
+
     def _has_metrics(r):
-        return any((r.get(c) or "").strip() for c in _EVAL_METRIC_COLUMNS)
+        return any((r.get(c) or "").strip() for c in _owned)
 
     # 1) a row for this variant already has metrics -> nothing to do
     for r in same_ck_ep:
         if (r.get("eval_variant") or "") == ev and _has_metrics(r):
             return
-    # 2) an existing row (any variant, typically the "" params row) with EMPTY
-    #    metric cells -> fill it in place and stamp the variant
-    target = None
-    for r in same_ck_ep:
-        if not _has_metrics(r):
-            target = r
-            break
-    if target is not None:
-        target["eval_variant"] = ev
-        for col, val in metrics.items():
-            target[col] = "" if val is None else str(val)
+    # 2) fill existing rows whose OWNED cells are empty. broadcast=True fills EVERY
+    #    such row for this checkpoint+epoch (checkpoint-level facts like channel
+    #    importances are the same across ALL horizon variants, so a checkpoint with
+    #    rollout6 AND rollout8 rows must get the importances on BOTH); broadcast=False
+    #    fills just the first (variant-specific metrics belong on one row).
+    targets = [r for r in same_ck_ep if not _has_metrics(r)]
+    if not broadcast:
+        targets = targets[:1]
+    if targets:
+        for target in targets:
+            # Only stamp the variant if the row has none yet -- a fill by a
+            # non-metric tool (check_latent_channels, variant "") must NOT overwrite
+            # an existing "rollout6" tag, which would lose which eval produced the
+            # metrics already on that row.
+            if not (target.get("eval_variant") or "").strip():
+                target["eval_variant"] = ev
+            for col, val in metrics.items():
+                target[col] = "" if val is None else str(val)
     else:
         # 3) metrics already present under a different variant -> new row
         new_row = {"checkpoint_path": ck, "epoch": ep, "eval_variant": ev}

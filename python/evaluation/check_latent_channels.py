@@ -36,7 +36,8 @@ import torch
 
 from evaluation.check_rollout import _format_small, _padded_bounds
 from utils.plot_helpers import moving_window as _moving_window, pretty_label as _pretty_label
-from utils.eval_log import upsert_eval_row, eval_csv_for_checkpoint, params_from_checkpoint
+from utils.eval_log import (upsert_eval_row, upsert_eval_metrics,
+                            eval_csv_for_checkpoint, params_from_checkpoint)
 from models.autoencoder import Autoencoder, EncoderDecoderPair, MultiStreamAutoencoder
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -427,6 +428,23 @@ def check_latent_channels(
 
     checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
     ae_config = checkpoint["config"]
+    # The AE state lives under different keys by checkpoint kind: an AE checkpoint
+    # (stage 1/2) has it at top-level "model_state"; a refinement checkpoint
+    # (stage 4/5) bundles several sub-states and keeps the (refined) AE under
+    # "ae_state". Resolve once so this tool works on both -- analysing the refined
+    # encoder's channels is legitimate. Fail clearly if it is neither (e.g. a
+    # stage-3 f_theta-only checkpoint has no AE state to analyse).
+    ae_state = checkpoint.get("model_state")
+    if ae_state is None:
+        ae_state = checkpoint.get("ae_state")
+    if ae_state is None and isinstance(checkpoint.get("model_states"), dict):
+        ae_state = checkpoint["model_states"].get("ae_state")
+    if ae_state is None:
+        raise SystemExit(
+            f"{ae_checkpoint_path} has no autoencoder state to analyse (looked for "
+            f"'model_state', 'ae_state', and 'model_states[\"ae_state\"]'). "
+            f"check_latent_channels needs an AE checkpoint (stage 1/2) or a refinement "
+            f"checkpoint (stage 4/5); a stage-3 f_theta checkpoint has no AE to inspect.")
     # Filter/preprocessing params default to the checkpoint's own recorded values
     # (reproducing the training frame population), overridden only if passed
     # explicitly. normalize_phi is NOT a CLI arg -- it MUST match how the encoder
@@ -441,11 +459,11 @@ def check_latent_channels(
     _normalize_phi = bool(ae_config.get("normalize_phi", False))
     stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
     stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
-        stream_configs, recon_stream_name, checkpoint["model_state"],
+        stream_configs, recon_stream_name, ae_state,
     )
     recon_stream = stream_configs[recon_stream_name]
     decoder_for_stream = ae_config.get("decoder_for_stream")
-    is_flat_checkpoint = any(k.startswith("encoder.") for k in checkpoint["model_state"])
+    is_flat_checkpoint = any(k.startswith("encoder.") for k in ae_state)
     if is_flat_checkpoint:
         # Mirrors model_assembly.py's own construction exactly (the
         # SAME code that produced this checkpoint) -- encoder built
@@ -490,7 +508,7 @@ def check_latent_channels(
                                      stream_configs=stream_configs,
                                      decoder_for_stream=decoder_for_stream).to(device)
     from models.encoder import zero_pad_theta_columns
-    ae.load_state_dict(zero_pad_theta_columns(checkpoint["model_state"], ae))
+    ae.load_state_dict(zero_pad_theta_columns(ae_state, ae))
     ae.eval()
     ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
 
@@ -677,9 +695,17 @@ def check_latent_channels(
                     _metrics[f"val_{_k}"] = float(_v)
                 if checkpoint.get("val_components"):
                     _metrics["val_components_kind"] = "weighted_scaled"
-            upsert_eval_row(
+            # Fill-or-branch on the CH IMPORTANCE cells (this tool's distinctive
+            # output) -- so importances fill an existing row for the same
+            # checkpoint+epoch (e.g. compare_f_theta's rollout row) instead of
+            # spawning an empty-variant twin. params/components in _metrics are
+            # shared checkpoint facts and are NOT the discriminator.
+            _imp_cols = [c for c in _metrics if c.startswith("ch") and c.endswith("_imp")]
+            upsert_eval_metrics(
                 eval_csv_for_checkpoint(ae_checkpoint_path, _PYTHON_ROOT.parent / "output"),
-                ae_checkpoint_path, checkpoint.get("epoch"), _metrics)
+                ae_checkpoint_path, checkpoint.get("epoch"), _metrics,
+                owned_cols=_imp_cols, broadcast=True)   # importances are checkpoint-level
+                                                        # -> fill ALL horizon rows
         except Exception as _e:      # logging must never break the diagnostic
             print(f"  (eval-log skipped: {_e})")
         if other_stream_names:
