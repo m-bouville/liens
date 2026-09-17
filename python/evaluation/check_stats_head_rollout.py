@@ -56,7 +56,7 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent
 
 from models.constants import LATENT_SPATIAL_SIZE, N_THETA  # noqa: E402
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config  # noqa: E402
-from training.checkpoint_components import build_ae_from_checkpoint  # noqa: E402
+from training.checkpoint_components import build_ae_from_checkpoint, resolve_normalize_phi  # noqa: E402
 from training.datasets import (  # noqa: E402
     MicrostructureEvolutionDataset, complete_run_dirs, split_run_dirs,
 )
@@ -190,7 +190,7 @@ def main():
         test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
         min_step=_min_step, min_normalized_stdev_phi=_mnsp,
         max_dt=_max_dt, encode_both_streams=True,
-        normalize_phi=ae_config.get("normalize_phi", False),
+        normalize_phi=resolve_normalize_phi(ae_config, ae_checkpoint),
         time_coordinate=_time_coord,           # MATCH TRAINING (was defaulting to 't')
         derivative_source=_deriv_src,          # MATCH TRAINING (was defaulting to 'z1')
         return_phys_dt=_return_phys,

@@ -44,6 +44,7 @@ from models.latent_streams import (
     LatentStreamMode, cross_check_stream_configs_against_state_dict,
     resolve_stream_configs_from_checkpoint_config,
 )
+from training.checkpoint_components import resolve_normalize_phi
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
 from utils.naming import ae_checkpoint_name
@@ -227,7 +228,7 @@ def check_reconstruction(
     # normalize_phi MUST match how the AE was trained (recorded on the checkpoint):
     # feeding raw phi to a psi-trained encoder shows the raw field (bulk at phi_eq(T),
     # not +/-1) and evaluates reconstruction on the wrong distribution.
-    normalize_phi = bool(model_cfg.get("normalize_phi", False))
+    normalize_phi = resolve_normalize_phi(model_cfg, checkpoint)
     dataset = MicrostructureEvolutionDataset(
         test_dirs, encoder=None, window_length=2, min_step=min_step, min_stdev_phi=min_stdev_phi,
         normalize_phi=normalize_phi,

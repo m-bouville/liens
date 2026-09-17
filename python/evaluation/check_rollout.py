@@ -57,7 +57,7 @@ from models.constants import N_THETA
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from models.latent_streams import resolve_stream_configs_from_checkpoint_config
 from utils.window_parsing import parse_fixed_window
-from training.checkpoint_components import build_ae_from_checkpoint
+from training.checkpoint_components import build_ae_from_checkpoint, resolve_normalize_phi
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
@@ -491,9 +491,9 @@ def check_rollout(
             test_dirs, encoder=ae_encoder, device=device, window_length=window_length,
             max_dt=max_dt,
             min_step=min_step, min_stdev_phi=min_stdev_phi,
-            # Feed the encoder the SAME field scaling it was trained on; absent key
-            # (pre-normalize_phi checkpoint) = raw = False, which is what it was.
-            normalize_phi=ae_config.get("normalize_phi", False),
+            # Feed the encoder the SAME field scaling it was trained on; the resolver
+            # falls back to data_config for checkpoints that recorded it only there.
+            normalize_phi=resolve_normalize_phi(ae_config, ae_checkpoint),
             # Match the model's deriv stream: a previous_quotient f_theta is seeded with
             # the backward quotient q, not the z1 head (the dataset default). The
             # COORDINATE is handled below (t-mode build, converted to Delta-u/z~1 at

@@ -17,6 +17,7 @@ from training.checkpoint_components import (
     validate_component_compatibility, assemble_joint_checkpoint,
     split_joint_checkpoint_for_evaluation,
     _strip_encoder_or_decoder_prefix, _strip_decoder_prefix_for_stream,
+    resolve_normalize_phi,
 )
 from models.constants import LATENT_SPATIAL_SIZE
 
@@ -470,3 +471,127 @@ def test_split_joint_checkpoint_lds_view_carries_data_config(tmp_path):
     assert lds_view["data_config"] == checkpoint["data_config"]
     assert lds_view["test_dirs"] == checkpoint["test_dirs"]
     assert lds_view["config"] == checkpoint["lds_config"]
+
+
+# --------------------------------------------------------------------------- #
+# resolve_normalize_phi
+# --------------------------------------------------------------------------- #
+# Had ZERO call sites and ZERO direct tests before the 2026-09-17 refactor
+# session that wired it into check_latent_channels/check_reconstruction/
+# check_rollout/check_stats_head_rollout/compare_f_theta (each previously read
+# config.get("normalize_phi", False) directly, independently -- exactly the
+# drift its own docstring warns about). These cover the function itself, in
+# isolation, at the level the wiring guards below assume it already works.
+
+def test_resolve_normalize_phi_reads_primary_config():
+    assert resolve_normalize_phi({"normalize_phi": True}) is True
+    assert resolve_normalize_phi({"normalize_phi": False}) is False
+
+
+def test_resolve_normalize_phi_falls_back_to_checkpoint_data_config():
+    """The documented 'older stage-3/4 saves' case: the flag is absent from
+    the primary config dict but present under checkpoint["data_config"]."""
+    config = {}   # normalize_phi absent here
+    checkpoint = {"data_config": {"normalize_phi": True}}
+    assert resolve_normalize_phi(config, checkpoint) is True
+
+
+def test_resolve_normalize_phi_primary_config_wins_over_fallback():
+    """config["normalize_phi"] is authoritative when present -- the
+    checkpoint fallback is consulted ONLY when the primary is absent, never
+    used to override a value that IS recorded (even if they'd disagree)."""
+    config = {"normalize_phi": False}
+    checkpoint = {"data_config": {"normalize_phi": True}}
+    assert resolve_normalize_phi(config, checkpoint) is False
+
+
+def test_resolve_normalize_phi_defaults_false_when_absent_everywhere():
+    """Absent from the primary config, no checkpoint passed at all (the
+    pre-feature / stage-1-only case) -- the documented raw default, not a
+    crash on checkpoint=None."""
+    assert resolve_normalize_phi({}) is False
+    assert resolve_normalize_phi({}, None) is False
+
+
+def test_resolve_normalize_phi_defaults_false_when_checkpoint_has_no_data_config():
+    """checkpoint IS passed but has no data_config key at all -- the
+    fallback's own .get("data_config", {}) must not raise."""
+    assert resolve_normalize_phi({}, {"config": {}}) is False
+
+
+def test_resolve_normalize_phi_coerces_to_bool():
+    """Documented contract is a bool return, not whatever falsy/truthy value
+    happened to be stored (e.g. an old checkpoint recording 0/1 or "True")."""
+    assert resolve_normalize_phi({"normalize_phi": 1}) is True
+    assert resolve_normalize_phi({"normalize_phi": 0}) is False
+
+
+# --------------------------------------------------------------------------- #
+# resolve_normalize_phi wiring: each diagnostic must ROUTE THROUGH the
+# resolver rather than reading config.get("normalize_phi", ...) directly --
+# that direct-read pattern is exactly what left the function with 0 real
+# call sites despite being documented as "the ONE place" to read this flag.
+# Source-inspection (not behavioral): each of these tools needs a full AE +
+# dataset to exercise behaviorally, which is disproportionate for a wiring
+# check: the resolver's own correctness is covered above, and
+# test_check_latent_channels.py / test_check_rollout.py /
+# test_compare_f_theta.py cover each tool's broader behavior already. This
+# only guards that the wiring itself doesn't quietly regress back to a
+# direct .get() -- matching this session's test_stage2_ancestor_timestamping
+# precedent for the same kind of "did the call site route through the
+# canonical function" check.
+# --------------------------------------------------------------------------- #
+from pathlib import Path as _Path
+
+_HERE = _Path(__file__).resolve().parent
+
+
+def _find_source(name: str) -> str:
+    for cand in (_HERE / name, _HERE.parent / "evaluation" / name,
+                 _HERE.parent / "training" / name, _HERE.parent / name):
+        if cand.exists():
+            return cand.read_text()
+    for cand in _HERE.parent.rglob(name):
+        return cand.read_text()
+    raise FileNotFoundError(name)
+
+
+def test_check_latent_channels_routes_through_resolve_normalize_phi():
+    src = _find_source("check_latent_channels.py")
+    assert "resolve_normalize_phi(ae_config, _ae_source_ckpt)" in src
+    # the stage-3 redirect must repoint the tracker at the ANCESTOR checkpoint
+    # (not leave it on the 3b) -- the exact bug this wiring had to avoid.
+    assert "_ae_source_ckpt = _ae_ckpt" in src
+
+
+def test_check_reconstruction_routes_through_resolve_normalize_phi():
+    src = _find_source("check_reconstruction.py")
+    assert "resolve_normalize_phi(model_cfg, checkpoint)" in src
+
+
+def test_check_rollout_routes_through_resolve_normalize_phi():
+    src = _find_source("check_rollout.py")
+    assert "resolve_normalize_phi(ae_config, ae_checkpoint)" in src
+
+
+def test_check_stats_head_rollout_routes_through_resolve_normalize_phi():
+    src = _find_source("check_stats_head_rollout.py")
+    assert "resolve_normalize_phi(ae_config, ae_checkpoint)" in src
+
+
+def test_compare_f_theta_routes_through_resolve_normalize_phi():
+    src = _find_source("compare_f_theta.py")
+    assert 'resolve_normalize_phi(model.get("ae_config") or {}, model.get("ck"))' in src
+
+
+def test_select_latent_channels_deliberately_not_wired():
+    """select_latent_channels.py's normalize_phi handling preserves
+    ABSENCE (prints a warning, writes no key) rather than resolving a
+    default -- resolve_normalize_phi always returns a bool and would
+    collapse that distinction, reintroducing the exact silent-mismatch
+    failure its own comment warns about. This documents the omission was a
+    deliberate scope decision, not a miss -- if the file's actual logic
+    changes, this guard should be revisited alongside it."""
+    src = _find_source("select_latent_channels.py")
+    assert "resolve_normalize_phi" not in src
+    assert 'config.get("normalize_phi")' in src   # the deliberate presence-check it keeps instead

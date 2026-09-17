@@ -21,9 +21,12 @@ Two levels:
 """
 import re
 import time
+import ast
 from pathlib import Path
 
 import pytest
+
+from _ast_helpers import calls_to, call_kwarg
 
 # _archive_ancestor is a pure stdlib file op -- import and run it directly.
 try:
@@ -45,6 +48,17 @@ def _find(name: str) -> str:
     for cand in _HERE.parent.rglob(name):
         return cand.read_text()
     raise FileNotFoundError(name)
+
+
+def _find_ast(name: str):
+    """AST of a source file located the same way _find locates its text --
+    for asserting call STRUCTURE (a call to X, a kwarg passed to Y) rather
+    than source substrings, which break on a rename/reformat that leaves the
+    behaviour identical, and can false-match the same text in a comment or an
+    unrelated call. See tests/_ast_helpers.py."""
+    import ast
+    return ast.parse(_find(name), filename=name)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -114,24 +128,69 @@ def test_refinement_records_timestamped_ancestors_in_signature():
     """run_refinement_stage must archive BOTH ancestors (stage-2 encoder AND
     stage-3b f_theta) via _archive_ancestor and record the RETURNED timestamped
     paths in the checkpoint signature -- so N+1's saved ancestor pointer is
-    timestamped, not the overwritten generic name."""
-    src = _find("pipeline.py")
-    assert "_ae_ancestor = _archive_ancestor(stage2_checkpoint)" in src
-    assert "_f_theta_ancestor = _archive_ancestor(stage3_checkpoint)" in src
-    assert 'str(_ae_ancestor)' in src and 'str(_f_theta_ancestor)' in src
+    timestamped, not the overwritten generic name.
+
+    Structural (AST) rather than substring: asserts _archive_ancestor is
+    actually CALLED on each ancestor, which survives a rename of the result
+    variable or a reformat, and can't be satisfied by the name appearing in a
+    comment. The argument identifiers (stage2_checkpoint / stage3_checkpoint)
+    are the stable public-ish names the refinement path threads through."""
+    tree = _find_ast("pipeline.py")
+    archived_args = {
+        arg.id
+        for call in calls_to(tree, "_archive_ancestor")
+        for arg in call.args[:1]
+        if isinstance(arg, ast.Name)
+    }
+    assert "stage2_checkpoint" in archived_args, (
+        "the stage-2 encoder ancestor is not archived via _archive_ancestor -- "
+        f"archived-on names found: {sorted(archived_args)}")
+    assert "stage3_checkpoint" in archived_args, (
+        "the stage-3b f_theta ancestor is not archived via _archive_ancestor -- "
+        f"archived-on names found: {sorted(archived_args)}")
 
 
 def test_refinement_passes_timestamped_ancestors_to_trainer_for_logging():
     """The trainer receives the timestamped paths (not the generic names), so its
-    'loaded ... / f_theta from ...' log line names the timestamped ancestor."""
-    src = _find("pipeline.py")
-    assert "ae_checkpoint_path=_ae_ancestor" in src
-    assert "lds_checkpoint_path=_f_theta_ancestor" in src
+    'loaded ... / f_theta from ...' log line names the timestamped ancestor.
+
+    Structural: the string form ("ae_checkpoint_path=_ae_ancestor" in src) could
+    not scope to the RIGHT call -- pipeline.py passes ae_checkpoint_path= /
+    lds_checkpoint_path= to several tools (check_latent_channels, train_lds,
+    check_rollout, ...). This asserts specifically that the train_refinement call
+    is handed the archived-ancestor variables, which is the invariant that
+    actually matters."""
+    tree = _find_ast("pipeline.py")
+    refine_calls = calls_to(tree, "train_refinement")
+    assert refine_calls, "no call to train_refinement found in pipeline.py"
+
+    def _kwarg_names(kw):
+        return {call_kwarg(c, kw).id for c in refine_calls
+                if isinstance(call_kwarg(c, kw), ast.Name)}
+
+    ae_args = _kwarg_names("ae_checkpoint_path")
+    lds_args = _kwarg_names("lds_checkpoint_path")
+    assert "_ae_ancestor" in ae_args, (
+        "train_refinement is not passed the archived stage-2 ancestor as "
+        f"ae_checkpoint_path -- got {sorted(ae_args)}")
+    assert "_f_theta_ancestor" in lds_args, (
+        "train_refinement is not passed the archived stage-3b ancestor as "
+        f"lds_checkpoint_path -- got {sorted(lds_args)}")
 
 
 def test_trainer_logs_the_ancestor_path_it_was_given():
     """train_refinement builds its load-line ancestor_note from the paths it is
-    handed -- so passing timestamped paths (above) makes the LOG timestamped."""
+    handed -- so passing timestamped paths (above) makes the LOG timestamped.
+
+    Mixed by design: "f_theta from" is a genuine user-facing LOG STRING literal
+    (a string match is correct for it -- it IS a string), while the _pin(...)
+    calls are code structure, asserted via calls_to so a rename/reformat doesn't
+    break them and "_pin(ae_checkpoint_path" can't false-match _pin(ae_checkpoint_path_x)."""
     src = _find("train_refinement.py")
-    assert "f_theta from" in src and "ancestor_note" in src
-    assert "_pin(ae_checkpoint_path" in src and "_pin(lds_checkpoint_path" in src
+    assert "f_theta from" in src and "ancestor_note" in src   # user-facing log text
+    tree = ast.parse(src, filename="train_refinement.py")
+    pinned = {call.args[0].id for call in calls_to(tree, "_pin")
+              if call.args and isinstance(call.args[0], ast.Name)}
+    assert "ae_checkpoint_path" in pinned and "lds_checkpoint_path" in pinned, (
+        "train_refinement must _pin() both ancestor paths into its load line -- "
+        f"_pin'd names found: {sorted(pinned)}")

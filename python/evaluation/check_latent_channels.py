@@ -46,6 +46,7 @@ from models.latent_streams import (
     DEFAULT_STREAM_NAME, cross_check_stream_configs_against_state_dict,
     resolve_stream_configs_from_checkpoint_config,
 )
+from training.checkpoint_components import resolve_normalize_phi
 from training.datasets import MicrostructureSnapshotDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
@@ -453,6 +454,13 @@ def check_latent_channels(
 
     checkpoint = torch.load(ae_checkpoint_path, map_location=device, weights_only=True)
     ae_config = checkpoint["config"]
+    # The dict ae_config actually came from -- `checkpoint` here, but reassigned to
+    # `_ae_ckpt` below on the stage-3 redirect. Tracked separately from `checkpoint`
+    # (which deliberately stays the 3b for eval-log identity, see below) so
+    # resolve_normalize_phi's data_config fallback reads the AE's OWN checkpoint,
+    # not the f_theta 3b's -- a stage-3 checkpoint has no data_config of its own to
+    # fall back to correctly.
+    _ae_source_ckpt = checkpoint
     # The AE state lives under different keys by checkpoint kind: an AE checkpoint
     # (stage 1/2) has it at top-level "model_state"; a refinement checkpoint
     # (stage 4/5) bundles several sub-states and keeps the (refined) AE under
@@ -492,6 +500,7 @@ def check_latent_channels(
             _ae_ckpt = torch.load(ae_ptr, map_location=device, weights_only=True)
             ae_config = _ae_ckpt["config"]
             ae_state = _ae_ckpt.get("model_state")
+            _ae_source_ckpt = _ae_ckpt
     if ae_state is None:
         raise SystemExit(
             f"{ae_checkpoint_path} has no autoencoder state to analyse (looked for "
@@ -510,7 +519,7 @@ def check_latent_channels(
         min_stdev_phi = ae_config.get("min_stdev_phi")
     if min_normalized_stdev_phi is None:
         min_normalized_stdev_phi = ae_config.get("min_normalized_stdev_phi")
-    _normalize_phi = bool(ae_config.get("normalize_phi", False))
+    _normalize_phi = resolve_normalize_phi(ae_config, _ae_source_ckpt)
     stream_configs, recon_stream_name = resolve_stream_configs_from_checkpoint_config(ae_config)
     stream_configs, recon_stream_name = cross_check_stream_configs_against_state_dict(
         stream_configs, recon_stream_name, ae_state,

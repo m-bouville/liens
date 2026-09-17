@@ -73,7 +73,7 @@ _PYTHON_ROOT = Path(__file__).resolve().parent.parent
 from models.constants import LATENT_SPATIAL_SIZE, theta_coordinates, N_THETA
 from utils.paths import default_latent_cache_dir
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
-from training.checkpoint_components import build_ae_from_checkpoint
+from training.checkpoint_components import build_ae_from_checkpoint, resolve_normalize_phi
 from training.datasets import MicrostructureEvolutionDataset
 from training.losses import ReconLoss
 from utils import load_datasets as load
@@ -191,9 +191,10 @@ def _select_windows(model: dict, n_samples: int, n_steps: int, seed: int,
         min_step=data_config.get("min_step", 0),
         min_stdev_phi=data_config.get("min_stdev_phi"),
         # Feed the encoder the SAME field scaling it was trained on -- read from the
-        # ENCODER's own config (model["ae_config"]), not the LDS data_config. Absent
-        # key (pre-normalize_phi checkpoint) = raw = False, which is what it was.
-        normalize_phi=(model.get("ae_config") or {}).get("normalize_phi", False),
+        # ENCODER's own config (model["ae_config"]), not the LDS data_config; the
+        # resolver also falls back to model["ck"]'s data_config for checkpoints that
+        # recorded it only there.
+        normalize_phi=resolve_normalize_phi(model.get("ae_config") or {}, model.get("ck")),
         # Apply the SAME window filters the anchor model trained under, so the
         # eval population matches training. Without threading the normalized
         # filter, a model trained with min_normalized_stdev_phi (and thus
