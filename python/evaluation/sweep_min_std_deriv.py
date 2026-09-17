@@ -33,19 +33,9 @@ from pathlib import Path
 import numpy as np
 
 from training.datasets import MicrostructureEvolutionDataset, complete_run_dirs
+from utils.sweep_filters_common import _sma
 
 _PYTHON_ROOT = Path(__file__).resolve().parent.parent
-
-
-def _sma(y, w):
-    """Centered, NaN-aware simple moving average over w points (w<=1 = no-op)."""
-    if w <= 1:
-        return y
-    y = np.asarray(y, float)
-    valid = ~np.isnan(y)
-    num = np.convolve(np.where(valid, y, 0.0), np.ones(w), "same")
-    den = np.convolve(valid.astype(float), np.ones(w), "same")
-    return np.where(den > 0, num / den, np.nan)
 
 
 def _window_std_deriv_values(ds):

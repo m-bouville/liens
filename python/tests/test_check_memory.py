@@ -138,13 +138,13 @@ def test_the_power_law_beats_the_fixed_predictors_on_real_measurements():
     """
     import numpy as np
 
-    from evaluation.check_memory import _fit_and_residuals, fit_power_law
+    from evaluation.check_memory import _fit_and_residuals, fit_memory_power_law
     n = np.array([2048, 1343, 821, 593, 427, 167], float)
     hi = np.array([43, 93, 152, 210, 291, 470], float)
     mib = np.array([869.9, 1108.5, 1125.4, 1047.7, 1010.1, 474.1])
 
     _, worst_raw = _fit_and_residuals(n * hi, mib)
-    p, _, worst_pow = fit_power_law(n, hi, mib)
+    p, _, worst_pow = fit_memory_power_law(n, hi, mib)
 
     assert 0.35 < worst_raw < 0.50, f"raw residual moved: {worst_raw:.1%}"
     assert 0.70 <= p <= 0.90, f"fitted exponent moved: {p:.2f}"

@@ -214,6 +214,7 @@ dict_key_imports_values = {
     },
     'evaluation/sweep_min_std_deriv.py': {
         'training/datasets.py',
+        'utils/sweep_filters_common.py',
     },
     'evaluation/sweep_min_stdev_phi.py': {
         'training/datasets.py',
@@ -828,6 +829,7 @@ dict_key_imported_by_values = {
     },
     'utils/sweep_filters_common.py': {
         'evaluation/sweep_min_passing_steps.py',
+        'evaluation/sweep_min_std_deriv.py',
         'evaluation/sweep_min_stdev_phi.py',
     },
     'utils/window_parsing.py': {

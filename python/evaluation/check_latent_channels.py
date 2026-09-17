@@ -28,6 +28,7 @@ being on sys.path):
 """
 
 import argparse
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -404,6 +405,30 @@ def plot_importance_by_condition(temps, times, deltas, output_path, n_bins: int 
     _save_figure_or_warn(fig, out)
 
 
+def _resolve_input_size(ae_config: dict, ae_state: dict, latent_spatial_size: int) -> int:
+    """Real-space input size for building the AE.
+
+    Stage 1/2 checkpoints record it as config["size"]; stage-3 checkpoints
+    do NOT (size lives only in their stage-2 ancestor), so fall back to
+    inferring it from the encoder's down-block count in the bundled AE
+    state -- each DownBlock halves resolution, so
+        size = latent_spatial_size * 2 ** n_down_blocks.
+    Prefix-agnostic: matches down_blocks.<i>. wherever the encoder sits in
+    the key path (encoder.down_blocks.., ae.encoder.down_blocks.., ..).
+    """
+    recorded = ae_config.get("size")
+    if recorded is not None:
+        return int(recorded)
+    idx = [int(m.group(1)) for k in ae_state
+           for m in [re.search(r"down_blocks\.(\d+)\.", k)] if m]
+    if not idx:
+        raise KeyError(
+            "checkpoint config has no 'size' and its AE state has no "
+            "down_blocks.* keys to infer it from -- cannot determine the "
+            "input size to build the autoencoder.")
+    return latent_spatial_size * (2 ** (max(idx) + 1))
+
+
 def check_latent_channels(
     ae_checkpoint_path: Path, fixed_frames: list[str] | None = None,
     n_frames: int = 12, seed: int = 0, min_step: int | None = None, min_stdev_phi: float | None = None,
@@ -431,20 +456,49 @@ def check_latent_channels(
     # The AE state lives under different keys by checkpoint kind: an AE checkpoint
     # (stage 1/2) has it at top-level "model_state"; a refinement checkpoint
     # (stage 4/5) bundles several sub-states and keeps the (refined) AE under
-    # "ae_state". Resolve once so this tool works on both -- analysing the refined
-    # encoder's channels is legitimate. Fail clearly if it is neither (e.g. a
-    # stage-3 f_theta-only checkpoint has no AE state to analyse).
+    # "ae_state". A stage-3 f_theta checkpoint carries NO AE weights -- it stores
+    # f_theta as "model_state" and only a PATH to its frozen AE ancestor in
+    # "ae_checkpoint"; that case is followed to the ancestor just below.
     ae_state = checkpoint.get("model_state")
     if ae_state is None:
         ae_state = checkpoint.get("ae_state")
     if ae_state is None and isinstance(checkpoint.get("model_states"), dict):
         ae_state = checkpoint["model_states"].get("ae_state")
+    # If what we resolved is not an AE (no encoder-trunk keys), this is a stage-3
+    # f_theta checkpoint: follow its "ae_checkpoint" pointer and inspect the frozen
+    # AE ancestor instead. Stage 3 freezes the encoder, so the ancestor's channels
+    # ARE this run's channels -- inspecting the 3b and its ancestor is equivalent.
+    _is_ae = ae_state is not None and any(
+        "down_blocks." in k or "bottlenecks." in k for k in ae_state)
+    if not _is_ae:
+        ae_ptr = checkpoint.get("ae_checkpoint")
+        if ae_ptr is None and isinstance(checkpoint.get("model_states"), dict):
+            ae_ptr = checkpoint["model_states"].get("ae_checkpoint")
+        if ae_ptr is not None:
+            ae_ptr = Path(ae_ptr)
+            if not ae_ptr.exists():
+                raise SystemExit(
+                    f"{ae_checkpoint_path} is a stage-3 f_theta checkpoint whose frozen "
+                    f"AE ancestor is recorded at {ae_ptr}, but that file is not present "
+                    f"-- pass the stage-2 ancestor directly, or re-base the path.")
+            print(f"{Path(ae_checkpoint_path).name} is a stage-3 f_theta checkpoint "
+                  f"(no bundled AE); inspecting its frozen AE ancestor {ae_ptr.name}.")
+            # Load the ANCESTOR only to BUILD/RUN the encoder. Deliberately do NOT
+            # rebind `checkpoint`: it stays the 3b the user passed, so the eval-log
+            # row is keyed and populated from the 3b (its epoch, params, val
+            # components) -- not the stage-2 ancestor's. Rebinding it here logged
+            # the ancestor's epoch, spawning a duplicate row instead of updating
+            # the 3b's own.
+            _ae_ckpt = torch.load(ae_ptr, map_location=device, weights_only=True)
+            ae_config = _ae_ckpt["config"]
+            ae_state = _ae_ckpt.get("model_state")
     if ae_state is None:
         raise SystemExit(
             f"{ae_checkpoint_path} has no autoencoder state to analyse (looked for "
             f"'model_state', 'ae_state', and 'model_states[\"ae_state\"]'). "
             f"check_latent_channels needs an AE checkpoint (stage 1/2) or a refinement "
-            f"checkpoint (stage 4/5); a stage-3 f_theta checkpoint has no AE to inspect.")
+            f"checkpoint (stage 4/5); a stage-3 f_theta checkpoint must record its AE "
+            f"ancestor path in 'ae_checkpoint'.")
     # Filter/preprocessing params default to the checkpoint's own recorded values
     # (reproducing the training frame population), overridden only if passed
     # explicitly. normalize_phi is NOT a CLI arg -- it MUST match how the encoder
@@ -462,6 +516,10 @@ def check_latent_channels(
         stream_configs, recon_stream_name, ae_state,
     )
     recon_stream = stream_configs[recon_stream_name]
+    # Stage 1/2 record 'size' in config; stage 3+ do not (it lives in their
+    # stage-2 ancestor), so resolve it once here -- from config when present,
+    # else inferred from the bundled AE state's down-block count.
+    size = _resolve_input_size(ae_config, ae_state, recon_stream.spatial_size)
     decoder_for_stream = ae_config.get("decoder_for_stream")
     is_flat_checkpoint = any(k.startswith("encoder.") for k in ae_state)
     if is_flat_checkpoint:
@@ -470,37 +528,37 @@ def check_latent_channels(
         # with the FULL stream_configs (every bottleneck, even ones
         # with no decoder here), wrapped in a single-pathway
         # EncoderDecoderPair for just the reconstruction stream.
-        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+        encoder = Encoder(input_size=size, in_channels=1,
                            base_channels=ae_config["base_channels"], stream_configs=stream_configs)
-        decoder = Decoder(output_size=ae_config["size"], out_channels=1,
+        decoder = Decoder(output_size=size, out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
         ae = EncoderDecoderPair(encoder, decoder, stream_name=recon_stream_name,
                                  mode=recon_stream.mode).to(device)
     elif len(stream_configs) == 1:
         ae = Autoencoder(
-            size=ae_config["size"], channels=1,
+            size=size, channels=1,
             base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
             latent_spatial_size=recon_stream.spatial_size,
         ).to(device)
     elif decoder_for_stream is None:
-        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+        encoder = Encoder(input_size=size, in_channels=1,
                            base_channels=ae_config["base_channels"], stream_configs=stream_configs,
                            n_theta=N_THETA)
-        decoder = Decoder(output_size=ae_config["size"], out_channels=1,
+        decoder = Decoder(output_size=size, out_channels=1,
                            base_channels=ae_config["base_channels"], latent_channels=recon_stream.channels,
                            latent_spatial_size=recon_stream.spatial_size)
         ae = MultiStreamAutoencoder(encoders={"shared": encoder}, decoders={"shared": decoder},
                                      stream_configs=stream_configs).to(device)
     else:
-        encoder = Encoder(input_size=ae_config["size"], in_channels=1,
+        encoder = Encoder(input_size=size, in_channels=1,
                            base_channels=ae_config["base_channels"], stream_configs=stream_configs,
                            n_theta=N_THETA)
         decoders = {}
         for stream_name, decoder_key in decoder_for_stream.items():
             stream_cfg = stream_configs[stream_name]
             decoders[decoder_key] = Decoder(
-                output_size=ae_config["size"], out_channels=1,
+                output_size=size, out_channels=1,
                 base_channels=ae_config["base_channels"], latent_channels=stream_cfg.channels,
                 latent_spatial_size=stream_cfg.spatial_size,
             )
@@ -512,7 +570,7 @@ def check_latent_channels(
     ae.eval()
     ae_encoder = ae.encoder if hasattr(ae, "encoder") else ae.encoders["shared"]
 
-    nx, ny = ae_config["size"], ae_config["size"]
+    nx, ny = size, size
 
     # Every stream gets shown, not just the recon one -- recon stream
     # first (it's "the" state, most familiar to read), then the rest in

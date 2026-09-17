@@ -297,6 +297,15 @@ def run_from_params_file(params_path: Path, default_base: Path,
                                             own_keys=renamed_keys(stages.get(2, {})))
     stage2_kwargs, stage2_resume_from, stage2_overridden = _resolve_stage_specific_ancestor(
         stage2_kwargs, stage1_checkpoint, "Stage 2")
+    if stage2_resume_from is not None and not stage2_overridden:
+        # Auto-chained ancestor (stage 1 -> stage 2): pin its timestamped identity
+        # so the log and cache signature name the ACTUAL stage-1, not the rotating
+        # canonical 128x128-stage1.pt that the next stage-1 run overwrites in place
+        # -- matching the archiving stages 3/4/5 already do for their own ancestors.
+        # Also makes a RETRAINED stage 1 (new mtime -> new name) correctly
+        # invalidate this stage-2's cache, which the unchanging canonical name did
+        # not: that is how a killed/undertrained stage 1 could silently reseed here.
+        stage2_resume_from = _archive_ancestor(Path(stage2_resume_from))
     # Naming note: registries use a consistent "stageN_checkpoint" ancestry
     # convention across ALL stages, independent of whatever the underlying
     # function calls its own parameter (train_stage2 calls it resume_from,
@@ -320,7 +329,7 @@ def run_from_params_file(params_path: Path, default_base: Path,
     # shaped checkpoint (PURE_LATENT deriv, no D1, stats_head1 present),
     # not a no-op.
     signature2 = {"base_path": str(base_path),
-                   "stage1_checkpoint": str(stage1_checkpoint),
+                   "stage1_checkpoint": str(stage1_checkpoint if stage2_overridden else stage2_resume_from),
                    **({"resumed_from": str(stage2_resume_from)} if stage2_overridden else {}),
                    **extra_signature, **_signature_kwargs(stage2_kwargs)}
     stage2_checkpoint = resolve_checkpoint(2, force2, signature2, stage2_kwargs.get("epochs"))

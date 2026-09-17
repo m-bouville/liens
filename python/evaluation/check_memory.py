@@ -127,7 +127,7 @@ def _fit_and_residuals(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     return a, float(rel.max())
 
 
-def fit_power_law(n: np.ndarray, hi: np.ndarray, y: np.ndarray,
+def fit_memory_power_law(n: np.ndarray, hi: np.ndarray, y: np.ndarray,
                    lo_p: float = 0.3, hi_p: float = 1.5) -> tuple[float, float, float]:
     """Best n * hi**p fit to measured bytes; returns (p, bytes_per_unit, worst).
 
@@ -474,7 +474,7 @@ def check_memory(lds_checkpoint_path: Path, base_path: Path | None = None,
                   f"constant {_c / 2**20:6.1f} MiB)")
         _n = np.array([r["predictors"]["n_windows"] for r in rows], float)
         _hi = np.array([r["predictors"]["count_hi"] for r in rows], float)
-        _p, _a, _worst = fit_power_law(_n, _hi, measured)
+        _p, _a, _worst = fit_memory_power_law(_n, _hi, measured)
         fits["n_x_depth^p"] = {"bytes_per_unit": _a, "worst_rel_residual": _worst,
                                 "exponent": _p}
         print(f"  {'n x depth^p':>14}: {_a:8.0f} bytes/unit at p={_p:.2f}, "
