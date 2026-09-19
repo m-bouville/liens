@@ -9,7 +9,7 @@ val_fraction  =  0.25
 min_step 	  = 2000       	# skip snapshots earlier than this step
 min_stdev_phi = 1.e-3      	# skip snapshots whose stdev_phi is below this
 min_normalized_stdev_phi= 0.02	# was min_stdev_phi; skip snapshots whose normalized_stdev_phi (stdev_phi / sqrt(...)) is below this
-min_std_deriv = 1.e-7		# was 1.5e-4, then 1.e-6; TARGET: 1.e-8; skip time derivatives (w.r.t. t, not its log) whose stdev is below this (for: late, converged microstructures)
+min_std_deriv = 1.e-7		# was 1.5e-4, then 1.e-6; TARGET: 1.e-8; skip time derivatives (w.r.t. t, not its log) whose stdev is below this (aim: remove late, converged microstructures); BUG: currently applied only in stage 2, not 3-5.
 min_passing_steps= None		# was 12 (causing too much trouble). any run with fewer than that many steps (out of 65) clearing `min_stdev_phi` is dropped entirely (all its steps, not just the sub-threshold ones)
 
 recon0_scale  = 0.07e-3		# was 0.17e-3 then 0.1e-3
@@ -58,7 +58,7 @@ augment       = False		# takes hours per epoch otherwise
 #   latent-space structure: z1 approximates d z0 / dt
 #############################################################
 
-# resume_from = checkpoints/stage2/128x128-stage2a-20260910_10h35.pt
+resume_from = checkpoints/stage2/128x128-stage2a-20260917_01h09.pt
 
 ## Stage 2a (trains only z1 head, not z0: faster)
 # stage2a	  	= True
@@ -83,8 +83,8 @@ deriv_weight    = 0.5		# was 4. (with scale * 10)
 interp_weight   = 0.		# was 0.1
 
 # loss scales
-recon0_scale  	= 7.e-3		# was 0.07e-3, then 0.7e-3
-stats0_scale  	= 1.	 	# was 0.1
+recon0_scale  	= 20.e-3	# was 7.e-3
+stats0_scale  	= 0.5	 	# was 1.
 deriv_scale   	= 0.07e-6 
 
 val_ema_decay   = 0.7		# was 0.7 (default)
@@ -146,7 +146,7 @@ z0_growth_scale = 	 5.e-3	# was 0.8e-3, then 2.5e-3; statistics: |ln ratio|: med
 use_dt_decade_weights=False	# incompatible with `deriv_linear`
 
 epochs 		  	=2000		# improvements are barely noticeable after that
-patience 	  	= 200
+patience 	  	= 400
 lr_warmup_epochs=  50
 
 num_workers	  	=   4 		# was 4, then 0
@@ -239,32 +239,31 @@ max_dt        	= inf 		# possible with `deriv_linear`
 #   encoder-LDS refinement
 #############################################################
 
-n_rollout_steps = 6
+n_rollout_steps = 8
 
 # loss weights
-rollout_weight	= 1.0       # primary term for stage 4 (default: 1.)
-recon0_weight	= 0.2  		# was 0.5       # small but > 0 anchor
-stats0_weight   = 0.05		# same ratio as stages 1 & 2: L_stats0 = L_recon0/4
+rollout_weight	   = 1.0 	# primary term for stage 4 (default: 1.)
+recon0_weight	   = 0.2  	# was 0.5       # small but > 0 anchor
+stats0_weight      = 0.05	# same ratio as stages 1 & 2: L_stats0 = L_recon0/4
 recon_predict_weight=0.2
 grad_predict_weight= 0.1 	# was implicitly 0
-allen_cahn_weight= 0.25
+allen_cahn_weight  = 0.25
 
 # loss scales
 rollout_scale   =   0.5 	# was 0.15
-recon0_scale    =   0.2e-3 	# was 0.1e-3 
+recon0_scale    =   0.5e-3 	# was 0.1e-3, then 0.2e-3
 stats0_scale    =   0.3 	# was 0.15
-recon_predict_scale=200.e-3	# was 20.e-3
-grad_predict_scale=	50.e-3	# was 5.e-3
-allen_cahn_scale=   100.e-6	# was 10.e-6
+recon_predict_scale=0.4		# was 20.e-3, then 0.2
+grad_predict_scale=	0.1		# was 5.e-3,  then 50.e-3
+allen_cahn_scale=   0.2e-3	# was 10.e-6, then 0.1e-3
 
 allen_cahn_all_steps= False	# True eats VRAM: reduce `batches`
 val_ema_decay   =   0.8		# was 0.7 (default)
 
 lr 			  	=   0.2e-6
 
-epochs 		  	=  30
-patience 	  	=   6
-
+epochs 		  	=  50
+patience 	  	=  10
 # warmups
 lr_warmup_epochs				  = 10
 rollout_weight_warmup_epochs      = 10	# 10 w/o `resume_from`
@@ -296,23 +295,23 @@ stats0_weight   = 0.05		# same ratio as stages 1 & 2: L_stats0 = L_recon0/4
 allen_cahn_weight=0.5
 
 # loss scales
-recon_predict_scale=4.0e-3	# was 3.5e-3, then 2.0e-3
-grad_predict_scale= 1.0e-3	# was 1.0e-3, then 0.5e-3
-rollout_scale   = 0.3 		# was 0.005,  then 0.15
-recon0_scale    = 4.0e-3 	# was 0.5e-3, then 2.0e-3
-stats0_scale    = 0.15		# was 0.003
-allen_cahn_scale= 0.2e-6	# was 5.e-3,  then 0.5e-6
+recon_predict_scale=10.e-3	# was 
+grad_predict_scale=  2.e-3	# was 
+rollout_scale     =  0.3 	# was 
+recon0_scale      =  7.e-3	# was 20.e-3
+stats0_scale      =  0.1	# was  0.3
+allen_cahn_scale  =  0.7e-6	# was  2.e-6
 
 allen_cahn_all_steps= False	# True eats VRAM: reduce `batches`
 
-lr 			  	=   6.e-6  	# was 6.e-6
+lr 			  	=   4.e-6  	# was 6.e-6
 
 epochs         	=  80
 patience       	=  15
 recon_predict_weight_warmup_epochs= 8
-allen_cahn_weight_warmup_epochs	  = 8
+# allen_cahn_weight_warmup_epochs	  = 8	# not implemented
 
-batches        	=  32		# model is larger than in stage 4 (D not longer frozen)
+batches        	=  24		# model is larger than in stage 4 (D not longer frozen)
 
 max_dt         	= same
 

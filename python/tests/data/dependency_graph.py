@@ -209,6 +209,11 @@ dict_key_imports_values = {
     'evaluation/lineage.py': {
         'orchestration/checkpoint_registry.py',
     },
+    'evaluation/plot_evolution.py': {
+        'evaluation/compare_f_theta.py',
+        'utils/load_datasets.py',
+        'utils/plot_helpers.py',
+    },
     'evaluation/select_latent_channels.py': set(),
     'evaluation/sweep_min_passing_steps.py': {
         'training/datasets.py',
@@ -490,7 +495,9 @@ dict_key_imported_by_values = {
     'evaluation/check_substep_convergence.py': set(),
     'evaluation/check_z1_degeneracy.py': set(),
     'evaluation/check_z2_measurability.py': set(),
-    'evaluation/compare_f_theta.py': set(),
+    'evaluation/compare_f_theta.py': {
+        'evaluation/plot_evolution.py',
+    },
     'evaluation/compare_integrators.py': set(),
     'evaluation/compare_rollout_training.py': set(),
     'evaluation/find_windows.py': set(),
@@ -498,6 +505,7 @@ dict_key_imported_by_values = {
     'evaluation/lineage.py': {
         'evaluation/compare_f_theta.py',
     },
+    'evaluation/plot_evolution.py': set(),
     'evaluation/select_latent_channels.py': set(),
     'evaluation/sweep_min_passing_steps.py': set(),
     'evaluation/sweep_min_std_deriv.py': set(),
@@ -779,6 +787,7 @@ dict_key_imported_by_values = {
         'evaluation/compare_f_theta.py',
         'evaluation/compare_rollout_training.py',
         'evaluation/find_windows.py',
+        'evaluation/plot_evolution.py',
         'orchestration/sweep_status.py',
         'training/_dataset_filtering.py',
         'training/datasets.py',
@@ -821,6 +830,7 @@ dict_key_imported_by_values = {
         'evaluation/check_latent_channels.py',
         'evaluation/check_parameter_dependence.py',
         'evaluation/compare_f_theta.py',
+        'evaluation/plot_evolution.py',
     },
     'utils/plots.py': {
         'evaluation/check_alpha.py',

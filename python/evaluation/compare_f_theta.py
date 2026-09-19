@@ -57,7 +57,8 @@ import torch
 from evaluation.lineage import (
     resolve_lineage, _stage_label, _ancestor_pointers, _registry_resume_of)
 
-from utils.plot_helpers import moving_window as _moving_window, pretty_label as _pretty_label
+from utils.plot_helpers import (moving_window as _moving_window,
+                                 pretty_label as _pretty_label, every_other_columns)
 from utils.eval_log import (upsert_eval_row, upsert_eval_metrics,
                             eval_csv_for_checkpoint, params_from_checkpoint)
 from utils.window_parsing import parse_fixed_window
@@ -1382,16 +1383,10 @@ def _trajectory_figure(run_dir: Path, steps: list[int], a: dict, b: dict,
     lo, hi = _padded_bounds(np.concatenate([f.ravel() for f in real_frames]),
                              1.0, symmetric=True)
 
-    # When there are more than 10 steps the panel gets unreadably wide, so plot
-    # every OTHER column (always keeping the first and the last frame, since the
-    # start and the final state are the two a reader most needs). At <=10 steps
-    # every column is shown.
-    if n_cols > 11:
-        col_indices = list(range(0, n_cols, 2))
-        if col_indices[-1] != n_cols - 1:
-            col_indices.append(n_cols - 1)
-    else:
-        col_indices = list(range(n_cols))
+    # Long runs get unreadably wide, so thin to every OTHER column (keeping the
+    # first and last frame). Shared with plot_evolution via every_other_columns
+    # so the rule can't drift between the two montage renderers.
+    col_indices = every_other_columns(n_cols)
     n_plot_cols = len(col_indices)
 
     # A little taller than 3 x 3.1: every model panel now carries a caption.

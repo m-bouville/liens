@@ -11,7 +11,7 @@ Run from python/ (imports rely on that root being on sys.path).
 """
 import numpy as np
 
-from utils.plot_helpers import moving_window, pretty_label
+from utils.plot_helpers import moving_window, pretty_label, every_other_columns
 
 
 # --------------------------------------------------------------------------- #
@@ -101,3 +101,33 @@ def test_pretty_label_finds_timestamp_amid_extra_text():
     everything before it as the stage part."""
     out = pretty_label("128x128-stage1-20260910_06h19-latent_channels")
     assert out == "128x128-stage1 (10/09 at 06:19)"
+
+
+# --------------------------------------------------------------------------- #
+# every_other_columns: the "long run" montage-thinning rule, shared by
+# compare_f_theta's _trajectory_figure and evaluation/plot_evolution so the two
+# renderers cannot drift (the exact per-file-copy hazard this module exists to
+# kill). Was inline in compare_f_theta; behaviour must be preserved exactly.
+# --------------------------------------------------------------------------- #
+def test_every_other_columns_shows_all_at_or_below_threshold():
+    for n in range(0, 12):                            # 0..11 inclusive
+        assert every_other_columns(n) == list(range(n))
+
+
+def test_every_other_columns_thins_above_threshold_keeping_first_and_last():
+    # 13 frames -> every other, and the last (12) is kept even though it is odd.
+    assert every_other_columns(13) == [0, 2, 4, 6, 8, 10, 12]
+    # 12 frames -> 11 is odd and range(0,12,2) ends at 10, so 11 is appended.
+    assert every_other_columns(12) == [0, 2, 4, 6, 8, 10, 11]
+
+
+def test_every_other_columns_always_includes_both_endpoints_when_thinned():
+    for n in range(12, 60):
+        idx = every_other_columns(n)
+        assert idx[0] == 0 and idx[-1] == n - 1       # start and final state kept
+
+
+def test_every_other_columns_threshold_is_configurable():
+    # A caller wanting a tighter montage can lower max_full.
+    assert every_other_columns(8, max_full=6) == [0, 2, 4, 6, 7]
+    assert every_other_columns(6, max_full=6) == [0, 1, 2, 3, 4, 5]

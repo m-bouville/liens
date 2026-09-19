@@ -142,3 +142,25 @@ def pretty_label(label: str, include_year: bool = False) -> str:
         date += f"/{m.group('Y')}"
     stamp = f"{date} at {m.group('h')}:{m.group('min')}"
     return f"{stage} ({stamp})" if stage else f"({stamp})"
+
+
+def every_other_columns(n_cols: int, max_full: int = 11) -> list[int]:
+    """Column indices to DISPLAY from an n_cols-frame trajectory montage.
+
+    <= max_full columns: every column. More than that: every OTHER column,
+    ALWAYS keeping the first and the last frame -- the start and the final
+    state are the two a reader most needs, and a montage past ~11 columns gets
+    unreadably wide. Purely a DISPLAY subsample: the rollout still steps
+    through every frame; this only thins which columns are drawn.
+
+    Single source of truth for the "long run" thinning, shared by
+    compare_f_theta's _trajectory_figure and plot_evolution (the two montage
+    renderers), so the rule cannot drift between them -- this file exists to
+    kill exactly that class of per-file copy.
+    """
+    if n_cols > max_full:
+        idx = list(range(0, n_cols, 2))
+        if idx[-1] != n_cols - 1:
+            idx.append(n_cols - 1)
+        return idx
+    return list(range(n_cols))
