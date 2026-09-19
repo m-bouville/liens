@@ -92,7 +92,16 @@ def check_stdev_phi_temperature(
               "distinguish these -- results below are NOT reliable evidence for either explanation "
               "until that's done.")
     if output_path is None:
-        output_path = _PYTHON_ROOT.parent / "output" / "stdev_phi_temperature.png"
+        # Checkpoint-free dataset diagnostic: belongs with the other
+        # dataset-level outputs (output/datasets/), like check_stdev_phi_time.
+        # The SIZE prefix matters because every conclusion here (the amplitude
+        # deficit near T0, the per-temperature exclusion fractions) is
+        # size-dependent, and an unprefixed name silently overwrites one
+        # sweep's figure with another's -- the same hazard that tool's own
+        # comment flags. Was output/stdev_phi_temperature.png (no size, wrong
+        # folder); an explicit --output still wins.
+        output_path = (_PYTHON_ROOT.parent / "output" / "datasets"
+                        / f"{size}x{size}-stdev_phi_temperature.png")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     run_dirs = load.enumerate_run_dirs_from_metadata(base_path, size, size)

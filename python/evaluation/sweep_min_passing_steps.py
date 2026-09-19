@@ -45,9 +45,8 @@ def main():
     p.add_argument("--max-runs", type=int, default=0, help="0 = all runs")
     p.add_argument("--min-bin-count", type=int, default=10)
     p.add_argument("--sma", type=int, default=3)
-    p.add_argument("--output", type=Path,
-                   default=_PYTHON_ROOT.parent / "output" / "datasets"
-                            / "128x128-min_passing_steps_sweep.png")
+    p.add_argument("--output", type=Path, default=None,
+                   help="default: output/datasets/<size>x<size>-min_passing_steps_sweep.png")
     a = p.parse_args()
 
     run_dirs = complete_run_dirs(a.base_path, a.size, a.size)
@@ -75,8 +74,13 @@ def main():
                               min_stdev_phi=a.min_stdev_phi, min_passing_steps=mps)
         starts[mps] = window_start_times(gs, dts, a.window_length, a.max_dt)
 
+    # Output name derives from the grid size, so a --size 256 run writes
+    # 256x256-... instead of silently overwriting the 128x128 file. An explicit
+    # --output still wins.
+    _out = a.output or (_PYTHON_ROOT.parent / "output" / "datasets"
+                        / f"{a.size}x{a.size}-min_passing_steps_sweep.png")
     render("min_passing_steps", values, starts, baseline_starts, a.current_value, scale,
-           frac, f"min_stdev_phi={a.min_stdev_phi:g}", a.output,
+           frac, f"min_stdev_phi={a.min_stdev_phi:g}", _out,
            min_bin_count=a.min_bin_count, sma=a.sma,
            baseline_label="no min_passing_steps filter")
 

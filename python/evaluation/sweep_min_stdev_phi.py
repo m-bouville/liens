@@ -59,9 +59,8 @@ def main():
     p.add_argument("--max-runs", type=int, default=0, help="0 = all runs")
     p.add_argument("--min-bin-count", type=int, default=10)
     p.add_argument("--sma", type=int, default=3)
-    p.add_argument("--output", type=Path,
-                   default=_PYTHON_ROOT.parent / "output" / "datasets"
-                            / "128x128-min_stdev_phi_sweep.png")
+    p.add_argument("--output", type=Path, default=None,
+                   help="default: output/datasets/<size>x<size>-min[_normalized]_stdev_phi_sweep.png")
     a = p.parse_args()
 
     # Mode-aware default for the swept axis: raw stdev_phi lives on a very
@@ -104,9 +103,12 @@ def main():
         starts[msp] = window_start_times(gs, dts, a.window_length, a.max_dt)
 
     _name = _filter_key
-    _out = a.output
-    if a.normalized and _out.name == "128x128-min_stdev_phi_sweep.png":
-        _out = _out.with_name("128x128-min_normalized_stdev_phi_sweep.png")
+    # Output name derives from BOTH the grid size and the filter mode, so a
+    # --size 256 run writes 256x256-... instead of silently overwriting the
+    # 128x128 file, and --normalized picks up its own name automatically
+    # (_filter_key already encodes it). An explicit --output still wins.
+    _out = a.output or (_PYTHON_ROOT.parent / "output" / "datasets"
+                        / f"{a.size}x{a.size}-{_filter_key}_sweep.png")
     render(_name, values, starts, baseline_starts, a.current_value, scale,
            frac, f"min_passing_steps={a.min_passing_steps}", _out,
            min_bin_count=a.min_bin_count, sma=a.sma,

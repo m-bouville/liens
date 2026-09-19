@@ -183,13 +183,16 @@ def main():
     p.add_argument("--sma", type=int, default=3,
                    help="centered moving-average window (in x-axis / time points) applied "
                         "to each survival curve; 1 = off, raise for a choppier tail")
-    p.add_argument("--output", type=Path,
-                   default=_PYTHON_ROOT.parent / "output" / "datasets"
-                            / "128x128-min_std_deriv_sweep.png",
-                   help="survival-curve png (default output/datasets/128x128-...)")
+    p.add_argument("--output", type=Path, default=None,
+                   help="survival-curve png (default output/datasets/<size>x<size>-min_std_deriv_sweep.png)")
     a = p.parse_args()
+    # Output name derives from the grid size, so a --size 256 run writes
+    # 256x256-... instead of silently overwriting the 128x128 file. An explicit
+    # --output still wins.
+    _out = a.output or (_PYTHON_ROOT.parent / "output" / "datasets"
+                        / f"{a.size}x{a.size}-min_std_deriv_sweep.png")
     sweep(a.base_path, a.size, a.window_length, a.min_step, a.min_stdev_phi,
-          a.min_passing_steps, a.max_dt, a.max_runs, a.min_std_deriv, a.current_value, a.output,
+          a.min_passing_steps, a.max_dt, a.max_runs, a.min_std_deriv, a.current_value, _out,
           min_bin_count=a.min_bin_count, sma=a.sma)
 
 

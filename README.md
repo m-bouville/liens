@@ -162,4 +162,4 @@ For more details on the structure of the `python` directory, see [./docs/NN-code
 
 ### Example of results
 Three predictions of the evolution of microstructures:
-![predictions of the evolution of microstructures](../figures/evolution_prediction.png "predictions of the evolution of microstructures")
+![predictions of the evolution of microstructures](./figures/evolution_prediction.png "predictions of the evolution of microstructures")
