@@ -125,8 +125,9 @@ This is at heart a greedy workflow, training
 │   └── NN-code_structure.md #written automatically by Claude
 ├── figures/				# figures selected for inclusion here
 ├── output/					# figures generated automatically
-│   └── datasets/			# statistics on phase-field runs
-│   └── stage<N>/
+│   ├── datasets/			# statistics on phase-field runs
+│   ├── stage<N>/
+│   └── rollout_check_png/
 ├── python/            		# neural network
 └── README.md 				# this (written by hand)
 ```
@@ -147,13 +148,18 @@ For more details on the structure of the `python` directory, see [./docs/NN-code
 - [X] Satisfactory results for short times
 - [X] Satisfactory results for long times
 - [X] Satisfactory results at all temperatures
-- [ ] Smooth results (not moth-eaten)
-- [ ] Curvature is not created
+- [X] Smooth results (not moth-eaten)
+- [X] Curvature is not created
 - [ ] Satisfying results overall
+- [ ] Larger systems
+
 
 ### For those who prefer text
 - All five training stages are implemented and run end-to-end. The work currently underway is improving the accuracy of the surrogate, not making it run at all.
-- The initial development was carried out using 64×64 images (32×32 for testing the code end-to-end). They were serviceable but hit their limit, with finite-size artifacts eventually dominating the results. The focus is now on 128×128 microstructures.
-- There is a (physically plausible) difference of behavior above and below $T \approx 0.9 \times T_0$. 
-- A curve to the left is straightened (correctly), but then it may turn into a curve to the right (unphysical). This looks like some sort of inertia.
-- Predicted microstructures are not smooth, they look moth-eaten. `L_allen_cahn` accounts for expected patterns of time evolution (PINN) in the loss functions of stages 4 and 5 in order to reduce the problem.
+- The initial development was carried out using 64×64 images (32×32 for testing the code end-to-end). They were serviceable but hit their limit, with finite-size artifacts eventually dominating the results. The focus is now on 128×128 microstructures. The 256×256 dataset is ready, but I may hit hardware limitations (esp. VRAM).
+- There is a (physically plausible) difference of behavior above and below $T \approx 0.9 \times T_0$.
+
+
+### Example of results
+Three predictions of the evolution of microstructures:
+![predictions of the evolution of microstructures](../figures/evolution_prediction.png "predictions of the evolution of microstructures")

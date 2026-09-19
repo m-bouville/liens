@@ -30,8 +30,14 @@ Everything else is about models at various stages.
 
 The combined `compare_f_theta` (no `--*-only` flag) still runs both: `python -m evaluation.compare_f_theta checkpoints/stage3a/128x128-stage3a.pt checkpoints/stage3b/128x128-stage3b.pt --n-stats 200 --n-samples 6 --steps 10 --seed 0 --trajectory`
 
+
 ### Stage 2 only 
 `python -m evaluation.compare_f_theta checkpoints/stage2/128x128-stage2-20260812_20h08.pt checkpoints/stage2/128x128-stage2-20260818_13h54.pt checkpoints/stage2/128x128-stage2-20260819_11h20.pt --stage2-compare --n-stats 200 --steps 10`
+
+
+### plot_evolution
+This is a variant for clean display, rather than diagnostic. For this reason, runs have to be chosen by hand, no `--seed`. The output is three reality/prediction pairs of rows.
+`python -m evaluation.plot_evolution checkpoints/stage5/128x128-stage5.pt --steps 12 --datasets ../datasets/128x128/T725_n003_s97:70000 ../datasets/128x128/T975_n030_s3:115000 ../datasets/128x128/T933_n005_s97:35000`
 
 
 
