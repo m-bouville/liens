@@ -145,19 +145,30 @@ For more details on the structure of the `python` directory, see [./docs/NN-code
 - [X] 2. Derivative `C1`
 - [X] 3. Latent dynamics surrogate
 - [X] 4-5. End-to-end training
-- [X] Satisfactory results for short times
-- [X] Satisfactory results for long times
 - [X] Satisfactory results at all temperatures
 - [X] Smooth results (not moth-eaten)
 - [X] Curvature is not created
-- [ ] Satisfying results overall
 - [ ] Larger systems
+- [ ] Speed-up measured
 
 
 ### For those who prefer text
 - All five training stages are implemented and run end-to-end. The work currently underway is improving the accuracy of the surrogate, not making it run at all.
 - The initial development was carried out using 64×64 images (32×32 for testing the code end-to-end). They were serviceable but hit their limit, with finite-size artifacts eventually dominating the results. The focus is now on 128×128 microstructures. The 256×256 dataset is ready, but I may hit hardware limitations (esp. VRAM).
 - There is a (physically plausible) difference of behavior above and below $T \approx 0.9 \times T_0$.
+
+
+### The stages
+Evolution of the loss and correlation (of final - initial, i.e. the change, in real space), evaluated after 16 chained time steps.
+
+| Stage | Median loss | Median corr_dx |
+|-------|-------------|----------------|
+| 3a    |  0.1162     |   36.8%        |
+| 3b    |  0.0540     |   55.8%        |
+| 4     |  0.0596     |   54.8%        |
+| 5     |  0.0402     |   75.4%        |
+
+Stage 4 fuses the autoencoder (AE) from stages 1 and 2 and $f_\theta$ from stages 3. It does not improve over stage 3b, but prepares for stage 5 where the decoder unfreezes.
 
 
 ### Example of results
