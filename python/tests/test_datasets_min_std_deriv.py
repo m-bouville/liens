@@ -112,6 +112,84 @@ def test_min_std_deriv_rejects_cached_latent_mode(tmp_path):
                                          min_std_deriv=0.01)
 
 
+def test_min_std_deriv_checks_only_the_first_transition(tmp_path):
+    """The filter (datasets.py) computes its per-window derivative std from
+    ONLY the window's FIRST transition (kept_steps[start] -> kept_steps[start+1]
+    ) -- its own print message says so explicitly ("near-degenerate
+    FIRST-TRANSITION derivative"). Every other min_std_deriv test in this file
+    uses window_length=2, where "first transition" and "only transition" are
+    the same thing, so none of them can distinguish a genuine first-transition-
+    only filter from one that (wrongly) looks at the window's WORST or MEAN
+    transition. This uses window_length=3 (two transitions per window) to
+    actually separate the two claims:
+
+      - frames A, A, B: the window's FIRST transition (A->A) is degenerate,
+        its SECOND (A->B) is not -- this window must be EXCLUDED. A filter
+        that used the worst/any transition would also exclude it (both agree
+        here), but a filter using only the LAST or the mean transition would
+        wrongly KEEP it.
+      - frames A, B, B: the window's FIRST transition (A->B) is fine, its
+        SECOND (B->B) is degenerate -- this window must be KEPT. This is the
+        case that actually distinguishes "first transition only" from "any/
+        worst transition": a filter checking every transition (not just the
+        first) would wrongly EXCLUDE it.
+    """
+    import numpy as np
+    import pandas as pd
+    run_dir = tmp_path / "T800_n010_s3"
+    run_dir.mkdir()
+    size = 16
+    steps = [0, 1000, 2000, 3000]
+    metadata_text = "\n".join([
+        "directory = T800_n010_s3", "code version = test", "status = complete",
+        f"Nx = {size}", f"Ny = {size}", "dt = 0.05", "steps = 3000",
+        f"save_steps = {' '.join(str(s) for s in steps)}",
+        "a0 = 1.0", "b = 1.0", "T0 = 1.0", "temperature = 0.8",
+        "kappa = 0.2", "mobility = 0.05", "phi0 = 0.0", "noise = 0.01",
+        "seed = 1", "equation = allen_cahn", "solver = explicit", "",
+    ])
+    (run_dir / "metadata.txt").write_text(metadata_text)
+
+    rng = np.random.default_rng(0)
+    A = np.zeros((size, size), dtype="float32")
+    B = (rng.standard_normal((size, size)) * 10.0).astype("float32")  # std ~10, well separated from 0
+    # frames at steps 0,1000,2000,3000: A, A, B, B
+    #   window start=0 (steps 0,1,2): first transition (A,A) degenerate,
+    #     second (A,B) large -- must be EXCLUDED.
+    #   window start=1 (steps 1,2,3): first transition (A,B) large,
+    #     second (B,B) degenerate -- must be KEPT.
+    frames = [A, A, B, B]
+    for step, fr in zip(steps, frames):
+        fr.astype("<f2").tofile(run_dir / load.snapshot_filename(step))
+
+    stdev_phi = float(np.stack(frames).std())
+    df = pd.DataFrame({"stdev_phi": [stdev_phi] * len(steps)}, index=steps)
+    df.index.name = "step"
+    df.to_csv(run_dir / "statistics.csv")
+
+    # first_dt = 1000*0.05 = 50; the large transition's std ~= 10/50 = 0.2;
+    # degenerate transitions are exactly 0. threshold sits safely between.
+    threshold = 0.02
+    ds = MicrostructureEvolutionDataset(
+        [run_dir], encoder=None, window_length=3, min_stdev_phi=None,
+        min_std_deriv=threshold,
+    )
+    assert len(ds) == 1, (
+        f"expected exactly 1 window kept (start=1, whose FIRST transition A->B "
+        f"is large), got {len(ds)}"
+    )
+    kept_starts = [start for _run_idx, start in ds._index]
+    assert kept_starts == [1], (
+        f"expected the surviving window to be start=1 (first transition A->B), "
+        f"got starts={kept_starts}. If start=0 survived instead (or alongside), "
+        f"the filter is not using only the FIRST transition -- a later large "
+        f"step is wrongly rescuing a window whose first transition is degenerate. "
+        f"If len(ds)==0, the filter is checking a LATER transition instead of "
+        f"the first -- start=1's own degenerate SECOND transition (B->B) wrongly "
+        f"excluded it."
+    )
+
+
 def _build_varying_deriv_run(base_dir, name, size=16):
     """A run whose successive transitions have DIFFERENT derivative std --
     some frames barely change, some change a lot -- so a mid-range

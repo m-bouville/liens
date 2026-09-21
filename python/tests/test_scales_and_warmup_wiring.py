@@ -43,6 +43,22 @@ def test_stage1_builds_and_emits_the_scale_ratio_history():
     assert "write_epoch_figures(" in s
 
 
+def test_train_lds_builds_and_emits_the_scale_ratio_history():
+    """train_lds builds a scale_ratio_history too (one entry per active
+    component, appended from _val_means[c + "_ratio"] every epoch) and passes
+    it to write_epoch_figures alongside its own stage-3-specific rollout/1step
+    scatter (extra=...) -- the only one of the four trainers wired for
+    scale_ratio_history that had no coverage here. Missing this wiring would
+    leave the "Stage 3 loss/scale ratios" figure silently blank or stale,
+    exactly the class of regression this whole file exists to catch for the
+    other three trainers."""
+    s = _src("training/train_lds.py")
+    assert "scale_ratio_history" in s
+    assert 'scale_ratio_history[c].append(_val_means[c + "_ratio"])' in s
+    assert "scale_ratios=scale_ratio_history" in s
+    assert "scales_path=loss_scales_path" in s
+
+
 def test_write_epoch_figures_forwards_scale_ratios_to_the_curve():
     s = _src("training/_training_loop.py")
     assert "scale_ratios" in s and "loss_scale_curve(" in s

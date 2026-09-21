@@ -326,7 +326,6 @@ def test_prune_stale_baseline_rows(tmp_path):
     assert len(rows) == 2
     kinds = {(r["checkpoint_path"].startswith("baseline"), (r["epoch"] or "").strip()) for r in rows}
     # remaining: the model row, and the blank-epoch baseline
-    assert ("checkpoints/stage3b/m.pt", ) or True
     assert any(r["checkpoint_path"] == "checkpoints/stage3b/m.pt" for r in rows)
     assert any(r["checkpoint_path"].startswith("baseline") and not (r["epoch"] or "").strip() for r in rows)
 
@@ -664,7 +663,7 @@ def test_collapse_merges_unique_cells_before_dropping_empty_twin(tmp_path):
 
 def test_scales_captured_from_loss_term_header(tmp_path):
     """The per-term SCALES live only in the loss-term header ("/N train = w*name/scale
-    +..."), not the flat key=value block -- so eval-stageN.csv had weights but not
+    +...")," not the flat key=value block -- so eval-stageN.csv had weights but not
     scales. parse_log_params must emit p_*_scale from the header. Also guards the
     early-break bug: a save-schedule report line ("4114 runs (94%):") must NOT stop
     parsing before the header is reached."""

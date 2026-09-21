@@ -214,19 +214,37 @@ def test_encoding_never_buffers_more_than_one_batch_plus_one_run(tmp_path):
     )
 
 
-def test_cuda_empty_cache_guard_only_matches_cuda_device():
+def test_cuda_empty_cache_is_not_called_on_a_cpu_device(tmp_path, monkeypatch):
     """
-    Lightweight, GPU-independent check of the GUARD CONDITION itself
-    (torch.device(device).type == "cuda") for every spelling of device
-    this constructor accepts (str or torch.device) -- doesn't require
-    an actual GPU, unlike the full integration below, so this always
-    runs and always catches a broken condition (e.g. a typo'd string
-    comparison) even in a CPU-only environment.
+    The GPU-cache flush must be GATED on a cuda device (the constructor guards
+    it with `torch.device(device).type == "cuda"`). On a cpu device it must
+    NEVER fire -- empty_cache() on cpu is a harmless no-op, but the guard being
+    dropped (an unconditional call, or a typo'd string comparison) would be a
+    real defect, and THIS test catches it on a CPU-only machine, where the
+    cuda-gated integration test below is skipped entirely.
+
+    This exercises the real constructor path (build a dataset with an encoder on
+    device="cpu"), not just torch.device() facts -- the previous version of this
+    test asserted only `torch.device("cpu").type != "cuda"` etc., properties of
+    torch that a broken guard in datasets.py could never falsify, so it never
+    actually guarded anything.
     """
-    assert torch.device("cpu").type != "cuda"
-    assert torch.device(torch.device("cpu")).type != "cuda"
-    assert torch.device("cuda").type == "cuda"
-    assert torch.device(torch.device("cuda")).type == "cuda"
+    import training.datasets as datasets_module
+
+    run_dirs = _write_runs(tmp_path, run_step_counts=[3, 4], size=64)
+    encoder = _FakeEncoderBothStreams(size=64, latent_channels=4)
+
+    calls = []
+    monkeypatch.setattr(datasets_module.torch.cuda, "empty_cache", lambda: calls.append(True))
+
+    MicrostructureEvolutionDataset(
+        run_dirs, encoder=encoder, device="cpu", window_length=2,
+        min_step=0, min_stdev_phi=None, encode_batch_size=4,
+    )
+    assert not calls, (
+        "torch.cuda.empty_cache() was called on device='cpu' -- the "
+        "`torch.device(device).type == 'cuda'` guard was dropped"
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a real CUDA device")

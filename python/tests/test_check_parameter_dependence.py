@@ -1,21 +1,20 @@
 """
-Tests for evaluation/check_parameter_dependence.py's torch-free logic
-(fit_power_law, fit_saturating_exponential, fit_exponential,
-robust_polynomial_fit, fit_taylor_residual_coefficients, the binned/
-grouped mean-curve helpers behind the [1,0]/[1,1]/[0,3] panels, and the
-per-(temperature,noise)/per-run aggregation logic behind panel [0,2] and
-the "highest error" console report) -- extracted verbatim below, since
-the module can't be imported directly without torch. Actually run in
-this environment -- no torch needed.
+Tests for the torch-free numeric helpers behind check_parameter_dependence's
+figures and reports: the fit family (fit_power_law, fit_exponential,
+fit_saturating_exponential, robust_polynomial_fit, fit_taylor_residual_
+coefficients -- all in utils.fits), max_autocorr_dist, and the binned/grouped
+mean-curve + y-range helpers (_mean_curves_by_unique_value, _mean_curves_by_bin,
+_size_by_count, _symmetric_left_zero_right_ylim, _ylim_from_below_cutoff).
 
-Regenerated from scratch against the CURRENT module (the previous
-version of this file predated: robust_polynomial_fit replacing
-robust_linear_fit, fit_taylor_residual_coefficients, the
-_mean_curves_by_unique_value/_mean_curves_by_bin/_size_by_count/
-_symmetric_left_zero_right_ylim helpers behind the current [1,0]/[1,1]/
-[0,3] panels, and -- most importantly -- panel [0,2]'s aggregation
-switching from per-run to per-(temperature,noise), which is exactly the
-kind of behavior change most worth having a real regression test for).
+These import the SHIPPED implementations directly rather than testing verbatim
+copies pasted into this file (which an earlier version did, on a now-false "the
+module can't be imported without torch" rationale -- utils.fits is numpy-only,
+and evaluation.check_parameter_dependence imports fine in the test env, as the
+sibling end-to-end tests and test_evaluation_reconstruction_integration already
+rely on). Testing copies let the shipped code regress with every test still
+green, and the copies had already drifted (e.g. _size_by_count's empty-array
+guard, _mean_curves_by_bin's non-positive-x handling) -- the whole point of the
+fixup was to make these guard the real functions.
 
 Run from python/ (imports rely on that root being on sys.path):
     pytest tests/test_check_parameter_dependence.py -v
@@ -23,559 +22,31 @@ Run from python/ (imports rely on that root being on sys.path):
 import numpy as np
 import pytest
 
-# Extracted verbatim from evaluation/check_parameter_dependence.py,
-# since that module imports torch at the top level and can't be
-# imported directly in a torch-free environment.
+from utils.fits import (
+    fit_exponential, fit_power_law, fit_saturating_exponential,
+    fit_taylor_residual_coefficients, robust_polynomial_fit,
+)
+from evaluation.check_parameter_dependence import (
+    max_autocorr_dist, _mean_curves_by_unique_value, _mean_curves_by_bin,
+    _size_by_count, _symmetric_left_zero_right_ylim, _ylim_from_below_cutoff,
+)
 
-
-def max_autocorr_dist(nx: int, ny: int) -> int:
-    """
-    The C++ simulation caps autocorr_length's search at
-    min(Nx*2/3, Ny*2/3) (integer division) -- distances beyond that are
-    deemed artifacts of the periodic-boundary autocorrelation wrapping
-    around on itself, not a genuine length scale. Any window whose
-    autocorrelation never decays within that search range gets this
-    exact value back as a SENTINEL, not a real measurement -- and it's
-    common enough (near-critical/smooth microstructures in particular)
-    to distort both the plot and any regression fit through it if left
-    in as if it were real data. Mirrors the C++ integer-division
-    formula exactly (Python's // matches C++'s truncating int division
-    for non-negative operands), so this returns the same sentinel value
-    the simulation actually produced, not an approximation of it.
-    """
-    return min(nx * 2 // 3, ny * 2 // 3)
-
-
-def robust_polynomial_fit(x: np.ndarray, y: np.ndarray, basis_funcs: list,
-                           n_iter: int = 10, huber_delta_scale: float = 1.345):
-    """
-    Generalizes robust_linear_fit (see its own docstring for the IRLS/
-    Huber mechanism itself, unchanged here) from a fixed 2-term model
-    (slope*x + intercept) to an ARBITRARY set of basis functions of x --
-    y = sum_j(coef_j * basis_funcs[j](x)). Needed specifically for the
-    Taylor-residual decomposition below: that model has a genuine 1/dt
-    term (see fit_taylor_residual_coefficients' own docstring for why),
-    which robust_linear_fit's fixed [x, 1] basis has no way to
-    represent at all -- fitting a straight line to data that actually
-    contains a 1/dt term doesn't approximate it, it silently absorbs
-    that term's effect into a BIASED estimate of the intercept instead.
-
-    Returns (coefs, coef_stderr): coefs in the SAME order as
-    basis_funcs; coef_stderr are the weighted-least-squares standard
-    errors from the FINAL IRLS iteration's own weights (sigma^2 *
-    (X^T W X)^-1 diagonal) -- lets a caller judge whether a given
-    coefficient (e.g. the 1/dt term's own coefficient) is actually
-    distinguishable from zero, not just report a point estimate with
-    no sense of its own uncertainty.
-    """
-    X = np.column_stack([f(x) for f in basis_funcs])
-    n, p = X.shape
-    weights = np.ones(n)
-
-    def _weighted_lstsq(w):
-        sqrt_w = np.sqrt(w)
-        coefs, *_ = np.linalg.lstsq(X * sqrt_w[:, None], y * sqrt_w, rcond=None)
-        return coefs
-
-    coefs = _weighted_lstsq(weights)
-    for _ in range(n_iter):
-        residuals = y - X @ coefs
-        mad = np.median(np.abs(residuals - np.median(residuals)))
-        scale = 1.4826 * mad if mad > 0 else np.std(residuals) + 1e-12
-        huber_delta = huber_delta_scale * scale
-        abs_resid = np.abs(residuals)
-        weights = np.where(abs_resid <= huber_delta, 1.0, huber_delta / np.maximum(abs_resid, 1e-12))
-        coefs = _weighted_lstsq(weights)
-
-    # Standard errors from the FINAL weights -- same weighted normal-
-    # equations matrix the last _weighted_lstsq call itself solved,
-    # reused here rather than recomputed independently, so these are
-    # guaranteed consistent with the coefficients actually returned.
-    residuals = y - X @ coefs
-    XtWX = X.T @ (weights[:, None] * X)
-    dof = max(n - p, 1)
-    sigma2 = np.sum(weights * residuals ** 2) / dof
-    try:
-        cov = sigma2 * np.linalg.inv(XtWX)
-        coef_stderr = np.sqrt(np.diag(cov))
-    except np.linalg.LinAlgError:
-        coef_stderr = np.full(p, np.nan)  # near-singular design (e.g. dt range too narrow) -- be honest, not silent
-    return coefs, coef_stderr
-
-
-def fit_taylor_residual_coefficients(dts: np.ndarray, euler_losses_signed: np.ndarray,
-                                      latent_losses_signed: np.ndarray,
-                                      n_iter: int = 10, huber_delta_scale: float = 1.345,
-                                      label: str = "", euler_only: bool = False) -> dict:
-    """
-    Fits the FULL Taylor-residual model (not the plain-linear
-    approximation robust_linear_fit's own 2-term model reduces to),
-    separating out the divergent 1/dt term explicitly rather than
-    letting it silently bias a straight-line fit's intercept.
-
-    SIGN CONVENTION: predicted minus true, throughout -- matching
-    _per_sample_signed_mean(pred, true) = (pred-true).mean(), which is
-    where euler_losses_signed/latent_losses_signed themselves come from
-    (unchanged by this function), and matching the derivation's own
-    numerator (z0_tilde(t+dt) - z0(t+dt), i.e. predicted minus true).
-    Not something this function chose independently -- it's inherited
-    directly from how those two arrays were already computed.
-
-    Derivation (z1(t) = [z0(t+dt)-z0(t)+eps]/dt + eps' -- z1's own
-    error, split into a piece that scales with 1/dt and a piece that
-    doesn't; z0_ddot(t) the TRUE curvature; A*dt^3 the next real Taylor
-    term beyond what either the Euler-only or f_theta-corrected
-    prediction can represent). Written here in terms of the UNDIVIDED
-    residual (euler_losses_signed/latent_losses_signed themselves, NOT
-    divided by dt) -- fit AGAINST this form, not R=residual/dt:
-        euler_losses_signed = eps + eps'*dt - (z0_ddot/2)*dt^2 - A*dt^3
-        latent_losses_signed = eps + eps'*dt + ((f_theta-z0_ddot)/2)*dt^2 - A*dt^3
-    (multiply either of the R(dt) formulas from this function's own
-    module docstring by dt to get these directly). Fitting the
-    UNDIVIDED residual, not R=residual/dt, avoids a real problem: if
-    the residual's own measurement noise is roughly dt-INDEPENDENT
-    (plausible -- e.g. floating-point/encoder-level noise with no
-    reason to scale with dt itself), then dividing by dt makes that
-    same fixed-size noise LOOK like it grows as 1/dt at small dt --
-    heteroscedastic (dt-dependent-variance) noise that violates plain
-    least-squares' own equal-variance assumption, and which Huber/IRLS
-    reweighting does NOT fix (it downweights OUTLIERS, not a smoothly
-    varying noise scale). Fitting the undivided residual sidesteps this
-    entirely. The R=residual/dt representation is still what gets
-    PLOTTED (see the panel below) -- it's the quantity with the direct
-    theoretical interpretation (-> eps as dt->0) -- just not what the
-    regression itself is run against.
-
-    eps, eps' (BOTH the same physical quantity -- z1's own error --
-    regardless of which model it's measured through) and A (a property
-    of z0's own TRUE dynamics, likewise independent of which
-    approximation is being compared against it) are fit JOINTLY,
-    constrained EQUAL across the euler-only and full residuals, in a
-    SINGLE regression over both datasets stacked together -- not two
-    independent per-model fits. An earlier version of this function did
-    fit them independently, and reported eps'_euler and eps'_full
-    differing by ~1.8x despite representing the literal same underlying
-    quantity in both models: that's not evidence eps' is unstable in
-    reality, it's evidence that estimating the SAME parameter twice,
-    independently, from two correlated-but-distinct fits, needlessly
-    discards the constraint that they must agree -- each fit only gets
-    to use HALF the available data to pin down a parameter both halves
-    actually inform, and near-degenerate basis functions (1/dt-ish and
-    dt^2-ish terms trading off against each other under noise) are then
-    free to resolve that ambiguity differently in each independent fit.
-    The joint fit uses ALL the data for eps/eps'/A (both residual types
-    inform the same three shared parameters at once) and only lets the
-    dt^2-coefficient itself differ between euler-only (C, ~ -z0_ddot/2)
-    and full (D, ~ (f_theta-z0_ddot)/2) -- the one place they SHOULD
-    differ, since that's exactly where f_theta's own contribution
-    enters.
-
-    dt is rescaled by its own geometric mean before building the
-    polynomial design matrix (converted back to physical units in the
-    returned/printed coefficients) -- raw dt spans several orders of
-    magnitude in this project's own data, and unscaled dt/dt^2/dt^3
-    columns in the SAME design matrix then differ from each other by
-    many further orders of magnitude on top of that: a classical
-    ill-conditioning trap for polynomial regression, and a second,
-    independent likely contributor (alongside the fully-independent-fit
-    issue above) to that same eps' instability.
-
-    Returns a dict with the joint fit's own coefficients+stderrs, the
-    EARLIER independent-fit numbers too (kept as a diagnostic showing
-    the disagreement the joint fit resolves, not as the recommended
-    estimate), and the two derived quantities: mean_z0_ddot (from C)
-    and mean_f_theta_minus_z0_ddot (from D) -- f_theta's own average
-    signed bias relative to the true curvature, directly.
-
-    label: purely cosmetic -- included in the printed report's own
-    header (e.g. "T < 0.9 SUBSET") so console output from multiple
-    calls (e.g. comparing a temperature-restricted subset against the
-    full dataset, to check whether a specific region of parameter space
-    is driving a large stderr) doesn't read as one undifferentiated
-    block.
-
-    euler_only: False (default) does the full joint fit described
-    above. True skips it entirely and fits a single, simpler 4-term
-    model (eps, eps', C, -A -- no D, no joint stacking, no independent-
-    fit diagnostic) against euler_losses_signed ALONE -- for exactly
-    the situation where latent_losses_signed IS euler_losses_signed
-    (the same array passed twice; see check_parameter_dependence's own
-    euler_only substitution), where the joint/independent-fit machinery
-    above would otherwise silently fit a perfectly degenerate model
-    (D == C by construction, mean_f_theta_minus_z0_ddot == 0.0 always)
-    and print it as if it were a real finding.
-    """
-    n = len(dts)
-    if n < 50:
-        print(f"\n  WARNING: fit_taylor_residual_coefficients called with only {n} windows"
-              f"{f' [{label}]' if label else ''} -- the joint model has 5 free parameters "
-              f"shared across 2*{n} stacked rows; a small subset can make coefficients "
-              f"(especially C/D, the dt^2 terms) genuinely poorly determined rather than "
-              f"revealing a real difference from the full-data fit. Treat stderr-vs-estimate "
-              f"comparisons on a small subset with real caution.")
-    # Geometric mean -- appropriate for log-uniformly-sampled dt (this
-    # project's own dt distribution spans decades, not a linear range),
-    # matching how the rest of this module already treats dt on a log
-    # axis everywhere else.
-    dt_scale = float(np.exp(np.mean(np.log(dts))))
-    u = dts / dt_scale
-    basis_funcs = [lambda uu: np.ones_like(uu), lambda uu: uu, lambda uu: uu ** 2, lambda uu: uu ** 3]
-    unscale4 = np.array([1.0, dt_scale, dt_scale ** 2, dt_scale ** 3])
-
-    if euler_only:
-        # Single 4-term fit against euler_losses_signed ALONE -- no
-        # joint stacking, no independent-fit diagnostic (there's only
-        # one model here, nothing to compare against or reconcile). See
-        # this function's own docstring for why this branch exists
-        # instead of just letting the joint fit below run on
-        # euler_losses_signed passed in twice.
-        coefs_u, stderr_u = robust_polynomial_fit(u, euler_losses_signed, basis_funcs,
-                                                    n_iter=n_iter, huber_delta_scale=huber_delta_scale)
-        coefs_phys = coefs_u / unscale4
-        stderr_phys = stderr_u / unscale4
-        eps, eps_prime, C, neg_A = coefs_phys
-        eps_se, eps_prime_se, C_se, neg_A_se = stderr_phys
-        mean_z0_ddot = -2 * C
-        A = -neg_A
-        param_names = ["eps", "eps'", "C (dt^2, ~-z0_ddot/2)", "-A (dt^3)"]
-
-        result = {
-            "param_names": param_names, "euler_only": True,
-            "joint_coefs": coefs_phys, "joint_stderr": stderr_phys,
-            "eps": eps, "eps_stderr": eps_se,
-            "eps_prime": eps_prime, "eps_prime_stderr": eps_prime_se,
-            "C": C, "C_stderr": C_se, "A": A, "A_stderr": neg_A_se,
-            "mean_z0_ddot": mean_z0_ddot,
-            "dt_scale": dt_scale,
-        }
-        print("\n" + "=" * 70)
-        print(f"Taylor-residual coefficient fit (euler-only)" + (f"  [{label}]" if label else ""))
-        print("=" * 70)
-        for name, c, se in zip(param_names, coefs_phys, stderr_phys):
-            print(f"    {name:<26} = {c: .6e}  (stderr {se:.2e})")
-        print(f"\n  derived quantity:")
-        print(f"    mean(z0_ddot) [true curvature, from C] = {mean_z0_ddot:.4e}")
-        print("=" * 70)
-        return result
-
-    # ---- Independent per-model fits (diagnostic only -- see docstring
-    # for why these are NOT the recommended estimate, kept here purely
-    # to report the disagreement the joint fit below resolves). Fit
-    # against the UNDIVIDED residual now too (basis [1, dt, dt^2, dt^3]
-    # in RESCALED u, not [1/dt, 1, dt, dt^2] against R=residual/dt as
-    # an earlier version of this function did) -- both the
-    # heteroscedasticity and conditioning fixes apply here as much as
-    # to the joint fit.
-    indep_euler_u, indep_euler_se_u = robust_polynomial_fit(u, euler_losses_signed, basis_funcs,
-                                                              n_iter=n_iter, huber_delta_scale=huber_delta_scale)
-    indep_full_u, indep_full_se_u = robust_polynomial_fit(u, latent_losses_signed, basis_funcs,
-                                                            n_iter=n_iter, huber_delta_scale=huber_delta_scale)
-    indep_euler = indep_euler_u / unscale4
-    indep_full = indep_full_u / unscale4
-    eps_euler_indep, eps_prime_euler_indep = indep_euler[0], indep_euler[1]
-    eps_full_indep, eps_prime_full_indep = indep_full[0], indep_full[1]
-
-    # ---- Joint fit: eps, eps', A shared; only the dt^2 coefficient
-    # (C vs D) differs by residual type. Stacked design: row 0..n-1 are
-    # euler-only residuals, row n..2n-1 are full residuals.
-    y = np.concatenate([euler_losses_signed, latent_losses_signed])
-    u_stack = np.concatenate([u, u])
-    is_euler = np.concatenate([np.ones(n, dtype=bool), np.zeros(n, dtype=bool)])
-    X = np.column_stack([
-        np.ones_like(u_stack),                    # eps            (shared)
-        u_stack,                                   # eps'           (shared)
-        np.where(is_euler, u_stack ** 2, 0.0),      # C (euler-only dt^2 coefficient)
-        np.where(~is_euler, u_stack ** 2, 0.0),     # D (full-only dt^2 coefficient)
-        u_stack ** 3,                               # -A             (shared)
-    ])
-    param_names = ["eps", "eps'", "C (euler dt^2, ~-z0_ddot/2)", "D (full dt^2, ~(f_theta-z0_ddot)/2)", "-A (dt^3)"]
-
-    weights = np.ones(len(y))
-
-    def _weighted_lstsq(w):
-        sqrt_w = np.sqrt(w)
-        coefs, *_ = np.linalg.lstsq(X * sqrt_w[:, None], y * sqrt_w, rcond=None)
-        return coefs
-
-    coefs = _weighted_lstsq(weights)
-    for _ in range(n_iter):
-        residuals = y - X @ coefs
-        mad = np.median(np.abs(residuals - np.median(residuals)))
-        scale = 1.4826 * mad if mad > 0 else np.std(residuals) + 1e-12
-        huber_delta = huber_delta_scale * scale
-        abs_resid = np.abs(residuals)
-        weights = np.where(abs_resid <= huber_delta, 1.0, huber_delta / np.maximum(abs_resid, 1e-12))
-        coefs = _weighted_lstsq(weights)
-
-    residuals = y - X @ coefs
-    XtWX = X.T @ (weights[:, None] * X)
-    dof = max(len(y) - X.shape[1], 1)
-    sigma2 = np.sum(weights * residuals ** 2) / dof
-    try:
-        cov = sigma2 * np.linalg.inv(XtWX)
-        coef_stderr_u = np.sqrt(np.diag(cov))
-    except np.linalg.LinAlgError:
-        coef_stderr_u = np.full(X.shape[1], np.nan)
-
-    unscale5 = np.array([1.0, dt_scale, dt_scale ** 2, dt_scale ** 2, dt_scale ** 3])
-    coefs_phys = coefs / unscale5
-    stderr_phys = coef_stderr_u / unscale5
-    eps, eps_prime, C, D, neg_A = coefs_phys
-    eps_se, eps_prime_se, C_se, D_se, neg_A_se = stderr_phys
-
-    mean_z0_ddot = -2 * C
-    mean_f_theta_minus_z0_ddot = 2 * D
-    A = -neg_A
-
-    result = {
-        "param_names": param_names,
-        "joint_coefs": coefs_phys, "joint_stderr": stderr_phys,
-        "eps": eps, "eps_stderr": eps_se,
-        "eps_prime": eps_prime, "eps_prime_stderr": eps_prime_se,
-        "C": C, "C_stderr": C_se, "D": D, "D_stderr": D_se,
-        "A": A, "A_stderr": neg_A_se,
-        "mean_z0_ddot": mean_z0_ddot, "mean_f_theta_minus_z0_ddot": mean_f_theta_minus_z0_ddot,
-        "dt_scale": dt_scale,
-        # kept as a diagnostic, not the recommended estimate -- see docstring
-        "independent_euler_coefs": indep_euler, "independent_full_coefs": indep_full,
-    }
-
-    print("\n" + "=" * 70)
-    print("Taylor-residual coefficient decomposition" + (f"  [{label}]" if label else ""))
-    print("(joint fit: eps, eps', A shared across euler-only and full residuals)")
-    print("=" * 70)
-    print("  independent per-model fits (DIAGNOSTIC ONLY -- see this function's own "
-          "docstring for why these should NOT be trusted as the final estimate):")
-    print(f"    eps_euler={eps_euler_indep:.4e}   eps_full={eps_full_indep:.4e}   "
-          f"|diff|={abs(eps_euler_indep - eps_full_indep):.4e}")
-    print(f"    eps'_euler={eps_prime_euler_indep:.4e}  eps'_full={eps_prime_full_indep:.4e}  "
-          f"|diff|={abs(eps_prime_euler_indep - eps_prime_full_indep):.4e}")
-    print("\n  joint fit (recommended):")
-    for name, c, se in zip(param_names, coefs_phys, stderr_phys):
-        print(f"    {name:<38} = {c: .6e}  (stderr {se:.2e})")
-    print(f"\n  derived quantities:")
-    print(f"    mean(z0_ddot) [true curvature, from C]              = {mean_z0_ddot:.4e}")
-    print(f"    mean(f_theta - z0_ddot) [f_theta's own signed bias] = {mean_f_theta_minus_z0_ddot:.4e}")
-    if mean_z0_ddot != 0:
-        rel_bias = mean_f_theta_minus_z0_ddot / abs(mean_z0_ddot)
-        print(f"    relative bias = mean(f_theta-z0_ddot) / |mean(z0_ddot)| = {rel_bias:.2%}")
-    print("=" * 70)
-    return result
-
-
-def fit_power_law(dt: np.ndarray, error: np.ndarray):
-    """
-    log(error) = a*log(dt) + b via least squares. Returns (a, b, r2_log,
-    sse_real, pred_real) -- sse_real is the fit's error IN REAL (non-log)
-    space, so it can be compared directly against fit_saturating_exponential's
-    sse, which is fit in real space to begin with. Comparing R^2 values
-    computed in DIFFERENT spaces (log vs real) would not be a fair comparison.
-    """
-    log_dt = np.log(dt)
-    log_err = np.log(np.clip(error, 1e-12, None))
-    a, b = np.polyfit(log_dt, log_err, 1)
-    pred_log = a * log_dt + b
-    ss_res_log = np.sum((log_err - pred_log) ** 2)
-    ss_tot_log = np.sum((log_err - log_err.mean()) ** 2)
-    r2_log = 1 - ss_res_log / ss_tot_log if ss_tot_log > 0 else float("nan")
-    pred_real = np.exp(pred_log)
-    sse_real = np.sum((error - pred_real) ** 2)
-    return a, b, r2_log, sse_real, pred_real
-
-
-def fit_exponential(x: np.ndarray, error: np.ndarray):
-    """
-    log(error) = a*x + b via least squares (x itself, NOT log(x)) --
-    i.e. error = exp(b) * exp(a*x). The semi-log analogue of
-    fit_power_law: appropriate for a panel with a LINEAR x-axis and
-    log-scaled error axis (like length_scale's), where fit_power_law's
-    form would plot as a curve rather than a straight line and so
-    wouldn't give the same at-a-glance visual fit-quality check that it
-    does on a genuinely log-log panel (like dt's). Same
-    sse_real/pred_real convention as fit_power_law, for direct SSE
-    comparison against fit_saturating_exponential.
-    """
-    log_err = np.log(np.clip(error, 1e-12, None))
-    a, b = np.polyfit(x, log_err, 1)
-    pred_log = a * x + b
-    ss_res_log = np.sum((log_err - pred_log) ** 2)
-    ss_tot_log = np.sum((log_err - log_err.mean()) ** 2)
-    r2_log = 1 - ss_res_log / ss_tot_log if ss_tot_log > 0 else float("nan")
-    pred_real = np.exp(pred_log)
-    sse_real = np.sum((error - pred_real) ** 2)
-    return a, b, r2_log, sse_real, pred_real
-
-
-def fit_saturating_exponential(dt: np.ndarray, error: np.ndarray, n_grid: int = 200):
-    """
-    error = c*(1 - exp(-dt/tau)) -- a smooth, fully DETERMINISTIC
-    relaxation toward an asymptote c, with timescale tau. This is a
-    genuinely different mechanism from "error grows without bound" or
-    "irreducible unpredictability": it's ordinary exponential relaxation,
-    which can look deceptively like a decelerating power law in a log-log
-    plot over a limited dt range -- exactly why this needs an explicit
-    fit-and-compare rather than eyeballing curvature in binned means.
-
-    Fit via a tau grid search (log-spaced across the observed dt range)
-    with closed-form c at each tau -- error is LINEAR in c for fixed tau,
-    so c has a direct least-squares solution, avoiding a scipy dependency.
-    """
-    tau_grid = np.logspace(np.log10(dt.min() / 10), np.log10(dt.max() * 10), n_grid)
-    best_sse, best_tau, best_c = np.inf, None, None
-    for tau in tau_grid:
-        basis = 1 - np.exp(-dt / tau)
-        denom = np.sum(basis ** 2)
-        if denom < 1e-12:
-            continue
-        c = np.sum(error * basis) / denom
-        pred = c * basis
-        sse = np.sum((error - pred) ** 2)
-        if sse < best_sse:
-            best_sse, best_tau, best_c = sse, tau, c
-    pred_real = best_c * (1 - np.exp(-dt / best_tau))
-    ss_tot = np.sum((error - error.mean()) ** 2)
-    r2_real = 1 - best_sse / ss_tot if ss_tot > 0 else float("nan")
-    return best_c, best_tau, r2_real, best_sse, pred_real
-
-
-def _mean_curves_by_unique_value(x_values: np.ndarray, y_signed: np.ndarray, y_abs: np.ndarray,
-                                  round_decimals: int = 6):
-    """
-    For DISCRETE x (temperature/noise -- a handful of fixed sweep
-    values, not a continuous range): groups by each unique (rounded)
-    x value -- same rounding convention as _boxplot_by_x, for the same
-    reason (float round-trip through a text metadata file can turn one
-    intended sweep value into many bit-distinct floats) -- and returns
-    (sorted unique x values, mean(y_signed) per value, mean(y_abs) per
-    value, window count per value). Two curves instead of
-    _boxplot_by_x's full per-value distribution: simpler to read at a
-    glance, at the cost of not showing spread -- an intentional trade a
-    boxplot-per-value grid doesn't make.
-    """
-    rounded = np.round(x_values, round_decimals)
-    unique_x = np.unique(rounded)
-    masks = [rounded == v for v in unique_x]
-    mean_signed = np.array([y_signed[m].mean() for m in masks])
-    mean_abs = np.array([y_abs[m].mean() for m in masks])
-    n_windows = np.array([int(m.sum()) for m in masks])
-    return unique_x, mean_signed, mean_abs, n_windows
-
-
-def _mean_curves_by_bin(x_values: np.ndarray, y_signed: np.ndarray, y_abs: np.ndarray,
-                         n_bins: int = 8, log_bins: bool = False):
-    """
-    For CONTINUOUS x (length_scale -- computed per window, a different
-    value nearly every time; or dt, which additionally spans several
-    orders of magnitude): n_bins bins -- equal-width in LINEAR space by
-    default (matching _print_binned_summary's own console table, for
-    temperature/noise-like ranges), or equal-width in LOG space when
-    log_bins=True (appropriate for dt, which is naturally log-uniformly
-    sampled -- see dt_scale's own geometric-mean choice in
-    fit_taylor_residual_coefficients for the same reasoning). Returns
-    (bin centers, mean(y_signed) per bin, mean(y_abs) per bin, window
-    count per bin), skipping any bin with no points in it. Bin centers
-    are geometric-mean centers under log_bins=True (consistent with the
-    log-spaced edges), arithmetic-mean otherwise.
-    """
-    if log_bins:
-        edges = np.geomspace(x_values.min(), x_values.max(), n_bins + 1)
-    else:
-        edges = np.linspace(x_values.min(), x_values.max(), n_bins + 1)
-    centers, mean_signed, mean_abs, n_windows = [], [], [], []
-    for i in range(n_bins):
-        lo, hi = edges[i], edges[i + 1]
-        mask = (x_values >= lo) & (x_values <= hi if i == n_bins - 1 else x_values < hi)
-        if mask.sum() == 0:
-            continue
-        centers.append(np.sqrt(lo * hi) if log_bins else (lo + hi) / 2)
-        mean_signed.append(y_signed[mask].mean())
-        mean_abs.append(y_abs[mask].mean())
-        n_windows.append(int(mask.sum()))
-    return np.array(centers), np.array(mean_signed), np.array(mean_abs), np.array(n_windows)
-
-
-def _size_by_count(n_windows: np.ndarray, min_size: float = 20.0, max_size: float = 150.0) -> np.ndarray:
-    """
-    Marker AREA (matplotlib scatter's own s= convention -- area, not
-    diameter; see [0,2]'s own comment on this) scaled linearly between
-    min_size and max_size across THIS call's own observed range of
-    window counts. Proportional in spirit to [0,2]'s own window-count
-    sizing, but re-normalized per panel here rather than reusing that
-    panel's literal additive formula (30 + 10*n) -- these panels' window
-    counts (pooled per temperature/noise VALUE, or per length_scale
-    BIN) are typically on a very different scale than [0,2]'s own
-    (pooled per sweep point), and reusing a formula tuned for one scale
-    on the other would produce either imperceptibly-similar dots or
-    absurdly oversized ones.
-    """
-    n_windows = np.asarray(n_windows, dtype=float)
-    lo, hi = n_windows.min(), n_windows.max()
-    if hi <= lo:
-        return np.full_like(n_windows, (min_size + max_size) / 2)
-    return min_size + (max_size - min_size) * (n_windows - lo) / (hi - lo)
-
-
-def _symmetric_left_zero_right_ylim(left_axes, right_axes):
-    """
-    For a group of twin-axis panels sharing one signed quantity (left,
-    "mean(error)"-style) and one non-negative quantity (right,
-    "mean|error|"-style): computes ONE shared y-range per side, from
-    each axis's own current (already-autoscaled) limits.
-
-    Left: symmetric about 0 -- (-a, +a), a = the largest magnitude seen
-    across every left axis in the group. Not just "start below the most
-    negative point" -- a symmetric range makes it possible to judge "is
-    this curve mostly positive or mostly negative" at a glance (equal
-    visual weight either side of the y=0 reference line), which an
-    asymmetric range skews toward whichever sign happens to have the
-    larger excursion.
-
-    Right: floored at 0 (never negative -- this axis's own quantity
-    never is either), extending up to the largest value actually seen.
-
-    Returns (left_ylim, right_ylim); does not itself call set_ylim --
-    the caller applies these to every axis in the group.
-    """
-    left_los, left_his = zip(*(ax.get_ylim() for ax in left_axes))
-    right_los, right_his = zip(*(ax.get_ylim() for ax in right_axes))
-    a = max(abs(min(left_los)), abs(max(left_his)))
-    left_ylim = (-a, a)
-    right_ylim = (0.0, max(right_his))
-    return left_ylim, right_ylim
-
-def _aggregate_per_point(temperatures, noises, latent_losses):
-    """
-    Extracted verbatim from check_parameter_dependence()'s own
-    per-(temperature, noise) aggregation (panel [0,2]) -- keyed by
-    (rounded temperature, rounded noise), NOT run_dir, specifically so
-    multiple SEEDS sharing one sweep point pool into a single bubble
-    rather than each getting its own overlapping one. See that
-    function's own inline comment for the full rationale.
-    """
-    per_point = {}
-    for t, n, ll in zip(temperatures, noises, latent_losses):
-        key = (round(float(t), 6), round(float(n), 6))
-        entry = per_point.setdefault(key, {"temperature": key[0], "noise": key[1], "losses": []})
-        entry["losses"].append(ll)
-    return per_point
-
-
-def _aggregate_per_run(run_dirs, temperatures, noises, latent_losses):
-    """
-    Extracted verbatim from check_parameter_dependence()'s own per-RUN
-    aggregation -- kept SEPARATE from _aggregate_per_point above,
-    specifically for the "which specific run/seed performs worst"
-    console report, which needs each seed identified individually.
-    """
-    per_run = {}
-    for run_dir, t, n, ll in zip(run_dirs, temperatures, noises, latent_losses):
-        entry = per_run.setdefault(run_dir, {"temperature": t, "noise": n, "losses": []})
-        entry["losses"].append(ll)
-    return per_run
+# NOTE on aggregation coverage: the per-(temperature,noise) vs per-run
+# aggregation behind panel [0,2] and the "worst runs" report is NOT a
+# standalone function -- it lives inline in
+# check_parameter_dependence._print_summary_statistics (built there as `per_point`
+# and `per_run` dict comprehensions). A previous version of this file tested
+# local copies named `_aggregate_per_point`/`_aggregate_per_run` that do not exist
+# in the module, so those tests guarded nothing and were removed. The inline
+# aggregation is exercised end-to-end by
+# test_evaluation_reconstruction_integration.test_check_parameter_dependence_non_default_spatial_size
+# (which asserts the populated SUMMARY block). Extracting it into a real helper
+# here would let it be unit-tested directly -- a worthwhile follow-up, but a
+# change to the module, not this test file.
 
 
 # ---------------------------------------------------------------------
-# max_autocorr_dist -- unchanged since the previous version of this file
+# max_autocorr_dist
 # ---------------------------------------------------------------------
 
 def test_max_autocorr_dist_matches_cpp_formula():
@@ -593,8 +64,7 @@ def test_max_autocorr_dist_takes_the_smaller_axis():
 
 
 # ---------------------------------------------------------------------
-# fit_power_law / fit_exponential / fit_saturating_exponential --
-# unchanged since the previous version of this file
+# fit_power_law / fit_exponential / fit_saturating_exponential
 # ---------------------------------------------------------------------
 
 def test_fit_power_law_recovers_known_exponent():
@@ -653,10 +123,7 @@ def test_model_comparison_prefers_the_true_generating_model():
 
 
 # ---------------------------------------------------------------------
-# robust_polynomial_fit -- replaces the previous version's
-# robust_linear_fit tests (that function no longer exists: superseded
-# by this one, which generalizes it to an arbitrary basis, needed for
-# fit_taylor_residual_coefficients's own 1/dt term)
+# robust_polynomial_fit
 # ---------------------------------------------------------------------
 
 def test_robust_polynomial_fit_recovers_a_known_clean_line():
@@ -733,8 +200,7 @@ def test_robust_polynomial_fit_stderr_grows_with_noise():
 
 
 # ---------------------------------------------------------------------
-# fit_taylor_residual_coefficients -- new since the previous version of
-# this file
+# fit_taylor_residual_coefficients
 # ---------------------------------------------------------------------
 
 def test_fit_taylor_residual_coefficients_joint_mode_recovers_known_params():
@@ -784,10 +250,7 @@ def test_fit_taylor_residual_coefficients_euler_only_mode_ignores_second_array()
 
 
 # ---------------------------------------------------------------------
-# _mean_curves_by_unique_value / _mean_curves_by_bin -- new since the
-# previous version of this file (replace the old, plain
-# _make_bin_masks helper -- panels [1,0]/[1,1] no longer bin
-# temperature/noise at all, they group by exact unique value instead)
+# _mean_curves_by_unique_value / _mean_curves_by_bin
 # ---------------------------------------------------------------------
 
 def test_mean_curves_by_unique_value_groups_and_averages_correctly():
@@ -853,7 +316,7 @@ def test_mean_curves_by_bin_log_bins_spaces_edges_geometrically():
 
 
 # ---------------------------------------------------------------------
-# _size_by_count -- new since the previous version of this file
+# _size_by_count
 # ---------------------------------------------------------------------
 
 def test_size_by_count_spans_the_requested_range():
@@ -873,9 +336,16 @@ def test_size_by_count_handles_all_equal_counts_without_dividing_by_zero():
     np.testing.assert_allclose(sizes, 85.0)  # midpoint of [20, 150]
 
 
+def test_size_by_count_handles_an_empty_curve():
+    """A curve emptied by run-coverage filtering is a legitimate outcome;
+    .min() on an empty array raises, so the shipped helper guards it and
+    returns the (empty) input unchanged rather than crashing."""
+    sizes = _size_by_count(np.array([]), min_size=20.0, max_size=150.0)
+    assert sizes.size == 0
+
+
 # ---------------------------------------------------------------------
-# _symmetric_left_zero_right_ylim -- new since the previous version of
-# this file
+# _symmetric_left_zero_right_ylim
 # ---------------------------------------------------------------------
 
 def test_symmetric_left_zero_right_ylim():
@@ -912,81 +382,14 @@ def test_symmetric_left_zero_right_ylim():
 
 
 # ---------------------------------------------------------------------
-# per-(temperature, noise) vs per-run aggregation -- panel [0,2] used
-# to be keyed by run_dir, which meant several SEEDS sharing one
-# (temperature, noise) sweep point each got their own overlapping
-# bubble at the same (x, y) location. This is the single most important
-# regression test in this file: it locks in the actual bug fix, not
-# just the surrounding machinery.
+# _ylim_from_below_cutoff
 # ---------------------------------------------------------------------
-
-def test_per_point_aggregation_pools_across_seeds():
-    from pathlib import Path
-    # Three runs: two are DIFFERENT SEEDS at the SAME (temperature,
-    # noise) sweep point; one is a genuinely different sweep point.
-    run_dirs = [Path("T900_n020_s79"), Path("T900_n020_s79"),
-                Path("T900_n020_s599"), Path("T900_n020_s599"),
-                Path("T850_n020_s79")]
-    temperatures = [0.9, 0.9, 0.9, 0.9, 0.85]
-    noises = [0.02, 0.02, 0.02, 0.02, 0.02]
-    latent_losses = [1.0, 2.0, 3.0, 4.0, 10.0]  # seeds s79/s599 together: mean([1,2,3,4])=2.5
-
-    per_point = _aggregate_per_point(temperatures, noises, latent_losses)
-
-    # ONE entry for (0.9, 0.02) pooling BOTH seeds' windows together,
-    # not two separate entries that would show up as two overlapping
-    # bubbles at the identical (x, y) location.
-    assert len(per_point) == 2
-    key_pooled = (0.9, 0.02)
-    assert key_pooled in per_point
-    assert len(per_point[key_pooled]["losses"]) == 4  # all 4 windows from BOTH seeds
-    assert np.mean(per_point[key_pooled]["losses"]) == pytest.approx(2.5)
-
-
-def test_per_run_aggregation_keeps_seeds_separate():
-    """The OTHER aggregation (kept deliberately separate from
-    per_point above) -- for the "which specific run/seed performs
-    worst" report, which needs seeds identified individually, unlike
-    panel [0,2]'s own pooled view. Same input as the pooling test
-    above, opposite expectation."""
-    from pathlib import Path
-    run_dirs = [Path("T900_n020_s79"), Path("T900_n020_s79"),
-                Path("T900_n020_s599"), Path("T900_n020_s599"),
-                Path("T850_n020_s79")]
-    temperatures = [0.9, 0.9, 0.9, 0.9, 0.85]
-    noises = [0.02, 0.02, 0.02, 0.02, 0.02]
-    latent_losses = [1.0, 2.0, 3.0, 4.0, 10.0]
-
-    per_run = _aggregate_per_run(run_dirs, temperatures, noises, latent_losses)
-
-    assert len(per_run) == 3  # three DISTINCT run_dirs, seeds NOT pooled
-    assert np.mean(per_run[Path("T900_n020_s79")]["losses"]) == pytest.approx(1.5)
-    assert np.mean(per_run[Path("T900_n020_s599")]["losses"]) == pytest.approx(3.5)
-    assert np.mean(per_run[Path("T850_n020_s79")]["losses"]) == pytest.approx(10.0)
-
-
-def test_per_point_aggregation_merges_near_duplicate_floats():
-    """Same float round-trip concern as _mean_curves_by_unique_value --
-    two runs meant to be the SAME sweep point, differing only in the
-    17th decimal digit after a metadata-file round-trip, must still
-    pool into one bubble."""
-    from pathlib import Path
-    run_dirs = [Path("runA"), Path("runB")]
-    temperatures = [0.9, 0.9000000001]
-    noises = [0.02, 0.0199999998]
-    latent_losses = [1.0, 3.0]
-
-    per_point = _aggregate_per_point(temperatures, noises, latent_losses)
-    assert len(per_point) == 1
-    assert len(list(per_point.values())[0]["losses"]) == 2
-
 
 def test_ylim_from_below_cutoff_ignores_the_converged_regime():
     """The dt-dependence y-range must come ONLY from points below the
     convergence cutoff -- points at/above it (dz0->0, error/dt meaningless)
     would blow the range up. This logic caused a three-iteration y-range saga
     when it lived inline in _build_and_save_figures; now a module-level unit."""
-    from evaluation.check_parameter_dependence import _ylim_from_below_cutoff
     fb = (-9.0, 9.0)
     # below-cutoff points [0,10] set the range (padded 5%); x=100 (converged) excluded
     lo, hi = _ylim_from_below_cutoff([([1.0, 2.0, 100.0], [0.0, 10.0, 999.0])],

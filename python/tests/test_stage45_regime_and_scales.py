@@ -213,7 +213,13 @@ def test_only_the_TRAIN_step_is_ramped():
     """
     src = source_without_comments(_ROOT / "training/train_refinement.py")
     assert "effective_rollout_weight=effective_rollout_weight" in src
-    val_call = src[src.index("step(batch, train=False"):] if "step(batch, train=False" in src else ""
+    # The validation pass calls `step(b, train=False)` -- arg name `b`, NOT
+    # `batch` (that is the DEFINITION's parameter name), and with NO effective_*
+    # weights, so val_loss uses the full (unramped) weight. An earlier version
+    # searched for "step(batch, train=False", which never matched, so val_call
+    # was "" and the assertion passed vacuously.
+    assert "step(b, train=False)" in src, "validation step call not found -- test is stale"
+    val_call = src[src.index("step(b, train=False)"):]
     assert "effective_rollout_weight" not in val_call[:200], (
         "the validation step must use the full rollout_weight"
     )

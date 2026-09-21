@@ -19,6 +19,7 @@ These assert the plumbing -- that the flag reaches the dataset and that its
 default is unchanged -- rather than measuring memory, which would be flaky.
 """
 import inspect
+import re
 from pathlib import Path
 
 import torch
@@ -370,17 +371,35 @@ def test_stage1_has_an_ema_warmup_by_default():
 def test_stage1_warmup_epochs_do_not_count_toward_early_stopping():
     """
     GUARDS counting warmup epochs as non-improvement. During the window
-    should_save is unconditionally False, so every warmup epoch increments the
-    counter -- any ema_warmup_epochs >= early_stopping_patience would stop the
-    run before the criterion had begun answering. Exactly the interaction that
-    made stage 2's deriv_target_centered switch stop one epoch short of its
-    own grace window.
+    should_save is unconditionally False, so a trainer that increments its
+    patience counter on every non-save -- including warmup -- effectively
+    "spends" the whole warmup on the counter: by the time the window ends, the
+    counter already sits at or past patience whenever ema_warmup_epochs >=
+    early_stopping_patience, and the FIRST post-warmup epoch then stops
+    immediately no matter its own result.
+
+    This bit twice. First (a mid-run version, train_stage2's
+    deriv_target_centered switch) fixed in train_stage2/train_refinement/
+    train_lds by excluding grace epochs from the COUNTER itself (see
+    test_trainer_excludes_grace_epochs_from_patience in
+    test_pipeline_tool_integration.py). Stage 1's own warmup only ever got the
+    weaker, check-level mitigation -- gating the STOP CHECK with a bare
+    `epoch > _grace` while the counter kept incrementing unconditionally
+    through every warmup epoch -- which is not equivalent, and reproduced the
+    same failure on a real 256x256 run with ema_warmup_epochs=patience=10:
+    early stopping fired at epoch 11, the very first epoch checked, while the
+    EMA had been falling monotonically through the entire warmup.
+
+    Guards the same counter-level exclusion train_stage2/train_refinement/
+    train_lds already use, now required of train_stage1 too.
     """
     source = inspect.getsource(train_autoencoder)
-    guard = [l for l in source.splitlines() if "epochs_since_improvement >= early_stopping_patience" in l]
-    assert guard, "could not find the early-stopping check"
-    window = source[source.index("if (early_stopping_patience is not None"):]
-    assert "epoch > _grace" in window.split(":")[0]
+    assert "was_in_grace_period = tracker.in_grace_period" in source, \
+        "grace/warmup flag not captured before tracker.update()"
+    assert "elif not was_in_grace_period:" in source, \
+        "patience counter does not exclude warmup/grace epochs"
+    assert not re.search(r"else:\s*\n\s*epochs_since_improvement \+= 1", source), \
+        "still has a bare else-increment of the patience counter"
 
 
 def test_stage1_warmup_is_clamped_so_a_short_run_can_still_save():
@@ -437,6 +456,8 @@ def test_no_epoch_inside_the_warmup_window_can_save(tmp_path, capsys):
         assert "without ever saving" in str(exc), exc
         assert not checkpoint_path.exists()
         return          # nothing saved at all -- vacuously inside no window
+    finally:
+        pass
 
     # The output file may be the ANCESTOR, copied forward because nothing beat
     # it -- a third legitimate outcome, added when the reference ceiling made
@@ -456,4 +477,63 @@ def test_no_epoch_inside_the_warmup_window_can_save(tmp_path, capsys):
     assert all(e > warmup for e in saved_epochs), (
         f"epoch(s) {[e for e in saved_epochs if e <= warmup]} saved inside the "
         f"{warmup}-epoch warmup window"
+    )
+
+
+# --------------------------------------------------------------------
+# regression: warmup == patience must not deadlock early stopping
+# --------------------------------------------------------------------
+
+def test_warmup_equal_to_patience_does_not_deadlock(tmp_path, capsys):
+    """
+    THE regression, end to end. ema_warmup_epochs == early_stopping_patience is
+    exactly the observed real-world failure (256x256.txt: both set to 10) --
+    with the counter-level fix, an improving-then-flat trajectory must survive
+    the full warmup and only stop on a REAL post-warmup plateau, not on the
+    warmup's own length.
+
+    Runs the real tracker/counter logic (not the full train_autoencoder loop,
+    which needs a dataset+model): this is train_stage1's own three-line
+    early-stopping block, reproduced exactly, mirroring how
+    test_grace_period_early_stopping.py tests train_stage2's loop.
+    """
+    from training._checkpoint_criterion import CheckpointCriterionTracker, clamp_grace_epochs
+
+    WARMUP = PATIENCE = 10
+    # noisy-but-improving through warmup (matches the real 256x256 log's shape:
+    # raw val bounces around but the EMA falls every epoch), then a genuine,
+    # unrecoverable plateau -- so the run's own new epochs must be what stops
+    # it, not the warmup window's length.
+    warmup_vals = [42.7, 20.7, 19.8, 7.1, 9.3, 12.6, 5.2, 7.0, 7.0, 4.7]
+    assert len(warmup_vals) == WARMUP
+    plateau_vals = [17.4] * 15   # strictly worse than epoch 10's 4.7, forever
+
+    epochs = 50
+    grace = clamp_grace_epochs(WARMUP, epochs)
+    tracker = CheckpointCriterionTracker(ema_warmup_epochs=grace, val_ema_decay=0.7)
+    epochs_since_improvement = 0
+    stopped_at = None
+    for epoch, val in enumerate(warmup_vals + plateau_vals, start=1):
+        was_in_grace_period = tracker.in_grace_period
+        _, saved = tracker.update(epoch, val)
+        if saved:
+            epochs_since_improvement = 0
+        elif not was_in_grace_period:
+            epochs_since_improvement += 1
+        if epochs_since_improvement >= PATIENCE:
+            stopped_at = epoch
+            break
+
+    # Must NOT stop at epoch 11 (the first post-warmup epoch) purely because
+    # the counter was already saturated by the warmup itself -- that was the
+    # actual incident. It MUST eventually stop once the plateau is long enough
+    # (patience real post-warmup non-improvements), just not immediately.
+    assert stopped_at != WARMUP + 1, (
+        "early stopping fired on the very first post-warmup epoch -- the "
+        "counter was poisoned by the warmup window itself"
+    )
+    assert stopped_at is not None, "a genuine, unbroken plateau must still stop the run eventually"
+    assert stopped_at >= WARMUP + PATIENCE, (
+        f"stopped at epoch {stopped_at}, before {PATIENCE} REAL post-warmup "
+        f"non-improvements had a chance to accumulate"
     )

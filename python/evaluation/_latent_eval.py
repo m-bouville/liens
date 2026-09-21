@@ -23,7 +23,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from models.constants import LATENT_SPATIAL_SIZE
+from models.constants import LATENT_SPATIAL_SIZE, N_THETA
+from models.encoder import zero_pad_theta_columns
 from models.latent_dynamics import LatentDynamics, integration_kwargs_from_config
 from training.checkpoint_components import build_ae_from_checkpoint
 from training.datasets import MicrostructureEvolutionDataset
@@ -268,8 +269,25 @@ def _load_ae_f_theta_and_dataset(
     ae_decoder = (ae.pathways[recon_stream_name].decoder if hasattr(ae, "pathways")
                   else ae.decoder)
 
+    # Built at the CURRENT N_THETA, not the checkpoint's own recorded
+    # lds_config["n_theta"] -- an old checkpoint (trained before the
+    # 2-feature theta change) records n_theta=1, but
+    # MicrostructureEvolutionDataset.__getitem__ ALWAYS yields theta at
+    # the current N_THETA width regardless of what this checkpoint was
+    # trained with (see datasets.py's own docstring). Building f_theta at
+    # the checkpoint's own n_theta would size its first Linear for 1
+    # theta column while every batch below hands it N_THETA columns --
+    # a matrix-shape crash the first time forward() runs, not a graceful
+    # fallback. This is the exact zero-pad-upgrade pattern already used at
+    # every OTHER f_theta reconstruction site in the project (see
+    # build_ae_from_checkpoint/model_assembly.py, and the diagnostic
+    # scripts check_rollout.py/compare_f_theta.py/
+    # compare_rollout_training.py/check_latent_channels.py, all of which
+    # build LatentDynamics at n_theta=N_THETA and zero-pad rather than
+    # trusting the checkpoint's own recorded width) -- this site had
+    # drifted from that pattern; see NN-code_structure.md.
     f_theta = LatentDynamics(
-        latent_channels=lds_config["latent_channels"], n_theta=lds_config["n_theta"],
+        latent_channels=lds_config["latent_channels"], n_theta=N_THETA,
         latent_spatial=lds_config.get("latent_spatial_size", LATENT_SPATIAL_SIZE),
         hidden_dim=lds_config["hidden_dim"], n_hidden_layers=lds_config["n_hidden_layers"],
         # EVERY meaning-changing field, from ONE list -- see
@@ -281,7 +299,11 @@ def _load_ae_f_theta_and_dataset(
         # at dt=500. One list, one call, and a new field cannot miss a site.
         **integration_kwargs_from_config(lds_config),
     ).to(device)
-    f_theta.load_state_dict(lds_checkpoint["model_state"])
+    # zero_pad_theta_columns is a no-op (returns the state dict unchanged)
+    # when the checkpoint's own weights are already N_THETA-wide, so this
+    # is safe and correct for a checkpoint trained after the theta change
+    # too -- not just for the old-checkpoint case this comment describes.
+    f_theta.load_state_dict(zero_pad_theta_columns(lds_checkpoint["model_state"], f_theta))
     f_theta.eval()
 
     dataset = MicrostructureEvolutionDataset(
@@ -686,5 +708,3 @@ def _evaluate_windows(dataset, f_theta, ae_decoder, device, decode: bool, euler_
         dz1_signed=dz1_signed, dz1_abs=dz1_abs,
         signed_residual_sum=signed_residual_sum, n_total=n_total,
     )
-
-

@@ -8,6 +8,7 @@ constructed here the way the OLD code would have written them: 1-theta
 modules, config recording n_theta=1."""
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -56,17 +57,26 @@ def _old_style_multistream_ae_checkpoint(path: Path, size=32, latent_channels=4)
     return path
 
 
-def _old_style_lds_checkpoint(path: Path, latent_channels=4):
+def _old_style_lds_checkpoint(path: Path, latent_channels=4, ae_checkpoint="whatever",
+                                test_dirs=None, window_length=2):
     """A stage-3 checkpoint as the pre-change train_lds saved it: f_theta at
-    n_theta=1 and config recording n_theta=1."""
+    n_theta=1 and config recording n_theta=1.
+
+    ae_checkpoint/test_dirs default to the original placeholder values used by
+    every test that only inspects this checkpoint's OWN model_state/config
+    (test_model_assembly_upgrades_an_old_1theta_f_theta, via
+    load_lds_component) -- those never open ae_checkpoint or read test_dirs.
+    A test that instead runs this through the real evaluation._latent_eval
+    loader must pass both explicitly (a real AE checkpoint path, and at least
+    one real run dir), since that loader DOES open and validate them."""
     f_theta = LatentDynamics(latent_channels=latent_channels, n_theta=1,  # OLD
                               latent_spatial=8, hidden_dim=8, n_hidden_layers=1)
     torch.save({
         "model_state": f_theta.state_dict(), "epoch": 2, "val_loss": 0.2,
-        "ae_checkpoint": "whatever", "test_dirs": [],
+        "ae_checkpoint": str(ae_checkpoint), "test_dirs": test_dirs or [],
         "config": {"latent_channels": latent_channels, "n_theta": 1,  # OLD
                     "latent_spatial_size": 8, "hidden_dim": 8, "n_hidden_layers": 1},
-        "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": 2,
+        "data_config": {"min_step": 0, "min_stdev_phi": None, "window_length": window_length,
                           "min_std_deriv": None},
     }, path)
     return path
@@ -123,13 +133,11 @@ def test_model_assembly_upgrades_an_old_1theta_f_theta(tmp_path):
     from training.checkpoint_components import load_ae_components
     components = load_ae_components(ae_ck, device="cpu")  # {"encoder": ..., "decoder": ...}
     components["lds"] = load_lds_component(lds_ck, device="cpu")
-    # component dicts' exact shape differs per assembly API -- use it directly:
-    try:
-        ae, stats_head, f_theta, frozen, cfgs, recon = build_models_from_components(
-            components, device="cpu")
-    except TypeError:
-        pytest.skip("assembly API differs -- covered by the loader tests above")
-        return
+    # build_models_from_components returns EXACTLY six values; a TypeError here
+    # is a real assembly regression, so it must FAIL rather than be swallowed as
+    # a skip (the earlier try/except TypeError: pytest.skip could never go red).
+    ae, stats_head, f_theta, frozen, cfgs, recon = build_models_from_components(
+        components, device="cpu")
     z0 = torch.randn(2, 4, 8, 8); z1 = torch.randn(2, 4, 8, 8)
     dt = torch.rand(2) * 50.0
     theta2 = torch.randn(2, N_THETA)
@@ -138,25 +146,105 @@ def test_model_assembly_upgrades_an_old_1theta_f_theta(tmp_path):
     assert out.shape == z0.shape
 
 
+def _write_tiny_run(base_path: Path, name: str, size: int = 32, temperature: float = 0.8,
+                     steps=(0, 1000, 2000)) -> Path:
+    """A minimal real run directory -- metadata.txt plus real snapshot files
+    in the actual on-disk format (see utils.load_datasets.snapshot_filename/
+    read_phi_half) -- big enough for MicrostructureEvolutionDataset to build
+    at least one window_length=2 window from it. No statistics.csv: with
+    min_stdev_phi=None (this file's data_config), build_good_steps never
+    opens it, and validate_run_dirs only requires it when min_stdev_phi is
+    set (see load_datasets.validate_run_dirs's own required-files logic)."""
+    from utils import load_datasets as load
+    run_dir = base_path / name
+    run_dir.mkdir()
+    metadata_text = "\n".join([
+        f"directory = {name}", "code version = test", "status = complete",
+        f"Nx = {size}", f"Ny = {size}", "dt = 0.05", f"steps = {steps[-1]}",
+        f"save_steps = {' '.join(str(s) for s in steps)}",
+        "a0 = 1.0", "b = 1.0", "T0 = 1.0", f"temperature = {temperature}",
+        "kappa = 0.2", "mobility = 0.05", "phi0 = 0.0", "noise = 0.01", "seed = 1",
+        "equation = allen_cahn", "solver = explicit", "",
+    ])
+    (run_dir / "metadata.txt").write_text(metadata_text)
+    rng = np.random.default_rng(0)
+    for step in steps:
+        arr = rng.standard_normal((size, size)).astype("<f2")
+        arr.tofile(run_dir / load.snapshot_filename(step))
+    return run_dir
+
+
 def test_latent_eval_f_theta_loader_upgrades_an_old_lds_checkpoint(tmp_path):
     """_latent_eval builds f_theta for every stage-3 diagnostic
     (check_parameter_dependence, check_dt_vs_time, ...). An old lds
     checkpoint (config n_theta=1, 1-theta weights) must come back as a
-    2-theta model with the old weights padded."""
+    2-theta model with the old weights padded.
+
+    This calls the REAL production loader (evaluation._latent_eval's
+    _load_ae_f_theta_and_dataset), not an inline re-implementation -- an
+    earlier version of this test built its own LatentDynamics +
+    zero_pad_theta_columns by hand, which could only ever prove the upgrade
+    pattern WORKS, never that this specific call site actually uses it. It
+    didn't: the real function built f_theta at the checkpoint's own
+    (n_theta=1) width with a plain load_state_dict, which would crash the
+    first time it was handed a batch from MicrostructureEvolutionDataset
+    (which always yields theta at the CURRENT N_THETA=2 width, regardless of
+    what the checkpoint itself was trained with -- see datasets.py's own
+    docstring). Fixed at the call site to mirror check_rollout.py/
+    check_stats_head_rollout.py's own pattern: build at n_theta=N_THETA, then
+    zero_pad_theta_columns before load_state_dict.
+    """
+    from evaluation._latent_eval import _load_ae_f_theta_and_dataset
     from models.encoder import zero_pad_theta_columns
-    lds_ck = _old_style_lds_checkpoint(tmp_path / "old_lds2.pt")
+
+    ae_ck = _old_style_multistream_ae_checkpoint(tmp_path / "old_ae2.pt")
+    run_dir = _write_tiny_run(tmp_path, "T800_n001_s0")
+    lds_ck = _old_style_lds_checkpoint(
+        tmp_path / "old_lds2.pt", ae_checkpoint=ae_ck, test_dirs=[str(run_dir)],
+        window_length=2,
+    )
     prev = torch.load(lds_ck, map_location="cpu", weights_only=True)
-    # the exact construction _latent_eval now performs:
-    f_theta = LatentDynamics(latent_channels=prev["config"]["latent_channels"],
-                              n_theta=N_THETA,
-                              latent_spatial=prev["config"]["latent_spatial_size"],
-                              hidden_dim=prev["config"]["hidden_dim"],
-                              n_hidden_layers=prev["config"]["n_hidden_layers"])
-    f_theta.load_state_dict(zero_pad_theta_columns(prev["model_state"], f_theta))
+
+    (device, euler_only, lds_checkpoint_path, ae_config, dataset,
+     ae_decoder, f_theta) = _load_ae_f_theta_and_dataset(
+        lds_checkpoint_path=lds_ck, min_step=None, min_stdev_phi=None,
+        min_passing_steps=None, base_path=None, size=None,
+        ae_stats_weight=None, hidden_dim=8, n_hidden_layers=1,
+        condition_on_theta=None, euler_only=None, device="cpu",
+    )
+
+    assert len(dataset) > 0, "the tiny run must yield at least one window_length=2 window"
+
+    # f_theta must actually accept the CURRENT theta width, which is what a
+    # real DataLoader batch over `dataset` hands it -- this is the exact call
+    # that crashed before the fix (shape mismatch between a 1-theta first
+    # Linear and a 2-column theta tensor).
     theta2 = torch.randn(3, N_THETA)
-    out = f_theta(torch.randn(3, 4, 8, 8), torch.randn(3, 4, 8, 8),
-                   torch.rand(3) * 50.0, theta2)
-    assert out.shape == (3, 4, 8, 8)
+    z0 = torch.randn(3, 4, 8, 8)
+    z1 = torch.randn(3, 4, 8, 8)
+    dt = torch.rand(3) * 50.0
+    with torch.no_grad():
+        out = f_theta(z0, z1, dt, theta2)
+    assert out.shape == z0.shape
+
+    # And the upgrade must be the SAME zero-pad upgrade used everywhere else
+    # in the project, not just "some" 2-theta model that happens to run:
+    # rebuild independently via zero_pad_theta_columns and compare outputs.
+    expected_f_theta = LatentDynamics(
+        latent_channels=prev["config"]["latent_channels"], n_theta=N_THETA,
+        latent_spatial=prev["config"]["latent_spatial_size"],
+        hidden_dim=prev["config"]["hidden_dim"],
+        n_hidden_layers=prev["config"]["n_hidden_layers"],
+    )
+    expected_f_theta.load_state_dict(zero_pad_theta_columns(prev["model_state"], expected_f_theta))
+    expected_f_theta.eval()
+    with torch.no_grad():
+        expected_out = expected_f_theta(z0, z1, dt, theta2)
+    assert torch.allclose(out, expected_out, atol=1e-6), (
+        "the real loader's f_theta does not match the standard zero-pad upgrade of the "
+        "same old checkpoint -- it upgraded, but not the same way every other reconstruction "
+        "site in the project does"
+    )
 
 
 def test_zero_pad_passes_non_theta_shape_mismatches_through_untouched():

@@ -76,6 +76,80 @@ def test_refinement_passes_split_labels_to_all_three_constructions():
         f"expected three constructions labeled training/validation")
 
 
+# --------------------------------------------------------------------------- #
+# validation progress bar + validation-aware training ETA
+# --------------------------------------------------------------------------- #
+# Trainers whose VALIDATION pass runs the encoder/decoder on RAW PIXELS, so the
+# pass is genuinely slow at 128x128+ and both a bar and an ETA that accounts
+# for it actually matter. train_lds (stage 3) is DELIBERATELY EXCLUDED: its
+# validation runs on cached latents through the small f_theta, so the pass is
+# fast and EpochProgress' own delay-gate keeps it silent -- the slow-val
+# condition this guards does not arise there. (Its train() call also has no
+# tail because its own validation is not the multi-minute pass this is about.)
+_RAW_PIXEL_TRAINERS = ["training/train_stage1.py", "training/train_stage2.py",
+                       "training/train_refinement.py"]
+
+_PRESENT = object()   # sentinel: keyword given but not a plain constant (e.g. a name)
+
+
+def _epoch_progress_calls(rel):
+    """Every EpochProgress(...) call in `rel`, as a list of {kwarg: value} dicts.
+    A keyword whose value is a literal is recorded as that literal; a keyword
+    whose value is anything else (a name like `_prev_val_seconds`) is recorded
+    as the _PRESENT sentinel, so callers can test for presence without pinning
+    the exact expression."""
+    tree = ast.parse((_ROOT / rel).read_text())
+    calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = getattr(fn, "id", getattr(fn, "attr", None))
+            if name == "EpochProgress":
+                kw = {}
+                for k in node.keywords:
+                    if k.arg is None:          # **kwargs splat -- ignore
+                        continue
+                    kw[k.arg] = (k.value.value if isinstance(k.value, ast.Constant)
+                                 else _PRESENT)
+                calls.append(kw)
+    return calls
+
+
+def test_raw_pixel_trainers_show_a_validation_bar_and_account_for_it_in_the_eta():
+    """
+    A raw-pixel trainer's validation is a full, minutes-long sweep at 128x128+.
+    Two failures make that user-hostile, and both were observed on stage 1's
+    256x256 run:
+
+      1. the training-epoch ETA counts only training batches, so it reads
+         "~3m52s left" and is then followed by an UNTIMED val pass;
+      2. the val pass shows no progress at all -- the run looks hung.
+
+    EpochProgress already supports both (tail_label/tail_seconds fold the
+    validation duration into the training ETA; a second instance with
+    label="validation" gives the val pass its own bar), and stages 2/4/5 used
+    them -- but stage 1 was wired for NEITHER, so it exhibited exactly (1) and
+    (2). Pin the wiring across every raw-pixel trainer so it can't regress or
+    be forgotten on the next one. Same lesson, same shape, as the grace-period
+    guard: the fix existed in the other trainers; the gap was one trainer left
+    out of the pattern.
+    """
+    for rel in _RAW_PIXEL_TRAINERS:
+        calls = _epoch_progress_calls(rel)
+        # (1) at least one EpochProgress is a validation bar
+        assert any(c.get("label") == "validation" for c in calls), (
+            f"{rel}: no EpochProgress(label='validation') -- the validation pass "
+            f"runs without a progress bar and looks hung on a large sweep")
+        # (2) a training-epoch EpochProgress carries the validation tail, so its
+        #     ETA reflects the whole epoch (training + validation), not just
+        #     training. tail_seconds is a name (the prior epoch's timing), so it
+        #     is checked for PRESENCE, not a literal value.
+        assert any(c.get("tail_label") == "validation" and "tail_seconds" in c
+                   for c in calls), (
+            f"{rel}: no EpochProgress(tail_label='validation', tail_seconds=...) "
+            f"-- the training ETA excludes the validation pass that follows it")
+
+
 def test_all_saving_trainers_stamp_the_save_time():
     """Every trainer that prints '-> saved' must also stamp the wall-clock
     time, so a saved-epoch line can be matched to the timestamped checkpoint

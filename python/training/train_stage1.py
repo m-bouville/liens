@@ -480,6 +480,14 @@ def train_autoencoder(
     _grace = clamp_grace_epochs(ema_warmup_epochs, epochs)
     tracker = CheckpointCriterionTracker(ema_warmup_epochs=_grace, val_ema_decay=val_ema_decay)
     epochs_since_improvement = 0
+    # Previous epoch's measured validation duration, fed into the NEXT epoch's
+    # training-progress ETA as its tail (see EpochProgress' tail_seconds). None
+    # until the first val pass has been timed, so epoch 1's ETA marks the tail
+    # "+ validation" rather than hiding it. Same pattern as train_stage2 /
+    # train_refinement -- stage 1 (raw-pixel, so its val pass is slow at 128+)
+    # had neither this nor a validation bar, so its ETA read "~3m52s left" and
+    # then went silent through a multi-minute val pass.
+    _prev_val_seconds = None
 
     print(f"Starting {epochs} epochs (early_stopping_patience: "
           f"{early_stopping_patience}, batches of {batch_size})...")
@@ -524,14 +532,25 @@ def train_autoencoder(
         _ref_recon0 = torch.zeros((), device=device)
         _ref_stats0 = torch.zeros((), device=device)
         _ref_z0_scale = torch.zeros((), device=device)
+        # Same silent-tail issue as the per-epoch val loop below: on a resume at
+        # 256x256 this reference pass is a full, multi-minute val sweep with no
+        # output. Bar it (EpochProgress self-gates on its delay, so it stays
+        # silent for a fast pass) and time it, so the FIRST real epoch's
+        # training ETA can already include validation instead of marking it
+        # "+ validation" with an unknown duration.
+        _ref_val_prog = EpochProgress(len(val_loader), label="validation", unit="batches")
+        _ref_val_t0 = time.monotonic()
         with torch.no_grad():
             for batch in val_loader:
+                _ref_val_prog.tick()
                 bs = batch[0].size(0) if include_stats else batch.size(0)
                 total, recon0, stats0, z0_scale = step(batch, train=False)
                 _ref_total += total * bs
                 _ref_recon0 += recon0 * bs
                 _ref_stats0 += stats0 * bs
                 _ref_z0_scale += z0_scale * bs
+        _ref_val_prog.close()
+        _prev_val_seconds = time.monotonic() - _ref_val_t0   # seeds epoch 1's ETA
         _n = len(val_set)
         _r_total = (_ref_total / _n).item()
         # Same as stage 2's: this pass has just measured the ancestor's
@@ -588,7 +607,14 @@ def train_autoencoder(
         train_z0_scale_sum = torch.zeros((), device=device)
         n_train = 0
         if epoch > 0:
-            _epoch_progress = EpochProgress(len(train_loader))
+            # tail_label/tail_seconds so the ETA reads as time left in the whole
+            # epoch (training + validation), not just training -- the val pass
+            # is a full raw-pixel sweep here and is not free. tail_seconds is the
+            # PREVIOUS epoch's measured val duration (None on the very first
+            # non-resume epoch, which EpochProgress renders as "+ validation").
+            _epoch_progress = EpochProgress(
+                len(train_loader),
+                tail_label="validation", tail_seconds=_prev_val_seconds)
             for batch_idx, batch in enumerate(train_loader):
                 _epoch_progress.tick()
                 bs = batch[0].size(0) if include_stats else batch.size(0)
@@ -624,16 +650,28 @@ def train_autoencoder(
         # accumulate_epoch expects; the z0_val_stats side effect happens inside
         # step, unchanged. Sample-weighted mean over len(val_set) -- no drop_last,
         # so that equals the summed batch sizes, bit-identical to the old loop.
+        # Its own progress bar (self-gating on the delay) so a slow raw-pixel val
+        # pass is not silent, and timed so the NEXT epoch's training ETA can
+        # account for it -- same pattern as train_stage2 / train_refinement.
+        _val_prog = EpochProgress(len(val_loader), label="validation", unit="batches")
+        _val_t0 = time.monotonic()
         with torch.no_grad():
             _val_means, _ = accumulate_epoch(
                 val_loader,
                 lambda b: dict(zip(("total", "recon0", "stats0", "z0_scale"), step(b, train=False))),
-                len(val_set))
+                len(val_set), progress=_val_prog)
+        _val_prog.close()
+        _prev_val_seconds = time.monotonic() - _val_t0   # feeds next epoch's ETA
         val_total = _val_means["total"]
         val_recon0 = _val_means["recon0"]
         val_stats0 = _val_means["stats0"]
         val_z0_scale = _val_means["z0_scale"]
 
+        # Captured BEFORE update(): update() flips in_grace_period to False on
+        # the LAST grace/warmup epoch, but that epoch was still a forced
+        # non-save and must still be excluded from the patience counter below
+        # (see the comment at the counter itself).
+        was_in_grace_period = tracker.in_grace_period
         _, saved_this_epoch = tracker.update(epoch, val_total)
         val_ema = tracker.val_ema
         val_ema_str = f"{val_ema:7.4f}" if val_ema is not None else "(warmup)"
@@ -771,7 +809,27 @@ def train_autoencoder(
                     # and continue -- a lost registry row, never a lost run.
                     print(f"  WARNING: on_checkpoint_saved failed "
                           f"({type(e).__name__}: {e}) -- continuing training")
-        else:
+        elif not was_in_grace_period:
+            # Grace/warmup epochs are EXCLUDED from the counter itself, not
+            # merely gated out of the check below. was_in_grace_period was
+            # captured BEFORE tracker.update() precisely so the LAST grace
+            # epoch (whose in_grace_period flag update() has just flipped to
+            # False) is still recognised as a forced non-save and skipped
+            # here too.
+            #
+            # Gating only the CHECK (a bare `epoch > _grace` there, with the
+            # counter itself incrementing unconditionally) still lets the
+            # counter accumulate through the whole warmup -- so the first
+            # post-warmup epoch inherits a counter already at or past
+            # patience and stops immediately regardless of its own
+            # performance. Observed on a real 256x256 run with
+            # ema_warmup_epochs=patience=10: early stopping fired at epoch 11
+            # (the very first epoch checked) even though the EMA had been
+            # falling monotonically through the entire warmup. Same class of
+            # bug, same fix, as the mid-run grace case already handled in
+            # train_stage2/train_refinement/train_lds (see
+            # test_grace_period_patience.py) -- stage 1's own warmup grace
+            # just hadn't had the counter itself fixed yet, only the check.
             epochs_since_improvement += 1
 
         if log_every_epoch or saved_this_epoch:
@@ -781,14 +839,7 @@ def train_autoencoder(
             print(f"      z0: train mean={z0_train_mean:+.4e} std={z0_train_std:.4e} | "
                   f"val mean={z0_val_mean:+.4e} std={z0_val_std:.4e}")
 
-        # `epoch > _grace`, mirroring train_lds: during the warmup window
-        # should_save is unconditionally False, so every one of those epochs
-        # increments epochs_since_improvement. Without this, any
-        # ema_warmup_epochs >= early_stopping_patience would stop the run
-        # before the criterion had even started answering -- the same
-        # interaction that made train_stage2's deriv_target_centered switch
-        # stop one epoch short of its own grace window.
-        if (early_stopping_patience is not None and epoch > _grace
+        if (early_stopping_patience is not None
                 and epochs_since_improvement >= early_stopping_patience):
             print(f"Early stopping at epoch {epoch}: no improvement for "
                   f"{early_stopping_patience} epochs")

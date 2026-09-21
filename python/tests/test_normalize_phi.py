@@ -277,11 +277,28 @@ def test_z0_scale_loss_shape_invariant_magnitude():
 # 3. LOSS: AC un-normalization is invariant
 # --------------------------------------------------------------------------- #
 # The residual on a decoded psi with normalize_phi=True must equal the residual
-# on psi*phi_eq with normalize_phi=False. We drive compute_stage45_loss with
-# minimal stubs so only the Allen-Cahn component is exercised, and a decoder
-# whose output we control. If the loss's internal interfaces differ from these
-# stubs on your tree, adjust the stubs -- the ASSERTION (invariance) is the point.
+# on psi*phi_eq with normalize_phi=False. We drive compute_stage45_loss through
+# its REAL model interfaces (ae.encoders["shared"](x, theta=...) -> dict of
+# streams, ae.pathways[name].decoder(z), f_theta.rollout(...)) with minimal
+# stand-ins, so only the Allen-Cahn component's math is actually exercised.
+#
+# HISTORY: this test used to be an xfail stub whose _StubAE exposed an
+# ae.encode(x, theta=...) method -- but compute_stage45_loss never calls
+# ae.encode() at all; it calls ae.encoders["shared"](x, theta=...) (see
+# _refinement_loss.py). The stub's encode() was therefore dead code, and every
+# run hit an AttributeError on ae.encoders before ever reaching the Allen-Cahn
+# math the test exists to check. Fixed by giving _StubAE a real .encoders
+# dict (a tiny stub "shared" encoder module returning a fixed-shape zero
+# latent dict), matching the interface every other call site in this project
+# actually uses. A SECOND interface mismatch survived that first fix: the stub
+# named its recon stream "recon", but compute_stage45_loss looks streams up by
+# recon_stream_name, whose DEFAULT is DEFAULT_STREAM_NAME ("state"), so the
+# encoder's returned dict was indexed with a key it did not contain and the loss
+# died with KeyError: 'state' before ever reaching the Allen-Cahn math. The stub
+# now names its recon stream DEFAULT_STREAM_NAME, so it lines up with the real
+# default (deriv_stream_name already defaulted to "deriv", which the stub used).
 from training._refinement_loss import compute_stage45_loss  # noqa: E402
+from models.latent_streams import DEFAULT_STREAM_NAME  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
 
@@ -299,16 +316,31 @@ class _StubPathway(nn.Module):
         return self._field[:1].expand(n, *self._field.shape[1:])
 
 
+class _StubSharedEncoder(nn.Module):
+    """Stand-in for ae.encoders["shared"]: ignores the actual pixel content
+    (the Allen-Cahn term never depends on what z0/z1 numerically ARE -- only
+    the decoded field, which _StubPathway fixes independently of them) and
+    returns a fixed-shape zero latent per stream. Real shape values don't
+    matter here -- only that recon_stream_name/deriv_stream_name are both
+    present with a shape _StubPathway.decoder can accept (any (N, C, h, w)
+    works, since it ignores z entirely)."""
+    def __init__(self, recon_name, deriv_name, latent_channels=8, latent_spatial=8):
+        super().__init__()
+        self._recon_name = recon_name
+        self._deriv_name = deriv_name
+        self._shape = (latent_channels, latent_spatial, latent_spatial)
+
+    def forward(self, x, theta=None):
+        b = x.shape[0]
+        z = torch.zeros(b, *self._shape, dtype=x.dtype, device=x.device)
+        return {self._recon_name: z, self._deriv_name: z.clone()}
+
+
 class _StubAE(nn.Module):
-    def __init__(self, field, recon_name):
+    def __init__(self, field, recon_name, deriv_name="deriv"):
         super().__init__()
         self.pathways = {recon_name: _StubPathway(field)}
-        self._recon_name = recon_name
-
-    # loss encodes x_window[:,0] to z0; return a zero latent of a plausible shape
-    def encode(self, x, theta=None):
-        b = x.shape[0]
-        return {self._recon_name: torch.zeros(b, 8, 8, 8)}
+        self.encoders = {"shared": _StubSharedEncoder(recon_name, deriv_name)}
 
 
 class _StubFTheta(nn.Module):
@@ -322,9 +354,6 @@ class _StubFTheta(nn.Module):
         return z0[:, None].expand(z0.shape[0], n_r + 1, *z0.shape[1:])
 
 
-@pytest.mark.xfail(reason="stub interfaces may differ on-tree; the invariance "
-                          "assertion is what matters -- adjust stubs to run.",
-                   strict=False)
 def test_ac_unnormalization_is_invariant():
     """AC residual on (psi, normalize_phi=True) == residual on (psi*phi_eq,
     normalize_phi=False): un-normalizing inside the loss recovers the physical
@@ -332,12 +361,12 @@ def test_ac_unnormalization_is_invariant():
     physics as one in raw units."""
     torch.manual_seed(0)
     B, n_r, H, W = 2, 2, 8, 8
-    recon = "recon"
+    recon = DEFAULT_STREAM_NAME   # must match the loss's recon_stream_name default
     T, T0, a0, b = 0.75, 1.0, 1.0, 1.0
     phi_eq = math.sqrt(a0 * (T0 - T) / b)
 
     psi = torch.randn(B * (n_r + 1), 1, H, W) * 0.5      # a normalized-scale field
-    theta = torch.tensor([[T - T0, math.log10(T0 - T)]] * B)   # theta[:,0] = T-T0
+    theta = torch.tensor([[T - T0, math.log(T0 - T)]] * B)   # theta[:,0] = T-T0
     x_window = torch.randn(B, n_r + 1, 1, H, W)
     t_window = torch.arange(1, n_r + 2, dtype=torch.float32)[None].expand(B, -1).contiguous()
     dt_window = t_window[:, 1:] - t_window[:, :-1]

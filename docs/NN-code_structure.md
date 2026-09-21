@@ -1,8 +1,8 @@
 # LIENS Codebase Structure
 
-A neural surrogate replacing PDE solving for Allen-Cahn phase-field microstructure evolution. This document describes the code as it currently stands, not the original design plan — see `./neural_nets.md` for the latter (and be aware the two may have drifted apart in places; several known differences are noted throughout).
+A neural surrogate replacing PDE solving for Allen-Cahn phase-field microstructure evolution. This document describes the code as it currently stands, not the original design plan — see `./neural_nets.md` for the latter (the two may differ in places; known differences are noted throughout).
 
-The presesent document is written automatically by Claude based on the code.
+The present document is written automatically by Claude based on the code.
 
 
 
@@ -44,23 +44,20 @@ output/stage<N>/           [output]Diagnostic PNGs (reconstruction, rollout, los
 
 A leading underscore marks a module LOCAL to its package -- imported only from
 within its own directory, never across packages (verified by
-tests/data/dependency_graph.py, a checked-in import-graph snapshot; a module
-whose importers are all same-directory is a rename candidate). It is applied to
-extracted helpers/leaf modules (`_training_loop`, `_dataset_filtering`,
+tests/data/dependency_graph.py, a checked-in import-graph snapshot). It is
+applied to extracted helpers/leaf modules (`_training_loop`, `_dataset_filtering`,
 `_spike_guard`, `_checkpoint_criterion`, `_refinement_loss`, `_train_ae_common`),
 not to every local module -- `blocks`, `latent_cache`, `lineage` are local but
 first-class enough to keep plain names.
 
 The corollary is that a module imported from OTHER packages should NOT be
-underscore-prefixed and often belongs in `utils/`, not the app layer. Four
-general helpers were moved out of `evaluation/` into `utils/` on this basis --
-`fits.py` (power-law/exponential fits, pure numpy), `plot_helpers.py`,
-`window_parsing.py`, `sweep_filters_common.py` -- each had no evaluation-specific
-dependency, and `fits` is now imported by `utils/plots.py` too, so keeping it in
-`evaluation/` inverted the layering (a foundational module reaching up into an
-app layer). The underscore was dropped on the move. (`paths.py` is a similar
-case still parked -- foundational path constants living in `orchestration/`,
-imported everywhere -- a higher-stakes move because of its reach.)
+underscore-prefixed and usually belongs in `utils/`, not the app layer. General
+helpers with no evaluation-specific dependency live there rather than in
+`evaluation/`: `fits.py` (power-law/exponential fits, pure numpy; imported by
+`utils/plots.py` too, so keeping it in `evaluation/` would invert the layering),
+`plot_helpers.py`, `window_parsing.py`, `sweep_filters_common.py`. (`paths.py` is a
+similar case still parked in `orchestration/` -- foundational path constants
+imported everywhere, a higher-stakes move because of its reach.)
 
 
 
@@ -73,17 +70,25 @@ latent-space consistency loss comparing `z1(t)` against what `z0`'s own trajecto
 its rate of change should be — this is what stage 3's coupled integrator needs primed, and
 is genuinely different from `check_interpolation.py`'s diagnostic (see Evaluation below).
 
+`train_stage2()` builds the deriv stream itself, in memory, directly from the stage-1
+checkpoint, via `extend_encoder.py`'s `extend_state_checkpoint_with_deriv_stream()` —
+extending the encoder with a fresh bottleneck + theta-conditioner and transferring stage 1's
+own trained weights unchanged. A checkpoint's `deriv` stream is `PURE_LATENT` (no per-stream
+decoder). For backward compatibility `train_stage2()` also accepts an already-multi-stream
+ancestor directly (resuming a prior stage-2 run, or a legacy checkpoint that still carries a
+real deriv-stream decoder `D1` — which then sits inert, never called). This is why stage 2's
+model is a `MultiStreamAutoencoder`, not the plain `Autoencoder` stage 1 uses (see `models/`).
+
 **Residual deriv head** (`deriv_head_hidden > 0`, config `head_kind: "residual"`): the
-deriv stream's output head, historically a `z = B·y` 1×1 conv (pointwise-linear), can be
-extended to `z = B·y + H(y)` with `H` a zero-initialised nonlinear branch (3×3 → activation
+deriv stream's output head is either `"linear"` (a `z = B·y` 1×1 conv, pointwise-linear) or
+`"residual"` (`z = B·y + H(y)` with `H` a zero-initialised nonlinear branch: 3×3 → activation
 → 3×3, width `head_hidden`). Zero-init means a `"residual"` head is byte-identical to
-`"linear"` until trained, so `train_stage2()` can UPGRADE a pre-residual-head ancestor
-mid-lineage: resuming such a checkpoint adds the zero-init `H` tensors (log: "N zero-initialised
+`"linear"` until trained, so `train_stage2()` can UPGRADE a linear-head ancestor mid-lineage:
+resuming such a checkpoint adds the zero-init `H` tensors (log: "N zero-initialised
 residual-head tensor(s) added") and starts identical to the ancestor, preserving all of its
-`z0`. This is the strict-upgrade mechanism used to bring the 128×128 stage-2 lineage onto the
-current architecture without restarting from stage 1 — combined with `zero_pad_theta_columns`
-(see `LatentDynamics`/`θ` under `models/` below), an old single-theta linear-head checkpoint
-loads into the current residual-head two-theta model losing nothing.
+`z0`. Combined with `zero_pad_theta_columns` (see `LatentDynamics`/`θ` under `models/`), an
+old single-theta linear-head checkpoint loads into the current residual-head two-theta model
+losing nothing.
 
 **Stage 2a** (`stage2a=True`): a head-only warmup — the deriv head trains while the trunk,
 decoder and recon head are frozen and in `.eval()` mode, so `z0` is unchanged and `recon0`
@@ -91,8 +96,8 @@ is flat by construction. Meant to give a freshly-added residual head a sensible 
 `stage2a=False` ("2b") unfreezes the trunk and lets `L_deriv` reshape `z0` (governed by
 `trunk_from_deriv_weight` and `z0_from_deriv_weight`). Because only the deriv term moves in
 2a, the stacked loss-components figure would be two dead-flat bands plus deriv and is skipped
-in 2a (the plain loss curve is still written). Raising `stage2a=True` on a linear-head
-ancestor with nothing to warm up raises rather than silently no-op'ing.
+in 2a (the plain loss curve is still written). `stage2a=True` on a linear-head ancestor with
+nothing to warm up raises rather than silently no-op'ing.
 
 Two stage-2 additions share one schedule:
 
@@ -108,32 +113,14 @@ Two stage-2 additions share one schedule:
   `interp_scale`, both recorded in `stage2_config`): penalizes
   `||(1-alpha) z0(t1) + alpha z0(t3) - z0(t2)||^2` with the dt-weighted
   `alpha = dt_minus/(dt_minus+dt_plus)`, on the SAME 3-frame window the centered target
-  already loads — no extra dataset, no extra encodes; `MicrostructureTripletDataset`
-  stays unused. Gated on the same switch epoch; `interp_weight > 0` with
-  `deriv_target_centered=False` raises at construction (no middle frame exists).
-  The residual is EXACTLY `(dt_minus*dt_plus/2) * z0_ddot` (verified to machine
-  precision), so `L_deriv` and `L_interp` are orthogonal components of the same
-  triplet — the first-difference and second-difference directions respectively. Its
-  degenerate minimum is any `z0` affine in t, INCLUDING A CONSTANT; only `L_recon0`
-  prevents that collapse, deliberately (an internal guard would hide the collapse
-  rather than prevent it), so `recon0` must be watched from the switch epoch whenever
-  the weight is raised.
-
-There used to be a separate stage 1b between them, whose job was building this second
-stream. It's gone: `train_stage2()` now builds the deriv stream itself, in memory, directly
-from the stage-1 checkpoint, via `extend_encoder.py`'s
-`extend_state_checkpoint_with_deriv_stream()` — extending the encoder with a fresh
-bottleneck + theta-conditioner and transferring stage 1's own trained weights unchanged.
-The old stage 1b pass had gone inert (running at `epochs=0` in every configuration this
-project actually used) well before it was formally removed; the one thing it genuinely
-built — a per-stream *decoder* (`D1`) for the deriv stream — is confirmed permanently
-unnecessary and no longer exists at all. A checkpoint's `deriv` stream is `PURE_LATENT`
-now, not `DECODER`-mode. `train_stage2()` still accepts an already-multi-stream ancestor
-directly (resuming a prior stage-2 run, or a pre-removal checkpoint that still has a real
-`D1`) for backward compatibility — such a `D1`, if present, simply sits inert, never called.
-
-This is also why stage 2's model is a `MultiStreamAutoencoder`, not the plain `Autoencoder`
-stage 1 uses (see `models/` below).
+  already loads — no extra dataset, no extra encodes. Gated on the same switch epoch;
+  `interp_weight > 0` with `deriv_target_centered=False` raises at construction (no middle
+  frame exists). The residual is EXACTLY `(dt_minus*dt_plus/2) * z0_ddot` (verified to machine
+  precision), so `L_deriv` and `L_interp` are orthogonal components of the same triplet — the
+  first-difference and second-difference directions respectively. Its degenerate minimum is
+  any `z0` affine in t, INCLUDING A CONSTANT; only `L_recon0` prevents that collapse,
+  deliberately (an internal guard would hide the collapse rather than prevent it), so `recon0`
+  must be watched from the switch epoch whenever the weight is raised.
 
 ### Stage 3
 Stages 3a and 3b are calls to the same `train_lds()`, with 3b resuming from 3a's checkpoint at a longer rollout horizon. A params file can instead use a single bare `# Stage 3` section: `main.py` enforces that 3a and 3b are either both present or both absent.
@@ -145,8 +132,7 @@ Stages 3a and 3b are calls to the same `train_lds()`, with 3b resuming from 3a's
 - `z1_resync` (on `train_lds`, a training policy) — whether `z1` is reset to
   the encoder's value at each real frame.
 
-`(1, True)` is exactly stage 3a's configuration and reproduces the historical
-behaviour byte-for-byte, so 3a needs no new parameters. 3b raises `n_substeps`.
+3a uses `(n_substeps=1, z1_resync=True)`; 3b raises `n_substeps`.
 
 **3a must stay at `n_substeps=1`.** Sub-stepping evaluates `f_theta` at
 model-generated intermediate states, which destroys the ground-truth
@@ -160,28 +146,26 @@ doc defines as `n_substeps` grows. `n_substeps` is therefore recorded in the
 checkpoint and reported on resume (not fatal: 1 -> N *is* the 3a -> 3b
 handoff).
 
-Fixed `n_substeps` has since been superseded in practice by the ADAPTIVE
-integrator: `alpha` bounds the curvature correction as a fraction of the
-linear term, so the sub-step count is derived per window
-(`n ~ |f| dt / (alpha |z1|)`), capped at `max_substeps`. When the cap binds
-(`CLAMPED ...x` in the log), the alpha criterion is NOT in force on exactly
-the longest-dt windows (a source of deadlocked runs). Memory is governed separately: retained
-autograd depth is bounded by `truncate_bptt` (gradients flow within
-segments), batches are cost-budgeted (`batch_cost_budget`, an ESTIMATE the
-integrator's realised counts can outgrow as |f_theta| grows through
-training — `bucket_refresh_epochs` re-estimates periodically), and a
-measured-VRAM governor (`target_vram_gib`) rescales the epoch's batch count
-after the fact — which under `grad_clip` silently changes the effective
-learning rate, so a binding budget from epoch 1 is preferable. The alpha /
-`n_substeps` distinction also gates evaluation: a vector-field `f_theta`
-(alpha-trained) supports h -> 0 refinement, a fixed-`n_substeps` one is a
-dt-averaged corrector and does not — and resuming an alpha-trained
-checkpoint at a coarser alpha asks a finely-fitted field to act as a
-one-shot corrector, which diverges badly (the log's own
-NOTE warns when this mismatch is configured).
+The integrator can run at a fixed `n_substeps` or ADAPTIVELY: `alpha` bounds the
+curvature correction as a fraction of the linear term, so the sub-step count is
+derived per window (`n ~ |f| dt / (alpha |z1|)`), capped at `max_substeps`. When
+the cap binds (`CLAMPED ...x` in the log), the alpha criterion is NOT in force on
+exactly the longest-dt windows (a source of deadlocked runs). Memory is governed
+separately: retained autograd depth is bounded by `truncate_bptt` (gradients flow
+within segments), batches are cost-budgeted (`batch_cost_budget`, an ESTIMATE the
+integrator's realised counts can outgrow as |f_theta| grows through training —
+`bucket_refresh_epochs` re-estimates periodically), and a measured-VRAM governor
+(`target_vram_gib`) rescales the epoch's batch count after the fact — which under
+`grad_clip` silently changes the effective learning rate, so a binding budget from
+epoch 1 is preferable. The alpha / `n_substeps` distinction also gates evaluation: a
+vector-field `f_theta` (alpha-trained) supports h -> 0 refinement, a
+fixed-`n_substeps` one is a dt-averaged corrector and does not — and resuming an
+alpha-trained checkpoint at a coarser alpha asks a finely-fitted field to act as a
+one-shot corrector, which diverges badly (the log's own NOTE warns when this
+mismatch is configured).
 
-Two newer, checkpointed (`_MEANING_FIELDS`, so they round-trip through
-save/rebuild) axes sit on top of this:
+Two checkpointed (`_MEANING_FIELDS`, so they round-trip through save/rebuild) axes
+sit on top of this:
 
 - **`dynamics_mode='deriv_linear'`** — `f_theta` takes `log(dt)` as an input
   and its output is applied with a LINEAR `f*dt` prefactor, so the network
@@ -199,27 +183,27 @@ save/rebuild) axes sit on top of this:
   autonomous rollout the derivative at each step is the backward quotient
   `q_i = (z0_i - z0_{i-1})/dt_{i-1}` from the model's OWN trajectory, so
   training matches the test-time regime (training on encoder-z1 then rolling
-  out on q was a confirmed train/test mismatch). Inert in a 1-step
-  `z1_resync=True` 3a, by construction.
+  out on q is a train/test mismatch). Inert in a 1-step `z1_resync=True` 3a,
+  by construction.
 
 `train_lds` also carries two latent-space regularizers (checkpointed weights, default 0):
 - **`L_stats0_predict`** — `‖stats_head(ẑ_k) − stats_head(z_true_k)‖²` over the rollout,
   self-consistent (both sides through the frozen stats head, no C++ stats; compared
-  DIRECTLY, not via `StatsLoss._wrapped_diff`, which re-normalizes its target and froze the
-  term). Needs the frozen stats head, loaded by `_load_frozen_stats_head` from the AE
-  checkpoint — stage 3 otherwise loads only the encoder.
+  DIRECTLY, not via `StatsLoss._wrapped_diff`, which re-normalizes its target). Needs the
+  frozen stats head, loaded by `_load_frozen_stats_head` from the AE checkpoint — stage 3
+  otherwise loads only the encoder.
 - **`L_z0_growth`** — `(ln‖z0_{k+1}‖ − ln‖z0_k‖)²`, a symmetric latent-norm growth penalty.
 Both feed the shared component-tracking (`component_histories`, `scale_ratio_history`, the
 console breakdown), as in the rollout trainers.
 
-Empirical status (as of the u-arc): u-trained-on-q improves IN-BOX accuracy
-(97% 5-step in the active regime vs ~92% t-scheme) but does NOT widen the
-stable envelope — late-`t` windows are low-SNR (`|Δz0| -> 0` is physical) and
-the frozen tail destabilises the guard; the binding constraint is the box,
-not the training horizon.
+Empirical status: u-trained-on-q improves IN-BOX accuracy (97% 5-step in the
+active regime vs ~92% t-scheme) but does NOT widen the stable envelope —
+late-`t` windows are low-SNR (`|Δz0| -> 0` is physical) and the frozen tail
+destabilises the guard; the binding constraint is the box, not the training
+horizon.
 
 ### Stages 4 and 5
-Stages 4 and 5 are similarly one function, `train_refinement()`, selected by
+Stages 4 and 5 are one function, `train_refinement()`, selected by
 `freeze_decoder` (`True` for 4, `False` for 5) — stage 4's `D` stays frozen as a "tether"
 keeping `E`'s output decodable; stage 5 lets `D` adapt too. The objectives differ in what
 leads: stage 4 refines `E` for dynamics (`L_rollout` leads, `L_recon0`/`L_stats0` anchor a
@@ -233,6 +217,12 @@ being assembled from two independent ancestors.
 Stage 4/5 are also the only stages with **two ancestors** to begin with (stage 2's E/D and
 stage 3's f) — every other stage has exactly one. This is why `checkpoint_components.py`
 exists at all (see below).
+
+A caveat: because every stage reuses an existing checkpoint whose signature matches, a
+silently UNDERTRAINED ancestor (a stage-1 killed at epoch 26/50, say) is reused without
+complaint and seeds everything downstream — the damage then only becomes visible at stages
+4/5. The provenance machinery below (`source_stage1`, ancestor pinning) exists to make WHICH
+ancestor seeded a run recoverable after the fact.
 
 
 
@@ -252,37 +242,41 @@ end.
 
 
 ### `models/` — architecture only, no training logic
-- **`Encoder`**: depth scales with input size so the spatial bottleneck is always 8×8 (3
-  stages for 64×64, 5 for 256×256). Built around `stream_configs` (a
+- **`Encoder`**: depth scales with input size so the spatial bottleneck lands exactly on
+  `latent_spatial_size` (a configurable value, defaulting to `models.constants.LATENT_SPATIAL_SIZE
+  = 8` when a checkpoint/params file doesn't set it) — `n_stages = log2(input_size /
+  latent_spatial_size)`. E.g. 3 stages for 64×64 at the default 8×8 bottleneck, but the
+  256×256 stage-1 checkpoint was trained at `latent_spatial_size=16` (4 stages, not 5) — the
+  bottleneck size is a per-checkpoint choice, not a fixed 8×8 regardless of input size. Built
+  around `stream_configs` (a
   `dict[str, LatentStreamConfig]`), not a single fixed output — one bottleneck per named
-  latent stream (e.g. today's `state`/`deriv` pair), each independently configurable
-  (channels, spatial size, whether it's theta-conditioned via a FiLM-style
-  `theta_conditioner` — taking the length-`N_THETA` θ vector, see `LatentDynamics` below —
-  and its output-head kind via `head_kind`: `"linear"` (the historical 1×1 conv) or
-  `"residual"` (that plus a zero-init nonlinear branch, see Stage 2 above)). A single-stream
-  case is just `stream_configs` with one entry, not a separate code path. `zero_pad_theta_columns()`
-  lives here: it right-zero-pads a checkpoint's theta-conditioner (and `f_theta`) first-Linear
-  weights when the model expects a wider θ than the checkpoint was trained with, the
-  backward-compatible `N_THETA`-growth mechanism. Can optionally return skip-connection features (`use_skips=True`,
-  `neural_nets.md`'s skip-connection idea) — scaffolded, never enabled anywhere.
+  latent stream (the `state`/`deriv` pair), each independently configurable (channels,
+  spatial size, whether it's theta-conditioned via a FiLM-style `theta_conditioner` — taking
+  the length-`N_THETA` θ vector, see `LatentDynamics` below — and its output-head kind via
+  `head_kind`: `"linear"` (a 1×1 conv) or `"residual"` (that plus a zero-init nonlinear
+  branch, see Stage 2 above)). A single-stream case is just `stream_configs` with one entry,
+  not a separate code path. `zero_pad_theta_columns()` lives here: it right-zero-pads a
+  checkpoint's theta-conditioner (and `f_theta`) first-Linear weights when the model expects a
+  wider θ than the checkpoint was trained with, the backward-compatible `N_THETA`-growth
+  mechanism. Can optionally return skip-connection features (`use_skips=True`) — scaffolded,
+  never enabled anywhere.
 - **`Decoder`**: mirrors the encoder; `UpBlock` uses `ConvTranspose2d(kernel_size=2,
-  stride=2)` — a deliberately non-overlapping 2× expansion, chosen specifically to avoid
-  the classic checkerboard-artifact failure mode of mismatched kernel/stride ratios.
-  (A checkerboard artifact *did* appear during stage 4 development regardless — working on it.)
+  stride=2)` — a deliberately non-overlapping 2× expansion, chosen to avoid the classic
+  checkerboard-artifact failure mode of mismatched kernel/stride ratios. (A checkerboard
+  artifact does appear during stage 4 development regardless — working on it.)
 - **`Autoencoder`**: composes a single Encoder + Decoder (one stream). `ae.encoder`/
   `ae.decoder` are the attributes checkpoint-splitting code (below) relies on when
   stripping/re-adding `"encoder."`/`"decoder."` prefixes from a combined `state_dict()`.
-  Stage 1 is the only stage that still builds this (single-stream) class directly.
-- **`MultiStreamAutoencoder`**: the class every other stage actually uses (stage 2 onward)
-  — one shared `Encoder` (multi-stream, as above) plus one or more named `Decoder`s
+  Stage 1 is the only stage that builds this (single-stream) class directly.
+- **`MultiStreamAutoencoder`**: the class every other stage uses (stage 2 onward) — one
+  shared `Encoder` (multi-stream, as above) plus one or more named `Decoder`s
   (`self.encoders["shared"]`/`self.decoders[...]`, not the flat `.encoder`/`.decoder`
-  attributes above). `decoder_for_stream` maps each stream to which decoder actually
-  decodes it — today's checkpoints map only the recon (`state`) stream to a decoder at all;
-  the `deriv` stream is `PURE_LATENT` (no decoder — see Stages 1 and 2 above), so
-  `self.pathways["deriv"]` has no `.decoder` to call. A stream's decoder mode
-  (`PURE_LATENT`/`DECODER`/`AUTOENCODER`) is a structural property fixed once, when the
-  stream is created, not something later stages can change by resuming with a different
-  value.
+  attributes above). `decoder_for_stream` maps each stream to which decoder actually decodes
+  it — checkpoints map only the recon (`state`) stream to a decoder; the `deriv` stream is
+  `PURE_LATENT` (no decoder — see Stages 1 and 2 above), so `self.pathways["deriv"]` has no
+  `.decoder` to call. A stream's decoder mode (`PURE_LATENT`/`DECODER`/`AUTOENCODER`) is a
+  structural property fixed once, when the stream is created, not something later stages can
+  change by resuming with a different value.
 - **`LatentDynamics`** (`f_theta`): predicts `dz` from `(z, dt, θ)`. `.rollout(z0, dts,
   theta)` chains multiple Euler steps (`z ← z + f_theta(z, dt, θ)`) given a *sequence* of
   per-transition `dt`s — this is the mechanism every multi-step rollout computation in the
@@ -290,28 +284,26 @@ end.
   `θ` is a length-`N_THETA` vector of physical coordinates, not raw temperature, built by
   the single source of truth `theta_coordinates(temperature, T0)` in `models/constants.py`
   (so the dataset's per-frame `θ` and any diagnostic that rebuilds `θ` cannot drift).
-  `N_THETA` is now **2**: feature 0 is `T - T0` (smooth, signed proximity to criticality —
-  the original single coordinate) and feature 1 is `log(T0 - T)` (finite because `T < T0`
-  strictly), added specifically to LINEARISE the power-law physical scales near the critical
-  point — i.e. to attack the temperature regime directly rather than leaving it to the
-  network. Standardisation (zero-mean/unit-variance over the sweep's temperature list) is
-  applied by the caller that knows the sweep, not inside `theta_coordinates`, so the raw
-  physical coordinates are explicit and storable in the checkpoint config. `θ` can be
-  extended further; the machinery below (`zero_pad_theta_columns`) makes widening it
+  `N_THETA` is **2**: feature 0 is `T - T0` (smooth, signed proximity to criticality) and
+  feature 1 is `log(T0 - T)` (finite because `T < T0` strictly), to LINEARISE the power-law
+  physical scales near the critical point — i.e. to attack the temperature regime directly
+  rather than leaving it to the network. Standardisation (zero-mean/unit-variance over the
+  sweep's temperature list) is applied by the caller that knows the sweep, not inside
+  `theta_coordinates`, so the raw physical coordinates are explicit and storable in the
+  checkpoint config. `θ` can be extended further; `zero_pad_theta_columns` makes widening it
   backward-compatible with older checkpoints.
 
   **Backward compatibility across an `N_THETA` change is load-bearing.** Every
   theta-conditioned module takes `θ` as the LAST `N_THETA` columns of its first `Linear`.
-  Growing `N_THETA` (the 1→2 change above) widens those weights; `zero_pad_theta_columns`
-  (`models/encoder.py`) right-zero-pads an older checkpoint's narrower weights so the loaded
-  model is BIT-IDENTICAL in function to the checkpoint (the new coordinate contributes
-  nothing until trained). Every checkpoint-load path that can face an older-`N_THETA`
-  ancestor routes through it — the AE load in `checkpoint_components.py`, all three load
-  paths in `model_assembly.py`, and the diagnostic scripts that rebuild `f_theta`
-  (`check_rollout.py`, `compare_f_theta.py`, `compare_rollout_training.py`,
-  `check_latent_channels.py`, all of which build `LatentDynamics` at `n_theta=N_THETA`, not
-  the checkpoint's own recorded `n_theta`). This is the same zero-init upgrade contract the
-  residual head uses (below).
+  Growing `N_THETA` widens those weights; `zero_pad_theta_columns` (`models/encoder.py`)
+  right-zero-pads an older checkpoint's narrower weights so the loaded model is BIT-IDENTICAL
+  in function to the checkpoint (the new coordinate contributes nothing until trained). Every
+  checkpoint-load path that can face an older-`N_THETA` ancestor routes through it — the AE
+  load in `checkpoint_components.py`, all three load paths in `model_assembly.py`, and the
+  diagnostic scripts that rebuild `f_theta` (`check_rollout.py`, `compare_f_theta.py`,
+  `compare_rollout_training.py`, `check_latent_channels.py`, all of which build
+  `LatentDynamics` at `n_theta=N_THETA`, not the checkpoint's own recorded `n_theta`). This is
+  the same zero-init upgrade contract the residual head uses.
 
 
 ### `training/` — the largest module, several distinct responsibilities
@@ -319,11 +311,9 @@ end.
 #### Datasets (`datasets.py`)
 - `MicrostructureSnapshotDataset` — single frames, for stage 1. Supports D4×translation
   augmentation (32×) via `augment=True`.
-- `MicrostructureTripletDataset` — `(t1, t2, t3)` triples, built for the ORIGINAL
-  `L_interp` (pre-C0/C1 redesign). `L_interp` is back in training (stage 2, see above)
-  but does NOT use this class — it reuses the centered-target 3-frame window, which was
-  already loaded. This class remains unused by the pipeline; `check_interpolation.py`
-  uses the same underlying idea as a post-hoc diagnostic.
+- `MicrostructureTripletDataset` — `(t1, t2, t3)` triples. Unused by the pipeline;
+  `check_interpolation.py` uses the same underlying idea as a post-hoc diagnostic. Stage 2's
+  `L_interp` reuses the centered-target 3-frame window rather than this class.
 - `MicrostructureEvolutionDataset` — the workhorse for stages 2, 3, 4 and 5. Two modes
   selected by whether `encoder` is given: with a frozen encoder, latents are cached once
   upfront (stage 3's fast path); with `encoder=None`, raw pixel windows are returned and
@@ -343,29 +333,26 @@ end.
   plus missing/corrupt snapshot exclusion) used by all three dataset classes,
   so they agree on which steps are usable for the same `run_dirs`/filters. These
   helpers (`build_good_steps`, `_filtered_steps`, `split_run_dirs`,
-  `complete_run_dirs`, `report_save_step_distribution`) were **extracted to
-  `training/_dataset_filtering.py`** — a leaf module that imports nothing from
+  `complete_run_dirs`, `report_save_step_distribution`) live in
+  `training/_dataset_filtering.py` — a leaf module that imports nothing from
   `datasets.py`; `datasets.py` re-exports them, so `from training.datasets import
   build_good_steps` (used across the sweep tools, the trainers and the tests)
-  is unchanged. `min_std_deriv` is NOT part of this set: it is a
-  **stage-2-only** window filter (rejected outright in cached-latent mode),
-  saved in the config for *reportability, not reproducibility* — it shapes what
-  the ENCODER trains on, and reaches stage 3 only through the encoder's
-  representation quality. The measured per-`t` survival of all these filters
-  lives in the sweep tools (see `NN-tools.md`).
+  works. `min_std_deriv` is NOT part of this set: it is a **stage-2-only** window
+  filter (rejected outright in cached-latent mode), saved in the config for
+  *reportability, not reproducibility* — it shapes what the ENCODER trains on, and
+  reaches stage 3 only through the encoder's representation quality. The measured
+  per-`t` survival of all these filters lives in the sweep tools (see `NN-tools.md`).
 - **`require_consecutive`** (default `True`) — a window must be `window_length`
   frames that are consecutive in the ORIGINAL save schedule (`metadata.save_steps`),
   not merely consecutive *kept* steps. When a step-level filter drops a quiet
   frame, the two surviving frames on either side become adjacent in the kept list
   while a real saved frame sits between them; a window spanning that seam silently
-  jumps the gap and carries a large-`Δt` transition it never actually simulated
-  (the `du_total ≈ 2` tail and the `du_max = 2.5e4` grad-spike windows were exactly
-  these). The guard rejects such windows at the *definition* of a window — cheaper
-  and more principled than clipping their `dt` with `max_dt`, which only caps the
-  single largest jump. It closed the du_total gap, the grad-spike tail and the
-  large-dt instability together; a construction-time line reports the count skipped
-  (`N/M candidate window(s) … NOT k CONSECUTIVE saved steps`). `max_dt` still coexists,
-  for genuinely large single transitions from a natively sparse late-time schedule.
+  jumps the gap and carries a large-`Δt` transition it never actually simulated.
+  The guard rejects such windows at the *definition* of a window — cheaper and more
+  principled than clipping their `dt` with `max_dt`, which only caps the single
+  largest jump. A construction-time line reports the count skipped (`N/M candidate
+  window(s) … NOT k CONSECUTIVE saved steps`). `max_dt` still coexists, for
+  genuinely large single transitions from a natively sparse late-time schedule.
 - **u-scheme support** — with `time_coordinate='log10_t'`, the cached `deriv` latents
   are converted in place at construction (`z̃1 = ln10 · t · z1`) and window steps become
   `Δu`; the opt-in `return_phys_dt=True` makes batches 5-tuples carrying the PHYSICAL
@@ -375,18 +362,18 @@ end.
   through `build_good_steps()`, `MicrostructureSnapshotDataset` and
   `MicrostructureEvolutionDataset` into their construction-time diagnostic lines (runs
   dropped ENTIRELY, runs with too few windows, candidate windows skipped). Since a pipeline
-  builds the same dataset class once per split, these otherwise-identical lines repeat with
-  no way to tell which population each describes; the label makes each say `258/2837
-  training runs …` explicitly. Default `""` leaves the lines exactly as before, so nothing
-  but the labelled callers (stages 1 and 2) is affected.
-- **Progress bars for the long silent construction passes.** At 128×128 on CPU, three
-  stretches ran for minutes with no output and looked hung: the per-run read/encode pass in
+  builds the same dataset class once per split, these otherwise-identical lines would repeat
+  with no way to tell which population each describes; the label makes each say `258/2837
+  training runs …` explicitly. Default `""` leaves the lines unlabelled, so nothing but the
+  labelled callers (stages 1 and 2) is affected.
+- **Progress counters for the long silent construction passes.** At 128×128 on CPU, three
+  stretches run for minutes with no output: the per-run read/encode pass in
   `MicrostructureEvolutionDataset` (`encoding runs: N/436 (K cache hits)`), the per-run
   stats/index pass in `MicrostructureSnapshotDataset` (`indexing runs: …`), and the
   27k-triple encode loop in `check_interpolation.py` (`interpolation check: 27.1/27.1
   thousand triples`). Each prints an in-place counter (via `format_progress_count`), gated
   to a non-trivial run/triple count so small debugging runs stay silent, and — because the
-  chunks start with `\r` — none of them reach the log file (see `_Tee` above).
+  chunks start with `\r` — none reach the log file (see `_Tee` below).
 - Augmentation is implemented for stage 1 and stage 2's raw-pixel mode (the same
   (k, flip, shift) applied consistently across every frame in a window, so a window still
   describes a physically meaningful evolution, not a scrambled one), but not yet for stage
@@ -414,33 +401,30 @@ individual run directories, so it works before a sweep is generated.)
   against its own degenerate (constant-z0) minimum by design;
 - `StatsLoss`: per-stat normalized — raw statistics span ~800× different scales, e.g. `avg_phi` vs `energy` — the paper-level formula in `neural_nets.md` doesn't show this normalization;
 - `OneStepLoss`;
-- `RolloutLoss`: `return_per_step=True` exposes each chained step's own loss, `step_weights` can reweight individual steps (not currently used);
+- `RolloutLoss`: `return_per_step=True` exposes each chained step's own loss, `step_weights` can reweight individual steps (not currently used). Note it is a plain (scale-SENSITIVE) squared error, `‖z_hat − z_true‖²` — so shrinking the whole latent amplitude lowers it quadratically. The `torch.no_grad()` on its target (refinement, below) blocks the trivial E→const collapse but NOT a gentle global scale-down of the code, which corr_dx (scale-invariant) cannot see — the amplitude anchors (`L_recon_predict`/`L_grad_predict`) are what pin it;
 - `DtDecadeWeights`: precomputed per-decade reweighting for `RolloutLoss`'s own `weights` parameter, built once from the training set's own dt distribution and raw per-transition loss — gives each dt *decade* equal total loss-mass contribution rather than each window equal weight, countering a real, measured imbalance (~7% of windows carrying ~68% of total loss). Not the same fix as weighting by window count alone, which was tried first and made things worse (see the class's own docstring for the measured numbers).
 
 #### Checkpoint criterion (`_checkpoint_criterion.py`)
-`CheckpointCriterionTracker` is the shared "when should a checkpoint be saved" state machine (raw `val_loss` during an initial warmup, switching to an EMA afterward), used by all four training functions (`train_autoencoder`, `train_stage2`, `train_lds`, `train_refinement` — five stages, four functions, since `train_refinement` runs both 4 and 5). The module also holds three pure helpers the trainers used to inline (each was duplicated and drifted -- the reason this module exists):
-- **`scale_balance_report(contributions, raw, weights, scales)`** -- diagnoses a mis-scaled multi-term objective: warns when one term is >99% of the validation loss (its scale too small, drowning the rest) or a nonzero-weight term is <1% (scale too large, term effectively out). Two-sided; keyed on nonzero weight so a deliberately-off term is never flagged. Used by `train_refinement` and `train_stage2` (byte-identical inline copies before).
+`CheckpointCriterionTracker` is the shared "when should a checkpoint be saved" state machine (raw `val_loss` during an initial warmup, switching to an EMA afterward), used by all four training functions (`train_autoencoder`, `train_stage2`, `train_lds`, `train_refinement` — five stages, four functions, since `train_refinement` runs both 4 and 5). The module also holds three pure helpers:
+- **`scale_balance_report(contributions, raw, weights, scales)`** -- diagnoses a mis-scaled multi-term objective: warns when one term is >99% of the validation loss (its scale too small, drowning the rest) or a nonzero-weight term is <1% (scale too large, term effectively out). Two-sided; keyed on nonzero weight so a deliberately-off term is never flagged. Used by `train_refinement` and `train_stage2`.
 - **`ramp_completion_grace(epoch, epochs, warmup_epochs, tracker, val_ema_decay)`** -- when the LAST active weight-ramp completes (max of the nonzero warmups), reset the criterion with a clamped grace period and return which ramp(s) completed. The caller owns the message/event label. Used by `train_refinement` (rollout + recon_predict ramps); NOT by train_lds (no weight ramp) or stage 2 (graces on the deriv-target switch, a different trigger -- both use the shared `grace_epochs_for_ema`/`clamp_grace_epochs` primitives directly).
-- **`save_checkpoint(path, *, model_states, provenance, epoch, val_loss, val_loss_ema, test_dirs, val_components=None, val_components_raw=None, on_saved)`** -- atomic write + the fields every stage needs (epoch/val_loss/val_loss_ema/test_dirs, so none can be silently omitted -- the class of the stage45_config gap) + the on_saved hook wrapped so a failing registry upsert announces and continues. Used by all three of stage 2/3/4-5; the stage-specific config sub-dicts go in `provenance`. (Stage 1 is NOT migrated -- it still saves via `atomic_torch_save` directly; see the shared-loop note below.) `val_components` (weighted/scaled contributions, summing to `val_loss`) and `val_components_raw` (un-weighted/un-scaled, comparable across runs) are written into the checkpoint so an eval tool can read the per-component breakdown without parsing the `.log`; stage 1 writes the same two keys into its `atomic_torch_save` dict directly.
+- **`save_checkpoint(path, *, model_states, provenance, epoch, val_loss, val_loss_ema, test_dirs, val_components=None, val_components_raw=None, on_saved)`** -- atomic write + the fields every stage needs (epoch/val_loss/val_loss_ema/test_dirs, so none can be silently omitted) + the on_saved hook wrapped so a failing registry upsert announces and continues. Used by stage 2/3/4-5; the stage-specific config sub-dicts go in `provenance`. (Stage 1 saves via `atomic_torch_save` directly; see the shared-loop note below.) `val_components` (weighted/scaled contributions, summing to `val_loss`) and `val_components_raw` (un-weighted/un-scaled, comparable across runs) are written into the checkpoint so an eval tool can read the per-component breakdown without parsing the `.log`; stage 1 writes the same two keys into its `atomic_torch_save` dict directly.
 
-Two interactions are easy to get wrong and are now guarded:
+Three save-criterion invariants that are easy to get wrong and are guarded:
 
 - **Grace windows must not feed early stopping.** During a grace period
   `should_save` is unconditionally `False`, so counting those epochs as "no
-  improvement" makes early stopping fire whenever `grace >= patience`. Observed:
-  stage 2's `deriv_target_centered` switch (grace 5) against `patience=4` stopped
-  one epoch before the criterion became usable again, with the EMA still falling.
-  Both stage 2 and stage 3 now exempt grace epochs.
-- **Stage 1 has `ema_warmup_epochs=5`** (was 0, and it was the only stage
-  without one). With no warmup, epoch 1's raw `val_loss` seeds BOTH the EMA and
-  `best_val_loss`, so a lucky first epoch can set a bar later smoothed values
-  struggle to clear, starving the rest of the run of saves.
-
+  improvement" makes early stopping fire whenever `grace >= patience` (stage 2's
+  `deriv_target_centered` switch has grace 5 against `patience=4`). Both stage 2
+  and stage 3 exempt grace epochs.
+- **Stage 1 has `ema_warmup_epochs=5`.** With no warmup, epoch 1's raw `val_loss`
+  seeds BOTH the EMA and `best_val_loss`, so a lucky first epoch can set a bar
+  later smoothed values struggle to clear, starving the rest of the run of saves.
 - **Saving is an AND-gate: raw `val_loss` AND its EMA must both be at new lows**,
-  and both bars advance ONLY on an actual save. A low-EMA epoch whose raw valid was
-  *up* used to save (observed: e260 saved with valid rising); and a non-saving
-  low-raw epoch must not quietly lower the raw bar for later epochs. Grace periods
-  cap the raw bar at the reference rather than letting grace epochs move it.
+  and both bars advance ONLY on an actual save. A low-EMA epoch whose raw valid is
+  up must not save, and a non-saving low-raw epoch must not quietly lower the raw
+  bar for later epochs. Grace periods cap the raw bar at the reference rather than
+  letting grace epochs move it.
 
 Stages 2 and 3 also raise a clear `RuntimeError` when a run finishes without
 ever saving, rather than letting the next `torch.load` fail with a bare
@@ -460,7 +444,7 @@ upgrades pre-multistream checkpoints, the same backward-compat contract as
 `zero_pad_theta_columns`. `DEFAULT_STREAM_NAME = "state"`.
 
 #### Checkpoint components (`checkpoint_components.py`)
-adapters between checkpoint *shapes*, needed only because stage 4/5 is the first point in the pipeline where checkpoints from independent lineages get combined:
+Adapters between checkpoint *shapes*, needed because stage 4/5 is the first point in the pipeline where checkpoints from independent lineages get combined:
 - `load_ae_components()` / `load_lds_component()` — read a standalone stage-1/2 or stage-3
   checkpoint into a componentized `ComponentCheckpoint` (state_dict/config/provenance).
 - `assemble_joint_checkpoint()` — stage 4's entry point: merges two independent ancestors,
@@ -474,12 +458,18 @@ adapters between checkpoint *shapes*, needed only because stage 4/5 is the first
   this changes WHICH DATASET IS READ. Stage 2 derives `size` from its ancestor
   and uses it in `complete_run_dirs(base_path, size, size)`, while the output
   filename comes from the params file — so a mistyped `resume_from` pointing at
-  a 64x64 checkpoint trained a 64x64 model on 64x64 data and wrote it to
+  a 64x64 checkpoint would train a 64x64 model on 64x64 data and write it to
   `128x128-stage2.pt`, with every printed number internally consistent.
 - `split_joint_checkpoint_for_evaluation()` — the reverse direction: derives standalone-
   shaped checkpoint files from a joint stage 4/5 checkpoint so `check_reconstruction`/
-  `check_rollout` (which only know the older, standalone shapes) can run against stage 4/5
+  `check_rollout` (which only know the standalone shapes) can run against stage 4/5
   output unchanged, without either evaluation script needing to know about the joint format.
+- `resolve_normalize_phi(config, checkpoint=None)` — the single source of truth for reading a
+  checkpoint's `normalize_phi` (canonical `config["normalize_phi"]`, else the older
+  `data_config` location, else `False`). The six diagnostics that feed a decoder
+  (`check_latent_channels`, `check_reconstruction`, `check_rollout`, `check_stats_head_rollout`,
+  `compare_f_theta`, and via them `plot_evolution`) route through it rather than each reading
+  the key directly, so a lost-flag checkpoint can't silently be fed raw φ to a ψ-trained encoder.
 
 #### Model assembly (`model_assembly.py`)
 `build_models_from_components()` turns a
@@ -494,8 +484,9 @@ bottleneck, FiLM conditioners and unbottleneck have the wrong shape — which is
 why this is a separate operation.
 
 - `rescale_checkpoint_to_size()` — takes a STAGE-1 (single-stream) checkpoint
-  and rebuilds it at `size * 2^k`. `latent_spatial_size` stays 8, so each
-  doubling adds one down/up-block pair. Exactly 25% of parameters transfer at
+  and rebuilds it at `size * 2^k`. `latent_spatial_size` is held fixed at the
+  checkpoint's own value (read from its `stream_configs`), so each doubling adds one
+  down/up-block pair. Exactly 25% of parameters transfer at
   every rung (the doubling-per-stage rule makes each new deepest pair ~3x
   everything below it); the rest is fresh init, concentrated on the SMALLEST
   spatial maps where training is cheapest.
@@ -518,15 +509,18 @@ why this is a separate operation.
 The first two are properties of the DATA (`autocorr_length`'s search cap is
 `min(Nx,Ny)*2/3`, so 42 -> 84); `stats_head` maps latent -> statistics and the
 latent basis is rebuilt by the reinitialised bottleneck, the same argument that
-rules out porting `f_theta`. Keeping it was also an outright crash whenever the
-new run wanted a different `stat_names`.
+rules out porting `f_theta`. Keeping it would also crash whenever the new run
+wanted a different `stat_names`.
 
 #### Refinement loss (`_refinement_loss.py`)
 `compute_stage45_loss()` — the actual stage 4/5
 objective. The one mechanism worth understanding precisely: `L_rollout`'s target
 (`E(x_{t+dt})`) is computed under `torch.no_grad()`, not just `.detach()`'d after a normal
 forward pass — without this, `E` could trivially collapse to a constant with `f_theta`
-learning to match it, since nothing else in the loss would catch it.
+learning to match it, since nothing else in the loss would catch it. (This blocks the FULL
+collapse; a gentle global amplitude shrink still lowers the scale-sensitive `L_rollout` and
+is held only by the pixel-endpoint terms below — the failure mode where refinement "keeps the
+shape, loses the contrast".)
 
 The terms and *what each is applied to* (they differ in a way that matters):
 - **`L_rollout`** — latent-space: `f_theta^n(E(x0))` vs the re-encoded true future
@@ -539,7 +533,7 @@ The terms and *what each is applied to* (they differ in a way that matters):
   ONLY: decode `z_hat[:, -1] = f_theta^n(E(x0))`, grade against `x_future[:, -1]`. The only
   term that closes the loop on what is actually rendered at inference. Endpoint-only (the
   decoded frame, the most-drifted latent, and one decode not `n`); backprops the decoder
-  THROUGH the rollout, co-adapting `E`/`f_theta`/`D` — the first `D` signal about rendering
+  THROUGH the rollout, co-adapting `E`/`f_theta`/`D` — the `D` signal about rendering
   *predictions* (the point of unfreezing `D` in stage 5). Weight/scale + linear warmup;
   no-op at weight 0.
 - **`L_grad_predict`** — the spatial-gradient sibling of `L_recon_predict`: same decoded
@@ -556,11 +550,12 @@ The terms and *what each is applied to* (they differ in a way that matters):
   (`neural_nets.md` has the physics and the large-Δt caveat.)
 
 `train_refinement` warms `rollout_weight`, `recon_predict_weight`, `grad_predict_weight` and
-`allen_cahn_weight` in via **`linear_warmup_weight`** — linear (`epoch/warmup_epochs`), the
-same convention as stage 2's deriv warmup. The three pixel-endpoint terms share
-`recon_predict_weight_warmup_epochs` (all backprop through the rollout into a decoder that,
-resuming from stage 4, only saw frame-0 latents). The save-criterion grace fires when the
-last active ramp completes (`ramp_completion_grace`).
+`allen_cahn_weight` in via **`linear_warmup_weight`** (single source in `_training_loop.py`,
+imported by `train_refinement`) — linear (`epoch/warmup_epochs`), the same convention as stage
+2's deriv warmup. The three pixel-endpoint terms share `recon_predict_weight_warmup_epochs`
+(all backprop through the rollout into a decoder that, resuming from stage 4, only saw frame-0
+latents). The save-criterion grace fires when the last active ramp completes
+(`ramp_completion_grace`).
 
 Separately, `train_lds`/`train_refinement` take an optional **`lr_warmup_epochs`** (a
 learning-rate warmup, default 0): `LinearLR` 1%→full over `lr_warmup_epochs * len(train_loader)`
@@ -577,10 +572,9 @@ running-stat buffers the forward pass moved are RESTORED (`snapshot`/`restore_ru
 because "the step wasn't taken" covers parameters but not buffers, and unrestored buffers
 can move val_loss measurably via skipped batches alone. `SkipReporter` digests the per-epoch skips into ONE
 line — verbose the first time, then a compact `N grad (Kx) + M loss (Lx) of B @ du_max=…`
-per epoch — and MERGES the two guards' reports into a single block when both fire (they used
-to print two near-identical paragraphs). `SkipReporter.report_epoch(epoch, loss_guard,
-grad_guard, n_batches)` owns the running-total-to-delta bookkeeping (the four counters the
-trainers used to thread by hand and drift on); `grad_guard=None` handles a single-guard stage.
+per epoch — and MERGES the two guards' reports into a single block when both fire.
+`SkipReporter.report_epoch(epoch, loss_guard, grad_guard, n_batches)` owns the
+running-total-to-delta bookkeeping; `grad_guard=None` handles a single-guard stage.
 `end_epoch_pair` also tracks consecutive all-skip epochs to trigger a
 deadlock rollback / LR-lowering stop. Stage 2 keeps its OWN bespoke skip message
 (single loss guard, per-epoch API, no digest) on purpose — adopting `report_epoch` there would
@@ -588,21 +582,22 @@ change its log format/gating, a deliberate opt-in, not a mechanical dedup (docum
 `train_stage2`).
 
 #### Shared epoch loop (`_training_loop.py`)
-The per-epoch machinery that stage 2/3/4-5 each grew their own copy of, extracted so a fix
-lands once (the BatchNorm-restore-on-skip fix, the merged skip reporter, and the
-stage45_config provenance gap all landed in one trainer and not the others before this). Each
-trainer keeps its own `step()` (the forward + loss, genuinely stage-specific); the shared
+The per-epoch machinery shared by stage 2/3/4-5, so a fix (the BatchNorm-restore-on-skip
+behaviour, the merged skip reporter, the stage45_config provenance completeness) lands once.
+Each trainer keeps its own `step()` (the forward + loss, genuinely stage-specific); the shared
 pieces are pure/near-pure functions it calls:
 - **`accumulate_epoch(loader, forward_fn, n_samples, progress)`** — the inner train/val batch
   pass: iterate, run `forward_fn` (which returns `{component: scalar_tensor}` incl. `"total"`,
   already guarded/stepped), sample-weight-average, return `({name: mean}, n_batches)`. Used by
   all three trainers. Sample-weighted (not batch-weighted) so an unequal last batch is not
   over-counted. An empty loader returns `({}, 0)` so `means["total"]` raises loudly rather
-  than the old silent `zeros/0` → nan.
+  than a silent `zeros/0` → nan.
 - **`weighted_contributions(raw, weights, scales)`** — `{name: weight·raw/scale}`, the single
   arithmetic behind a stage's objective decomposition (the total, the loss line, the component
   scatter, `scale_balance_report` all consume it). An absent weight defaults to 1 (stage 2's
   implicit-anchor `recon0`).
+- **`linear_warmup_weight(epoch, full_weight, warmup_epochs)`** — the shared weight-ramp
+  formula (`full_weight · min(1, epoch/warmup_epochs)`), imported by `train_refinement`.
 - **`write_epoch_figures(...)`** — the `should_write_loss_figure`-gated loss_curve + CSV +
   decomposition figure, in-loop-throttled and force-written at run end. Parameterised for all
   three: optional `secondary_*`/`reference_levels` (train_lds's 1step line + ancestor bars),
@@ -611,21 +606,18 @@ pieces are pure/near-pure functions it calls:
 
 Not every helper fits every trainer, and the misfits are deliberate, not gaps: train_lds has
 no weight ramp (so no `ramp_completion_grace`) and no component decomposition (so no
-`weighted_contributions`); stage 2 keeps its own skip reporting. Recognising a non-fit is part
-of the extraction — forcing a helper where the trainer genuinely differs would be a behaviour
-change dressed as a refactor.
+`weighted_contributions`); stage 2 keeps its own skip reporting. Forcing a helper where the
+trainer genuinely differs would be a behaviour change dressed as a refactor.
 
-**Stage 1 (`train_autoencoder`) is the FOURTH trainer and is PARTIALLY migrated** — it
-predates the extraction and trains a plain autoencoder (no rollout, no f_theta, no weight
-ramp). It now uses `write_epoch_figures` (all its figures) and `accumulate_epoch` for its
-VALIDATION loop. Two pieces stay deliberately inline, each a genuine non-fit rather than an
-omission: the TRAIN loop (its per-batch VRAM logging and epoch-0 NaN branch have no hook in
-`accumulate_epoch`; forcing them through a closure counter would be a behaviour change dressed
-as a refactor) and the checkpoint save (stage 1's hand-built dict -- `model_state`,
-`stats_head_state`, `config` with `stream_configs`, `stats_config` -- is the contract stage 2,
-`build_ae_from_checkpoint` and the identity-resume tests read key-for-key, so it is not routed
-through `save_checkpoint` without a byte-identical guarantee). Migrating the val loop required
-one shared change: `accumulate_epoch`'s batch size is now
+**Stage 1 (`train_autoencoder`) is the FOURTH trainer, partially sharing this machinery.** It
+trains a plain autoencoder (no rollout, no f_theta, no weight ramp): it uses
+`write_epoch_figures` (all its figures) and `accumulate_epoch` for its VALIDATION loop. Two
+pieces stay deliberately inline, each a genuine non-fit: the TRAIN loop (its per-batch VRAM
+logging and epoch-0 NaN branch have no hook in `accumulate_epoch`) and the checkpoint save
+(stage 1's hand-built dict -- `model_state`, `stats_head_state`, `config` with `stream_configs`,
+`stats_config` -- is the contract stage 2, `build_ae_from_checkpoint` and the identity-resume
+tests read key-for-key, so it is not routed through `save_checkpoint` without a byte-identical
+guarantee). Supporting the shared val loop, `accumulate_epoch`'s batch size is
 `(batch[0] if isinstance(batch, (list, tuple)) else batch).size(0)`, because stage 1 without
 stats targets yields a bare-tensor batch, not the rollout trainers' tuple.
 
@@ -639,27 +631,26 @@ tiny and huge `dt` in one batch where the median is uninformative.
 - **`train_stage1.py`**: `train_autoencoder()` (stage 1) plus this module's own CLI entry
   point (`python -m training.train_stage1`) — the only training-loop module with one,
   since every other stage always resumes from an ancestor and has no "from scratch" mode.
-- **`train_stage2.py`**: `train_stage2()` (stage 2) — see Stages 1 and 2 above for what
-  changed here recently.
+- **`train_stage2.py`**: `train_stage2()` (stage 2) — see Stages 1 and 2 above.
 - **`_train_ae_common.py`**: shared by the two above — `freeze_outer_layers()` (a
   regularization knob) and `compute_weight_drift()` (its own diagnostic: per-block L2 drift
   in parameters vs. buffers, since a frozen block's *parameters* should show exactly zero
   drift but its BatchNorm *buffers* can still drift via forward-pass running stats unless
   the frozen submodules are re-`.eval()`'d every epoch — see that function's own docstring).
-  `train_autoencoder()` also exposes `cache_in_memory` (default `True` =
-  historical behaviour), `vram_log_every` and an epoch-0 **reference row** when
-  resuming. `cache_in_memory=False` is needed from 128x128 up: snapshots are
-  float16 on disk and cached as float32, and on Windows the DataLoader spawns,
-  so each worker gets its own copy — ~2.3 GB at 128 becomes ~11.7 GB with
+  `train_autoencoder()` also exposes `cache_in_memory` (default `True`),
+  `vram_log_every` and an epoch-0 **reference row** when resuming.
+  `cache_in_memory=False` is needed from 128x128 up: snapshots are float16 on
+  disk and cached as float32, and on Windows the DataLoader spawns, so each
+  worker gets its own copy — ~2.3 GB at 128 becomes ~11.7 GB with
   `num_workers=4`. Disabling it also makes STARTUP faster, since the cache is
   built by a serial single-threaded loop with the GPU idle whereas uncached
   reads happen inside the workers.
 
   The reference row saves and restores the RNG around its forward passes: it
   would otherwise reorder `train_loader`'s shuffle and silently change what the
-  run trains on. The same rule bit the test suite's artifact cache later —
-  **an action taken for diagnostics or infrastructure must not perturb the
-  sequence the real work depends on.**
+  run trains on — **an action taken for diagnostics or infrastructure must not
+  perturb the sequence the real work depends on** (the same rule the test
+  suite's artifact cache follows).
 
 - **`train_lds.py`**: `train_lds()`, shared by stages 3a and 3b (`n_rollout_steps`
   distinguishes them; `resume_from` chains 3a→3b). Carries the u/q-scheme axes
@@ -686,24 +677,30 @@ figure via `utils.plots.loss_curve`, early stopping) → save.
 
 
 ### `orchestration/` — pipeline orchestration, split out of `main.py`
-`main.py` itself is now a thin CLI entry point (argument parsing, then a call into
-`pipeline.run_from_params_file()`) — every other name it used to define locally lives here
-instead, split along natural seams:
+`main.py` itself is a thin CLI entry point (argument parsing, then a call into
+`pipeline.run_from_params_file()`); every other name it uses lives here instead, split along
+natural seams:
 - **`pipeline.py`** is the actual orchestrator: `run_from_params_file()` runs stages
   1→2→3(a/b)→4→5 as specified by one params file, stopping early and returning whichever
   checkpoint is the last one actually produced. See the **Orchestration** section below for
-  the caching/registry mechanics this drives.
+  the caching/registry mechanics this drives. It also **pins each stage's auto-chained
+  ancestor(s) to a timestamped copy** (`_archive_ancestor`, in `stage_params.py`) before
+  recording them, so a stage's registry/signature names WHICH ancestor produced it even
+  after the rotating canonical name (`128x128-stageN.pt`) is overwritten by a later run —
+  and a retrained ancestor (new mtime → new name) correctly invalidates the descendant's
+  cache. Stage 2 pins its stage-1 ancestor the same way stages 3/4/5 pin theirs, so stage-1
+  lineage stays recoverable once the canonical name is reused.
 - **`paths.py`**: `_PYTHON_ROOT`/`_STAGE_DIRS`/`_CHECKPOINTS_ROOT`, the anchor every other
   file in this package (and `main.py`) imports rather than each computing its own copy —
-  one shared source of truth instead of N independently-computed ones that could drift
-  apart (see the project's own path-policy history for why that's not hypothetical).
+  one shared source of truth instead of N independently-computed ones that could drift apart.
 - **`stage_params.py`** parses a stage-parameters file into per-stage kwargs:
   `parse_stage_params()` (section headers, `key=value`, inline `#` comments),
   `same`-inheritance resolution (`_preceding_stages()`'s hardcoded per-stage chain, e.g.
   stage 4 checks `["3b", "3a", 3, 2, 1]` in order), and best-effort str→bool/int/float
-  conversion.
+  conversion. Also holds `_archive_ancestor`/`_backup_before_overwrite` (ancestor pinning
+  and pre-overwrite backups, above).
 - **`checkpoint_registry.py`** matches a requested configuration against
-  `registry-stage<N>.csv` (`_find_matching_checkpoint()`), and recording new entries as
+  `registry-stage<N>.csv` (`_find_matching_checkpoint()`), and records new entries as
   training proceeds (`_upsert_registry()`, called on every intermediate save so a killed
   run doesn't falsely look "complete" to a later resume attempt, not just once at the end).
   Also resolves a `stageN_checkpoint` registry field to a concrete, canonical path
@@ -712,9 +709,8 @@ instead, split along natural seams:
   checkpoint's *structure* (not its filename) to determine which stage actually produced
   it, so a mismatched file is caught with a clear error instead of failing deep inside
   training with a confusing shape-mismatch. Recognizes `stage3_config` as well as
-  `stage2_config` for stage 2, so a checkpoint trained before the stage-renumbering doesn't
-  need retraining just to be correctly identified. Still recognizes a legacy `stage1b_config`
-  too, for any pre-removal checkpoint that still exists on disk (see Stages 1 and 2 above).
+  `stage2_config` for stage 2, and a legacy `stage1b_config`, so a pre-renumbering or
+  pre-removal checkpoint is correctly identified without retraining.
 - **`sweep_status.py`**: `check_sweep_status()` (`main.py --scan-only`), reports
   COMPLETE/INCOMPLETE/missing run directories per grid size, reading each size's own
   `metadata.txt` rather than depending on `config.txt`.
@@ -730,17 +726,14 @@ instead, split along natural seams:
 Each has a real, importable function (not just CLI logic) so `main.py` can call it directly, plus a thin `main()` CLI wrapper:
 
 - **`check_reconstruction.py`**: AE reconstruction quality on held-out samples.
-- **`check_rollout.py`**: multi-step rollout comparison (`state(t)`, `real Δx`, `predicted Δx`, `error`, over the full window chain via `f_theta.rollout()`). Also has `_padded_bounds()` for predictable, comparable color scales across different checkpoints/runs — derived only from the *real* data, never from the prediction, so a bad prediction shows as visible saturation instead of stretching its own scale.
-- **`check_interpolation.py`** and **`check_perturbation.py`** are stage 2's two latent-space  diagnostics (the letter post-hoc only: not used as loss function).
-- **`check_parameter_dependence.py`** scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `pipeline.py`'s stage 3 sanity checks alongside `check_rollout`. Also reports the oracle-z1 attribution (whether the euler error is z0's or z1's), the bias-vs-variance split of z1's error, and correlations against temperature / noise / autocorrelation length scale with a saturation confound-control cross-tab. The console output is data-by-default: the static explanatory prose (how to read each metric, the oracle-verdict caveat) is routed through a `_vprint` gate and appears only under `--verbose`/`-v`; every number, table and run-specific conclusion always prints, so the default output is paste-able. On this project's data at adequate (128×128) resolution the clean single error driver is the microstructural length scale (~63% correlation) — temperature and noise correlations (~1%/0%) are spurious, an artifact of finite-size autocorrelation-length saturation that the small-domain (64×64) analysis could not separate. The dt-dependence y-range logic (`_ylim_from_below_cutoff`:
-range from below-saturation points only, fallback on empty/degenerate) is a
-module-level unit-tested function — it caused a three-iteration y-range saga while it
-lived inline. The remaining figure body (`_build_and_save_figures`, ~1000 lines) draws
-TWO figures interleaved (each computed quantity onto both) and is at its documented
-safe stopping point: splitting it is a draw-reorder that needs a render gate.
+- **`check_rollout.py`**: multi-step rollout comparison (`state(t)`, `real Δx`, `predicted Δx`, `error`, over the full window chain via `f_theta.rollout()`). Also has `_padded_bounds()` for predictable, comparable color scales across different checkpoints/runs — derived only from the *real* data, never from the prediction, so a bad prediction shows as visible saturation instead of stretching its own scale. `compute_sample`/`compute_trajectory` here are the shared roll-and-decode primitives (endpoint-only vs every-frame); `compare_f_theta` and `plot_evolution` both consume them.
+- **`check_interpolation.py`** and **`check_perturbation.py`** are stage 2's two latent-space  diagnostics (post-hoc only: not used as loss function).
+- **`check_parameter_dependence.py`** scatters one-step error against `dt` across the *whole*  test set (not a handful of samples), fitting both a power law and a saturating   exponential to check whether error growth with `dt` is smooth relaxation or something else. Run in `pipeline.py`'s stage 3 sanity checks alongside `check_rollout`. Also reports the oracle-z1 attribution (whether the euler error is z0's or z1's), the bias-vs-variance split of z1's error, and correlations against temperature / noise / autocorrelation length scale with a saturation confound-control cross-tab. The console output is data-by-default: the static explanatory prose is routed through a `_vprint` gate and appears only under `--verbose`/`-v`; every number, table and run-specific conclusion always prints, so the default output is paste-able. On this project's data at adequate (128×128) resolution the clean single error driver is the microstructural length scale (~63% correlation) — temperature and noise correlations (~1%/0%) are spurious, an artifact of finite-size autocorrelation-length saturation that the small-domain (64×64) analysis could not separate. The remaining figure body (`_build_and_save_figures`, ~1000 lines) draws TWO figures interleaved and is at a documented safe stopping point: splitting it is a draw-reorder that needs a render gate.
 - **`compare_f_theta.py`** — the maintained model-vs-model comparison: chained-rollout
   trajectory figures (real / causal frozen-dz0 / stage-2 Euler / 3a / 3b rows, absolute-time
-  headers; >10 steps display every other column, the exact list named in the title) and a
+  headers; >11 columns display every other column via `every_other_columns` in
+  `utils/plot_helpers.py` — the same thinning rule `plot_evolution` uses — the exact list
+  named in the title) and a
   2x5 statistics figure (loss + correlation vs CDF / **`t_init`** / temperature-SMA
   / step count, four baselines everywhere, shared y-ranges on the loss and correlation rows,
   correlation floored at -20%). The second column bins by **`t_init`** (the window's physical
@@ -755,21 +748,33 @@ safe stopping point: splitting it is a draw-reorder that needs a render gate.
   `min_passing_steps`) so the population matches training, and eval-created latent caches are
   stamped with the encoder source. `_reconcile_data_config` runs before window selection: if a
   filter field one compared checkpoint recorded is missing from another (an older lineage
-  predating the field being saved), it borrows the value from the sibling with a printed NOTE
-  — they were, in practice, trained on the same filter; warns without overriding on a genuine
-  disagreement; and leaves a field absent from ALL of them absent (so the usual 'no threshold'
-  error still fires when nobody has a value). Also carries the two diagnostic sweeps that produced
-  stage 3's current verdict: `--f-scale-sweep` (scale `f_theta`'s output by lambda in [0,1];
-  0 reproduces stage 2 bit-exactly through the real integrator) and `--alpha-sweep`
-  (h -> 0 refinement; refuses fixed-`n_substeps` checkpoints, whose `f_theta` is a
-  dt-averaged corrector with no h -> 0 meaning). The dx panel is 8 columns — `state | real
-  dx | stage-2 dx | pred a | pred b | error a | error b | b-a` — where the stage-2 column
-  (pure `z0 + z1·dt`, no `f_theta`, coordinate-aware) gets its OWN robust scale (99th-pct,
-  floored at the real-dx range) so a diverged `z1` shows as saturated pixels with the
-  magnitude printed in the title instead of washing out the shared scale; it is the
-  per-window exhibit of "z1 fails past its skill horizon, f_theta compensates". `--t0-range
-  LO HI` restricts
-  windows by starting step (behaviourally tested — the t0-split verdicts rest on it).
+  predating the field being saved), it borrows the value from the sibling with a printed NOTE;
+  warns without overriding on a genuine disagreement; and leaves a field absent from ALL of
+  them absent (so the usual 'no threshold' error still fires when nobody has a value). Also
+  carries the two diagnostic sweeps that produced stage 3's current verdict: `--f-scale-sweep`
+  (scale `f_theta`'s output by lambda in [0,1]; 0 reproduces stage 2 bit-exactly through the
+  real integrator) and `--alpha-sweep` (h -> 0 refinement; refuses fixed-`n_substeps`
+  checkpoints, whose `f_theta` is a dt-averaged corrector with no h -> 0 meaning). The dx panel
+  is 8 columns — `state | real dx | stage-2 dx | pred a | pred b | error a | error b | b-a` —
+  where the stage-2 column (pure `z0 + z1·dt`, no `f_theta`, coordinate-aware) gets its OWN
+  robust scale (99th-pct, floored at the real-dx range) so a diverged `z1` shows as saturated
+  pixels with the magnitude printed in the title instead of washing out the shared scale; it is
+  the per-window exhibit of "z1 fails past its skill horizon, f_theta compensates". `--t0-range
+  LO HI` restricts windows by starting step (behaviourally tested — the t0-split verdicts rest
+  on it). `--with-ancestors` expands ONE checkpoint into its lineage (via
+  `lineage.resolve_lineage`) and compares the whole chain; the encoder-only stages (1/2) are
+  excluded from the rollout comparison, so a lone stage-3a whose only ancestor is a stage-2 has
+  no second f_theta to compare and errors out (use two explicit checkpoints, or
+  `--stage2-compare`).
+- **`plot_evolution.py`** — the PRESENTATION sibling of `compare_f_theta`'s trajectory
+  figure: for ONE model and a few chosen runs, a montage of real/prediction row pairs (one
+  pair per run, a spanning run-label + exact T on the left, shared per-run symmetric colour
+  scale so a prediction cannot be flattered by its own autoscaling). Owns only the layout;
+  the roll-and-decode is `check_rollout.compute_trajectory` and the checkpoint load is
+  `compare_f_theta._load_model` (stage 3 and the stage 4/5 joint), both shared verbatim.
+  `RUNDIR:STARTSTEP --steps N` picks the N+1 consecutive saved steps from `metadata.save_steps`;
+  long runs are thinned to every other column via the shared `every_other_columns`. Built for
+  slides/posts, not diagnostics.
 - **`check_z2_measurability.py`** — is a second-derivative latent stream learnable at all?
   Nonuniform 3-point stencils (the uniform formula is ~256% wrong on the geometric schedule)
   over two DISJOINT frame triplets — (0,1,2)/(3,4,5), sharing no frame, because shared-centre
@@ -788,6 +793,13 @@ safe stopping point: splitting it is a draw-reorder that needs a render gate.
   per temperature. Data loading (per-run metadata + statistics.csv into the per-cell
   accumulators) is factored into `_load_run_data` (pure IO/compute, covered end-to-end
   by the file's own test fixtures); drawing is quarantined in the single-figure `_plot`.
+- **`check_latent_channels.py`** — per-channel ablation importance of the `state` latent
+  (zero a channel, measure the recon-loss increase) plus the raw channel maps, vs physical
+  time and vs temperature. Handles all checkpoint shapes: a stage-3 f_theta checkpoint (which
+  carries NO AE weights, only an `ae_checkpoint` pointer) is redirected to its frozen AE
+  ancestor for inspection, while the eval-log row stays keyed on the stage-3 checkpoint the
+  user passed; input `size` is inferred from the AE state's down-block count when the config
+  doesn't record it (stage-3 configs don't).
 - **`find_windows.py`** — finds windows in a specific `(dt, θ)` corner and prints them as
   ready-to-paste `--fixed-windows` arguments for `check_rollout`/`compare_f_theta`, so a
   degraded corner spotted in the off-diagonal rollout figures can be re-examined on exactly
@@ -795,16 +807,16 @@ safe stopping point: splitting it is a draw-reorder that needs a render gate.
 - **`check_dt_vs_time.py`** — breaks the `t`/`Δt` collinearity that makes an "error vs dt
   decade" table equally a table of "error vs time" on this project's geometric schedule, by
   pairing NON-ADJACENT frames so `dt` and `t_init` can be varied independently. Returns
-  tables, not figures. (Note: at time of writing it still creates anonymous latent caches
-  and does not thread the training window-filters — a known gap vs `compare_f_theta`.)
+  tables, not figures. (Note: it still creates anonymous latent caches and does not thread
+  the training window-filters — a known gap vs `compare_f_theta`.)
 - **`compare_integrators.py`** and **`compare_rollout_training.py`** are one-off exploratory   comparison scripts, not part of the maintained by-stage output/checkpoint conventions; treat as needing an explicit refactor-or-archive decision rather than assuming they stay current automatically.
 
 
 #### Evaluation ledger (`utils/eval_log.py`, `evaluation/backfill_eval_components.py`)
 A per-checkpoint CSV, `checkpoints/stage<N>/eval-stage<N>.csv`, one row per `(checkpoint_path, epoch, eval_variant)`. `check_reconstruction`, `check_latent_channels` and `compare_f_theta` upsert their own measurements into it as they run; `backfill_eval_components` fills the input parameters and per-component losses the diagnostics do not write.
 
-- **`utils/eval_log.py`** — the schema and the writers. `EVAL_COLUMNS` is composed from groups (key + `SOURCE_COLUMNS` + `PARAM_COLUMNS` + `LOSS_COLUMNS` + `OUTPUT_COLUMNS`); `is_column_in_scope(column, stage)` is the single source of truth for stage-specific columns (e.g. dynamics params only on stage 3, `source_stage3` only on stage 4/5), used by every writer and the missing-check so scoping can't drift. `canonical_checkpoint_key` normalizes path spellings so one checkpoint is one row. `upsert_eval_row` merges a tool's columns into the keyed row; `upsert_eval_metrics` (compare_f_theta) fills empty metric cells in place or branches to a new `eval_variant` row. `params_from_checkpoint` dumps the checkpoint config as `p_*`; component columns store RAW losses, marked `val_components_kind`.
-- **`evaluation/backfill_eval_components.py`** — fills params/components from the checkpoint config and the run `.log` (matched by the `-> saved at HH:MM` annotation, not by name; log contributions are un-weighted to RAW). `--all` seeds a row per `.pt`; a set of one-time cleanup flags (`--prune-baselines`, `--collapse-empty-variant`, `--blank-zero-components`, `--drop-aliased-params`, `--drop-out-of-scope-columns`) repair legacy rows. See `NN-tools.md` for the CLI.
+- **`utils/eval_log.py`** — the schema and the writers. `EVAL_COLUMNS` is composed from groups (key + `SOURCE_COLUMNS` + `PARAM_COLUMNS` + `LOSS_COLUMNS` + `OUTPUT_COLUMNS`); `is_column_in_scope(column, stage)` is the single source of truth for stage-specific columns (e.g. dynamics params only on stage 3, `source_stage1` only on stage 2, `source_stage3` only on stage 4/5), used by every writer and the missing-check so scoping can't drift. `canonical_checkpoint_key` normalizes path spellings so one checkpoint is one row. `upsert_eval_row` merges a tool's columns into the keyed row; `upsert_eval_metrics` (compare_f_theta) fills empty metric cells in place or branches to a new `eval_variant` row. `params_from_checkpoint` dumps the checkpoint config as `p_*`; component columns store RAW losses, marked `val_components_kind`. `SOURCE_COLUMNS` records ancestry — `source_stage1` (stage 2's stage-1 ancestor), `source_stage2`, `source_stage3`, `resume_from`.
+- **`evaluation/backfill_eval_components.py`** — fills params/components from the checkpoint config and the run `.log` (matched by the `-> saved at HH:MM` annotation, not by name; log contributions are un-weighted to RAW). Parses the log's provenance lines into the `source_stage*` columns, including the stage-2 `"Resuming from …stage1…"` line into `source_stage1`; writes the matched log name into `log` from EITHER the component pass or the param pass (a row needing only params still records which log filled it). `--all` seeds a row per `.pt`; a set of one-time cleanup flags (`--prune-baselines`, `--collapse-empty-variant`, `--blank-zero-components`, `--drop-aliased-params`, `--drop-out-of-scope-columns`) repair legacy rows. See `NN-tools.md` for the CLI.
 - **`evaluation/check_normalization_factor.py`** — plots the `normalize_phi` divisor A(T)=√(−a(T)/b) along trajectories and vs T (constant per run, collapsing toward T0), explaining the downstream cost of normalization.
 
 ### `utils/`
@@ -814,6 +826,11 @@ A per-checkpoint CSV, `checkpoints/stage<N>/eval-stage<N>.csv`, one row per `(ch
 - `naming.py` — canonical checkpoint filename construction (`ae_checkpoint_name()`,
   `lds_checkpoint_name()`), used both when saving and when reconstructing a path to an
   existing checkpoint without an explicit override.
+- `plot_helpers.py` — the single-source shared plotting helpers: `moving_window` (SMA over
+  distinct x values), `pretty_label` (checkpoint stem → human timestamp), `log_scale_if_positive`,
+  `fmt_corr`, and `every_other_columns` (the "long run → every other column, keep first and
+  last" montage-thinning rule, shared by `compare_f_theta._trajectory_figure` and
+  `plot_evolution` so the two renderers can't diverge).
 - `logging_utils.py` — console/log plumbing shared across the pipeline:
   - `_log_to_file()` tees stdout/stderr into a per-stage log file in addition to the
     console for the duration of a training call, via `_Tee`. The file is written through
@@ -822,9 +839,9 @@ A per-checkpoint CSV, `checkpoints/stage<N>/eval-stage<N>.csv`, one row per `(ch
     checkpoint name, cannot overwrite a valuable existing log with a near-empty one.
     Output before the first epoch is buffered in memory (still teed live to the console);
     the first epoch-summary line commits it — opens the file, flushes the buffer, then
-    writes live-and-flushed from there (so a killed training run keeps its log, as before).
-    The first epoch is detected by the epoch-line format all four stages share (`{epoch:4d}`
-    then `|` or a number), distinguishable from setup lines that also start with digits.
+    writes live-and-flushed from there (so a killed training run keeps its log). The first
+    epoch is detected by the epoch-line format all four stages share (`{epoch:4d}` then `|`
+    or a number), distinguishable from setup lines that also start with digits.
   - `_Tee` follows one convention: chunks beginning with `\r` are in-place progress
     updates (transient by definition — each overwrites the last on a terminal), so they go
     to the CONSOLE ONLY, never the log file, where they would otherwise pile up as a
@@ -843,7 +860,7 @@ A per-checkpoint CSV, `checkpoints/stage<N>/eval-stage<N>.csv`, one row per `(ch
   - `format_progress_count(current, total)` — shared counter formatter: raw digits below a
     10 000 total (`151/436`), thousands above (`2.8/27.1 thousand`), threshold on the total
     so the unit never flips mid-run. Used by `EpochProgress` and by the dataset/interpolation
-    progress bars (below).
+    progress bars (above).
   - `print_run_parameters()` — the flat parameter echo at the top of every run's log.
 - `plots.py` — every figure is written through **`_save_figure()`**, which is NON-FATAL:
   it retries the `savefig` a few times with a short backoff (on Windows a just-written PNG
@@ -873,9 +890,8 @@ A per-checkpoint CSV, `checkpoints/stage<N>/eval-stage<N>.csv`, one row per `(ch
     and a constant baseline — keeps only the DECREASING trend fits (a growing ratio is not
     converging), and shows the highest (log-space) R²; the constant wins ties. Paired colours (recon0/stats0, recon_predict/grad_predict) and the same red
     dotted `event_epochs` marker as the loss curve. Emitted by stages 1, 2 and 4/5, all via
-    `write_epoch_figures`' `scale_ratios` argument (stage 1's earlier direct call was migrated).
-    Guarded against empty/epoch-0 renders (needs a positive epoch and a positive ratio to
-    log-scale).
+    `write_epoch_figures`' `scale_ratios` argument. Guarded against empty/epoch-0 renders
+    (needs a positive epoch and a positive ratio to log-scale).
   - `loss_component_scatter()`: per-component train/val trajectories as a LOWER-TRIANGULAR
     corner plot (row = y variable, column = x variable; the upper triangle is the redundant
     transpose). Axis padding proportional to the data's own spread (`span**0.15`; a fixed
@@ -914,47 +930,52 @@ oversight: `training/` modules have thorough unit + integration tests (dataset l
 checkpoint adapters, model assembly, loss mechanics — especially the collapse-prevention
 detach, criterion-tracker edge cases). `evaluation/` scripts have real but more recent
 coverage (`test_check_rollout.py`, `test_check_interpolation.py`,
-`test_check_perturbation.py`, `test_check_reconstruction_stage4.py`) — the last of these needed a
-whole-function integration test rather than isolated-helper tests, since
-`check_reconstruction()` has no small torch-free piece to extract the way the other three
-do. `orchestration.pipeline.run_from_params_file()` — the actual orchestration logic behind
-`main.py`'s thin CLI (see the `orchestration/` section above) — has its own dedicated
-integration coverage in `test_pipeline_stage2.py`, running the real 1→2 flow end-to-end
-against a synthetic sweep; `main.py` itself (argument parsing only) does not.
+`test_check_perturbation.py`, `test_check_reconstruction_stage4.py` — the last a
+whole-function integration test, since `check_reconstruction()` has no small torch-free piece
+to extract the way the other three do). `orchestration.pipeline.run_from_params_file()` — the
+actual orchestration logic behind `main.py`'s thin CLI — has its own dedicated integration
+coverage in `test_pipeline_stage2.py`, running the real 1→2 flow end-to-end against a
+synthetic sweep; `main.py` itself (argument parsing only) does not.
 
 ### Site-enumerating tests
 
 A recurring defect shape: **one concept implemented in N places, a change
-applied to N−1.** `compare_rollout_training.py`'s own comment recorded it before
-it was named — *"fixing dt_cap in either of those did NOT fix it here."* Four
-tests now enumerate the sites themselves and fail when a new one appears
-unhandled; each found a real omission when written:
+applied to N−1.** Four tests enumerate the sites themselves and fail when a new
+one appears unhandled:
 
 - `test_lds_reconstruction_fidelity.py` — parses every `LatentDynamics(...)`
-  reconstruction (there are now **five**: `_latent_eval.py`, `check_rollout.py`,
+  reconstruction (currently **five**: `_latent_eval.py`, `check_rollout.py`,
   `model_assembly.py`, `compare_rollout_training.py`, `compare_f_theta.py`) and checks each
   restores `dt_cap`, `n_substeps` and the latent geometry via `.get(key, historical_default)`,
-  plus a scan for an unlisted site. The theta upgrade added a second obligation these sites
-  must all meet — building `f_theta` at `n_theta=N_THETA` and routing the load through
-  `zero_pad_theta_columns` — which surfaced one at a time as older checkpoints hit each
-  unmigrated path; the enumeration test is what forces a new reconstruction site to be
-  considered rather than silently omitted. `build_ae_from_checkpoint` (the shared AE loader
-  behind `_latent_eval` → several stage-2 diagnostics) was the latest such site found: it
-  loaded the state_dict directly, so an old 1-theta checkpoint failed with a
-  `theta_conditioners.deriv` shape mismatch until it too routed the load through
-  `zero_pad_theta_columns`, as the other three loaders already did.
+  builds `f_theta` at `n_theta=N_THETA`, and routes the load through `zero_pad_theta_columns` —
+  plus a scan for an unlisted site. `build_ae_from_checkpoint` (the shared AE loader behind
+  `_latent_eval` → several stage-2 diagnostics) must also route its state-dict load through
+  `zero_pad_theta_columns`, so an old 1-theta checkpoint loads without a
+  `theta_conditioners.deriv` shape mismatch.
 - `test_diagnostic_filter_inheritance.py` — every stage-3 diagnostic must
-  inherit the dataset filters from the checkpoint's `data_config`. `max_dt` was
-  inherited by one of two.
+  inherit the dataset filters from the checkpoint's `data_config`.
 - `test_save_step_distribution.py` — every direct caller of
   `enumerate_run_dirs_from_metadata` must report the save schedule.
 - `test_ancestor_size_consistency.py` — every stage adopting an ancestor's
   `size` must cross-check it BEFORE adopting (checking after compares the
   ancestor with itself and always passes).
 
+### Guard tests (whole-file invariants)
+
+- `test_source_file_size_guard.py` — a RATCHET on comment/docstring-stripped module size:
+  each source file carries a recorded ceiling (its current size + headroom), keyed
+  `"package/file.py"`; the test fails if a file grows past its ceiling or a NEW file starts
+  oversized. It holds module extractions in place — nothing else stops an extracted file from
+  regrowing past its pre-extraction size. Measured on stripped CODE, not raw lines, since this
+  project's heavy rationale docstrings are deliberate and shouldn't trip the guard.
+- Ancestor-timestamping guards (`test_ancestor_timestamping.py`,
+  `test_stage2_ancestor_timestamping.py`) assert, via AST rather than source substrings, that
+  each stage archives its auto-chained ancestor(s) through `_archive_ancestor` and records the
+  timestamped path — the provenance machinery above.
+
 ### Test speed
 
-The suite (~1490 tests) runs in a few minutes under `pytest -n 4` (chunked in practice to
+The suite (~1500 tests) runs in a few minutes under `pytest -n 4` (chunked in practice to
 stay within timeouts). `pytest.ini` (with
 `--strict-markers`, so a typo'd marker is a collection ERROR rather than a silent
 no-op) defines one marker:
@@ -967,8 +988,7 @@ no-op) defines one marker:
   the wall clock is set by the slowest worker, not total work, so the fast tier
   saves less than the deselected tests' serial cost suggests.
 
-Two older changes made the bulk of the difference, and both have correctness
-caveats worth knowing:
+Two changes carry the bulk of the speed, and both have correctness caveats:
 
 - **Cached ancestors** (`conftest.cached_artifact`, `cached_stage1_ancestor`).
   Keyed on the FULL kwargs, because a too-coarse key hands a test the wrong
@@ -977,8 +997,13 @@ caveats worth knowing:
   cache also saves and restores the RNG around each build, so a cache hit and a
   cache miss leave the caller in the same state.
 - **One torch thread per xdist worker**. Without it, four workers each size a
-  thread pool to the full core count: a ~4 s test took 20.65 s and four-way
-  parallelism returned only 1.7x.
+  thread pool to the full core count and four-way parallelism returns only ~1.7x.
+
+Some guard tests inspect source text; where the invariant is code SHAPE rather than a literal
+string, `tests/_ast_helpers.py` provides AST assertions (`calls_to`, `multiplies`,
+`names_bound`, …) that survive a rename or reformat and can't be fooled by the same text in a
+comment — preferred over `"literal" in src` wherever a behavioural or structural check is
+possible.
 
 ### Dependency-graph tooling (`tests/_import_graph.py`, `tests/data/dependency_graph.py`)
 A checked-in snapshot of the project's INTERNAL import graph, as two mutually-inverse maps
@@ -992,5 +1017,5 @@ only those). Two analysis tools: `imported_by_nobody()` (dead code, or a CLI ent
 `test_dependency_graph.py` guards it: the snapshot matches the real source (staleness), the two
 maps are exact inverses (f∘f=Id), and -- the key one -- an independent tokenize-based scan
 agrees with the AST detector, so an import form the AST parser silently drops is caught rather
-than quietly shrinking the graph (three such forms were found and fixed this way). Generate the
-snapshot on the tree it guards -- one made against a different file set is stale by construction.
+than quietly shrinking the graph. Generate the snapshot on the tree it guards -- one made
+against a different file set is stale by construction.

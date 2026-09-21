@@ -379,7 +379,7 @@ See [./docs/NN-code_structure.md](NN-code_structure.md) for command-line instruc
 
 ### System size: 64×64 → 512×512
 
-Configuration: `base_channels=32`, `latent_channels=8`, `latent_spatial_size=8` (so one extra down/up pair per doubling), `hidden_dim=256`, `n_hidden_layers=2`, 8 stats. Counts are from the `nn.Module`s.
+Configuration: `base_channels=32`, `latent_channels=8`, `latent_spatial_size=8` (so one extra down/up pair per doubling), `hidden_dim=256`, `n_hidden_layers=2`, 8 stats; counts are from the `nn.Module`s. This is for simplicity's sake: in fact, `latent_spatial_size` would increase with system size.
 
 Blocks are labelled by index and channel transition. Under same-`dx` scaling, index-aligned blocks operate at the same physical scale in every model, which is why a row is comparable across columns.
 

@@ -30,6 +30,7 @@ dict_key_imports_values = {
     },
     'evaluation/_latent_eval.py': {
         'models/constants.py',
+        'models/encoder.py',
         'models/latent_dynamics.py',
         'orchestration/checkpoint_identification.py',
         'training/checkpoint_components.py',
@@ -564,6 +565,7 @@ dict_key_imported_by_values = {
         'training/train_stage2.py',
     },
     'models/encoder.py': {
+        'evaluation/_latent_eval.py',
         'evaluation/check_latent_channels.py',
         'evaluation/check_reconstruction.py',
         'evaluation/check_rollout.py',

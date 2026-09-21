@@ -206,7 +206,7 @@ def test_check_reconstruction_non_default_spatial_size(tmp_path, tmp_run_dir, ca
     )
 
 @pytest.mark.filterwarnings("ignore:checkpoint's saved config only described streams")
-def test_check_reconstruction_stale_multi_stream_metadata(tmp_path, tmp_run_dir, capsys):
+def test_check_reconstruction_stale_multi_stream_metadata(tmp_path, tmp_run_dir):
     run_dir, steps = tmp_run_dir
     ae_path = tmp_path / "fake-stage2-stale.pt"
     _save_ae_checkpoint(ae_path, [run_dir], size=64, latent_spatial_size=_NON_DEFAULT_SPATIAL,
@@ -221,16 +221,8 @@ def test_check_reconstruction_stale_multi_stream_metadata(tmp_path, tmp_run_dir,
 # ---- check_interpolation / check_perturbation -------------------------------
 # Both need real statistics.csv data (stat_names must match real columns)
 # -- tmp_run_dir_with_stats provides that.
-    # A script that found NO data still writes its figure, so the blank check
-    # above cannot see that case; the count it prints can.
-    printed = capsys.readouterr().out
-    counts = [int(n) for n in re.findall(r"(\d+) samples", printed)]
-    assert counts and max(counts) > 0, (
-        f"the script reported no samples -- it wrote a figure without processing "
-        f"any data:\n{printed[-400:]}"
-    )
 
-def test_check_interpolation_non_default_spatial_size(tmp_path, tmp_run_dir_with_stats):
+def test_check_interpolation_non_default_spatial_size(tmp_path, tmp_run_dir_with_stats, capsys):
     run_dir, steps, stat_names = tmp_run_dir_with_stats
     ae_path = tmp_path / "fake-stage2.pt"
     _save_ae_checkpoint(ae_path, [run_dir], size=64, latent_spatial_size=_NON_DEFAULT_SPATIAL,
@@ -240,9 +232,18 @@ def test_check_interpolation_non_default_spatial_size(tmp_path, tmp_run_dir_with
         checkpoint_path=ae_path, device="cpu", min_step=0, output_path=tmp_path / "out.png",
     )
     assert_figure_was_really_written(output_path)
+    # A script that found NO data still writes its figure, so the blank check
+    # above cannot see that case; the count it prints can. check_interpolation
+    # prints "Using N (t1,t2,t3) triples from M test dirs".
+    printed = capsys.readouterr().out
+    counts = [int(n) for n in re.findall(r"Using (\d+) \(t1,t2,t3\) triples", printed)]
+    assert counts and max(counts) > 0, (
+        f"check_interpolation reported no triples -- it wrote a figure without "
+        f"processing any data:\n{printed[-400:]}"
+    )
 
 
-def test_check_perturbation_non_default_spatial_size(tmp_path, tmp_run_dir_with_stats):
+def test_check_perturbation_non_default_spatial_size(tmp_path, tmp_run_dir_with_stats, capsys):
     run_dir, steps, stat_names = tmp_run_dir_with_stats
     ae_path = tmp_path / "fake-stage2.pt"
     _save_ae_checkpoint(ae_path, [run_dir], size=64, latent_spatial_size=_NON_DEFAULT_SPATIAL,
@@ -253,6 +254,15 @@ def test_check_perturbation_non_default_spatial_size(tmp_path, tmp_run_dir_with_
         n_samples=2, n_repeats=2,
     )
     assert_figure_was_really_written(output_path)
+    # A script that found NO frames still writes its figure; the count it prints
+    # is what distinguishes a real run. check_perturbation prints
+    # "Perturbing N real test-set frames in LATENT space".
+    printed = capsys.readouterr().out
+    counts = [int(n) for n in re.findall(r"Perturbing (\d+) real test-set frames", printed)]
+    assert counts and max(counts) > 0, (
+        f"check_perturbation reported no frames -- it wrote a figure without "
+        f"processing any data:\n{printed[-400:]}"
+    )
 
 
 # ---- check_rollout / check_parameter_dependence -----------------------------

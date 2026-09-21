@@ -2,7 +2,8 @@
 
 Tested against its OUTPUT (the reduced means and the batch count), since the
 whole point of the extraction is that a fix to it lands once for all three
-trainers -- so its contract must be pinned independently of any trainer."""
+trainers -- so its contract must be pinned independently of any trainer.
+"""
 import torch
 
 from training._training_loop import accumulate_epoch

@@ -187,15 +187,30 @@ def test_check_latent_channels_prefers_raw_components():
 
 
 # --------------------------------------------------------------------------- #
-# grace epochs must not count against early-stopping patience
+# grace/warmup epochs must not count against early-stopping patience
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("module", ["train_refinement.py", "train_lds.py", "train_stage2.py"])
+@pytest.mark.parametrize("module", ["train_refinement.py", "train_lds.py",
+                                    "train_stage2.py", "train_stage1.py"])
 def test_trainer_excludes_grace_epochs_from_patience(module):
-    """Every trainer that uses reset_with_grace must (a) capture in_grace_period
-    BEFORE tracker.update() (the flag flips inside update() on the last grace
-    epoch) and (b) skip the patience increment for grace epochs. A bare
-    `else: epochs_since_improvement += 1` counts forced non-saves as stagnation
-    and early-stops unconditionally when grace >= patience-1."""
+    """Every trainer whose CheckpointCriterionTracker enters a grace period --
+    mid-run via reset_with_grace() (train_stage2/train_refinement/train_lds), or
+    up front via ema_warmup_epochs at construction (train_stage1) -- must (a)
+    capture in_grace_period BEFORE tracker.update() (the flag flips inside
+    update() on the last grace epoch) and (b) skip the patience increment for
+    grace epochs. A bare `else: epochs_since_improvement += 1` counts forced
+    non-saves as stagnation and early-stops unconditionally when grace >=
+    patience-1.
+
+    train_stage1 originally gated only the STOP CHECK (`epoch > _grace`) while
+    still incrementing the counter unconditionally through the whole warmup --
+    which is not equivalent: the counter reaches patience by the time warmup
+    ends regardless, so the first post-warmup epoch stops immediately no matter
+    its own result. Observed on a real 256x256 run with
+    ema_warmup_epochs=patience=10: early stopping fired at epoch 11, the very
+    first epoch checked, while the EMA had been falling monotonically through
+    the entire warmup. Fixed to the same counter-level exclusion as the other
+    three trainers.
+    """
     src = _find(module)
     assert "was_in_grace_period = tracker.in_grace_period" in src, \
         f"{module}: grace flag not captured before update()"

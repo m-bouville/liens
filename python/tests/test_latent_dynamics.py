@@ -419,3 +419,265 @@ def test_dt_cap_zero_fully_suppresses_the_second_order_term():
     expected = z0 + z1 * dt.view(-1, 1, 1, 1)  # pure euler -- the whole f_val*(...) term should vanish
     assert torch.allclose(actual, expected, atol=1e-5)
     assert torch.isfinite(actual).all()
+
+
+# ---- constructor guards for the other integration-meaning fields --------
+#
+# Everything below fills in coverage this file had none of: the __init__
+# validation for n_substeps/alpha/truncate_bptt/dynamics_mode/
+# derivative_source/derivative_time/time_coordinate, the actual n_substeps>1
+# sub-stepping scheme (_integrate), the deriv_linear update formula, the
+# z1_resync=False (propagated-z1) path, and supports_autonomous_rollout.
+# dt_cap above was already thoroughly covered; alpha's own adaptive-count
+# derivation (_substeps_for) and truncate_bptt's gradient-segmenting are
+# NOT covered here -- both are substantial features in their own right and
+# are left for a dedicated follow-up rather than bolted on thinly here.
+
+def test_n_substeps_below_one_is_rejected():
+    with pytest.raises(ValueError, match="n_substeps"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, n_substeps=0)
+
+
+def test_alpha_must_be_strictly_positive():
+    with pytest.raises(ValueError, match="alpha"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, alpha=-1.0)
+    with pytest.raises(ValueError, match="alpha"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, alpha=0.0)
+
+
+def test_alpha_and_n_substeps_both_set_is_rejected():
+    """alpha REPLACES n_substeps (it derives the count); setting both is two
+    answers to one question, not a legal combination."""
+    with pytest.raises(ValueError, match="n_substeps"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8,
+                        alpha=0.1, n_substeps=2)
+
+
+def test_n_substeps_with_a_finite_dt_cap_warns_but_does_not_raise(capsys):
+    """The two are two answers to the same question (see __init__'s own
+    docstring) -- not forbidden together (a cap set below every h is
+    harmless), but must be VISIBLE, since the combination silently makes an
+    n_substeps sweep measure the cap instead of the integration."""
+    LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8,
+                    n_substeps=2, dt_cap=50.0)
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "n_substeps" in out and "dt_cap" in out
+
+
+def test_truncate_bptt_below_two_is_rejected_but_two_and_none_are_fine():
+    with pytest.raises(ValueError, match="truncate_bptt"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, truncate_bptt=1)
+    # must not raise:
+    LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, truncate_bptt=2)
+    LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, truncate_bptt=None)
+
+
+def test_invalid_enum_valued_fields_are_all_rejected_by_name():
+    with pytest.raises(ValueError, match="dynamics_mode"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, dynamics_mode="bogus")
+    with pytest.raises(ValueError, match="derivative_source"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, derivative_source="bogus")
+    with pytest.raises(ValueError, match="derivative_time"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, derivative_time="bogus")
+    with pytest.raises(ValueError, match="time_coordinate"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8, time_coordinate="bogus")
+
+
+def test_previous_quotient_derivative_source_requires_deriv_linear():
+    """derivative_source='previous_quotient' (the q-scheme) is only defined
+    for dynamics_mode='deriv_linear' -- z1_taylor propagates z1 by its own
+    (trapezoidal) update and has no use for a backward quotient."""
+    with pytest.raises(ValueError, match="deriv_linear"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8,
+                        derivative_source="previous_quotient")  # dynamics_mode defaults to z1_taylor
+
+
+def test_deriv_linear_forbids_a_finite_dt_cap():
+    """deriv_linear has no dt^2 term for dt_cap to contain -- a finite cap
+    there would confound the order-of-convergence measurement it exists for."""
+    with pytest.raises(ValueError, match="dt_cap"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8,
+                        dynamics_mode="deriv_linear", dt_cap=100.0)
+
+
+def test_deriv_linear_forbids_substeps_and_alpha():
+    """deriv_linear is a FULL-STEP object (forward()'s own linear update);
+    the sub-stepping integrator implements the OLD Taylor form instead, so
+    n_substeps>1 or any alpha would silently run the wrong scheme."""
+    with pytest.raises(ValueError, match="n_substeps"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8,
+                        dynamics_mode="deriv_linear", n_substeps=2)
+    with pytest.raises(ValueError, match="n_substeps"):
+        LatentDynamics(latent_channels=4, latent_spatial=4, hidden_dim=8,
+                        dynamics_mode="deriv_linear", alpha=0.1)
+
+
+def test_supports_autonomous_rollout_reflects_dynamics_mode_and_derivative_source():
+    """False only for deriv_linear + derivative_source='z1' -- the one
+    combination with no z1-update (or quotient-update) equation to
+    propagate the derivative autonomously with."""
+    z1_taylor = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+                                 hidden_dim=8, n_hidden_layers=1)
+    assert z1_taylor.supports_autonomous_rollout is True
+
+    deriv_linear_z1 = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+                                       hidden_dim=8, n_hidden_layers=1,
+                                       dynamics_mode="deriv_linear")
+    assert deriv_linear_z1.supports_autonomous_rollout is False
+
+    deriv_linear_q = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+                                      hidden_dim=8, n_hidden_layers=1,
+                                      dynamics_mode="deriv_linear",
+                                      derivative_source="previous_quotient")
+    assert deriv_linear_q.supports_autonomous_rollout is True
+
+
+# ---- dynamics_mode="deriv_linear" ----------------------------------------
+
+def test_deriv_linear_forward_matches_the_linear_update_formula():
+    """dynamics_mode='deriv_linear': z0_next = z0 + z1*dt + f(z0,z1,theta,dt)*dt
+    -- a LINEAR prefactor (not dt^2/2), with f additionally conditioned on
+    dt (via log(dt), see f()'s own docstring) rather than dt-blind."""
+    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+                              hidden_dim=8, n_hidden_layers=1,
+                              dynamics_mode="deriv_linear")
+    with torch.no_grad():
+        f_theta.net[-1].bias.fill_(0.2)
+        f_theta.net[-1].weight.normal_(0, 0.05)
+
+    torch.manual_seed(22)
+    z0 = torch.randn(2, 4, 4, 4)
+    z1 = torch.randn(2, 4, 4, 4)
+    theta = torch.randn(2, 1)
+    dt = torch.tensor([3.0, 12.0])
+
+    f_val = f_theta.f(z0, z1, theta, dt=dt)
+    expected = z0 + z1 * dt.view(-1, 1, 1, 1) + f_val * dt.view(-1, 1, 1, 1)
+    actual = f_theta(z0, z1, dt, theta)
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
+def test_deriv_linear_f_requires_dt_when_called_directly():
+    """f() needs log(dt) as an input in deriv_linear mode -- calling it
+    without dt (as every z1_taylor test above does) must fail clearly
+    rather than silently building a wrong-sized input."""
+    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+                              hidden_dim=8, n_hidden_layers=1,
+                              dynamics_mode="deriv_linear")
+    z0 = torch.randn(2, 4, 4, 4)
+    z1 = torch.randn(2, 4, 4, 4)
+    theta = torch.randn(2, 1)
+    with pytest.raises(ValueError, match="dt"):
+        f_theta.f(z0, z1, theta)  # no dt
+
+
+# ---- n_substeps > 1: the _integrate sub-stepping scheme ------------------
+
+def test_n_substeps_two_matches_the_documented_velocity_verlet_scheme():
+    """With n_substeps=2 (dt_cap=inf so it never engages), rollout() must
+    follow EXACTLY the semi-implicit velocity-Verlet scheme from _integrate's
+    own docstring: z0 updated with the CARRIED f (recycled from the previous
+    sub-step, not re-evaluated), z1 updated by the TRAPEZOIDAL average of the
+    two f evaluations straddling each sub-step. Built here by hand, calling
+    only f_theta.f() (never .forward()/.rollout()/._integrate()), so this
+    cannot pass by accidentally re-deriving _integrate's own code -- it is an
+    independent reimplementation of the documented formula."""
+    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+                              hidden_dim=8, n_hidden_layers=1, n_substeps=2)
+    with torch.no_grad():
+        f_theta.net[-1].bias.fill_(0.15)
+        f_theta.net[-1].weight.normal_(0, 0.05)  # nonzero so f actually varies with its input
+
+    torch.manual_seed(20)
+    z0 = torch.randn(2, 4, 4, 4)
+    z1 = torch.randn(2, 4, 4, 4)
+    theta = torch.randn(2, 1)
+    dt = torch.tensor([8.0, 20.0])
+
+    h = (dt / 2).view(-1, 1, 1, 1)
+    f_n = f_theta.f(z0, z1, theta)
+    z0_1 = z0 + z1 * h + f_n * (h ** 2 / 2)
+    z1_pred1 = z1 + f_n * h
+    f_1 = f_theta.f(z0_1, z1_pred1, theta)
+    z1_1 = z1 + (f_n + f_1) * (h / 2)
+
+    z0_2 = z0_1 + z1_1 * h + f_1 * (h ** 2 / 2)
+
+    z1_sequence = z1.unsqueeze(1)  # (B, 1, C, H, W) -- only z1(t_0) is ever read
+    dts = dt.unsqueeze(1)          # (B, 1) -- ONE real transition, taken in 2 sub-steps
+
+    z0_hats = f_theta.rollout(z0, z1_sequence, dts, theta)
+    assert torch.allclose(z0_hats[:, 1], z0_2, atol=1e-5), (
+        "n_substeps=2 rollout does not match the hand-built velocity-Verlet "
+        "reference computed independently from f_theta.f() alone"
+    )
+
+
+def test_n_substeps_one_explicit_matches_the_default_fast_path():
+    """n_substeps=1 given explicitly must behave identically to the default
+    (n_substeps unset) -- confirms passing 1 by hand doesn't accidentally
+    route through the general _integrate loop with different numerics than
+    the historical forward()-based fast path."""
+    torch.manual_seed(23)
+    f_default = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+                                hidden_dim=8, n_hidden_layers=1)
+    torch.manual_seed(23)
+    f_explicit = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+                                 hidden_dim=8, n_hidden_layers=1, n_substeps=1)
+    with torch.no_grad():
+        f_default.net[-1].bias.fill_(0.1)
+        f_explicit.net[-1].bias.fill_(0.1)
+
+    z0 = torch.randn(2, 4, 4, 4)
+    z1_sequence = torch.randn(2, 3, 4, 4, 4)
+    dts = torch.tensor([[5.0, 9.0], [3.0, 7.0]])
+    theta = torch.randn(2, 1)
+
+    out_default = f_default.rollout(z0, z1_sequence, dts, theta)
+    out_explicit = f_explicit.rollout(z0, z1_sequence, dts, theta)
+    assert torch.allclose(out_default, out_explicit)
+
+
+# ---- z1_resync=False: z1 propagated internally, not teacher-forced -------
+
+def test_z1_resync_false_ignores_z1_sequence_after_the_seed():
+    """z1_resync=False propagates z1 internally via _integrate's own
+    trapezoidal update rather than teacher-forcing it from z1_sequence at
+    every step -- only z1_sequence[:, 0] (the seed) is ever consulted; every
+    later entry must be completely irrelevant to the result. Two rollouts
+    differing ONLY in z1_sequence[:, 1:] (different garbage values) must
+    produce IDENTICAL z0_hats under z1_resync=False, while z1_resync=True
+    (which DOES read those entries) must produce DIFFERENT results between
+    the same two calls -- proving the premise (that True actually reads
+    them) isn't accidentally also true of False."""
+    f_theta = LatentDynamics(latent_channels=4, n_theta=1, latent_spatial=4,
+                              hidden_dim=8, n_hidden_layers=1)
+    with torch.no_grad():
+        f_theta.net[-1].bias.fill_(0.1)
+        f_theta.net[-1].weight.normal_(0, 0.05)
+
+    torch.manual_seed(21)
+    z0 = torch.randn(1, 4, 4, 4)
+    z1_seed = torch.randn(1, 4, 4, 4)
+    theta = torch.randn(1, 1)
+    dts = torch.tensor([[5.0, 5.0]])
+
+    z1_seq_a = torch.cat([z1_seed.unsqueeze(1),
+                           torch.full((1, 2, 4, 4, 4), 999.0)], dim=1)
+    z1_seq_b = torch.cat([z1_seed.unsqueeze(1),
+                           torch.full((1, 2, 4, 4, 4), -777.0)], dim=1)
+
+    out_false_a = f_theta.rollout(z0, z1_seq_a, dts, theta, z1_resync=False)
+    out_false_b = f_theta.rollout(z0, z1_seq_b, dts, theta, z1_resync=False)
+    assert torch.allclose(out_false_a, out_false_b), (
+        "z1_resync=False result changed when only z1_sequence[:, 1:] changed -- "
+        "those entries should be completely ignored (z1 is propagated internally)"
+    )
+
+    out_true_a = f_theta.rollout(z0, z1_seq_a, dts, theta, z1_resync=True)
+    out_true_b = f_theta.rollout(z0, z1_seq_b, dts, theta, z1_resync=True)
+    assert not torch.allclose(out_true_a, out_true_b), (
+        "z1_resync=True should pick up the (different) garbage in z1_sequence[:, 1:] "
+        "and diverge -- if it doesn't, this test's premise (that True DOES read "
+        "those entries) is broken, not that False is wrong"
+    )

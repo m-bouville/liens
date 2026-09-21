@@ -430,3 +430,337 @@ def test_z0_growth_is_geometrically_symmetric_explode_equals_collapse():
     l_dn = z0_growth_loss(C, collapse).item()
     assert abs(l_up - l_dn) < 1e-6, f"explosion and collapse must cost equally, got {l_up} vs {l_dn}"
     assert l_up > 0
+
+
+# =====================================================================
+# Tier 3 coverage additions: the remaining public losses that had no
+# direct tests -- ReconLoss, InterpLoss, OneStepLoss, centered_deriv_target,
+# dt_weighted_deriv_loss, StatsLoss.forward/per_stat_mse, z0_scale_loss.
+# Each independent computation below is written from the docstring
+# definition, not from re-reading the implementation.
+# =====================================================================
+
+import pytest
+
+from training.losses import (
+    ReconLoss,
+    InterpLoss,
+    OneStepLoss,
+    centered_deriv_target,
+    dt_weighted_deriv_loss,
+    z0_scale_loss,
+)
+
+
+# --- ReconLoss -------------------------------------------------------
+
+def test_recon_loss_l2_is_mean_squared_error():
+    """Default kind='l2' is a MEAN (not summed) squared error -- the
+    deviation from the written summed-norm formula that keeps the loss
+    scale resolution-independent (see ReconLoss's own docstring)."""
+    torch.manual_seed(0)
+    x_recon = torch.randn(3, 1, 8, 8)
+    x = torch.randn(3, 1, 8, 8)
+    loss = ReconLoss()(x_recon, x)
+    assert torch.allclose(loss, (x_recon - x).pow(2).mean(), atol=1e-6)
+
+
+def test_recon_loss_l1_is_mean_absolute_error():
+    torch.manual_seed(1)
+    x_recon = torch.randn(3, 1, 8, 8)
+    x = torch.randn(3, 1, 8, 8)
+    loss = ReconLoss(kind="l1")(x_recon, x)
+    assert torch.allclose(loss, (x_recon - x).abs().mean(), atol=1e-6)
+
+
+def test_recon_loss_mean_reduction_is_resolution_independent():
+    """A uniform per-pixel error gives the SAME loss at 8x8 and 16x16 --
+    the whole reason mean reduction is used instead of the summed norm
+    the docs write (a sum would scale with image size)."""
+    small = ReconLoss()(torch.full((2, 1, 8, 8), 0.5), torch.zeros(2, 1, 8, 8))
+    large = ReconLoss()(torch.full((2, 1, 16, 16), 0.5), torch.zeros(2, 1, 16, 16))
+    assert torch.allclose(small, large, atol=1e-6)
+
+
+def test_recon_loss_rejects_unknown_kind():
+    with pytest.raises(ValueError, match="l1.*l2|kind"):
+        ReconLoss(kind="huber")
+
+
+# --- OneStepLoss (same shape as ReconLoss, but its own class) --------
+
+def test_one_step_loss_l2_matches_mean_squared_error():
+    torch.manual_seed(2)
+    z_next_pred = torch.randn(4, 3, 8, 8)
+    z_next_true = torch.randn(4, 3, 8, 8)
+    loss = OneStepLoss()(z_next_pred, z_next_true)
+    assert torch.allclose(loss, (z_next_pred - z_next_true).pow(2).mean(), atol=1e-6)
+
+
+def test_one_step_loss_l1_matches_mean_absolute_error():
+    torch.manual_seed(3)
+    z_next_pred = torch.randn(4, 3, 8, 8)
+    z_next_true = torch.randn(4, 3, 8, 8)
+    loss = OneStepLoss(kind="l1")(z_next_pred, z_next_true)
+    assert torch.allclose(loss, (z_next_pred - z_next_true).abs().mean(), atol=1e-6)
+
+
+def test_one_step_loss_rejects_unknown_kind():
+    with pytest.raises(ValueError, match="l1.*l2|kind"):
+        OneStepLoss(kind="nope")
+
+
+# --- InterpLoss ------------------------------------------------------
+
+def test_interp_loss_is_zero_on_an_exactly_affine_trajectory():
+    """The degenerate minimum the docstring warns about: for ANY z0
+    that is affine in t, z2 == (1-alpha)*z1 + alpha*z3 exactly, so the
+    loss is exactly 0. Deliberately unguarded -- this pins that no
+    self-protection was silently added."""
+    torch.manual_seed(4)
+    z1 = torch.randn(3, 2, 4, 4)
+    z3 = torch.randn(3, 2, 4, 4)
+    alpha = torch.tensor([0.2, 0.5, 0.8])
+    a = alpha.view(3, 1, 1, 1)
+    z2 = (1.0 - a) * z1 + a * z3            # exactly on the straight line
+    loss = InterpLoss()(z1, z2, z3, alpha)
+    assert loss.item() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_interp_loss_constant_z0_is_a_degenerate_minimum():
+    """A CONSTANT z0 (z1==z2==z3) is affine in t too and must score 0
+    for any alpha -- the specific collapse only L_recon0 prevents."""
+    z = torch.randn(2, 2, 4, 4)
+    z_seq = z  # same tensor for all three frames
+    loss = InterpLoss()(z_seq, z_seq, z_seq, alpha=torch.tensor([0.37, 0.91]))
+    assert loss.item() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_interp_loss_alpha_is_reshaped_per_sample_not_broadcast_against_width():
+    """alpha is (B,) and must be applied PER SAMPLE. With B != W the
+    naive trailing-dim broadcast would either error or silently align
+    alpha against the width axis; this pins the per-sample reshape by
+    comparing against an explicit per-sample loop. B=2, W=3 so the two
+    axes cannot be confused."""
+    torch.manual_seed(5)
+    z1 = torch.randn(2, 1, 2, 3)          # B=2, W=3 -- deliberately different
+    z2 = torch.randn(2, 1, 2, 3)
+    z3 = torch.randn(2, 1, 2, 3)
+    alpha = torch.tensor([0.25, 0.75])
+
+    loss = InterpLoss()(z1, z2, z3, alpha)
+
+    # Independent per-sample computation.
+    blended = torch.stack([
+        (1.0 - alpha[b]) * z1[b] + alpha[b] * z3[b] for b in range(2)
+    ])
+    expected = (blended - z2).pow(2).mean()
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
+def test_interp_loss_l1_kind_uses_absolute_error():
+    torch.manual_seed(6)
+    z1 = torch.randn(3, 2, 4, 4)
+    z2 = torch.randn(3, 2, 4, 4)
+    z3 = torch.randn(3, 2, 4, 4)
+    alpha = torch.tensor([0.1, 0.5, 0.9])
+    a = alpha.view(3, 1, 1, 1)
+
+    loss = InterpLoss(kind="l1")(z1, z2, z3, alpha)
+    expected = ((1.0 - a) * z1 + a * z3 - z2).abs().mean()
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
+def test_interp_loss_rejects_unknown_kind():
+    with pytest.raises(ValueError, match="l1.*l2|kind"):
+        InterpLoss(kind="l3")
+
+
+# --- centered_deriv_target -------------------------------------------
+
+def test_centered_deriv_reduces_to_symmetric_difference_at_equal_spacing():
+    """With dt_minus == dt_plus == h the non-uniform formula must reduce
+    exactly to the familiar (z_after - z_before)/(2h)."""
+    torch.manual_seed(7)
+    z_before = torch.randn(2, 3, 4, 4)
+    z_t = torch.randn(2, 3, 4, 4)
+    z_after = torch.randn(2, 3, 4, 4)
+    h = torch.tensor(0.5)
+
+    got = centered_deriv_target(z_before, z_t, z_after, h, h)
+    expected = (z_after - z_before) / (2.0 * h)
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
+def test_centered_deriv_is_exact_for_a_quadratic_with_unequal_spacing():
+    """A 3-point central difference is exact (2nd-order) for any
+    quadratic, EVEN with unequal spacing -- the property that removes
+    the O(dt) truncation bias of the one-sided target. Sample
+    f(t)=a+b*t+c*t^2 at t-dm, t, t+dp with dm != dp and require the
+    exact analytic derivative b+2*c*t back."""
+    a, b, c = 1.3, -0.7, 2.1
+    t = 2.0
+    dm = torch.tensor(1.0)
+    dp = torch.tensor(3.0)                 # deliberately unequal
+
+    def f(tt):
+        return a + b * tt + c * tt ** 2
+
+    z_before = torch.tensor(f(t - dm.item()))
+    z_t = torch.tensor(f(t))
+    z_after = torch.tensor(f(t + dp.item()))
+
+    got = centered_deriv_target(z_before, z_t, z_after, dm, dp)
+    analytic = b + 2.0 * c * t
+    assert got.item() == pytest.approx(analytic, abs=1e-5)
+
+
+# --- dt_weighted_deriv_loss ------------------------------------------
+
+def test_dt_weighted_deriv_exponent_zero_is_exactly_plain_recon_loss():
+    """exponent=0.0 must return the ReconLoss instance's own output
+    EXACTLY (torch.equal) -- the historical uniform-weight L_deriv,
+    routed straight through the trusted ReconLoss, not a numerically
+    close reconstruction."""
+    torch.manual_seed(8)
+    recon = ReconLoss()
+    z1_pred = torch.randn(4, 3, 4, 4)
+    target = torch.randn(4, 3, 4, 4)
+    dt = torch.rand(4, 1, 1, 1) + 0.1
+
+    got = dt_weighted_deriv_loss(recon, z1_pred, target, dt, exponent=0.0)
+    assert torch.equal(got, recon(z1_pred, target))
+
+
+def test_dt_weighted_deriv_exponent_one_is_mean1_renormalized_inverse_dt():
+    """exponent=1.0: weight_i = (1/dt_i) / mean(1/dt), then a weighted
+    mean of the squared per-element error -- verified against an
+    independent computation."""
+    torch.manual_seed(9)
+    recon = ReconLoss()
+    z1_pred = torch.randn(3, 2, 4, 4)
+    target = torch.randn(3, 2, 4, 4)
+    dt = (torch.rand(3, 1, 1, 1) + 0.1)
+
+    got = dt_weighted_deriv_loss(recon, z1_pred, target, dt, exponent=1.0)
+
+    weight = dt.pow(-1.0)
+    weight = weight / weight.mean()
+    per_element = (z1_pred - target) ** 2
+    expected = (weight * per_element).mean()
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
+def test_dt_weighted_deriv_l1_kind_uses_absolute_per_element_error():
+    torch.manual_seed(10)
+    recon = ReconLoss(kind="l1")
+    z1_pred = torch.randn(3, 2, 4, 4)
+    target = torch.randn(3, 2, 4, 4)
+    dt = (torch.rand(3, 1, 1, 1) + 0.1)
+
+    got = dt_weighted_deriv_loss(recon, z1_pred, target, dt, exponent=1.0)
+
+    weight = dt.pow(-1.0)
+    weight = weight / weight.mean()
+    per_element = (z1_pred - target).abs()
+    expected = (weight * per_element).mean()
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
+# --- StatsLoss.forward / per_stat_mse --------------------------------
+
+def test_stats_loss_forward_normalizes_the_target_per_stat():
+    """forward() normalizes the (raw) target by (target-mean)/std before
+    comparing to the (already-normalized) prediction, then means the
+    squared difference. Verified independently, no angle column."""
+    mean = torch.tensor([5.0, -3.0, 10.0])
+    std = torch.tensor([2.0, 0.5, 4.0])
+    sl = StatsLoss(mean, std, stat_names=["avg_phi", "energy", "stdev_phi"])  # no "angle"
+
+    torch.manual_seed(11)
+    pred = torch.randn(6, 3)               # already-normalized predictions
+    target = torch.randn(6, 3) * 5.0 + 2.0  # raw-scale targets
+
+    got = sl(pred, target)
+    target_norm = (target - mean) / std
+    expected = (pred - target_norm).pow(2).mean()
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
+def test_stats_loss_wraps_only_the_angle_column_by_its_normalized_period():
+    """angle is defined mod pi (physical orientation has no front): a
+    prediction off from the normalized target by exactly one period
+    (pi/std in normalized units) on the angle column must contribute
+    ZERO, while a non-angle column offset by the same amount does not."""
+    mean = torch.tensor([5.0, 0.0])
+    std = torch.tensor([2.0, 0.5])
+    sl = StatsLoss(mean, std, stat_names=["avg_phi", "angle"])
+    angle_idx = 1
+    period = torch.pi / std[angle_idx]
+
+    target = torch.tensor([[7.0, 0.3]])          # raw
+    target_norm = (target - mean) / std
+
+    # Prediction exactly on target_norm except the angle column shifted
+    # by a full normalized period -> wrapped angle diff is 0.
+    pred = target_norm.clone()
+    pred[0, angle_idx] = target_norm[0, angle_idx] + period
+    assert sl(pred, target).item() == pytest.approx(0.0, abs=1e-5)
+
+    # The same-sized shift on the NON-angle column is a real error.
+    pred_nonangle = target_norm.clone()
+    pred_nonangle[0, 0] = target_norm[0, 0] + period
+    assert sl(pred_nonangle, target).item() > 1e-3
+
+
+def test_stats_loss_with_no_angle_name_wraps_nothing():
+    """When stat_names has no 'angle' (or is None), angle_idx is None
+    and every column is treated as a plain normalized difference."""
+    mean = torch.tensor([1.0, 2.0])
+    std = torch.tensor([1.0, 1.0])
+    sl = StatsLoss(mean, std, stat_names=None)
+    assert sl.angle_idx is None
+
+    pred = torch.tensor([[0.0, 0.0]])
+    target = torch.tensor([[1.0, 2.0]])          # target_norm = 0 -> diff = pred
+    assert sl(pred, target).item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_stats_loss_per_stat_mse_returns_one_value_per_stat():
+    """per_stat_mse means over the batch dim only, returning (n_stats,)
+    -- and its mean over stats must equal the scalar forward()."""
+    mean = torch.tensor([5.0, -3.0, 10.0])
+    std = torch.tensor([2.0, 0.5, 4.0])
+    sl = StatsLoss(mean, std, stat_names=["avg_phi", "energy", "stdev_phi"])
+
+    torch.manual_seed(12)
+    pred = torch.randn(8, 3)
+    target = torch.randn(8, 3) * 3.0
+
+    per_stat = sl.per_stat_mse(pred, target)
+    assert per_stat.shape == (3,)
+    assert torch.allclose(per_stat.mean(), sl(pred, target), atol=1e-6)
+
+    target_norm = (target - mean) / std
+    expected_per_stat = (pred - target_norm).pow(2).mean(dim=0)
+    assert torch.allclose(per_stat, expected_per_stat, atol=1e-6)
+
+
+# --- z0_scale_loss ---------------------------------------------------
+
+def test_z0_scale_loss_is_mean_squared_latent_element():
+    """mean over batch of ||z0||^2/(C*H*W) == the mean squared latent
+    element over the whole tensor."""
+    torch.manual_seed(13)
+    z0 = torch.randn(4, 3, 4, 4)
+    assert torch.allclose(z0_scale_loss(z0), z0.pow(2).mean(), atol=1e-6)
+
+
+def test_z0_scale_loss_scale_is_independent_of_latent_channels():
+    """A constant-amplitude latent gives the SAME anchor value at 3 and
+    at 12 channels -- the mean-per-element normalization the docstring
+    promises (so the term isn't silently rescaled by latent_channels)."""
+    few = z0_scale_loss(torch.full((2, 3, 4, 4), 0.5))
+    many = z0_scale_loss(torch.full((2, 12, 4, 4), 0.5))
+    assert torch.allclose(few, many, atol=1e-6)
+    assert few.item() == pytest.approx(0.25, abs=1e-6)

@@ -71,16 +71,24 @@ def test_windowless_runs_message_labels_the_split():
     import tempfile, pathlib
     with tempfile.TemporaryDirectory() as d:
         base = pathlib.Path(d)
-        # runs with too few steps for window_length=3 -> windowless-runs message
-        run_dirs = [_make_run(base, f"r{i}", degenerate=True) for i in range(3)]
+        # The windowless-runs message fires for a run that SURVIVES filtering
+        # (>=1 kept step) but has fewer than window_length kept steps. A
+        # degenerate run has 0 kept steps -> it is "dropped ENTIRELY" and never
+        # reaches the window-count check, so it does NOT trigger this message
+        # (which is why an earlier version guarded the assertion with `if ... in
+        # out` and so asserted nothing). Use NON-degenerate runs -- their 4
+        # steps all clear min_stdev_phi=0.01, so they survive -- with
+        # window_length=5 > 4 available steps, so EVERY run has too few kept
+        # steps and the message fires for certain.
+        run_dirs = [_make_run(base, f"r{i}", degenerate=False) for i in range(3)]
         buf = io.StringIO()
         with redirect_stdout(buf):
             MicrostructureEvolutionDataset(
-                run_dirs, encoder=None, window_length=3,
+                run_dirs, encoder=None, window_length=5,
                 min_step=0, min_stdev_phi=0.01, split_label="validation")
         out = buf.getvalue()
-        if "had fewer than window_length" in out:
-            assert "validation runs" in out, out
+        assert "had fewer than window_length" in out, out
+        assert "validation runs" in out, out
 
 
 def test_snapshot_dataset_labels_the_split_too():
