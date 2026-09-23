@@ -107,7 +107,7 @@ def _load(lds_ckpt_path: Path, ae_ckpt_path: Path | None, device):
         raise SystemExit("The AE ancestor has no stats head (trained with stats0_weight=0); "
                          "stats0_predict and this diagnostic need one.")
     return (f_theta, ae_encoder, stats_head, lds_config, ae_ckpt_path,
-            lds_checkpoint.get("data_config", {}), ae_config)
+            lds_checkpoint.get("data_config", {}), ae_config, ae_checkpoint)
 
 
 def main():
@@ -144,7 +144,7 @@ def main():
     device = torch.device(args.device)
 
     (f_theta, ae_encoder, stats_head, lds_config, ae_ckpt,
-     lds_checkpoint_data_config, ae_config) = _load(args.lds_checkpoint, args.ae_checkpoint, device)
+     lds_checkpoint_data_config, ae_config, ae_checkpoint) = _load(args.lds_checkpoint, args.ae_checkpoint, device)
     # MATCH TRAINING's coordinate. The model steps in dt_window, which is Delta-u in
     # log10_t mode -- and the dataset only produces that (plus a physical dt) when
     # return_phys_dt is set the SAME way train_lds set it. Feeding a Delta-u model a

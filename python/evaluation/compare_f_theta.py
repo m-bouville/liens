@@ -1673,7 +1673,15 @@ def _default_figure_path(prefix, a, b, seed, n_steps_used, z1_resync,
     suffix = "" if fixed_windows else f"-seed{seed}"
     regime_tag = f"-{n_steps_used}step{'s' if n_steps_used != 1 else ''}"
     regime_tag += "-resync" if z1_resync else "-propagated"
-    out = (_PYTHON_ROOT.parent / "output" / _output_subdir(a["path"])
+    # Same-stage comparisons land in that stage's dir; a CROSS-stage one
+    # (e.g. 3a vs 3b) is not a single-stage figure, so route it to the neutral
+    # rollout_check_png/ rather than arbitrarily under the FIRST checkpoint's
+    # stage -- mirrors the --with-ancestors path, which does the same for its
+    # multi-stage lineage figures.
+    _sub_a = _output_subdir(a["path"])
+    _sub_b = _output_subdir(b["path"])
+    _subdir = _sub_a if _sub_a == _sub_b else "rollout_check_png"
+    out = (_PYTHON_ROOT.parent / "output" / _subdir
            / f"{name}{regime_tag}{suffix}.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     return out

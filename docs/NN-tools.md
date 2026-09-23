@@ -87,6 +87,11 @@ Use results from the previous to select channels (e.g. drop latent channels from
 
 
 
+## geometry
+`python -m evaluation.check_stats_head_rollout --size 256 checkpoints/stage3b/256x256-stage3b.pt --steps 16` gives the behavior of the stats head over step for a few windows.
+
+
+
 ## Low level
 
 ### substep_convergence

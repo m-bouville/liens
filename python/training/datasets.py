@@ -1257,6 +1257,15 @@ class MicrostructureEvolutionDataset(Dataset):
                 self._run_pred_z0[run_idx] = z0[k]                        # (C, 8, 8)
                 self._run_pred_du[run_idx] = du_pred
 
+        # Return the predecessor encode's peak activations to the allocator now
+        # that it is done -- mirrors _read_and_encode_all_runs' own cleanup. This
+        # method runs AFTER that function's empty_cache and has none of its own,
+        # so without this line the (full-resolution) predecessor encode's peak
+        # stays held as RESERVED VRAM through the entire training loop even
+        # though the cached-latent training step itself allocates almost nothing.
+        if torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()
+
         # Precompute the per-run quotient ONCE and swap it in for the deriv
         # stream: q_k = (z0_k - z0_{k-1})/du_{k-1}, frame 0 from the predecessor
         # (or the old z1 where there is none). Same memory (replaces z1), and
